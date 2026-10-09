@@ -23,6 +23,7 @@ import {
 } from "react";
 import { toast } from "sonner";
 
+import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -32,15 +33,6 @@ import {
   ContextMenuShortcut,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -113,6 +105,12 @@ export function FileTree({ className }: { className?: string }) {
   const uploadTarget = useRef<TreeID | null>(null);
   // Uploads need the server (blob store), so local-only projects skip them.
   const canUpload = !readOnly && assets !== null;
+
+  // Only what's on screen counts: a folder left open inside a collapsed one
+  // is hidden, and every visible open folder sits under an open root one.
+  const anyExpanded = tree.some(
+    (e) => e.kind === "dir" && !collapsed.has(e.id),
+  );
 
   const selected = selectedId ? byId.get(selectedId) : undefined;
   const deleting = pendingDelete ? byId.get(pendingDelete) : undefined;
@@ -450,6 +448,7 @@ export function FileTree({ className }: { className?: string }) {
         />
         <ToolbarButton
           label="Collapse all"
+          disabled={!anyExpanded}
           onClick={() =>
             setCollapsed(
               new Set(
@@ -507,38 +506,23 @@ export function FileTree({ className }: { className?: string }) {
         </ContextMenuContent>
       </ContextMenu>
 
-      <Dialog
+      <ConfirmDeleteDialog
         open={deleting !== undefined}
-        onOpenChange={(open) => !open && setPendingDelete(null)}
-      >
-        <DialogContent showCloseButton={false}>
-          <DialogHeader>
-            <DialogTitle>
-              Delete {deleting?.kind === "dir" ? "folder" : "file"}?
-            </DialogTitle>
-            <DialogDescription>
-              <span className="font-mono">{deleting?.path}</span>
-              {deleting?.kind === "dir" && " and everything in it"} will be
-              removed for everyone in this project.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
-            </DialogClose>
-            <Button
-              variant="destructive"
-              onClick={() => {
-                const id = pendingDelete;
-                setPendingDelete(null);
-                if (id) attempt(() => deleteNode(project, id));
-              }}
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete ${deleting?.kind === "dir" ? "folder" : "file"}?`}
+        description={
+          <>
+            <span className="font-mono">{deleting?.path}</span>
+            {deleting?.kind === "dir" && " and everything in it"} will be
+            removed for everyone in this project.
+          </>
+        }
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          const id = pendingDelete;
+          setPendingDelete(null);
+          if (id) attempt(() => deleteNode(project, id));
+        }}
+      />
     </div>
   );
 }
@@ -616,8 +600,16 @@ function indent(depth: number): number {
   return 4 + depth * 12;
 }
 
-function EntryIcon({ kind, open }: { kind: TreeEntry["kind"]; open: boolean }) {
-  const className = "size-4 shrink-0 text-muted-foreground";
+export function EntryIcon({
+  kind,
+  open,
+  className: extra,
+}: {
+  kind: TreeEntry["kind"];
+  open: boolean;
+  className?: string;
+}) {
+  const className = cn("size-4 shrink-0 text-muted-foreground", extra);
   if (kind === "dir")
     return open ? (
       <FolderOpenIcon className={className} />
@@ -641,10 +633,12 @@ function Badge({ tip, children }: { tip: string; children: ReactNode }) {
 
 function ToolbarButton({
   label,
+  disabled,
   onClick,
   children,
 }: {
   label: string;
+  disabled?: boolean;
   onClick: () => void;
   children: ReactNode;
 }) {
@@ -655,6 +649,7 @@ function ToolbarButton({
           variant="ghost"
           size="icon-sm"
           aria-label={label}
+          disabled={disabled}
           onClick={onClick}
         >
           {children}

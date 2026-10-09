@@ -5,6 +5,7 @@ import { EyeIcon, FileCodeIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AssetView } from "@/components/AssetView";
+import { FileTabs } from "@/components/FileTabs";
 import { getText } from "@/doc/fs-ops";
 import { Editor } from "@/editor/Editor";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
@@ -31,8 +32,7 @@ export interface EditorPaneProps {
 }
 
 export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
-  const { project, index, mainFile, openFileId, undoManager, readOnly } =
-    useProject();
+  const { project, index, openFileId, undoManager, readOnly } = useProject();
   const presence = usePresenceContext()?.presence;
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
@@ -83,52 +83,48 @@ export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
     view.focus();
   }, [view, reveal, openFileId]);
 
+  let content;
   if (openFileId && openKind === "asset") {
-    return <AssetView id={openFileId} className={className} />;
-  }
-
-  if (!openFileId || !text) {
-    return (
-      <div
-        className={cn(
-          "flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground",
-          className,
-        )}
-      >
+    content = <AssetView id={openFileId} className="min-h-0 flex-1" />;
+  } else if (!openFileId || !text) {
+    content = (
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
         <FileCodeIcon className="size-6" />
         <p>Select a file to {readOnly ? "view it" : "start editing"}</p>
       </div>
+    );
+  } else {
+    content = (
+      <>
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
+          <span className="truncate font-mono" title={path}>
+            {path}
+          </span>
+          {readOnly && (
+            <span className="ml-auto flex items-center gap-1 text-muted-foreground">
+              <EyeIcon className="size-3.5" />
+              Read only
+            </span>
+          )}
+        </div>
+        <Editor
+          doc={project.doc}
+          text={text}
+          undoManager={undoManager}
+          readOnly={readOnly}
+          extensions={extensions}
+          diagnostics={diagnostics}
+          onReady={setView}
+          className="min-h-0 flex-1"
+        />
+      </>
     );
   }
 
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
-        <span className="truncate font-mono" title={path}>
-          {path}
-        </span>
-        {openFileId === mainFile && (
-          <span className="rounded bg-primary/10 px-1 text-[10px] leading-4 font-medium text-primary uppercase">
-            main
-          </span>
-        )}
-        {readOnly && (
-          <span className="ml-auto flex items-center gap-1 text-muted-foreground">
-            <EyeIcon className="size-3.5" />
-            Read only
-          </span>
-        )}
-      </div>
-      <Editor
-        doc={project.doc}
-        text={text}
-        undoManager={undoManager}
-        readOnly={readOnly}
-        extensions={extensions}
-        diagnostics={diagnostics}
-        onReady={setView}
-        className="min-h-0 flex-1"
-      />
+      <FileTabs />
+      {content}
     </div>
   );
 }

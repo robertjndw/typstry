@@ -10,6 +10,7 @@ import {
 import { createProject, type ApiOptions } from "@/sync/api";
 
 import {
+  forgetProject,
   rememberProject,
   rememberShare,
   saveProjectKey,
@@ -62,4 +63,13 @@ export async function createLocalProject(
     title,
   });
   return { projectId: created.projectId, editToken: created.editToken, key };
+}
+
+/** Counterpart to createLocalProject. Leaves the server copy alone. */
+export async function deleteLocalProject(
+  projectId: string,
+  opts: { backend?: DocBackend } = {},
+): Promise<void> {
+  forgetProject(projectId);
+  await (opts.backend ?? (await defaultBackend())).remove(projectId);
 }

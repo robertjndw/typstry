@@ -1,4 +1,15 @@
-import { loadRecent, rememberProject, updateRecentTitle } from "./recent";
+import {
+  forgetProject,
+  loadProjectKey,
+  loadShare,
+  loadShareLinks,
+  loadRecent,
+  rememberProject,
+  rememberShare,
+  saveProjectKey,
+  saveShareLinks,
+  updateRecentTitle,
+} from "./recent";
 
 describe("recent projects", () => {
   afterEach(() => localStorage.clear());
@@ -22,5 +33,41 @@ describe("recent projects", () => {
       ["b", "B", 2],
       ["a", "A renamed", 1],
     ]);
+  });
+
+  it("forgets everything stored about one project", () => {
+    const key = "A".repeat(43);
+    for (const id of ["a", "b"]) {
+      rememberProject(
+        { projectId: id, token: `t${id}`, title: id },
+        localStorage,
+      );
+      saveShareLinks(
+        id,
+        { editToken: `e${id}`, viewToken: `v${id}` },
+        localStorage,
+      );
+      rememberShare(
+        `e${id}`,
+        { projectId: id, permission: "write" },
+        localStorage,
+      );
+      rememberShare(
+        `v${id}`,
+        { projectId: id, permission: "read" },
+        localStorage,
+      );
+    }
+    saveProjectKey("a", key, localStorage);
+
+    forgetProject("a", localStorage);
+
+    expect(loadRecent(localStorage).map((p) => p.projectId)).toEqual(["b"]);
+    expect(loadShareLinks("a", localStorage)).toBeNull();
+    expect(loadProjectKey("a", localStorage)).toBeNull();
+    expect(loadShare("ea", localStorage)).toBeNull();
+    expect(loadShare("va", localStorage)).toBeNull();
+    expect(loadShareLinks("b", localStorage)).not.toBeNull();
+    expect(loadShare("vb", localStorage)).not.toBeNull();
   });
 });

@@ -67,6 +67,22 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
     expect((await reopen(backend, "p2")).found).toBe(false);
   });
 
+  it("removes one project's snapshot and updates", async () => {
+    const backend = await makeBackend();
+    for (const id of ["p1", "p2"]) {
+      const doc = new LoroDoc();
+      const store = new LocalDocStore(id, doc, backend, { compactAfter: 1 });
+      await store.load();
+      write(doc, "a");
+      await store.flush();
+      write(doc, "b");
+      await store.flush();
+    }
+    await backend.remove("p1");
+    expect((await reopen(backend, "p1")).found).toBe(false);
+    expect(text((await reopen(backend, "p2")).doc)).toBe("ab");
+  });
+
   it("compacts into a snapshot without losing anything", async () => {
     const backend = await makeBackend();
     const doc = new LoroDoc();

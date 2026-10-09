@@ -16,6 +16,11 @@ export function basename(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 
+/** Parent folder path, or "" at the root. */
+export function dirname(path: string): string {
+  return path.slice(0, Math.max(path.lastIndexOf("/"), 0));
+}
+
 /**
  * Trimmed `raw` when it is 1 to `max` characters long, else null. Counts
  * code points, so an emoji is one character, as a user would expect.

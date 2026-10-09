@@ -32,6 +32,8 @@ export interface DocBackend {
     projectId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void>;
+  /** Drops everything stored for the project. */
+  remove(projectId: string): Promise<void>;
 }
 
 const DB_NAME = "typstry";
@@ -142,6 +144,16 @@ export class IndexedDbBackend implements DocBackend {
     for (const key of keys) updates.delete(key);
     await committed;
   }
+
+  async remove(projectId: string): Promise<void> {
+    const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readwrite");
+    const committed = done(tx);
+    tx.objectStore(SNAPSHOTS).delete(projectId);
+    const updates = tx.objectStore(UPDATES);
+    const keys = await request(updates.index(BY_PROJECT).getAllKeys(projectId));
+    for (const key of keys) updates.delete(key);
+    await committed;
+  }
 }
 
 /** For browsers without usable IndexedDB: survives navigation, not reloads. */
@@ -172,6 +184,10 @@ export class MemoryBackend implements DocBackend {
   ): Promise<void> {
     const snapshot = build(await this.load(projectId));
     this.docs.set(projectId, { snapshot, updates: [] });
+  }
+
+  async remove(projectId: string): Promise<void> {
+    this.docs.delete(projectId);
   }
 }
 

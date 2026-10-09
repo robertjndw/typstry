@@ -59,6 +59,35 @@ describe("FileTree", () => {
     expect(paths(project)).toContain("chapters/intro.typ");
   });
 
+  it("collapses all folders, and is disabled when none are open", () => {
+    const project = setup();
+    const collapseAll = screen.getByRole("button", { name: "Collapse all" });
+    expect(collapseAll).toBeDisabled();
+
+    act(() => {
+      const dir = createFile(project, null, "chapters", "dir");
+      createFile(project, dir, "intro.typ", "text");
+    });
+    expect(item("chapters")).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(collapseAll);
+    expect(item("chapters")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("treeitem", { name: "intro.typ" })).toBeNull();
+    expect(collapseAll).toBeDisabled();
+  });
+
+  it("disables collapse all when open folders are hidden in a closed one", () => {
+    const project = setup();
+    act(() => {
+      const dir = createFile(project, null, "chapters", "dir");
+      createFile(project, dir, "drafts", "dir");
+    });
+    expect(item("drafts")).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(item("chapters"));
+    expect(screen.getByRole("button", { name: "Collapse all" })).toBeDisabled();
+  });
+
   it("renames inline with F2", () => {
     const project = setup();
     fireEvent.keyDown(item("main.typ"), { key: "F2" });

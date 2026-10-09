@@ -166,3 +166,32 @@ export function forgetShare(
     // Same as every other storage access here: best effort.
   }
 }
+
+/** Drops the project's recent entry, links, key and cached share lookups. */
+export function forgetProject(
+  projectId: string,
+  storage: Storage | null = getStorage(),
+): void {
+  writeJson(
+    RECENT_KEY,
+    loadRecent(storage).filter((p) => p.projectId !== projectId),
+    storage,
+  );
+  const shares: string[] = [];
+  try {
+    if (!storage) return;
+    storage.removeItem(LINKS_PREFIX + projectId);
+    storage.removeItem(KEY_PREFIX + projectId);
+    // Removing while iterating would shift the indices.
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (!key?.startsWith(SHARE_PREFIX)) continue;
+      const token = key.slice(SHARE_PREFIX.length);
+      if (loadShare(token, storage)?.projectId === projectId)
+        shares.push(token);
+    }
+  } catch {
+    // Best effort, like every other storage access here.
+  }
+  for (const token of shares) forgetShare(token, storage);
+}

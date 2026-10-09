@@ -56,7 +56,39 @@ describe("ProjectProvider", () => {
     expect(hook.result.current.index.byId.get(other)?.path).toBe("renamed.typ");
   });
 
-  it("closes the open file when a peer deletes it", () => {
+  it("opens new tabs next to the active one", () => {
+    const { project, other, hook } = setup();
+    const main = project.mainFile!;
+    const third = createFile(project, null, "third.typ", "text");
+    expect(hook.result.current.tabs).toEqual([main]);
+
+    act(() => hook.result.current.openFile(other));
+    act(() => hook.result.current.openFile(main));
+    act(() => hook.result.current.openFile(third));
+    expect(hook.result.current.tabs).toEqual([main, third, other]);
+    expect(hook.result.current.openFileId).toBe(third);
+  });
+
+  it("activates the neighboring tab when closing the active one", () => {
+    const { project, other, hook } = setup();
+    const main = project.mainFile!;
+    const third = createFile(project, null, "third.typ", "text");
+    act(() => hook.result.current.openFile(other));
+    act(() => hook.result.current.openFile(third));
+
+    act(() => hook.result.current.closeFile(other));
+    expect(hook.result.current.tabs).toEqual([main, third]);
+    expect(hook.result.current.openFileId).toBe(third);
+
+    act(() => hook.result.current.closeFile(third));
+    expect(hook.result.current.openFileId).toBe(main);
+
+    act(() => hook.result.current.closeFile(main));
+    expect(hook.result.current.tabs).toEqual([]);
+    expect(hook.result.current.openFileId).toBeNull();
+  });
+
+  it("closes the tab of a file a peer deletes", () => {
     const { project, other, hook } = setup();
     act(() => hook.result.current.openFile(other));
 
@@ -64,7 +96,8 @@ describe("ProjectProvider", () => {
     deleteNode(peer, other);
     act(() => sync(project, peer));
 
-    expect(hook.result.current.openFileId).toBeNull();
+    expect(hook.result.current.tabs).toEqual([project.mainFile]);
+    expect(hook.result.current.openFileId).toBe(project.mainFile);
     expect(hook.result.current.index.byId.has(other)).toBe(false);
   });
 });

@@ -39,6 +39,7 @@ export function ProjectProvider({
       readOnly,
       assets: assets ?? null,
       openFile: (id) => store.open(id),
+      closeFile: (id) => store.close(id),
     }),
     [snapshot, store, readOnly, assets],
   );

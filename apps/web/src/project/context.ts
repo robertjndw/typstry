@@ -13,7 +13,8 @@ export interface ProjectContextValue extends ProjectSnapshot {
   readOnly: boolean;
   /** Binary files of a synced project; null for a local-only one. */
   assets: ProjectAssets | null;
-  openFile: (id: TreeID | null) => void;
+  openFile: (id: TreeID) => void;
+  closeFile: (id: TreeID) => void;
 }
 
 export const ProjectContext = createContext<ProjectContextValue | null>(null);

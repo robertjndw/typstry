@@ -1,11 +1,13 @@
-import { Loader2Icon, PlusIcon } from "lucide-react";
+import { Loader2Icon, PlusIcon, Trash2Icon } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router";
+import { toast } from "sonner";
 
+import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { createLocalProject } from "@/project/create";
-import { loadRecent } from "@/project/recent";
+import { createLocalProject, deleteLocalProject } from "@/project/create";
+import { loadRecent, type RecentProject } from "@/project/recent";
 
 const dateFormat = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -17,7 +19,20 @@ export function Home() {
   const [title, setTitle] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [recent] = useState(loadRecent);
+  const [recent, setRecent] = useState(loadRecent);
+  const [pendingDelete, setPendingDelete] = useState<RecentProject | null>(
+    null,
+  );
+
+  async function deleteProject(project: RecentProject) {
+    setRecent((list) => list.filter((p) => p.projectId !== project.projectId));
+    try {
+      await deleteLocalProject(project.projectId);
+    } catch (err) {
+      console.error(err);
+      toast.error("Could not clear the local copy of this project");
+    }
+  }
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -74,23 +89,46 @@ export function Home() {
           </h2>
           <ul className="divide-y rounded-lg border">
             {recent.map((p) => (
-              <li key={p.projectId}>
+              <li key={p.projectId} className="group flex items-center">
                 <Link
                   to={`/p/${encodeURIComponent(p.token)}`}
-                  className="flex items-baseline justify-between gap-3 px-3 py-2 text-sm hover:bg-muted"
+                  className="flex min-w-0 flex-1 items-baseline justify-between gap-3 py-2 pr-1 pl-3 text-sm hover:bg-muted"
                 >
-                  <span className="truncate font-medium">
-                    {p.title || "Untitled"}
-                  </span>
+                  <span className="truncate font-medium">{titleOf(p)}</span>
                   <span className="shrink-0 text-xs text-muted-foreground">
                     {dateFormat.format(p.visitedAt)}
                   </span>
                 </Link>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={`Delete ${titleOf(p)}`}
+                  title="Delete"
+                  className="mx-1 text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive focus-visible:opacity-100"
+                  onClick={() => setPendingDelete(p)}
+                >
+                  <Trash2Icon />
+                </Button>
               </li>
             ))}
           </ul>
         </section>
       )}
+      <ConfirmDeleteDialog
+        open={pendingDelete !== null}
+        title={<>Delete &ldquo;{titleOf(pendingDelete)}&rdquo;?</>}
+        description="It's only removed from this browser. Anyone with the link can still open it, so keep the link if you might want it back."
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          const project = pendingDelete;
+          setPendingDelete(null);
+          if (project) void deleteProject(project);
+        }}
+      />
     </main>
   );
+}
+
+function titleOf(project: RecentProject | null): string {
+  return project?.title || "Untitled";
 }
