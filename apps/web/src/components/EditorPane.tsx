@@ -124,35 +124,31 @@ export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
     );
   } else {
     content = (
-      <>
-        <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
-          <span className="truncate font-mono" title={path}>
-            {path}
-          </span>
-          {readOnly && (
-            <span className="ml-auto flex items-center gap-1 text-muted-foreground">
-              <EyeIcon className="size-3.5" />
-              Read only
-            </span>
-          )}
-        </div>
-        <Editor
-          doc={project.doc}
-          text={text}
-          undoManager={undoManager}
-          readOnly={readOnly}
-          extensions={extensions}
-          diagnostics={diagnostics}
-          onReady={setView}
-          className="min-h-0 flex-1"
-        />
-      </>
+      <Editor
+        doc={project.doc}
+        text={text}
+        undoManager={undoManager}
+        readOnly={readOnly}
+        extensions={extensions}
+        diagnostics={diagnostics}
+        onReady={setView}
+        className="min-h-0 flex-1"
+      />
     );
   }
 
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
-      <FileTabs />
+      <FileTabs
+        trailing={
+          readOnly && (
+            <span className="flex shrink-0 items-center gap-1 px-3 text-xs text-muted-foreground">
+              <EyeIcon className="size-3.5" />
+              Read only
+            </span>
+          )
+        }
+      />
       {content}
     </div>
   );

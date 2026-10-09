@@ -1,5 +1,5 @@
 import { XIcon } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { type ReactNode, useEffect, useMemo, useRef } from "react";
 
 import { EntryIcon } from "@/components/FileTree";
 import { basename, dirname } from "@/doc/names";
@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import { useProject } from "@/project/context";
 
 /** One tab per open file; the active one is what the editor shows. */
-export function FileTabs() {
+export function FileTabs({ trailing }: { trailing?: ReactNode }) {
   const { index, tabs, openFileId, openFile, closeFile } = useProject();
   const strip = useRef<HTMLDivElement>(null);
 
@@ -37,69 +37,72 @@ export function FileTabs() {
   if (entries.length === 0) return null;
 
   return (
-    <div
-      ref={strip}
-      role="tablist"
-      aria-label="Open files"
-      className="flex h-9 shrink-0 [scrollbar-width:none] overflow-x-auto overflow-y-hidden border-b bg-muted/30"
-    >
-      {entries.map((tab) => {
-        const active = tab.id === openFileId;
-        return (
-          <div
-            key={tab.id}
-            role="presentation"
-            className={cn(
-              "group relative flex max-w-56 shrink-0 items-center border-r text-xs",
-              active
-                ? "bg-background text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-            onAuxClick={(e) => {
-              if (e.button !== 1) return;
-              e.preventDefault();
-              closeFile(tab.id);
-            }}
-          >
-            {active && (
-              <span className="absolute inset-x-0 top-0 h-0.5 bg-primary" />
-            )}
-            <button
-              type="button"
-              role="tab"
-              aria-selected={active}
-              title={tab.path}
-              className="flex h-full min-w-0 items-center gap-1.5 pr-1 pl-3 outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset"
-              onClick={() => openFile(tab.id)}
-            >
-              <EntryIcon
-                kind={tab.kind}
-                name={tab.name}
-                open={false}
-                className="size-3.5 text-current"
-              />
-              <span className="truncate">{tab.name}</span>
-              {tab.folder !== null && (
-                <span className="truncate text-muted-foreground">
-                  {tab.folder}
-                </span>
-              )}
-            </button>
-            <button
-              type="button"
-              aria-label={`Close ${tab.path}`}
-              title="Close"
+    <div className="flex h-9 shrink-0 border-b bg-muted/30">
+      <div
+        ref={strip}
+        role="tablist"
+        aria-label="Open files"
+        className="flex min-w-0 flex-1 [scrollbar-width:none] overflow-x-auto overflow-y-hidden"
+      >
+        {entries.map((tab) => {
+          const active = tab.id === openFileId;
+          return (
+            <div
+              key={tab.id}
+              role="presentation"
               className={cn(
-                "mr-1.5 flex size-5 shrink-0 items-center justify-center rounded-sm outline-none hover:bg-muted focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-ring",
-                !active && "opacity-0 group-hover:opacity-100",
+                "group relative flex max-w-56 shrink-0 items-center border-r text-xs",
+                active
+                  ? "bg-background text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
               )}
-              onClick={() => closeFile(tab.id)}
+              onAuxClick={(e) => {
+                if (e.button !== 1) return;
+                e.preventDefault();
+                closeFile(tab.id);
+              }}
             >
-              <XIcon className="size-3.5" />
-            </button>
-          </div>
-        );
-      })}
+              {active && (
+                <span className="absolute inset-x-0 top-0 h-0.5 bg-primary" />
+              )}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={active}
+                title={tab.path}
+                className="flex h-full min-w-0 items-center gap-1.5 pr-1 pl-3 outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset"
+                onClick={() => openFile(tab.id)}
+              >
+                <EntryIcon
+                  kind={tab.kind}
+                  name={tab.name}
+                  open={false}
+                  className="size-3.5 text-current"
+                />
+                <span className="truncate">{tab.name}</span>
+                {tab.folder !== null && (
+                  <span className="truncate text-muted-foreground">
+                    {tab.folder}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                aria-label={`Close ${tab.path}`}
+                title="Close"
+                className={cn(
+                  "mr-1.5 flex size-5 shrink-0 items-center justify-center rounded-sm outline-none hover:bg-muted focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-ring",
+                  !active && "opacity-0 group-hover:opacity-100",
+                )}
+                onClick={() => closeFile(tab.id)}
+              >
+                <XIcon className="size-3.5" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      {trailing}
     </div>
   );
 }
