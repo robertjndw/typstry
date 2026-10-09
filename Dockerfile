@@ -1,5 +1,20 @@
 # syntax=docker/dockerfile:1.7
 
+FROM rust:1.98-slim-trixie AS tinymist
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install wasm-pack --locked --version 0.15.0
+WORKDIR /src
+COPY apps/web/scripts/build-tinymist.sh apps/web/scripts/
+# The checkout and its build cache live in target/, a cache mount; only the
+# wasm output in apps/web/vendor ends up in the layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/root/.cache/.wasm-pack \
+    apps/web/scripts/build-tinymist.sh
+
 FROM node:26-slim AS web
 WORKDIR /src
 RUN npm install -g pnpm@12.10.1
@@ -8,6 +23,7 @@ COPY apps/web/package.json apps/web/
 RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile --filter web...
 COPY apps/web apps/web
+COPY --from=tinymist /src/apps/web/vendor/tinymist apps/web/vendor/tinymist
 RUN pnpm --filter web build
 
 FROM rust:1.98-slim-trixie AS server

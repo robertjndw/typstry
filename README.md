@@ -27,7 +27,7 @@ The easiest way to run typstry is Docker Compose:
 docker compose up -d
 ```
 
-Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume.
+Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume. The first build compiles tinymist to wasm, so expect it to take several minutes.
 
 Or build and run the image directly:
 

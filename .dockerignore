@@ -3,6 +3,8 @@
 .agents
 **/node_modules
 **/dist
+# Built inside the image (see the tinymist stage in the Dockerfile).
+apps/web/vendor
 target
 data
 coverage
