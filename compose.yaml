@@ -1,0 +1,17 @@
+services:
+  typstry:
+    build: .
+    image: typstry:latest
+    ports:
+      - "8787:8787"
+    environment:
+      RUST_LOG: info
+    volumes:
+      - typstry-data:/data
+    restart: unless-stopped
+    # The server compacts room logs into snapshots on shutdown, so give it
+    # time to finish before Docker kills it.
+    stop_grace_period: 30s
+
+volumes:
+  typstry-data:

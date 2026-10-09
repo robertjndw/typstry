@@ -1,0 +1,86 @@
+[
+  {
+    "path": ".gitignore",
+    "id": "102@10",
+    "kind": "text",
+    "renamed": false
+  },
+  {
+    "path": ".gitignore~4@9223372036854775813",
+    "id": "4@9223372036854775813",
+    "kind": "text",
+    "renamed": true
+  },
+  {
+    "path": "Makefile",
+    "id": "112@10",
+    "kind": "dir",
+    "renamed": false
+  },
+  {
+    "path": "Makefile~8@9223372036854775813",
+    "id": "8@9223372036854775813",
+    "kind": "text",
+    "renamed": true
+  },
+  {
+    "path": "chapters",
+    "id": "84@10",
+    "kind": "dir",
+    "renamed": false
+  },
+  {
+    "path": "chapters/notes.typ",
+    "id": "0@9",
+    "kind": "text",
+    "renamed": false
+  },
+  {
+    "path": "chapters/notes~0@9223372036854775813.typ",
+    "id": "0@9223372036854775813",
+    "kind": "text",
+    "renamed": true
+  },
+  {
+    "path": "chapters/notes~98@10.typ",
+    "id": "98@10",
+    "kind": "text",
+    "renamed": true
+  },
+  {
+    "path": "images",
+    "id": "91@10",
+    "kind": "dir",
+    "renamed": false
+  },
+  {
+    "path": "images/diagram.svg",
+    "id": "5@9",
+    "kind": "text",
+    "renamed": false
+  },
+  {
+    "path": "introduction.typ",
+    "id": "87@10",
+    "kind": "text",
+    "renamed": false
+  },
+  {
+    "path": "main.typ",
+    "id": "0@10",
+    "kind": "text",
+    "renamed": false
+  },
+  {
+    "path": "refs.bib",
+    "id": "9@9",
+    "kind": "text",
+    "renamed": false
+  },
+  {
+    "path": "refs~108@10.bib",
+    "id": "108@10",
+    "kind": "text",
+    "renamed": true
+  }
+]
