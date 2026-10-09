@@ -1,5 +1,127 @@
 # typstry
 
-CRDT-based collaborative Typst online editor
+[![CI](https://github.com/robertjndw/typstry/actions/workflows/ci.yml/badge.svg)](https://github.com/robertjndw/typstry/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+
+A self-hostable, real-time collaborative editor for [Typst](https://typst.app), built on CRDTs and end-to-end encrypted.
 
 ![typstry split editor with Typst source on the left and the live preview on the right](docs/screenshot.png)
+
+## Features
+
+- **Real-time collaboration** - edits merge conflict-free through [Loro](https://loro.dev) CRDTs, with live cursors and presence for everyone in the project.
+- **End-to-end encryption** - the project key lives only in the URL fragment and the browser, so the server stores ciphertext for documents and uploads alike.
+- **In-browser compilation** - Typst compiles in a Web Worker via [typst.ts](https://github.com/Myriad-Dreamin/typst.ts), with a live SVG preview and inline diagnostics. Typst Universe packages are fetched on demand.
+- **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
+- **Multi-file projects** - file tree, tabs, image uploads (including paste and drop into the editor) and a range of file types.
+- **History** - save named versions, browse the edit history, diff and restore.
+- **Sharing** - separate edit and view-only links, no accounts required.
+- **Export** - download the compiled PDF or the whole project as a ZIP.
+
+## Quick start
+
+The easiest way to run typstry is Docker Compose:
+
+```sh
+docker compose up -d
+```
+
+Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume.
+
+Or build and run the image directly:
+
+```sh
+docker build -t typstry .
+docker run -d -p 8787:8787 -v typstry-data:/data typstry
+```
+
+## How it works
+
+```
+┌──────────────── browser ────────────────┐          ┌──────── typstry-server ────────┐
+│ CodeMirror ◄─► LoroDoc ◄─► IndexedDB    │  /ws     │ rooms (relay + compaction)     │
+│                  │                      │ ◄──────► │ SQLite: encrypted doc records  │
+│                  ├─► AES-GCM encrypt    │  /api    │ blobs/: encrypted uploads      │
+│                  └─► Typst worker ─► SVG│ ◄──────► │ static frontend                │
+└─────────────────────────────────────────┘          └────────────────────────────────┘
+```
+
+Each project is a single Loro document holding the file tree, file contents and version list. Clients encrypt every update before it leaves the browser and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
+
+Because the key is part of the share link, anyone with the link can read the project. Treat edit links like passwords.
+
+## Configuration
+
+The server is configured through environment variables:
+
+| Variable           | Default          | Description                                                  |
+| ------------------ | ---------------- | ------------------------------------------------------------ |
+| `TYPSTRY_ADDR`     | `127.0.0.1:8787` | Address to listen on (the Docker image uses `0.0.0.0:8787`). |
+| `TYPSTRY_DATA_DIR` | `data`           | Directory for the SQLite database and uploaded blobs.        |
+| `TYPSTRY_WEB_DIST` | `apps/web/dist`  | Built frontend to serve. Static serving is off if missing.   |
+| `RUST_LOG`         | `info`           | Log filter, see [`tracing-subscriber`][env-filter].          |
+
+Uploads are limited to 25 MB each. The container exposes `GET /healthz` for health checks.
+
+[env-filter]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+
+### Backups
+
+The data directory contains `typstry.db` and a `blobs/` directory. Take a consistent copy of the database while the server is running with:
+
+```sh
+typstry-server backup /path/to/backup.db
+# or, with Docker Compose:
+docker compose exec typstry typstry-server backup /data/backup.db
+```
+
+Copy `blobs/` separately. On shutdown the server compacts room logs into snapshots, so give it time to stop (Compose is configured with a 30 s grace period).
+
+## Development
+
+### Prerequisites
+
+- [Rust](https://rustup.rs) (stable, see `rust-toolchain.toml`; MSRV 1.94)
+- [Node.js](https://nodejs.org) 26 or newer
+- [pnpm](https://pnpm.io) 12 (`corepack enable` picks up the pinned version)
+
+### Getting started
+
+```sh
+pnpm install
+pnpm dev
+```
+
+This starts the Vite dev server for the frontend and the Rust server on port 8787, with Vite proxying `/api` and `/ws` to it. Set `TYPSTRY_BACKEND` to point Vite at a server on a different address.
+
+### Common tasks
+
+| Task           | Command                                                 |
+| -------------- | ------------------------------------------------------- |
+| Web tests      | `pnpm test`                                             |
+| Web lint/types | `pnpm lint`, `pnpm typecheck`                           |
+| Format         | `pnpm format` (Prettier), `cargo fmt --all`             |
+| Rust tests     | `cargo test --workspace`                                |
+| Rust lint      | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Production web | `pnpm build`                                            |
+| Server binary  | `cargo build --release -p typstry-server`               |
+
+CI runs all of the above plus a Docker build and smoke test on every push and pull request.
+
+### Project layout
+
+```
+apps/web/              React + Vite frontend (editor, sync, encryption, Typst worker)
+crates/typstry-doc/    Shared Loro document schema, mirrored in apps/web/src/doc/schema.ts
+crates/typstry-server/ Axum server: WebSocket rooms, REST API, SQLite and blob storage
+```
+
+The document schema exists on both sides. Changes to one must be reflected in the other, and incompatible layout changes bump `SCHEMA_VERSION`.
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a PR, please make sure formatting, linting and tests pass locally (see [Common tasks](#common-tasks)). Commit messages follow [Conventional Commits](https://www.conventionalcommits.org).
+
+## License
+
+Licensed under the [MIT License](https://opensource.org/licenses/MIT).
