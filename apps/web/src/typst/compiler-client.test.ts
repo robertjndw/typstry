@@ -464,3 +464,42 @@ describe("CompilerClient results", () => {
     expect(worker.sent).toContainEqual({ type: "resync" });
   });
 });
+
+describe("CompilerClient PDF export", () => {
+  it("flushes pending edits, then resolves with the worker's PDF", async () => {
+    const { project, worker, client } = setup();
+    worker.take();
+    const text = getText(project, mainId(project));
+    text.insert(0, "x");
+    project.doc.commit();
+    await Promise.resolve();
+
+    const pdf = client.exportPdf();
+    const sent = worker.take();
+    expect(sent).toEqual([
+      { type: "setText", path: "/main.typ", text: text.toString() },
+      { type: "exportPdf", id: 1, mainPath: "/main.typ" },
+    ]);
+    const data = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    worker.emit({ type: "pdf", id: 1, data });
+    await expect(pdf).resolves.toBe(data);
+  });
+
+  it("rejects with the worker's error", async () => {
+    const { worker, client } = setup();
+    const pdf = client.exportPdf();
+    worker.emit({ type: "pdf", id: 1, error: "the document has 2 errors" });
+    await expect(pdf).rejects.toThrow("the document has 2 errors");
+  });
+
+  it("rejects without a main file and on dispose", async () => {
+    const { client } = setup();
+    const pending = client.exportPdf();
+    client.dispose();
+    await expect(pending).rejects.toThrow("disposed");
+
+    const other = setup();
+    deleteNode(other.project, mainId(other.project));
+    await expect(other.client.exportPdf()).rejects.toThrow("no main file");
+  });
+});

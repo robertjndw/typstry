@@ -123,6 +123,11 @@ export class CompilerClient {
   private unrendered = false;
   private disposed = false;
   private readonly unsubscribeDoc: () => void;
+  private nextPdfId = 1;
+  private readonly pdfRequests = new Map<
+    number,
+    { resolve: (pdf: Uint8Array) => void; reject: (err: Error) => void }
+  >();
 
   constructor(project: ProjectDoc, options: CompilerClientOptions = {}) {
     this.project = project;
@@ -162,9 +167,27 @@ export class CompilerClient {
     this.post({ type: "reinit", fonts });
   }
 
+  /** Compiles the main file to a PDF, including edits not yet compiled. */
+  exportPdf(): Promise<Uint8Array> {
+    if (this.disposed) return Promise.reject(new Error("compiler disposed"));
+    const mainPath = this.mainPath();
+    if (mainPath === undefined)
+      return Promise.reject(new Error("the project has no main file"));
+    // Edits still waiting out the debounce would be missing otherwise.
+    this.flushTexts();
+    const id = this.nextPdfId++;
+    return new Promise((resolve, reject) => {
+      this.pdfRequests.set(id, { resolve, reject });
+      this.post({ type: "exportPdf", id, mainPath: typstPath(mainPath) });
+    });
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const { reject } of this.pdfRequests.values())
+      reject(new Error("compiler disposed"));
+    this.pdfRequests.clear();
     this.unsubscribeDoc();
     if (this.flushTimer !== null) clearTimeout(this.flushTimer);
     this.worker.removeEventListener("message", this.onWorkerMessage);
@@ -343,9 +366,15 @@ export class CompilerClient {
     );
   }
 
+  /** Project path of the main file, if it is a mirrored text file. */
+  private mainPath(): string | undefined {
+    return this.mainId !== null
+      ? this.textsById.get(this.mainId)?.path
+      : undefined;
+  }
+
   private requestCompile(): void {
-    const mainPath =
-      this.mainId !== null ? this.textsById.get(this.mainId)?.path : undefined;
+    const mainPath = this.mainPath();
     if (mainPath === undefined) {
       this.post({ type: "cancel" });
       if (this.state.mainPath !== null || this.state.document !== null) {
@@ -380,6 +409,13 @@ export class CompilerClient {
       case "result":
         this.handleResult(msg);
         break;
+      case "pdf": {
+        const request = this.pdfRequests.get(msg.id);
+        this.pdfRequests.delete(msg.id);
+        if ("data" in msg) request?.resolve(msg.data);
+        else request?.reject(new Error(msg.error));
+        break;
+      }
     }
   };
 

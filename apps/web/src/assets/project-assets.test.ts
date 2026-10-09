@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateRawProjectKey, importProjectKey } from "@/crypto/project-key";
 import { AssetCache } from "@/typst/asset-cache";
 
-import { MAX_ASSET_BYTES, mimeOf, projectAssets } from "./project-assets";
+import { mimeOf } from "./file-types";
+import { MAX_ASSET_BYTES, projectAssets } from "./project-assets";
 
 afterEach(() => vi.unstubAllGlobals());
 

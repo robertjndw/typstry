@@ -8,7 +8,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { memo, useLayoutEffect, useRef, useState } from "react";
+import { memo, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -24,6 +24,8 @@ import type { PreviewPage } from "@/typst/svg-pages";
 export interface PreviewPaneProps {
   client: CompilerClient | null;
   onDiagnosticClick?: (diagnostic: ProjectDiagnostic) => void;
+  /** Extra toolbar buttons, shown before the zoom controls. */
+  actions?: ReactNode;
   className?: string;
 }
 
@@ -40,6 +42,7 @@ type Zoom = { mode: "fit" } | { mode: "fixed"; scale: number };
 export function PreviewPane({
   client,
   onDiagnosticClick,
+  actions,
   className,
 }: PreviewPaneProps) {
   const state = usePreviewState(client);
@@ -74,6 +77,7 @@ export function PreviewPane({
       <div className="flex h-9 shrink-0 items-center gap-1 border-b bg-background px-2">
         <StatusIndicator state={state} />
         <div className="ml-auto flex items-center gap-0.5">
+          {actions}
           <WithTooltip label="Zoom out">
             <Button
               variant="ghost"

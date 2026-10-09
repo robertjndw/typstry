@@ -1,6 +1,8 @@
 import type { TreeID } from "loro-crdt";
 import { toast } from "sonner";
 
+import type { ProjectAssets } from "@/assets/project-assets";
+import { uploadFiles, type UploadedFile } from "@/assets/upload";
 import { FsError } from "@/doc/fs-ops";
 import { basename } from "@/doc/names";
 import type { PathIndex } from "@/doc/paths";
@@ -76,6 +78,32 @@ export function attempt<T>(fn: () => T): T | undefined {
   } catch (err) {
     toast.error(friendlyFsError(err));
     return undefined;
+  }
+}
+
+/**
+ * Uploads `files` under `parent`, showing a toast for each file that failed
+ * instead of throwing. Resolves to the files that were created.
+ */
+export async function uploadReporting(
+  project: ProjectDoc,
+  assets: ProjectAssets,
+  files: File[],
+  parent: TreeID | null,
+): Promise<UploadedFile[]> {
+  try {
+    const { created, errors } = await uploadFiles(
+      project,
+      assets,
+      files,
+      parent,
+    );
+    for (const failure of errors)
+      toast.error(`${failure.name}: ${failure.error.message}`);
+    return created;
+  } catch (err) {
+    toast.error(friendlyFsError(err));
+    return [];
   }
 }
 

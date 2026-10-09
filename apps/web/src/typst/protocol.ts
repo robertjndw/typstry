@@ -19,6 +19,8 @@ export type WorkerRequest =
   | { type: "remove"; path: string }
   /** Debounced in the worker; only the latest pending request runs. */
   | { type: "compile"; mainPath: string }
+  /** One-off PDF compile, answered by a "pdf" response with the same id. */
+  | { type: "exportPdf"; id: number; mainPath: string }
   /** Drops a scheduled compile that has not started yet. */
   | { type: "cancel" }
   /** Rebuilds the compiler with a new font set and resends all files. */
@@ -71,7 +73,8 @@ export type WorkerResponse =
       /** Absent when the compile failed; the last good render stays valid. */
       update?: ArtifactUpdate;
       compileMs: number;
-    };
+    }
+  | ({ type: "pdf"; id: number } & ({ data: Uint8Array } | { error: string }));
 
 /** Minimal Worker surface, so tests can substitute a fake. */
 export interface WorkerLike {

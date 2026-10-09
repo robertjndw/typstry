@@ -1,8 +1,14 @@
 import type { TreeID } from "loro-crdt";
 import {
   ChevronRightIcon,
+  FileAudioIcon,
+  FileBracesIcon,
   FileCodeIcon,
   FileIcon,
+  FileImageIcon,
+  FileTextIcon,
+  FileTypeIcon,
+  FileVideoIcon,
   FilePlusIcon,
   FolderIcon,
   FolderOpenIcon,
@@ -11,6 +17,7 @@ import {
   Loader2Icon,
   TriangleAlertIcon,
   UploadIcon,
+  type LucideIcon,
 } from "lucide-react";
 import {
   useEffect,
@@ -48,7 +55,7 @@ import {
   setMainFile,
 } from "@/doc/fs-ops";
 import { stemLength } from "@/doc/names";
-import { uploadFiles } from "@/assets/upload";
+import { fileCategory, type FileCategory } from "@/assets/file-types";
 import { cn } from "@/lib/utils";
 import { usePresence } from "@/presence/context";
 import type { RemotePeer } from "@/presence/presence";
@@ -56,7 +63,7 @@ import { useProject } from "@/project/context";
 import {
   attempt,
   buildTree,
-  friendlyFsError,
+  uploadReporting,
   type TreeEntry,
 } from "@/project/tree";
 
@@ -168,19 +175,10 @@ export function FileTree({ className }: { className?: string }) {
     if (parent) setExpanded(parent, true);
     setUploading((n) => n + files.length);
     try {
-      const { created, errors } = await uploadFiles(
-        project,
-        assets,
-        files,
-        parent,
-      );
-      for (const failure of errors)
-        toast.error(`${failure.name}: ${failure.error.message}`);
+      const created = await uploadReporting(project, assets, files, parent);
       const firstText = created.find((c) => c.kind === "text");
       if (firstText) openFile(firstText.id);
       if (created.length > 0) setSelectedId(created[0]!.id);
-    } catch (err) {
-      toast.error(friendlyFsError(err));
     } finally {
       setUploading((n) => n - files.length);
     }
@@ -253,7 +251,7 @@ export function FileTree({ className }: { className?: string }) {
         style={{ paddingLeft: indent(depth) }}
       >
         <span className="size-4 shrink-0" />
-        <EntryIcon kind={kind} open={false} />
+        <EntryIcon kind={kind} name={initial} open={false} />
         <NameInput
           initial={initial}
           label={label}
@@ -328,7 +326,11 @@ export function FileTree({ className }: { className?: string }) {
                   ) : (
                     <span className="size-4 shrink-0" />
                   )}
-                  <EntryIcon kind={entry.kind} open={expanded} />
+                  <EntryIcon
+                    kind={entry.kind}
+                    name={entry.displayName}
+                    open={expanded}
+                  />
                   <span
                     className="min-w-0 flex-1 truncate"
                     title={entry.displayName}
@@ -600,12 +602,26 @@ function indent(depth: number): number {
   return 4 + depth * 12;
 }
 
+const CATEGORY_ICONS: Record<FileCategory, LucideIcon> = {
+  typst: FileCodeIcon,
+  text: FileTextIcon,
+  image: FileImageIcon,
+  pdf: FileTextIcon,
+  font: FileTypeIcon,
+  audio: FileAudioIcon,
+  video: FileVideoIcon,
+  data: FileBracesIcon,
+  other: FileIcon,
+};
+
 export function EntryIcon({
   kind,
+  name,
   open,
   className: extra,
 }: {
   kind: TreeEntry["kind"];
+  name: string;
   open: boolean;
   className?: string;
 }) {
@@ -616,8 +632,12 @@ export function EntryIcon({
     ) : (
       <FolderIcon className={className} />
     );
-  if (kind === "text") return <FileCodeIcon className={className} />;
-  return <FileIcon className={className} />;
+  const category = fileCategory(name);
+  // Text nodes are editable whatever their extension, so an unknown one
+  // still looks like text rather than a blob.
+  const Icon =
+    CATEGORY_ICONS[category === "other" && kind === "text" ? "text" : category];
+  return <Icon className={className} />;
 }
 
 function Badge({ tip, children }: { tip: string; children: ReactNode }) {

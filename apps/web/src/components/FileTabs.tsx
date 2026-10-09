@@ -74,6 +74,7 @@ export function FileTabs() {
             >
               <EntryIcon
                 kind={tab.kind}
+                name={tab.name}
                 open={false}
                 className="size-3.5 text-current"
               />

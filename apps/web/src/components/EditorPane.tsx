@@ -4,14 +4,18 @@ import type { TreeID } from "loro-crdt";
 import { EyeIcon, FileCodeIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { fileCategory } from "@/assets/file-types";
 import { AssetView } from "@/components/AssetView";
 import { FileTabs } from "@/components/FileTabs";
 import { getText } from "@/doc/fs-ops";
 import { Editor } from "@/editor/Editor";
+import { imageDrop } from "@/editor/image-drop";
+import { typstLanguage } from "@/editor/language";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
 import { cn } from "@/lib/utils";
 import { usePresenceContext } from "@/presence/context";
 import { useProject } from "@/project/context";
+import { uploadReporting } from "@/project/tree";
 import type { CompilerClient } from "@/typst/compiler-client";
 import type { ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewDiagnostics } from "@/typst/hooks";
@@ -32,7 +36,8 @@ export interface EditorPaneProps {
 }
 
 export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
-  const { project, index, openFileId, undoManager, readOnly } = useProject();
+  const { project, index, openFileId, undoManager, readOnly, assets } =
+    useProject();
   const presence = usePresenceContext()?.presence;
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
@@ -44,8 +49,31 @@ export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
   );
   const path = openFileId ? index.byId.get(openFileId)?.path : undefined;
 
+  const isTypst = fileCategory(path ?? "") === "typst";
+  // Keyed on isTypst rather than the path, so a rename or move does not
+  // reconfigure the editor.
   const extensions = useMemo(
-    () =>
+    () => [
+      isTypst ? typstLanguage : [],
+      isTypst && text && openFileId && assets && !readOnly
+        ? imageDrop({
+            doc: project.doc,
+            text,
+            // Next to the edited file, so the bare name is the relative
+            // path Typst resolves.
+            upload: async (files) => {
+              const parent =
+                project.fs.getNodeByID(openFileId)?.parent()?.id ?? null;
+              const created = await uploadReporting(
+                project,
+                assets,
+                files,
+                parent,
+              );
+              return created.map((c) => c.name);
+            },
+          })
+        : [],
       presence && text && openFileId
         ? [
             remoteCursors({
@@ -57,7 +85,8 @@ export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
             reportSelection(presence, openFileId, text),
           ]
         : [],
-    [presence, project, text, openFileId],
+    ],
+    [presence, project, text, openFileId, isTypst, assets, readOnly],
   );
 
   const previewDiagnostics = usePreviewDiagnostics(compiler ?? null);

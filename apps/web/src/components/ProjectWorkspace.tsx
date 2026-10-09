@@ -2,6 +2,7 @@ import { ChevronLeftIcon, HistoryIcon } from "lucide-react";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 
+import { DownloadButton, PdfDownloadButton } from "@/components/DownloadButton";
 import { EditorPane, type RevealRequest } from "@/components/EditorPane";
 import { FileTree } from "@/components/FileTree";
 import { HistoryPanel } from "@/components/HistoryPanel";
@@ -76,6 +77,7 @@ export function ProjectWorkspace({
         <ProjectTitle />
         <div className="ml-auto flex items-center gap-3">
           <PresenceBar />
+          <DownloadButton project={project} assets={assets} name={[title]} />
           <Button
             variant={historyOpen || viewing ? "secondary" : "ghost"}
             size="sm"
@@ -141,6 +143,9 @@ export function ProjectWorkspace({
               <PreviewPane
                 client={compiler}
                 onDiagnosticClick={onDiagnosticClick}
+                actions={
+                  <PdfDownloadButton compiler={compiler} name={[title]} />
+                }
               />
             </section>
           </ResizablePanel>

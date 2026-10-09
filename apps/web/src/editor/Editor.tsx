@@ -6,7 +6,6 @@ import {
   type Text,
 } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { typst } from "codemirror-lang-typst";
 import type { LoroDoc, LoroText, UndoManager } from "loro-crdt";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -21,7 +20,10 @@ export interface EditorProps {
   text: LoroText;
   undoManager?: UndoManager;
   onReady?: (view: EditorView) => void;
-  /** Swapped in place when it changes; memoize it per text. */
+  /**
+   * Swapped in place when it changes; memoize it per text. Carries the
+   * language too (see languageFor), since a rename can change it.
+   */
   extensions?: Extension;
   readOnly?: boolean;
   /** Maps diagnostics onto the current text; re-applied when it changes. */
@@ -61,7 +63,6 @@ export function Editor({
         {
           extensions: [
             editorBasics,
-            typst(),
             fillParent,
             undoManager ? loroUndo({ doc, text, undoManager }) : [],
             readOnly

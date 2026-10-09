@@ -1,4 +1,5 @@
 import {
+  CompileFormatEnum,
   createTypstCompiler,
   type TypstCompiler,
 } from "@myriaddreamin/typst.ts/compiler";
@@ -173,15 +174,23 @@ function startSession(config: FontConfig): void {
   previous?.incr?.release();
 }
 
-async function compile(mainPath: string): Promise<void> {
+/**
+ * The current session once it is ready, or null when it failed to start
+ * (initError was already reported) or a reinit replaced it meanwhile.
+ */
+async function readySession(): Promise<Session | null> {
   if (!session) startSession(fonts);
-  let s: Session;
   try {
-    s = await session!;
+    const s = await session!;
+    return s === current ? s : null;
   } catch {
-    return; // initError was already reported
+    return null;
   }
-  if (s !== current) return; // superseded by a reinit, which recompiles
+}
+
+async function compile(mainPath: string): Promise<void> {
+  const s = await readySession();
+  if (!s) return; // a reinit recompiles once its session is ready
   const id = nextId++;
   post({ type: "compiling", id });
   const started = performance.now();
@@ -253,6 +262,33 @@ async function exportArtifact(
   return { action, data: result };
 }
 
+async function exportPdf(id: number, mainPath: string): Promise<void> {
+  const fail = (error: string) => post({ type: "pdf", id, error });
+  const s = await readySession();
+  if (!s) return fail("the compiler is not ready, try again");
+  try {
+    const { result, diagnostics } = await s.compiler.compile({
+      mainFilePath: mainPath,
+      format: CompileFormatEnum.pdf,
+      diagnostics: "full",
+    });
+    if (result) {
+      post({ type: "pdf", id, data: result }, [result.buffer as ArrayBuffer]);
+      return;
+    }
+    const errors = (diagnostics ?? []).filter(
+      (d) => normalizeDiagnostic(d as RawDiagnostic).severity === "error",
+    ).length;
+    fail(
+      errors > 0
+        ? `the document has ${errors} error${errors === 1 ? "" : "s"}`
+        : "the compiler produced no output",
+    );
+  } catch (err) {
+    fail(String(err));
+  }
+}
+
 // Throttle rather than a pure trailing debounce: with a trailing debounce
 // every keystroke pays the full 200 ms on top of compile and render, and
 // continuous typing starves the preview until the user pauses. Measured on a
@@ -284,6 +320,9 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
     case "compile":
       lastMainPath = msg.mainPath;
       scheduler.request(msg.mainPath);
+      break;
+    case "exportPdf":
+      void exportPdf(msg.id, msg.mainPath);
       break;
     case "cancel":
       lastMainPath = null;

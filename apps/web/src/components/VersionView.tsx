@@ -11,6 +11,7 @@ import {
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
+import { DownloadButton, PdfDownloadButton } from "@/components/DownloadButton";
 import { EditorPane } from "@/components/EditorPane";
 import { FileTree } from "@/components/FileTree";
 import { PreviewPane } from "@/components/PreviewPane";
@@ -105,11 +106,12 @@ export function VersionView(props: VersionViewProps) {
 function VersionBody({
   project,
   target,
+  assets,
   canRestore,
   onClose,
   previous,
 }: VersionViewProps & { previous: ProjectDoc }) {
-  const { project: version, openFileId, openFile, index } = useProject();
+  const { project: version, openFileId, openFile, index, title } = useProject();
   const compiler = useProjectCompiler();
   const [showChanges, setShowChanges] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -124,6 +126,7 @@ function VersionBody({
       ? {
           original: fileText(previous, openFileId) ?? "",
           text: fileText(version, openFileId) ?? "",
+          path: index.byId.get(openFileId)?.path ?? "",
         }
       : null;
 
@@ -150,6 +153,13 @@ function VersionBody({
           Viewing <span className="font-medium">{target.label}</span>
         </span>
         <div className="ml-auto flex items-center gap-2">
+          <DownloadButton
+            project={version}
+            assets={assets}
+            name={[title, target.label]}
+            mtime={target.time ?? undefined}
+            variant="outline"
+          />
           <Button
             variant={showChanges ? "secondary" : "outline"}
             size="sm"
@@ -186,17 +196,21 @@ function VersionBody({
         <ResizableHandle />
         <ResizablePanel id="version-editor" defaultSize="40" minSize="20">
           <section aria-label="Editor" className="h-full">
-            {diff ? (
-              <DiffView original={diff.original} text={diff.text} />
-            ) : (
-              <EditorPane compiler={compiler} />
-            )}
+            {diff ? <DiffView {...diff} /> : <EditorPane compiler={compiler} />}
           </section>
         </ResizablePanel>
         <ResizableHandle />
         <ResizablePanel id="version-preview" defaultSize="40" minSize="20">
           <section aria-label="Preview" className="h-full">
-            <PreviewPane client={compiler} />
+            <PreviewPane
+              client={compiler}
+              actions={
+                <PdfDownloadButton
+                  compiler={compiler}
+                  name={[title, target.label]}
+                />
+              }
+            />
           </section>
         </ResizablePanel>
       </ResizablePanelGroup>

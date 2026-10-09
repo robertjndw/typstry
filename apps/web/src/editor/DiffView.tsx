@@ -1,11 +1,11 @@
 import { unifiedMergeView } from "@codemirror/merge";
 import { EditorState } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
-import { typst } from "codemirror-lang-typst";
 import { useEffect, useRef } from "react";
 
 import { cn } from "@/lib/utils";
 
+import { languageFor } from "./language";
 import { fillParent } from "./setup";
 
 export interface DiffViewProps {
@@ -13,11 +13,13 @@ export interface DiffViewProps {
   original: string;
   /** The newer text, shown with deletions from `original` interleaved. */
   text: string;
+  /** Picks the syntax highlighting. */
+  path: string;
   className?: string;
 }
 
 /** Read-only unified diff of two texts. */
-export function DiffView({ original, text, className }: DiffViewProps) {
+export function DiffView({ original, text, path, className }: DiffViewProps) {
   const hostRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -29,7 +31,7 @@ export function DiffView({ original, text, className }: DiffViewProps) {
         doc: text,
         extensions: [
           lineNumbers(),
-          typst(),
+          languageFor(path),
           fillParent,
           EditorState.readOnly.of(true),
           EditorView.editable.of(false),
@@ -42,7 +44,7 @@ export function DiffView({ original, text, className }: DiffViewProps) {
       }),
     });
     return () => view.destroy();
-  }, [original, text]);
+  }, [original, text, path]);
 
   return (
     <div
