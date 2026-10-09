@@ -22,6 +22,7 @@ import type { VersionTarget } from "@/project/history-items";
 import { groupingFromLocation } from "@/project/useHistory";
 import type { ProjectDiagnostic } from "@/typst/diagnostics";
 import { useProjectCompiler } from "@/project/useProjectCompiler";
+import { useProjectTinymist } from "@/project/useProjectTinymist";
 
 /** The full project UI for whatever ProjectProvider is above it. */
 export function ProjectWorkspace({
@@ -48,6 +49,7 @@ export function ProjectWorkspace({
   }, [documentTitle, title]);
 
   const compiler = useProjectCompiler();
+  const tinymist = useProjectTinymist();
   const [reveal, setReveal] = useState<RevealRequest | null>(null);
 
   const onDiagnosticClick = useCallback(
@@ -134,7 +136,11 @@ export function ProjectWorkspace({
           <ResizableHandle />
           <ResizablePanel id="editor" defaultSize="40" minSize="20">
             <section aria-label="Editor" className="h-full">
-              <EditorPane compiler={compiler} reveal={reveal} />
+              <EditorPane
+                compiler={compiler}
+                tinymist={tinymist}
+                reveal={reveal}
+              />
             </section>
           </ResizablePanel>
           <ResizableHandle />

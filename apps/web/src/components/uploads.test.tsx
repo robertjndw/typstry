@@ -78,11 +78,15 @@ describe("uploads and assets", () => {
   });
 
   it("previews an image asset decrypted from the blob store", async () => {
-    vi.stubGlobal("URL", {
-      ...URL,
-      createObjectURL: vi.fn(() => "blob:decrypted"),
-      revokeObjectURL: vi.fn(),
-    });
+    // A subclass rather than a plain object: the editor still constructs
+    // URLs (for its workers) while this stub is in place.
+    vi.stubGlobal(
+      "URL",
+      Object.assign(class extends URL {}, {
+        createObjectURL: vi.fn(() => "blob:decrypted"),
+        revokeObjectURL: vi.fn(),
+      }),
+    );
     const project = initProject(newProject(1), { title: "T" });
     createAsset(project, null, "logo.png", {
       hash: "abc",

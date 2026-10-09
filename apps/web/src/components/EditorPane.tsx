@@ -12,6 +12,7 @@ import { Editor } from "@/editor/Editor";
 import { imageDrop } from "@/editor/image-drop";
 import { typstLanguage } from "@/editor/language";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
+import type { TinymistClient } from "@/lsp/tinymist-client";
 import { cn } from "@/lib/utils";
 import { usePresenceContext } from "@/presence/context";
 import { useProject } from "@/project/context";
@@ -31,11 +32,18 @@ export interface RevealRequest {
 
 export interface EditorPaneProps {
   compiler?: CompilerClient | null;
+  /** Completion and hover docs for Typst files, when available. */
+  tinymist?: TinymistClient | null;
   reveal?: RevealRequest | null;
   className?: string;
 }
 
-export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
+export function EditorPane({
+  compiler,
+  tinymist,
+  reveal,
+  className,
+}: EditorPaneProps) {
   const { project, index, openFileId, undoManager, readOnly, assets } =
     useProject();
   const presence = usePresenceContext()?.presence;
@@ -50,11 +58,13 @@ export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
   const path = openFileId ? index.byId.get(openFileId)?.path : undefined;
 
   const isTypst = fileCategory(path ?? "") === "typst";
-  // Keyed on isTypst rather than the path, so a rename or move does not
-  // reconfigure the editor.
+  // Only the LSP plugin depends on the path, since it is bound to the file's
+  // URI. Without tinymist, a rename or move does not reconfigure the editor.
+  const lspPath = isTypst && tinymist ? path : undefined;
   const extensions = useMemo(
     () => [
       isTypst ? typstLanguage : [],
+      tinymist && lspPath ? tinymist.plugin(lspPath) : [],
       isTypst && text && openFileId && assets && !readOnly
         ? imageDrop({
             doc: project.doc,
@@ -86,7 +96,17 @@ export function EditorPane({ compiler, reveal, className }: EditorPaneProps) {
           ]
         : [],
     ],
-    [presence, project, text, openFileId, isTypst, assets, readOnly],
+    [
+      presence,
+      project,
+      text,
+      openFileId,
+      isTypst,
+      assets,
+      readOnly,
+      tinymist,
+      lspPath,
+    ],
   );
 
   const previewDiagnostics = usePreviewDiagnostics(compiler ?? null);
