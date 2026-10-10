@@ -344,28 +344,28 @@ impl StateDir {
     }
 
     /// Where the decrypted bytes of the blob with ciphertext `hash` are
-    /// cached. The hash is `sha256:<hex>`; only the hex part names the file.
-    pub fn blob_path(&self, hash: &str) -> PathBuf {
-        let name: String = hash
-            .rsplit(':')
-            .next()
-            .unwrap_or(hash)
-            .chars()
-            .filter(char::is_ascii_hexdigit)
-            .collect();
-        self.dir.join(BLOBS).join(name)
+    /// cached. Only a canonical `sha256:<64 lowercase hex>` gets a file:
+    /// hashes come from the doc, and anything looser would let two of them
+    /// share one cached plaintext, which is read back without a check.
+    pub fn blob_path(&self, hash: &str) -> Option<PathBuf> {
+        let hex = hash.strip_prefix("sha256:")?;
+        (hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then(|| self.dir.join(BLOBS).join(hex))
     }
 
     pub fn read_blob(&self, hash: &str) -> Option<Vec<u8>> {
-        fs::read(self.blob_path(hash)).ok()
+        fs::read(self.blob_path(hash)?).ok()
     }
 
     pub fn write_blob(&self, hash: &str, plaintext: &[u8]) -> anyhow::Result<()> {
+        let path = self
+            .blob_path(hash)
+            .with_context(|| format!("{hash:?} is not a blob hash"))?;
         let dir = self.dir.join(BLOBS);
         if !dir.exists() {
             create_private_dir(&dir)?;
         }
-        atomic_write(&self.blob_path(hash), plaintext, true)
+        atomic_write(&path, plaintext, true)
     }
 }
 

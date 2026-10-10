@@ -297,6 +297,11 @@ export class CompilerClient {
     const index = buildPathIndex(this.project);
     let changed = false;
 
+    // One batch can hand a path from one file to another (a swap, or a
+    // delete plus a rename onto the freed name). Every remove has to reach
+    // the worker before any new content, or it would wipe the new owner.
+    const removed: string[] = [];
+    const fresh: TextFile[] = [];
     const seen = new Set<TreeID>();
     for (const [id, entry] of index.byId) {
       if (entry.kind !== "text") continue;
@@ -311,15 +316,13 @@ export class CompilerClient {
       if (prev && prev.path === entry.path && prev.container === container) {
         continue;
       }
-      if (prev && prev.path !== entry.path) {
-        this.post({ type: "remove", path: typstPath(prev.path) });
-      }
+      if (prev && prev.path !== entry.path) removed.push(prev.path);
       if (prev) this.idByContainer.delete(prev.container);
       const file = { id, path: entry.path, container };
       this.textsById.set(id, file);
       this.idByContainer.set(container, id);
       this.dirty.delete(id);
-      this.sendText(file);
+      fresh.push(file);
       changed = true;
     }
     for (const [id, file] of this.textsById) {
@@ -327,11 +330,16 @@ export class CompilerClient {
       this.textsById.delete(id);
       this.idByContainer.delete(file.container);
       this.dirty.delete(id);
-      this.post({ type: "remove", path: typstPath(file.path) });
+      removed.push(file.path);
       changed = true;
     }
 
+    for (const path of removed) {
+      this.post({ type: "remove", path: typstPath(path) });
+    }
+    // Asset removes go out in here too, still ahead of the texts below.
     if (this.syncAssets(index.byId)) changed = true;
+    for (const file of fresh) this.sendText(file);
 
     const main = this.project.mainFile;
     const mainId = main !== null && this.textsById.has(main) ? main : null;

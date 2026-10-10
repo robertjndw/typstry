@@ -177,6 +177,29 @@ describe("CompilerClient mirroring", () => {
     ]);
   });
 
+  it("removes a freed path before another file takes it over", async () => {
+    const { project, worker } = setup();
+    const a = createFile(project, null, "a.typ", "text", "old");
+    const b = createFile(project, null, "b.typ", "text", "new");
+    await settle();
+    worker.take();
+
+    // One commit, so the client sees both changes in a single batch.
+    project.fs.delete(a);
+    project.fs.getNodeByID(b)!.data.set("name", "a.typ");
+    project.doc.commit();
+    await settle();
+    const sent = worker.take();
+    const lastRemove = sent.findLastIndex(
+      (m) => m.type === "remove" && m.path === "/a.typ",
+    );
+    const set = sent.findIndex(
+      (m) => m.type === "setText" && m.path === "/a.typ",
+    );
+    expect(set).toBeGreaterThan(lastRemove);
+    expect(sent[set]).toEqual({ type: "setText", path: "/a.typ", text: "new" });
+  });
+
   it("follows moves into folders, including the main file", async () => {
     const { project, worker } = setup();
     const dir = createFile(project, null, "src", "dir");

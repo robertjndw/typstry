@@ -11,7 +11,7 @@ import {
 import { createFile, getText } from "@/doc/fs-ops";
 import { NODE, initProject } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
-import { AssetCache } from "@/typst/asset-cache";
+import { AssetCache, contentHash } from "@/typst/asset-cache";
 
 import { projectAssets } from "./project-assets";
 import { freeName, uploadFiles } from "./upload";
@@ -23,13 +23,11 @@ const ASSETS = projectAssets(TOKEN, key, {
 });
 
 function mockUploads() {
-  let n = 0;
   const fn = vi.fn<typeof fetch>(async (_url, init) => {
     const body = init?.body as Uint8Array;
-    n += 1;
     return new Response(
       JSON.stringify({
-        hash: `sha256:${String(n).padStart(64, "0")}`,
+        hash: await contentHash(body),
         size: body.length,
       }),
       { status: 201 },

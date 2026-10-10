@@ -238,23 +238,49 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       size = 0;
     };
     for (const span of spans) {
-      const plaintext = this.doc.export({
-        mode: "updates-in-range",
-        spans: [
-          {
-            id: { peer: span.peer, counter: span.start },
-            len: span.end - span.start,
-          },
-        ],
-      });
-      const record = await encryptDelta(this.options.key, span, plaintext);
-      if (this.destroyed) return;
-      if (size + record.length > CONTAINER_BUDGET) flush();
-      batch.push(record);
-      size += record.length;
-      raise(this.server, span.peer, span.end);
+      for (const [piece, plaintext] of this.exportSpan(span)) {
+        const record = await encryptDelta(this.options.key, piece, plaintext);
+        if (this.destroyed) return;
+        if (size + record.length > CONTAINER_BUDGET) flush();
+        batch.push(record);
+        size += record.length;
+        raise(this.server, piece.peer, piece.end);
+      }
     }
     flush();
+  }
+
+  /**
+   * The span's updates, cut into pieces of at most CONTAINER_BUDGET where
+   * the ops allow. A single record past the server's reassembly limit is
+   * refused for good, which a long offline session or a bulk import could
+   * otherwise produce. Same sizing as `encrypt_span` in the CLI's engine.
+   */
+  private exportSpan(span: Span): [Span, Uint8Array][] {
+    const plaintext = this.doc.export({
+      mode: "updates-in-range",
+      spans: [
+        {
+          id: { peer: span.peer, counter: span.start },
+          len: span.end - span.start,
+        },
+      ],
+    });
+    const ops = span.end - span.start;
+    if (plaintext.length <= CONTAINER_BUDGET || ops === 1) {
+      return [[span, plaintext]];
+    }
+    const pieces = Math.min(
+      Math.ceil(plaintext.length / (CONTAINER_BUDGET / 2)),
+      ops,
+    );
+    const step = Math.ceil(ops / pieces);
+    const out: [Span, Uint8Array][] = [];
+    for (let at = span.start; at < span.end; at += step) {
+      const end = Math.min(at + step, span.end);
+      out.push(...this.exportSpan({ peer: span.peer, start: at, end }));
+    }
+    return out;
   }
 
   private async importContainer(container: Uint8Array): Promise<void> {

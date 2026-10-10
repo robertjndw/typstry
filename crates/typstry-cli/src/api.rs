@@ -149,6 +149,7 @@ impl Api {
     }
 
     pub async fn upload_blob(&self, token: &str, sealed: Vec<u8>) -> anyhow::Result<StoredBlob> {
+        let expected = crate::worktree::digest(&sealed);
         let res = self
             .http
             .post(format!(
@@ -171,7 +172,19 @@ impl Api {
                 )
             }
             s if !s.is_success() => bail!("uploading an asset failed: HTTP {s}"),
-            _ => Ok(res.json().await.map_err(redact)?),
+            _ => {
+                let stored: StoredBlob = res.json().await.map_err(redact)?;
+                // The signed doc names the blob by this hash and downloads
+                // are only checked against it, so the server must not get
+                // to choose which blob that is.
+                if stored.hash != expected {
+                    bail!(
+                        "uploading an asset failed: the server named it {}, not {expected}",
+                        stored.hash
+                    );
+                }
+                Ok(stored)
+            }
         }
     }
 }

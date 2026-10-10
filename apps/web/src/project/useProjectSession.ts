@@ -215,20 +215,22 @@ export function useProjectSession(
     // text, so loading it proves nothing about the key. A view key that
     // reaches this point did not match the stored edit secret (see openKey),
     // and letting it replace that secret would let any crafted link take
-    // edit access away from this browser for good.
+    // edit access away from this browser for good. The same goes for any
+    // other key replacing a stored one: until the server's records decrypted
+    // with it, it may just be a wrong link, and saving it would lose the
+    // working key.
+    const secret = projectKey.editSecret ?? projectKey.viewSecret;
     const stored = loadProjectKey(share.projectId);
-    if (projectKey.editSecret || !stored || !isEditSecret(stored)) {
-      saveProjectKey(
-        share.projectId,
-        projectKey.editSecret ?? projectKey.viewSecret,
-      );
+    const proven = synced || stored === null || stored === secret;
+    if (proven && (projectKey.editSecret || !stored || !isEditSecret(stored))) {
+      saveProjectKey(share.projectId, secret);
     }
     rememberProject({
       projectId: share.projectId,
       token,
       title: project.title || "Untitled",
     });
-  }, [opened, share, projectKey, schema, token, project]);
+  }, [opened, synced, share, projectKey, schema, token, project]);
 
   useEffect(() => {
     if (!opened || !share) return;

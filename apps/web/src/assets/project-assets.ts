@@ -8,7 +8,7 @@ import {
 } from "@/crypto/project-key";
 import type { AssetInfo } from "@/doc/schema";
 import { ApiError, MAX_UPLOAD_BYTES, uploadBlob } from "@/sync/api";
-import { AssetCache } from "@/typst/asset-cache";
+import { AssetCache, contentHash } from "@/typst/asset-cache";
 
 /** Binary files of a synced project, encrypted on the way to the server. */
 export interface ProjectAssets {
@@ -42,10 +42,22 @@ export function projectAssets(
       }
       const plaintext = new Uint8Array(await file.arrayBuffer());
       const sealed = await seal(key, plaintext, BLOB_CONTEXT);
-      const { hash } = await uploadBlob(token, sealed, file.name, {
-        baseUrl: opts.baseUrl,
-        signal,
-      });
+      const [{ hash }, expected] = await Promise.all([
+        uploadBlob(token, sealed, file.name, {
+          baseUrl: opts.baseUrl,
+          signal,
+        }),
+        contentHash(sealed),
+      ]);
+      // The doc we sign names the blob by this hash, and downloads are only
+      // checked against it. Taking the server's word for it would let the
+      // server pick which blob the signed doc points at.
+      if (hash !== expected) {
+        throw new ApiError(
+          502,
+          `uploading ${file.name} failed: the server named it ${hash}, not ${expected}`,
+        );
+      }
       return { hash, size: file.size, mime: mimeOf(file) };
     },
   };
