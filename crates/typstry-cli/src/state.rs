@@ -464,10 +464,13 @@ struct LogRead {
     torn: bool,
 }
 
-/// Each log entry: the update's length (u32 LE), the first bytes of its
-/// SHA-256 and the update. The checksum tells a torn entry from a whole
-/// one where a file system leaves zeros or garbage after a crash.
-const LOG_HEADER: usize = 4 + LOG_CHECKSUM;
+/// Each log entry: the update's length (u32 LE), its bitwise complement,
+/// the first bytes of the update's SHA-256 and the update. The checksum
+/// tells a torn entry from a whole one where a file system leaves zeros or
+/// garbage after a crash. The complement catches a damaged length, which
+/// would otherwise look like a body cut off by a crash. It also means the
+/// search for intact entries after a damaged one rarely has to hash.
+const LOG_HEADER: usize = 8 + LOG_CHECKSUM;
 const LOG_CHECKSUM: usize = 8;
 
 fn log_checksum(bytes: &[u8]) -> [u8; LOG_CHECKSUM] {
@@ -480,41 +483,47 @@ fn log_frame(update: &[u8]) -> Vec<u8> {
     let len = u32::try_from(update.len()).expect("updates stay far below 4 GiB");
     let mut frame = Vec::with_capacity(LOG_HEADER + update.len());
     frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&(!len).to_le_bytes());
     frame.extend_from_slice(&log_checksum(update));
     frame.extend_from_slice(update);
     frame
 }
 
 /// The intact entries at the start of `log`. Only the last append can be
-/// torn, since each one is synced before the next, so a damaged entry is
-/// taken for a torn one only when it runs to the end of the file (or what
-/// follows is the zeros some file systems leave). A damaged entry with
-/// more after it means entries that were synced would be lost by cutting
-/// there; that is `Err` with its offset, for someone to look at.
+/// torn, since each one is synced before the next, so the first damaged
+/// entry is taken for a torn one only when no intact entry follows it.
+/// Otherwise cutting there would lose entries that were synced; that is
+/// `Err` with its offset, for someone to look at.
 fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
     let mut entries = Vec::new();
     let mut at = 0;
-    while log.len() - at >= LOG_HEADER {
-        let len = u32::from_le_bytes(log[at..at + 4].try_into().expect("4 bytes")) as usize;
-        let sum = &log[at + 4..at + LOG_HEADER];
-        let Some(body) = log.get(at + LOG_HEADER..at + LOG_HEADER + len) else {
-            break;
-        };
-        if len == 0 || log_checksum(body) != sum {
-            let reaches_end = at + LOG_HEADER + len == log.len();
-            if !reaches_end && log[at..].iter().any(|&b| b != 0) {
+    while at < log.len() {
+        let Some(body) = log_entry_at(log, at) else {
+            if (at + 1..log.len()).any(|later| log_entry_at(log, later).is_some()) {
                 return Err(at);
             }
             break;
-        }
+        };
         entries.push(body);
-        at += LOG_HEADER + len;
+        at += LOG_HEADER + body.len();
     }
     let read = LogRead {
         valid: at as u64,
         torn: at < log.len(),
     };
     Ok((entries, read))
+}
+
+/// The update of the intact entry starting at `at`, if there is one.
+fn log_entry_at(log: &[u8], at: usize) -> Option<&[u8]> {
+    let header = log.get(at..at + LOG_HEADER)?;
+    let len = u32::from_le_bytes(header[..4].try_into().expect("4 bytes"));
+    let check = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
+    if len == 0 || check != !len {
+        return None;
+    }
+    let body = log.get(at + LOG_HEADER..)?.get(..len as usize)?;
+    (log_checksum(body) == header[8..]).then_some(body)
 }
 
 fn read_optional(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -788,6 +797,32 @@ mod tests {
         assert!(read_doc(state.dir()).is_err());
         // The entry after it was synced; it stays for someone to recover.
         assert_eq!(fs::read(&log).unwrap(), before);
+    }
+
+    #[test]
+    fn a_damaged_middle_log_length_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let starts = three_entry_log(&state);
+        let log = state.dir().join(DOC_LOG);
+        // Flipping the high byte makes the length run past EOF, just like a
+        // torn tail.
+        flip_byte(&log, starts[1] + 3);
+        let before = fs::read(&log).unwrap();
+        assert!(state.load_doc().is_err());
+        assert_eq!(fs::read(&log).unwrap(), before);
+    }
+
+    #[test]
+    fn a_damaged_last_log_length_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let starts = three_entry_log(&state);
+        let log = state.dir().join(DOC_LOG);
+        flip_byte(&log, starts[2] + 3);
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "one two");
+        assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
 
     #[test]
