@@ -14,7 +14,7 @@ use loro_protocol::{
 };
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval, timeout};
-use typstry_wire::elo::decode_container;
+use typstry_wire::elo::container_len;
 use typstry_wire::fragment::Reassembler;
 
 use super::rate::TokenBucket;
@@ -339,16 +339,18 @@ impl Conn {
         //
         // Charged per record rather than per message: one message can carry
         // thousands of tiny records, and each is a row to store and index.
-        // An undecodable payload costs one; the room rejects it anyway.
+        // The count comes from the container's header, so this does not
+        // decode what the room parses anyway. An undecodable payload costs
+        // one; the room rejects it.
         let (bucket, cost) = match crdt {
             CrdtType::Elo => {
-                let records: usize = updates
+                let records: u64 = updates
                     .iter()
-                    .map(|update| decode_container(update).map_or(1, |records| records.len()))
+                    .map(|update| container_len(update).unwrap_or(1))
                     .sum();
                 (&mut self.doc_updates, records)
             }
-            _ => (&mut self.presence_updates, updates.len()),
+            _ => (&mut self.presence_updates, updates.len() as u64),
         };
         let cost = u32::try_from(cost.max(1)).unwrap_or(u32::MAX);
         if !bucket.try_take(Instant::now(), cost) {
