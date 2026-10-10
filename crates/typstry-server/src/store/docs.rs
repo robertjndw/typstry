@@ -45,23 +45,20 @@ pub async fn write_batch(
     writes: &[Write],
 ) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
-    let mut rest = writes;
-    while let Some(first) = rest.first() {
-        match first {
+    // Appends run together into multi-row inserts; each snapshot is a run
+    // of its own, since its deletes must land after what came before it.
+    let runs =
+        writes.chunk_by(|a, b| matches!((a, b), (Write::Append { .. }, Write::Append { .. })));
+    for run in runs {
+        match &run[0] {
             Write::Append { .. } => {
-                let run = rest
-                    .iter()
-                    .take_while(|write| matches!(write, Write::Append { .. }))
-                    .count();
-                for chunk in rest[..run].chunks(INSERT_CHUNK) {
+                for chunk in run.chunks(INSERT_CHUNK) {
                     insert(&mut tx, project_id, chunk).await?;
                 }
-                rest = &rest[run..];
             }
             Write::Snapshot { obsolete, .. } => {
-                insert(&mut tx, project_id, &rest[..1]).await?;
+                insert(&mut tx, project_id, run).await?;
                 delete(&mut tx, project_id, obsolete).await?;
-                rest = &rest[1..];
             }
         }
     }

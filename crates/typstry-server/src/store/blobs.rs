@@ -10,6 +10,7 @@ use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use tempfile::TempPath;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -122,9 +123,13 @@ impl BlobStore {
     {
         let tmp_dir = self.tmp_dir();
         fs::create_dir_all(&tmp_dir).await?;
-        let tmp = TmpFile::new(tmp_dir.join(format!("upload-{}", token::generate())));
-        let stored = self.write_tmp(&tmp.path, body).await?;
-        tmp.keep();
+        // Deleted on drop unless it made it into the store. Drop also runs
+        // when the request is cancelled mid-upload, which no error path
+        // would see.
+        let tmp = TempPath::try_from_path(tmp_dir.join(format!("upload-{}", token::generate())))?;
+        let stored = self.write_tmp(&tmp, body).await?;
+        // Renamed into the store or already removed by now.
+        tmp.keep().map_err(io::Error::from)?;
         Ok(stored)
     }
 
@@ -161,34 +166,6 @@ impl BlobStore {
             fs::rename(tmp, &target).await?;
         }
         Ok(StoredBlob { hex, size })
-    }
-}
-
-/// Deletes an upload's scratch file unless it made it into the store. Drop
-/// also runs when the request is cancelled mid-upload, which no error path
-/// would see.
-struct TmpFile {
-    path: PathBuf,
-    keep: bool,
-}
-
-impl TmpFile {
-    fn new(path: PathBuf) -> Self {
-        Self { path, keep: false }
-    }
-
-    /// The file was renamed into the store or already removed.
-    fn keep(mut self) {
-        self.keep = true;
-    }
-}
-
-impl Drop for TmpFile {
-    fn drop(&mut self) {
-        if !self.keep {
-            // Blocking, but a single unlink; Drop cannot await.
-            let _ = std::fs::remove_file(&self.path);
-        }
     }
 }
 
