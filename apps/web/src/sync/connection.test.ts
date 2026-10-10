@@ -1,11 +1,11 @@
 // @vitest-environment node
 import { LoroDoc } from "loro-crdt";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { generateRawProjectKey, importProjectKey } from "@/crypto/project-key";
+import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
 
 import { connectProject, projectWsUrl, type SyncStatus } from "./connection";
 
-const key = await importProjectKey(generateRawProjectKey());
+const key = await importProjectKey(generateEditSecret());
 
 type StatusCb = (s: string) => void;
 

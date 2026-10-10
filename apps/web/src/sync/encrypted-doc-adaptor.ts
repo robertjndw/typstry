@@ -5,15 +5,17 @@ import {
   EloRecordKind,
   UpdateStatusCode,
   decodeEloContainer,
-  decryptEloRecord,
   encodeEloContainer,
-  encryptDeltaSpan,
-  encryptSnapshot,
   parseEloRecordHeader,
   type JoinResponseOk,
 } from "loro-protocol";
 
-import { KeyMismatchError, type ProjectKey } from "@/crypto/project-key";
+import {
+  decryptRecord,
+  encryptDelta,
+  encryptSnapshot,
+  type ProjectKey,
+} from "@/crypto/project-key";
 import { toError } from "@/lib/errors";
 import { createSerialQueue } from "@/lib/serial-queue";
 
@@ -28,7 +30,10 @@ interface Span {
 
 export interface EncryptedDocAdaptorOptions {
   key: ProjectKey;
-  /** View links never send: the server refuses their doc updates anyway. */
+  /**
+   * View links never send: the server refuses their doc updates, and
+   * without the signing key other clients would too.
+   */
   canWrite: boolean;
   /**
    * Upload a compaction snapshot once the server reports holding this many
@@ -38,7 +43,7 @@ export interface EncryptedDocAdaptorOptions {
   compactAfterDeltas?: number;
   /** Delay before resending spans the server refused for a passing reason. */
   retryMs?: number;
-  /** A record could not be decrypted: wrong key, or tampered data. */
+  /** A record could not be decrypted: wrong key, unsigned or tampered. */
   onDecryptError?: (error: Error) => void;
 }
 
@@ -79,7 +84,8 @@ function storedDeltas(extra: Uint8Array | undefined): number {
 
 /**
  * Syncs a LoroDoc over the `%ELO` CRDT type of the Loro Protocol: every op
- * leaves this client AES-GCM encrypted, and the server only sees which op
+ * leaves this client encrypted and signed (see `crypto/project-key.ts`),
+ * and the server only sees which op
  * ranges (peer, counter span) a record covers so it can store, dedupe and
  * backfill without reading anything.
  *
@@ -124,6 +130,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       compactAfterDeltas: 200,
       retryMs: 2000,
       ...options,
+      canWrite: options.canWrite && options.key.sign !== null,
     };
     this.synced = new Promise((resolve) => {
       this.resolveSynced = resolve;
@@ -222,7 +229,6 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     const spans = missingSpans(this.doc.oplogVersion(), this.server);
     if (spans.length === 0) return;
 
-    const { key, keyId } = this.options.key;
     let batch: Uint8Array[] = [];
     let size = 0;
     const flush = () => {
@@ -241,16 +247,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
           },
         ],
       });
-      const { record } = await encryptDeltaSpan(
-        plaintext,
-        {
-          peerId: encoder.encode(span.peer),
-          start: span.start,
-          end: span.end,
-          keyId,
-        },
-        key,
-      );
+      const record = await encryptDelta(this.options.key, span, plaintext);
       if (this.destroyed) return;
       if (size + record.length > CONTAINER_BUDGET) flush();
       batch.push(record);
@@ -261,15 +258,11 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
   }
 
   private async importContainer(container: Uint8Array): Promise<void> {
-    const { key, keyId } = this.options.key;
     const plaintexts: Uint8Array[] = [];
     const received: Counters = new Map();
     for (const record of decodeEloContainer(container)) {
       try {
-        const out = await decryptEloRecord(record, async (recordKeyId) => {
-          if (recordKeyId !== keyId) throw new KeyMismatchError(recordKeyId);
-          return key;
-        });
+        const out = await decryptRecord(this.options.key, record);
         plaintexts.push(out.plaintext);
         if (out.kind === EloRecordKind.DeltaSpan) {
           raise(
@@ -330,10 +323,10 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       // ASCII digits, so string order is byte order.
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([peer, counter]) => ({ peerId: encoder.encode(peer), counter }));
-    const { record } = await encryptSnapshot(
+    const record = await encryptSnapshot(
+      this.options.key,
+      vv,
       this.doc.export({ mode: "snapshot" }),
-      { vv, keyId: this.options.key.keyId },
-      this.options.key.key,
     );
     if (this.destroyed) return;
     this.ctx?.send([encodeEloContainer([record])]);

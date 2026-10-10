@@ -48,7 +48,8 @@ pub struct SealedRecord<'a> {
     pub iv: Iv,
     /// The exact header bytes, bound to the ciphertext as associated data.
     pub aad: &'a [u8],
-    /// Ciphertext with the GCM tag.
+    /// The record body: salt, ciphertext with the GCM tag, and signature
+    /// (see the `crypto` module).
     pub ct: &'a [u8],
 }
 
@@ -236,8 +237,8 @@ pub fn encode_snapshot_header(vv: &[(u64, u64)], key_id: &str, iv: &Iv) -> Vec<u
     writer.finalize()
 }
 
-/// A full record: the header followed by the length-prefixed ciphertext
-/// (GCM tag included).
+/// A full record: the header followed by the length-prefixed body (see the
+/// `crypto` module for what the body holds).
 pub fn encode_record(header: &[u8], ct: &[u8]) -> Vec<u8> {
     let mut writer = BytesWriter::new();
     writer.push_bytes(header);

@@ -4,6 +4,7 @@
 
 use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, TreeID, ValueOrContainer};
 
+use crate::names::is_portable_segment;
 use crate::paths::{PathIndex, build_path_index};
 use crate::{FileKind, node, root, string_value, text_content};
 
@@ -103,13 +104,16 @@ pub fn materialize_at(doc: &LoroDoc, frontiers: &Frontiers) -> LoroResult<Vec<Ma
 /// The UI refuses names like `..` or ones with control characters, but a
 /// modified client can write anything into the doc, and exported paths end
 /// up on disk when someone unzips or checks out the project. Backslashes
-/// count as separators here because Windows tools treat them as such.
+/// count as separators here because Windows tools treat them as such, and
+/// segments that some file system would read as `.git` or as a drive or
+/// device are refused for the same reason.
 pub fn is_safe_path(path: &str) -> bool {
     path.split(['/', '\\']).all(|segment| {
         !segment.is_empty()
             && segment != "."
             && segment != ".."
             && !segment.chars().any(char::is_control)
+            && is_portable_segment(segment)
     })
 }
 
@@ -190,6 +194,19 @@ mod tests {
         assert!(is_safe_path("chapters/intro.typ"));
         assert!(!is_safe_path("/abs.typ"));
         assert!(!is_safe_path("a//b"));
+        for path in [
+            ".GIT/config",
+            "sub/.Git/config",
+            "GIT~1/HEAD",
+            ".git./config",
+            ".typstry/doc.bin",
+            "C:/x.typ",
+            "a:b.typ",
+            "nul.txt",
+            "dir/notes.",
+        ] {
+            assert!(!is_safe_path(path), "{path}");
+        }
     }
 
     #[test]

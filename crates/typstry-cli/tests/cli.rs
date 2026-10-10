@@ -18,6 +18,7 @@ use typstry_doc::apply::apply_files;
 use typstry_doc::init::starter_content;
 use typstry_doc::materialize::{FileContent, MaterializedFile, materialize};
 use typstry_doc::paths::build_path_index;
+use typstry_doc::{FileKind, node, root};
 use typstry_wire::crypto::ProjectKey;
 use typstry_wire::elo::encode_container;
 
@@ -482,6 +483,88 @@ async fn git_files_in_the_project_are_neither_written_nor_deleted() {
     );
 }
 
+/// Writes a node straight into the doc, the way a modified client could,
+/// without the name rules `apply_files` enforces.
+fn plant(
+    doc: &loro::LoroDoc,
+    parent: Option<loro::TreeID>,
+    name: &str,
+    body: Option<&str>,
+) -> loro::TreeID {
+    let tree = doc.get_tree(root::FS);
+    let id = tree.create(parent).unwrap();
+    let meta = tree.get_meta(id).unwrap();
+    let kind = if body.is_some() {
+        FileKind::Text
+    } else {
+        FileKind::Dir
+    };
+    meta.insert(node::KIND, kind.as_str()).unwrap();
+    meta.insert(node::NAME, name).unwrap();
+    if let Some(body) = body {
+        let content = meta
+            .insert_container(node::CONTENT, loro::LoroText::new())
+            .unwrap();
+        content.insert(0, body).unwrap();
+    }
+    doc.commit();
+    id
+}
+
+#[tokio::test]
+async fn a_shared_git_dir_in_another_spelling_is_never_written() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Planted").await;
+    let link = ShareLink::parse(&edit).unwrap();
+    let seed = tempfile::tempdir().unwrap();
+    let mut attacker = common::seeder(&link, seed.path()).await;
+    // On macOS and Windows `.GIT` is `.git`, so this would be the clone's
+    // git config, and git runs `core.fsmonitor` on the next `git add`.
+    let config = "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = touch pwned\n";
+    for top in [".GIT", "GIT~1", ".git."] {
+        let dir = plant(&attacker.doc, None, top, None);
+        plant(&attacker.doc, Some(dir), "config", Some(config));
+        plant(
+            &attacker.doc,
+            Some(dir),
+            "HEAD",
+            Some("ref: refs/heads/main\n"),
+        );
+    }
+    let sub = plant(&attacker.doc, None, "sub", None);
+    let nested = plant(&attacker.doc, Some(sub), ".Git", None);
+    plant(&attacker.doc, Some(nested), "config", Some(config));
+    plant(&attacker.doc, None, "C:", None);
+    plant(&attacker.doc, None, "nul.typ", Some("x"));
+    attacker.push_local().await.unwrap();
+    attacker.disconnect().await;
+
+    let work = tempfile::tempdir().unwrap();
+    let mut args = vec!["clone", edit.as_str(), "repo"];
+    if has_git() {
+        args.push("--git");
+    }
+    typstry(work.path(), &args).await.unwrap();
+    let repo = work.path().join("repo");
+
+    let mut names: Vec<String> = fs::read_dir(&repo)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let mut expected = vec![STATE_DIR, "main.typ"];
+    if has_git() {
+        expected.insert(0, ".git");
+    }
+    assert_eq!(names, expected);
+    assert!(!work.path().join("pwned").exists());
+    assert!(!repo.join("pwned").exists());
+    if has_git() {
+        let config = read(&repo, ".git/config");
+        assert!(!config.contains("pwned"), "{config}");
+    }
+}
+
 #[tokio::test]
 async fn a_remote_file_never_replaces_a_case_variant() {
     let server = Server::start().await;
@@ -657,7 +740,7 @@ async fn inject_foreign_record(link: &str) {
             4242, 0, end,
         )]))
         .unwrap();
-    let record = key.encrypt_delta(4242, 0, end as u64, &plaintext);
+    let record = key.encrypt_delta(4242, 0, end as u64, &plaintext).unwrap();
     let mut client = Client::connect(&ws_url(&link.origin).unwrap(), &share.project_id)
         .await
         .unwrap();

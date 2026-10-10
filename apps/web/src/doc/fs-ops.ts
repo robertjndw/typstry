@@ -34,6 +34,42 @@ const MAX_NAME_BYTES = 255;
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 
+// Same rules as is_reserved_segment and is_device_name in
+// crates/typstry-doc/src/names.rs, which the CLI enforces before writing.
+const RESERVED_DIRS = [".git", ".typstry"];
+// Code points HFS+ skips when comparing names, as in git's is_hfs_dotgit.
+const HFS_IGNORABLE = /[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g;
+
+// ASCII only, like Rust's eq_ignore_ascii_case: toLowerCase would also
+// fold some non-ASCII letters.
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/**
+ * Whether some file system reads `name` as `.git` or the CLI's `.typstry`:
+ * macOS and Windows ignore case, Windows drops trailing dots and spaces and
+ * knows `.git` as `GIT~1`. A shared `.GIT/config` would otherwise become a
+ * collaborator's git config, which can name commands for git to run.
+ */
+export function isReservedName(name: string): boolean {
+  const folded = asciiLower(name.replace(HFS_IGNORABLE, "")).replace(
+    /[. ]+$/,
+    "",
+  );
+  return folded === "git~1" || RESERVED_DIRS.includes(folded);
+}
+
+/** Whether Windows opens a device for `name`, with any extension. */
+export function isDeviceName(name: string): boolean {
+  const dot = name.indexOf(".");
+  const stem = asciiLower(dot < 0 ? name : name.slice(0, dot)).replace(
+    / +$/,
+    "",
+  );
+  return /^(con|prn|aux|nul|conin\$|conout\$|(com|lpt)[1-9¹²³])$/.test(stem);
+}
+
 export function validateName(name: string): void {
   if (name === "") throw new FsError("invalid-name", "Name must not be empty");
   if (name === "." || name === "..")
@@ -52,6 +88,42 @@ export function validateName(name: string): void {
       `Name must be at most ${MAX_NAME_BYTES} bytes`,
     );
   }
+  if (isReservedName(name))
+    throw new FsError("invalid-name", '".git" and ".typstry" are reserved');
+  // The rest are fine on Linux and macOS, but the project also syncs to
+  // Windows folders, where these break or, for ":", leave the folder.
+  if (name.includes(":"))
+    throw new FsError("invalid-name", 'Name must not contain ":"');
+  if (/[. ]$/.test(name)) {
+    throw new FsError(
+      "invalid-name",
+      "Name must not end with a dot or a space",
+    );
+  }
+  if (isDeviceName(name)) {
+    throw new FsError(
+      "invalid-name",
+      `"${name}" is reserved for a device on Windows`,
+    );
+  }
+}
+
+/**
+ * Whether every segment of `path` is a name this app would create, and
+ * safe to write anywhere. Docs from other clients can hold any name, so
+ * whatever writes paths to disk checks them again. Backslashes are fine as
+ * names here but separators on Windows, so they count as unsafe too.
+ */
+export function isSafePath(path: string): boolean {
+  return path.split("/").every((segment) => {
+    if (segment.includes("\\")) return false;
+    try {
+      validateName(segment);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 function liveNode(project: ProjectDoc, id: TreeID): LoroTreeNode {

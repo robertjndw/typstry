@@ -30,6 +30,28 @@ test("edits show up in the preview and survive a reload", async ({ page }) => {
   await expect(editor(page)).toContainText("Written by Playwright");
 });
 
+test.describe(() => {
+  // Chrome checks the CSP as soon as DOMParser meets the handler attribute,
+  // before the sanitizer gets to remove it. Nothing runs either way.
+  test.use({ expectedCspViolations: [/Executing inline event handler/] });
+
+  test("links in a document cannot run script in the app", async ({ page }) => {
+    await createProject(page, "Links");
+
+    // typst.ts puts `@typst:` link targets into an onclick verbatim.
+    await appendLine(
+      page,
+      '#link("@typst:window.pwned=1")[#block(width: 100%, height: 40pt)[Trap]]',
+    );
+    const trap = firstPage(page).locator("a").last();
+    await expect(firstPage(page)).toContainText("Trap");
+    await trap.hover();
+    await trap.click({ force: true });
+    expect(await page.evaluate(() => "pwned" in window)).toBe(false);
+    await expect(trap).not.toHaveAttribute("onclick");
+  });
+});
+
 test("compile errors are listed and jump to the source", async ({ page }) => {
   await createProject(page, "Errors");
 

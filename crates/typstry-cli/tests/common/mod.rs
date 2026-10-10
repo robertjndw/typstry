@@ -111,9 +111,10 @@ pub fn cached_doc(dir: &Path) -> loro::LoroDoc {
 pub async fn create_project(origin: &str) -> (ShareLink, ShareLink) {
     let created = Api::new(origin).unwrap().create_project().await.unwrap();
     let key = ProjectKey::generate_raw();
+    let view_key = ProjectKey::from_base64url(&key).unwrap().view_secret();
     (
         ShareLink::new(origin, &created.edit_token, &key),
-        ShareLink::new(origin, &created.view_token, &key),
+        ShareLink::new(origin, &created.view_token, &view_key),
     )
 }
 

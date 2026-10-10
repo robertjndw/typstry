@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { generateRawProjectKey, importProjectKey } from "@/crypto/project-key";
-import { AssetCache } from "@/typst/asset-cache";
+import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { AssetCache, contentHash } from "@/typst/asset-cache";
 
 import { mimeOf } from "./file-types";
 import { MAX_ASSET_BYTES, projectAssets } from "./project-assets";
@@ -16,7 +16,7 @@ function fakeServer() {
     const url = String(input);
     if (init?.method === "POST") {
       const body = init.body as Uint8Array;
-      const hash = `sha256:${String(blobs.size).padStart(64, "0")}`;
+      const hash = await contentHash(body);
       blobs.set(hash, body);
       return new Response(JSON.stringify({ hash, size: body.length }), {
         status: 201,
@@ -35,7 +35,7 @@ function fakeServer() {
 describe("projectAssets", () => {
   it("stores ciphertext and loads plaintext", async () => {
     const { blobs } = fakeServer();
-    const key = await importProjectKey(generateRawProjectKey());
+    const key = await importProjectKey(generateEditSecret());
     const assets = projectAssets("tok", key, {
       cache: new AssetCache({ caches: null }),
     });
@@ -50,7 +50,7 @@ describe("projectAssets", () => {
 
     const stranger = projectAssets(
       "tok",
-      await importProjectKey(generateRawProjectKey()),
+      await importProjectKey(generateEditSecret()),
       { cache: new AssetCache({ caches: null }) },
     );
     await expect(stranger.load(info.hash)).rejects.toThrow();
@@ -58,7 +58,7 @@ describe("projectAssets", () => {
 
   it("refuses files that would not fit once encrypted", async () => {
     const { fetch } = fakeServer();
-    const key = await importProjectKey(generateRawProjectKey());
+    const key = await importProjectKey(generateEditSecret());
     const assets = projectAssets("tok", key);
     const big = {
       name: "big.pdf",

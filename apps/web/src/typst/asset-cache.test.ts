@@ -1,15 +1,19 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
 
-import { AssetCache, BLOB_CACHE } from "./asset-cache";
+import { AssetCache, BLOB_CACHE, contentHash } from "./asset-cache";
 
-const HASH = `sha256:${"a".repeat(64)}`;
-const OTHER = `sha256:${"b".repeat(64)}`;
+const BYTES = new Uint8Array([1, 2, 3]);
+const OTHER_BYTES = new Uint8Array([4, 5]);
+const HASH = await contentHash(BYTES);
+const OTHER = await contentHash(OTHER_BYTES);
 
+/** Serves each blob's bytes under its own hash, like the server. */
 function fakeFetch(status = 200) {
-  return vi.fn<typeof fetch>(
-    async () => new Response(new Uint8Array([1, 2, 3]), { status }),
-  );
+  return vi.fn<typeof fetch>(async (url) => {
+    const other = String(url).includes(encodeURIComponent(OTHER));
+    return new Response(other ? OTHER_BYTES : BYTES, { status });
+  });
 }
 
 /** Minimal in-memory Cache Storage. */
@@ -87,5 +91,14 @@ describe("AssetCache", () => {
       HASH,
     );
     expect(bytes).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it("refuses content that does not match its hash", async () => {
+    const { storage, cache: store } = fakeCaches();
+    const served = vi.fn<typeof fetch>(async () => new Response(OTHER_BYTES));
+    await expect(
+      new AssetCache({ fetch: served, caches: storage }).get("tok", HASH),
+    ).rejects.toThrow(/different content/);
+    expect(store.put).not.toHaveBeenCalled();
   });
 });

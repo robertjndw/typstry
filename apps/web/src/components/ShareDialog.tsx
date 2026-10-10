@@ -12,6 +12,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import type { ProjectKey } from "@/crypto/project-key";
 import { loadShareLinks, projectUrl } from "@/project/recent";
 import type { SharePermission } from "@/sync/api";
 
@@ -19,8 +20,8 @@ export interface ShareDialogProps {
   projectId: string;
   /** The token this page was opened with. */
   token: string;
-  /** Encryption key; part of every link, never sent to the server. */
-  projectKey: string;
+  /** Its secrets are part of every link and never sent to the server. */
+  projectKey: ProjectKey;
   permission: SharePermission;
   /** From the share lookup; set for edit links, so any editor can pass on a view link. */
   viewToken?: string;
@@ -36,8 +37,11 @@ export function ShareDialog({
   const [open, setOpen] = useState(false);
   // Read on open so links saved in another tab show up.
   const links = open ? loadShareLinks(projectId) : null;
+  const editSecret = projectKey.editSecret;
   const editToken =
-    permission === "write" ? (links?.editToken ?? token) : undefined;
+    permission === "write" && editSecret
+      ? (links?.editToken ?? token)
+      : undefined;
   const viewToken =
     permission === "read" ? token : (links?.viewToken ?? resolvedViewToken);
 
@@ -56,13 +60,18 @@ export function ShareDialog({
             Anyone with a link can open this project. There are no accounts, so
             treat the edit link like a password. The project is end-to-end
             encrypted: the key is in the link, and the server never sees it.
+            Only the edit link can sign changes, so view links stay read-only
+            even if the server were compromised.
           </DialogDescription>
         </DialogHeader>
-        {editToken && (
-          <LinkRow label="Can edit" url={projectUrl(editToken, projectKey)} />
+        {editToken && editSecret && (
+          <LinkRow label="Can edit" url={projectUrl(editToken, editSecret)} />
         )}
         {viewToken ? (
-          <LinkRow label="Can view" url={projectUrl(viewToken, projectKey)} />
+          <LinkRow
+            label="Can view"
+            url={projectUrl(viewToken, projectKey.viewSecret)}
+          />
         ) : (
           <p className="text-xs text-muted-foreground">
             The view-only link is only known to the browser that created this

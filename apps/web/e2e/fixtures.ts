@@ -7,7 +7,7 @@ import {
 
 export { expect };
 
-export const test = base.extend({
+export const test = base.extend<{ expectedCspViolations: RegExp[] }>({
   // Without a stored identity, opening a project asks for a name first and
   // the dialog covers the workspace.
   context: async ({ context }, use) => {
@@ -18,6 +18,23 @@ export const test = base.extend({
       );
     });
     await use(context);
+  },
+  expectedCspViolations: [[], { option: true }],
+  // The server's CSP is strict; whatever it blocks is a feature broken in
+  // production, so every test doubles as a check of the policy.
+  page: async ({ page, expectedCspViolations }, use) => {
+    const violations: string[] = [];
+    page.on("console", (message) => {
+      const text = message.text();
+      if (
+        text.includes("Content Security Policy") &&
+        !expectedCspViolations.some((re) => re.test(text))
+      ) {
+        violations.push(text);
+      }
+    });
+    await use(page);
+    expect(violations).toEqual([]);
   },
 });
 

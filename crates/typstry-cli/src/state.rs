@@ -15,6 +15,8 @@ use loro::{Frontiers, LoroDoc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use typstry_wire::crypto::ProjectKey;
+
 use crate::api::Permission;
 use crate::git::GitMark;
 use crate::link::ShareLink;
@@ -54,14 +56,21 @@ impl Config {
         ShareLink::new(&self.server, &self.token, &self.key)
     }
 
+    /// Always built from the view secret: the edit secret in `key` must
+    /// never end up in a link meant for viewers.
     pub fn view_link(&self) -> Option<ShareLink> {
-        match self.permission {
-            Permission::Read => Some(self.link()),
-            Permission::Write => self
-                .view_token
-                .as_deref()
-                .map(|token| ShareLink::new(&self.server, token, &self.key)),
-        }
+        let secret = ProjectKey::from_base64url(&self.key).ok()?.view_secret();
+        let token = match self.permission {
+            Permission::Read => &self.token,
+            Permission::Write => self.view_token.as_ref()?,
+        };
+        Some(ShareLink::new(&self.server, token, &secret))
+    }
+
+    /// Whether `key` is an edit secret, which writing takes on top of an
+    /// edit token.
+    pub fn can_sign(&self) -> bool {
+        ProjectKey::from_base64url(&self.key).is_ok_and(|key| key.can_sign())
     }
 }
 

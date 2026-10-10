@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BLOB_CONTEXT,
   SEAL_OVERHEAD,
-  generateRawProjectKey,
+  generateEditSecret,
   importProjectKey,
   open,
 } from "@/crypto/project-key";
@@ -17,7 +17,7 @@ import { projectAssets } from "./project-assets";
 import { freeName, uploadFiles } from "./upload";
 
 const TOKEN = "e".repeat(22);
-const key = await importProjectKey(generateRawProjectKey());
+const key = await importProjectKey(generateEditSecret());
 const ASSETS = projectAssets(TOKEN, key, {
   cache: new AssetCache({ caches: null }),
 });

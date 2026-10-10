@@ -43,7 +43,7 @@ docker run -d -p 8787:8787 -v typstry-data:/data typstry
 ┌──────────────── browser ────────────────┐          ┌──────── typstry-server ────────┐
 │ CodeMirror ◄─► LoroDoc ◄─► IndexedDB    │  /ws     │ rooms (relay + compaction)     │
 │                  │                      │ ◄──────► │ SQLite: encrypted doc records  │
-│                  ├─► AES-GCM encrypt    │  /api    │ blobs/: encrypted uploads      │
+│                  ├─► encrypt + sign     │  /api    │ blobs/: encrypted uploads      │
 │                  ├─► Typst worker ─► SVG│ ◄──────► │ static frontend                │
 │                  └─► tinymist worker    │          │                                │
 └─────────────────────────────────────────┘          └────────────────────────────────┘
@@ -52,6 +52,8 @@ docker run -d -p 8787:8787 -v typstry-data:/data typstry
 Each project is a single Loro document holding the file tree, file contents and version list. The browser and the `typstry` CLI encrypt every update before it leaves your machine and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
 
 Because the key is part of the share link, anyone with the link can read the project. Treat edit links like passwords.
+
+An edit link carries a 32-byte secret. Two keys are derived from it with HKDF-SHA256: a read key and an Ed25519 signing key. A view link carries only the read key and the public key. Every message is encrypted with AES-256-GCM under a key derived from the read key and a fresh random salt, and every doc update is signed. Viewers can decrypt and verify, but other clients refuse updates they did not sign with the edit key, so a view link stays read-only even if the server is compromised. A compromised server can still withhold or roll back updates, and it serves the app's JavaScript.
 
 ## Working locally with git
 

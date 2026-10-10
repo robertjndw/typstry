@@ -7,7 +7,7 @@ import { EphemeralStore, LoroDoc } from "loro-crdt";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  generateRawProjectKey,
+  generateEditSecret,
   importProjectKey,
   type ProjectKey,
 } from "@/crypto/project-key";
@@ -56,7 +56,7 @@ function connect(
 /** What the creator's browser does: register, then seed the doc locally. */
 async function create(title: string) {
   const created = await createProject({ baseUrl });
-  const key = await importProjectKey(generateRawProjectKey());
+  const key = await importProjectKey(generateEditSecret());
   const seed = new LoroDoc();
   initProject(seed, { title });
   return { ...created, key, seed };
@@ -176,7 +176,7 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     await new Promise((r) => setTimeout(r, 200));
 
     const onDecryptError = vi.fn();
-    const wrongKey = await importProjectKey(generateRawProjectKey());
+    const wrongKey = await importProjectKey(generateEditSecret());
     const intruder = connect(created.projectId, created.viewToken, wrongKey, {
       canWrite: false,
       onDecryptError,

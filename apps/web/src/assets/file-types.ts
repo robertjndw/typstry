@@ -102,6 +102,21 @@ export function fileCategory(name: string, mime = ""): FileCategory {
   return "other";
 }
 
+// Types that render without running script. Everything else, notably
+// text/html and image/svg+xml, would turn an object URL into a page on the
+// app's origin if someone opened it in a tab.
+const INERT_MIME =
+  /^(image\/(png|jpeg|gif|webp|avif|bmp)|application\/pdf|font\/[a-z0-9.+-]+|audio\/(mpeg|wav|ogg|mp4|flac)|video\/(mp4|webm|quicktime)|text\/plain)$/;
+
+/**
+ * The type to give an object URL of a file's bytes. The stored mime comes
+ * from whoever uploaded the file, so it is only passed through when it is
+ * known not to be active content.
+ */
+export function inertBlobType(mime: string): string {
+  return INERT_MIME.test(mime) ? mime : "application/octet-stream";
+}
+
 /**
  * Image formats every current browser decodes, so a preview is worth
  * trying. TIFF, HEIC and friends get the generic view instead of a broken

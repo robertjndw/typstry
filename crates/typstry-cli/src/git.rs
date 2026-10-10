@@ -246,9 +246,29 @@ fn resolve_git_dir(dot_git: &Path) -> Option<PathBuf> {
         .then(|| target.canonicalize().ok())?
 }
 
+/// Where `core.hooksPath` points so that no hook is found.
+const NO_HOOKS: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// A `git` command that runs no program the repository's config names.
+///
+/// The folders the CLI runs git in are filled from a shared project, and a
+/// config that slipped in (`core.fsmonitor`) or a hook would be code any
+/// collaborator gets to run here. Name checks keep `.git` out of the
+/// project; this keeps git from executing anything should one ever miss.
+fn git() -> Command {
+    let mut command = Command::new("git");
+    command.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        &format!("core.hooksPath={NO_HOOKS}"),
+    ]);
+    command
+}
+
 /// Whether a `git` executable can be run at all.
 pub fn available() -> bool {
-    Command::new("git")
+    git()
         .arg("--version")
         .output()
         .is_ok_and(|out| out.status.success())
@@ -257,7 +277,7 @@ pub fn available() -> bool {
 /// `git config user.name` as seen from `dir`, if git is installed and the
 /// name is set.
 pub fn user_name(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git()
         .args(["config", "user.name"])
         .current_dir(dir)
         .output()
@@ -268,7 +288,7 @@ pub fn user_name(dir: &Path) -> Option<String> {
 
 /// Runs a git command in `dir` and fails with its stderr when it does.
 pub fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
+    let out = git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -379,5 +399,52 @@ mod tests {
         repo.exclude_state_dir().unwrap();
         let exclude = fs::read_to_string(main.join(".git/info/exclude")).unwrap();
         assert_eq!(exclude, ".typstry/\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_no_fsmonitor_or_hook_from_the_repo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run(root, &["init", "--quiet"]).unwrap();
+        let marker = root.join("ran");
+        let script = root.join("planted.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::copy(&script, hooks.join("pre-commit")).unwrap();
+        let config = root.join(".git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("[core]\n\tfsmonitor = {}\n", script.display()));
+        fs::write(&config, text).unwrap();
+        fs::write(root.join("a.typ"), "x").unwrap();
+
+        run(root, &["add", "-A"]).unwrap();
+        run(
+            root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@localhost",
+                "commit",
+                "--quiet",
+                "-m",
+                "x",
+            ],
+        )
+        .unwrap();
+        run(root, &["status", "--porcelain"]).unwrap();
+        assert!(!marker.exists());
     }
 }

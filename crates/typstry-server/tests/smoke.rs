@@ -1,7 +1,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use typstry_server::http::{AppState, router};
+use typstry_server::http::{APP_CSP, AppState, COMPILE_WORKER_CSP, router};
 use typstry_server::store::blobs::BlobStore;
 use typstry_server::store::db;
 
@@ -41,6 +41,61 @@ async fn spa_fallback_serves_index() {
         to_bytes(res.into_body(), 1024).await.unwrap(),
         "<!doctype html>app"
     );
+}
+
+#[tokio::test]
+async fn app_pages_carry_a_strict_csp() {
+    let dir = tempfile::tempdir().unwrap();
+    let dist = dir.path().join("dist");
+    std::fs::create_dir(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html>app").unwrap();
+    std::fs::write(dist.join("app.js"), "").unwrap();
+    let pool = common::open_db(dir.path()).await;
+    let app = router(AppState::new(pool, BlobStore::new(dir.path())), &dist);
+
+    for path in ["/", "/p/sometoken", "/app.js"] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let headers = res.headers();
+        assert_eq!(headers["content-security-policy"], APP_CSP, "{path}");
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
+        assert_eq!(headers["referrer-policy"], "no-referrer", "{path}");
+    }
+    // The policy that matters most: no inline script, so injected event
+    // handler attributes stay inert.
+    let script_src = APP_CSP
+        .split(';')
+        .map(str::trim)
+        .find(|d| d.starts_with("script-src"))
+        .unwrap();
+    assert!(!script_src.contains("unsafe-inline"));
+    assert!(!script_src.contains(" 'unsafe-eval'"));
+
+    // Only the compiler worker, which has no DOM, may evaluate strings.
+    std::fs::create_dir(dist.join("assets")).unwrap();
+    std::fs::write(dist.join("assets/compile.worker-Ab1_x.js"), "").unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/assets/compile.worker-Ab1_x.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["content-security-policy"], COMPILE_WORKER_CSP);
+
+    // API responses are not pages and keep no page policy.
+    let res = app
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(res.headers().get("content-security-policy").is_none());
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
 }
 
 #[tokio::test]

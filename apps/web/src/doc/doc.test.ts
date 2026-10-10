@@ -99,6 +99,10 @@ describe("validation", () => {
       "nul\u0000",
       "\u0085",
       "x".repeat(256),
+      ".GIT",
+      "c:",
+      "notes.",
+      "nul.txt",
     ]) {
       expectFsError(() => createFile(p, null, name, "text"), "invalid-name");
     }

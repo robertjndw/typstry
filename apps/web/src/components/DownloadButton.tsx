@@ -50,11 +50,16 @@ export function DownloadButton({
 }) {
   const { busy, run } = useDownload(
     async () => {
-      const zip = await exportZip(
+      const { zip, skipped } = await exportZip(
         project,
         assets ? (hash) => assets.load(hash) : null,
         mtime,
       );
+      if (skipped.length > 0) {
+        toast.warning(
+          `Left out ${skipped.length === 1 ? skipped[0] : `${skipped.length} files`}: the name is not safe to unpack.`,
+        );
+      }
       return new Blob([zip], { type: "application/zip" });
     },
     downloadFilename(name, "zip"),

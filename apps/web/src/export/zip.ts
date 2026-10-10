@@ -1,5 +1,6 @@
 import { zipSync, type Zippable } from "fflate";
 
+import { isSafePath } from "@/doc/fs-ops";
 import { dirname } from "@/doc/names";
 import { buildPathIndex } from "@/doc/paths";
 import { fileText } from "@/doc/restore";
@@ -20,6 +21,16 @@ export class ExportError extends Error {
   }
 }
 
+export interface ExportedZip {
+  zip: Uint8Array<ArrayBuffer>;
+  /**
+   * Paths left out because unpacking them could be unsafe, sorted. A
+   * modified client can put `.GIT/config` in a project, and unzipped into a
+   * checkout on macOS or Windows that would become git's own config.
+   */
+  skipped: string[];
+}
+
 /**
  * Packs every file of `project` into a zip, using the same paths the
  * compiler sees (clash losers keep their "~id" names). If any asset fails to
@@ -32,7 +43,7 @@ export async function exportZip(
   loadAsset: ((hash: string) => Promise<Uint8Array>) | null,
   /** Modification time stamped on the entries, unix ms. */
   mtime = Date.now(),
-): Promise<Uint8Array<ArrayBuffer>> {
+): Promise<ExportedZip> {
   const index = buildPathIndex(project);
   const files: Zippable = {};
   const pending: Promise<void>[] = [];
@@ -41,8 +52,13 @@ export async function exportZip(
   const nonEmptyDirs = new Set<string>();
   const dirs: string[] = [];
   const encoder = new TextEncoder();
+  const skipped: string[] = [];
 
   for (const [id, { path, kind }] of index.byId) {
+    if (!isSafePath(path)) {
+      skipped.push(path);
+      continue;
+    }
     const parent = dirname(path);
     if (parent) nonEmptyDirs.add(parent);
     if (kind === "dir") {
@@ -78,5 +94,5 @@ export async function exportZip(
   for (const dir of dirs) {
     if (!nonEmptyDirs.has(dir)) files[`${dir}/`] = new Uint8Array(0);
   }
-  return zipSync(files, { level: 6, mtime });
+  return { zip: zipSync(files, { level: 6, mtime }), skipped: skipped.sort() };
 }

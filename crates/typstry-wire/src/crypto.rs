@@ -1,33 +1,59 @@
-//! The project key and everything encrypted with it, mirroring
-//! `apps/web/src/crypto/project-key.ts` and the record encryption of
-//! `apps/web/src/sync/encrypted-doc-adaptor.ts`.
+//! The project secrets and everything encrypted with them, mirroring
+//! `apps/web/src/crypto/project-key.ts`.
 //!
-//! One AES-256-GCM key per project encrypts doc records, blobs and
-//! presence. Doc records bind their plaintext header as associated data;
-//! blobs and presence bind a context string instead.
+//! An edit link carries a 32-byte edit secret. Two keys are derived from it
+//! with HKDF-SHA256: the read key, which encrypts doc records, blobs and
+//! presence, and an Ed25519 signing key. A view link carries only the read
+//! key and the matching public key, so viewers can decrypt and verify but
+//! not write doc records the other clients accept, whatever the server lets
+//! through.
+//!
+//! Nothing is ever encrypted under the read key directly. Every message
+//! draws a random 16-byte salt and is encrypted with AES-256-GCM under
+//! `HKDF(read key, salt, purpose)`, so the usual limit of about 2^32 random
+//! nonces per GCM key does not apply, and each purpose gets its own keys.
+//! Doc records bind their plaintext header as associated data and are
+//! signed; sealed blobs and presence bind their purpose through the HKDF
+//! info and the associated data.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use sha2::{Digest, Sha256};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::elo::{
     IV_LEN, Iv, Record, SealedRecord, encode_delta_header, encode_record, encode_snapshot_header,
 };
 
-pub const BLOB_CONTEXT: &str = "typstry:blob:v1";
-pub const PRESENCE_CONTEXT: &str = "typstry:presence:v1";
+pub const BLOB_CONTEXT: &str = "typstry:v2:blob";
+pub const PRESENCE_CONTEXT: &str = "typstry:v2:presence";
+const RECORD_CONTEXT: &str = "typstry:v2:record";
+const SIGNATURE_CONTEXT: &[u8] = b"typstry:v2:record-signature";
+const READ_INFO: &[u8] = b"typstry:v2:read";
+const SIGN_INFO: &[u8] = b"typstry:v2:sign";
+const KEY_ID_INFO: &[u8] = b"typstry:v2:key-id";
 
-/// Bytes [`ProjectKey::seal`] adds: the IV and the GCM tag.
-pub const SEAL_OVERHEAD: usize = IV_LEN + 16;
+pub const SALT_LEN: usize = 16;
+pub type Salt = [u8; SALT_LEN];
+const TAG_LEN: usize = 16;
+const SIGNATURE_LEN: usize = 64;
 
-const RAW_KEY_BYTES: usize = 32;
+/// Bytes [`ProjectKey::seal`] adds: the salt, the IV and the GCM tag.
+pub const SEAL_OVERHEAD: usize = SALT_LEN + IV_LEN + TAG_LEN;
 
-/// The browser decodes keys with `atob`, which ignores the unused low bits
-/// of the last character, so this does too. Otherwise a key that works in
-/// the browser could be refused here.
+const SECRET_BYTES: usize = 32;
+/// A view secret is the read key followed by the public key.
+const VIEW_SECRET_BYTES: usize = 64;
+const KEY_ID_BYTES: usize = 9;
+
+/// The browser decodes secrets with `atob`, which ignores the unused low
+/// bits of the last character, so this does too. Otherwise a secret that
+/// works in the browser could be refused here.
 const BASE64URL: GeneralPurpose = GeneralPurpose::new(
     &URL_SAFE,
     GeneralPurposeConfig::new()
@@ -48,9 +74,14 @@ pub enum CryptoError {
     MalformedRecord(String),
     #[error("sealed data is truncated")]
     Truncated,
+    /// Someone who can read the project but holds no edit link wrote it.
+    #[error("record is not signed with the project's edit key")]
+    BadSignature,
     /// Wrong key or context, or tampered data; GCM cannot tell which.
     #[error("decryption failed")]
     Decrypt,
+    #[error("a view-only key cannot sign records")]
+    ReadOnly,
 }
 
 /// A record after decryption, with the header it was authenticated under.
@@ -61,48 +92,90 @@ pub struct DecryptedRecord {
 }
 
 pub struct ProjectKey {
-    cipher: Aes256Gcm,
+    read: Zeroizing<[u8; SECRET_BYTES]>,
+    verifying: VerifyingKey,
+    /// Only edit secrets carry it.
+    signing: Option<SigningKey>,
     key_id: String,
 }
 
-// The key itself must never end up in logs.
+// The secrets must never end up in logs.
 impl std::fmt::Debug for ProjectKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProjectKey")
             .field("key_id", &self.key_id)
+            .field("can_sign", &self.can_sign())
             .finish_non_exhaustive()
     }
 }
 
-fn random_iv() -> Iv {
-    let mut iv = [0; IV_LEN];
-    getrandom::fill(&mut iv).expect("OS random source unavailable");
-    iv
+fn random<const N: usize>() -> [u8; N] {
+    let mut out = [0; N];
+    getrandom::fill(&mut out).expect("OS random source unavailable");
+    out
+}
+
+fn hkdf(ikm: &[u8], salt: &[u8], info: &[&[u8]]) -> Zeroizing<[u8; SECRET_BYTES]> {
+    let mut out = Zeroizing::new([0; SECRET_BYTES]);
+    Hkdf::<Sha256>::new(Some(salt), ikm)
+        .expand(&info.concat(), out.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
+fn signed_message(header: &[u8], body: &[u8]) -> Vec<u8> {
+    [SIGNATURE_CONTEXT, header, body].concat()
 }
 
 impl ProjectKey {
-    /// A fresh key in its shareable form, like `generateRawProjectKey` in
-    /// `apps/web/src/crypto/project-key.ts`.
+    /// A fresh edit secret in its shareable form, like
+    /// `generateEditSecret` in `apps/web/src/crypto/project-key.ts`.
     pub fn generate_raw() -> String {
-        let mut bytes = [0u8; RAW_KEY_BYTES];
-        getrandom::fill(&mut bytes).expect("OS random source unavailable");
-        BASE64URL.encode(bytes)
+        BASE64URL.encode(random::<SECRET_BYTES>())
     }
 
-    /// Parses the shareable form: exactly 32 bytes as base64url without
-    /// padding, the way it appears in a share link's fragment.
+    /// Parses the shareable form, base64url without padding the way it
+    /// appears in a share link's fragment: 32 bytes for an edit secret, 64
+    /// for a view secret.
     pub fn from_base64url(raw: &str) -> Result<Self, CryptoError> {
-        let bytes = BASE64URL
-            .decode(raw)
-            .map_err(|_| CryptoError::MalformedKey)?;
-        if bytes.len() != RAW_KEY_BYTES {
-            return Err(CryptoError::MalformedKey);
+        let bytes = Zeroizing::new(
+            BASE64URL
+                .decode(raw)
+                .map_err(|_| CryptoError::MalformedKey)?,
+        );
+        match bytes.len() {
+            SECRET_BYTES => {
+                let read = hkdf(&bytes, &[], &[READ_INFO]);
+                let signing = SigningKey::from_bytes(&hkdf(&bytes, &[], &[SIGN_INFO]));
+                let verifying = signing.verifying_key();
+                Ok(Self::assemble(read, verifying, Some(signing)))
+            }
+            VIEW_SECRET_BYTES => {
+                let (read, public) = bytes.split_at(SECRET_BYTES);
+                let public: &[u8; 32] = public.try_into().expect("split at 32 of 64");
+                let verifying =
+                    VerifyingKey::from_bytes(public).map_err(|_| CryptoError::MalformedKey)?;
+                let read = Zeroizing::new(read.try_into().expect("split at 32 of 64"));
+                Ok(Self::assemble(read, verifying, None))
+            }
+            _ => Err(CryptoError::MalformedKey),
         }
-        let digest = Sha256::digest(&bytes);
-        Ok(Self {
-            cipher: Aes256Gcm::new_from_slice(&bytes).map_err(|_| CryptoError::MalformedKey)?,
-            key_id: BASE64URL.encode(&digest[..9]),
-        })
+    }
+
+    fn assemble(
+        read: Zeroizing<[u8; SECRET_BYTES]>,
+        verifying: VerifyingKey,
+        signing: Option<SigningKey>,
+    ) -> Self {
+        // Covers the public key too, so a view link whose halves come from
+        // different projects shows up as a key mismatch.
+        let id = hkdf(read.as_ref(), &[], &[KEY_ID_INFO, verifying.as_bytes()]);
+        Self {
+            key_id: BASE64URL.encode(&id[..KEY_ID_BYTES]),
+            read,
+            verifying,
+            signing,
+        }
     }
 
     /// The short fingerprint sent in clear with every record, so a wrong
@@ -111,87 +184,144 @@ impl ProjectKey {
         &self.key_id
     }
 
-    fn encrypt(&self, iv: &Iv, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
-        self.cipher
+    /// Whether this is an edit secret, which is what writing records takes.
+    pub fn can_sign(&self) -> bool {
+        self.signing.is_some()
+    }
+
+    /// The shareable view secret: the read key and the public key.
+    pub fn view_secret(&self) -> String {
+        let mut bytes = Zeroizing::new([0; VIEW_SECRET_BYTES]);
+        bytes[..SECRET_BYTES].copy_from_slice(self.read.as_ref());
+        bytes[SECRET_BYTES..].copy_from_slice(self.verifying.as_bytes());
+        BASE64URL.encode(bytes.as_ref())
+    }
+
+    fn cipher(&self, salt: &Salt, context: &str) -> Aes256Gcm {
+        let key = hkdf(self.read.as_ref(), salt, &[context.as_bytes()]);
+        Aes256Gcm::new_from_slice(key.as_ref()).expect("HKDF yields a 32-byte key")
+    }
+
+    /// Seals `plaintext` as `salt || iv || ciphertext+tag`, binding
+    /// `context` (one of the `*_CONTEXT` constants) so a blob cannot be
+    /// passed off as presence or the other way around.
+    pub fn seal(&self, plaintext: &[u8], context: &str) -> Vec<u8> {
+        let salt: Salt = random();
+        let iv: Iv = random();
+        let ct = self
+            .cipher(&salt, context)
             .encrypt(
-                &Nonce::from(*iv),
+                &Nonce::from(iv),
                 Payload {
                     msg: plaintext,
-                    aad,
+                    aad: context.as_bytes(),
                 },
             )
-            .expect("AES-GCM encryption does not fail for in-memory buffers")
-    }
-
-    fn decrypt(&self, iv: &Iv, ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.cipher
-            .decrypt(&Nonce::from(*iv), Payload { msg: ct, aad })
-            .map_err(|_| CryptoError::Decrypt)
-    }
-
-    /// Seals `plaintext` as `iv || ciphertext+tag`, binding `context` (one
-    /// of the `*_CONTEXT` constants) so a blob cannot be passed off as
-    /// presence or the other way around.
-    pub fn seal(&self, plaintext: &[u8], context: &str) -> Vec<u8> {
-        let iv = random_iv();
-        let mut out = Vec::with_capacity(SEAL_OVERHEAD + plaintext.len());
-        out.extend_from_slice(&iv);
-        out.extend(self.encrypt(&iv, plaintext, context.as_bytes()));
-        out
+            .expect("AES-GCM encryption does not fail for in-memory buffers");
+        [&salt[..], &iv, &ct].concat()
     }
 
     /// Inverse of [`Self::seal`]. Sealed data carries no key id, so a wrong
     /// key shows up as [`CryptoError::Decrypt`].
     pub fn open(&self, sealed: &[u8], context: &str) -> Result<Vec<u8>, CryptoError> {
-        let Some((iv, ct)) = sealed.split_first_chunk::<IV_LEN>() else {
+        if sealed.len() < SEAL_OVERHEAD {
             return Err(CryptoError::Truncated);
-        };
-        self.decrypt(iv, ct, context.as_bytes())
+        }
+        let (salt, rest) = sealed
+            .split_first_chunk::<SALT_LEN>()
+            .expect("length checked");
+        let (iv, ct) = rest.split_first_chunk::<IV_LEN>().expect("length checked");
+        self.cipher(salt, context)
+            .decrypt(
+                &Nonce::from(*iv),
+                Payload {
+                    msg: ct,
+                    aad: context.as_bytes(),
+                },
+            )
+            .map_err(|_| CryptoError::Decrypt)
     }
 
     /// Encrypts the Loro updates for ops `[start, end)` of `peer` into a
-    /// delta record.
+    /// signed delta record.
     ///
     /// # Panics
     ///
     /// When the span is empty.
-    pub fn encrypt_delta(&self, peer: u64, start: u64, end: u64, plaintext: &[u8]) -> Vec<u8> {
-        self.encrypt_delta_with_iv(peer, start, end, plaintext, &random_iv())
+    pub fn encrypt_delta(
+        &self,
+        peer: u64,
+        start: u64,
+        end: u64,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.encrypt_delta_with(peer, start, end, plaintext, &random(), &random())
     }
 
-    /// Encrypts a Loro snapshot covering `vv` into a snapshot record.
-    pub fn encrypt_snapshot(&self, vv: &[(u64, u64)], plaintext: &[u8]) -> Vec<u8> {
-        self.encrypt_snapshot_with_iv(vv, plaintext, &random_iv())
+    /// Encrypts a Loro snapshot covering `vv` into a signed snapshot record.
+    pub fn encrypt_snapshot(
+        &self,
+        vv: &[(u64, u64)],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.encrypt_snapshot_with(vv, plaintext, &random(), &random())
     }
 
-    /// Reusing an IV under the same key breaks GCM entirely; this exists so
-    /// tests can produce byte-stable records.
+    /// Reusing a salt and IV breaks the encryption of both messages; this
+    /// exists so tests can produce byte-stable records.
     #[doc(hidden)]
-    pub fn encrypt_delta_with_iv(
+    pub fn encrypt_delta_with(
         &self,
         peer: u64,
         start: u64,
         end: u64,
         plaintext: &[u8],
         iv: &Iv,
-    ) -> Vec<u8> {
+        salt: &Salt,
+    ) -> Result<Vec<u8>, CryptoError> {
         let header = encode_delta_header(peer, start, end, &self.key_id, iv);
-        encode_record(&header, &self.encrypt(iv, plaintext, &header))
+        self.seal_record(&header, iv, salt, plaintext)
     }
 
     #[doc(hidden)]
-    pub fn encrypt_snapshot_with_iv(
+    pub fn encrypt_snapshot_with(
         &self,
         vv: &[(u64, u64)],
         plaintext: &[u8],
         iv: &Iv,
-    ) -> Vec<u8> {
+        salt: &Salt,
+    ) -> Result<Vec<u8>, CryptoError> {
         let header = encode_snapshot_header(vv, &self.key_id, iv);
-        encode_record(&header, &self.encrypt(iv, plaintext, &header))
+        self.seal_record(&header, iv, salt, plaintext)
     }
 
-    /// Parses and decrypts one record of either kind, authenticating its
-    /// header.
+    /// A record's ciphertext field is `salt || ciphertext+tag || signature`,
+    /// the signature covering the header and everything before it.
+    fn seal_record(
+        &self,
+        header: &[u8],
+        iv: &Iv,
+        salt: &Salt,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let signing = self.signing.as_ref().ok_or(CryptoError::ReadOnly)?;
+        let ct = self
+            .cipher(salt, RECORD_CONTEXT)
+            .encrypt(
+                &Nonce::from(*iv),
+                Payload {
+                    msg: plaintext,
+                    aad: header,
+                },
+            )
+            .expect("AES-GCM encryption does not fail for in-memory buffers");
+        let mut body = [&salt[..], &ct].concat();
+        let signature = signing.sign(&signed_message(header, &body));
+        body.extend_from_slice(&signature.to_bytes());
+        Ok(encode_record(header, &body))
+    }
+
+    /// Parses, verifies and decrypts one record of either kind.
     pub fn decrypt_record(&self, record: &[u8]) -> Result<DecryptedRecord, CryptoError> {
         let sealed = SealedRecord::parse(record).map_err(CryptoError::MalformedRecord)?;
         let plaintext = self.open_record(&sealed)?;
@@ -201,13 +331,34 @@ impl ProjectKey {
         })
     }
 
-    /// Decrypts a record that is already parsed, for callers that need its
-    /// header even when decryption fails.
+    /// Verifies and decrypts a record that is already parsed, for callers
+    /// that need its header even when decryption fails.
     pub fn open_record(&self, sealed: &SealedRecord<'_>) -> Result<Vec<u8>, CryptoError> {
         if sealed.key_id != self.key_id {
             return Err(CryptoError::KeyMismatch(sealed.key_id.clone()));
         }
-        self.decrypt(&sealed.iv, sealed.ct, sealed.aad)
+        if sealed.ct.len() < SALT_LEN + TAG_LEN + SIGNATURE_LEN {
+            return Err(CryptoError::Truncated);
+        }
+        let (body, signature) = sealed.ct.split_at(sealed.ct.len() - SIGNATURE_LEN);
+        let signature = Signature::from_slice(signature).map_err(|_| CryptoError::BadSignature)?;
+        // Checked before decrypting: a record a viewer forged is refused
+        // whatever it decrypts to.
+        self.verifying
+            .verify_strict(&signed_message(sealed.aad, body), &signature)
+            .map_err(|_| CryptoError::BadSignature)?;
+        let (salt, ct) = body
+            .split_first_chunk::<SALT_LEN>()
+            .expect("length checked");
+        self.cipher(salt, RECORD_CONTEXT)
+            .decrypt(
+                &Nonce::from(sealed.iv),
+                Payload {
+                    msg: ct,
+                    aad: sealed.aad,
+                },
+            )
+            .map_err(|_| CryptoError::Decrypt)
     }
 }
 
@@ -225,8 +376,12 @@ mod tests {
         ProjectKey::from_base64url(&BASE64URL.encode([9; 32])).unwrap()
     }
 
+    fn viewer() -> ProjectKey {
+        ProjectKey::from_base64url(&key().view_secret()).unwrap()
+    }
+
     #[test]
-    fn parses_only_32_byte_base64url_keys() {
+    fn parses_only_32_and_64_byte_base64url_secrets() {
         assert_eq!(key().key_id().len(), 12);
         for bad in [
             "",
@@ -235,17 +390,31 @@ mod tests {
             &format!("{RAW}="),
             &RAW.replace('A', "+"),
             &BASE64URL.encode([0; 16]),
+            &BASE64URL.encode([0; 48]),
         ] {
             assert!(ProjectKey::from_base64url(bad).is_err(), "{bad:?}");
         }
         assert!(!format!("{:?}", key()).contains(RAW));
+        assert!(!format!("{:?}", key()).contains(&key().view_secret()));
+    }
+
+    #[test]
+    fn view_secrets_derive_from_the_edit_secret() {
+        let edit = key();
+        let view = viewer();
+        assert!(edit.can_sign());
+        assert!(!view.can_sign());
+        assert_eq!(view.key_id(), edit.key_id());
+        assert_eq!(view.view_secret(), edit.view_secret());
+        assert_eq!(view.view_secret().len(), 86);
+        assert_ne!(other_key().key_id(), edit.key_id());
     }
 
     #[test]
     fn records_round_trip() {
         let key = key();
-        let record = key.encrypt_delta(7, 0, 3, b"ops");
-        let out = key.decrypt_record(&record).unwrap();
+        let record = key.encrypt_delta(7, 0, 3, b"ops").unwrap();
+        let out = viewer().decrypt_record(&record).unwrap();
         assert_eq!(out.plaintext, b"ops");
         assert_eq!(
             out.record,
@@ -256,7 +425,9 @@ mod tests {
             }
         );
 
-        let record = key.encrypt_snapshot(&[(9, 1), (10, 2)], b"snapshot");
+        let record = key
+            .encrypt_snapshot(&[(9, 1), (10, 2)], b"snapshot")
+            .unwrap();
         let out = key.decrypt_record(&record).unwrap();
         assert_eq!(out.plaintext, b"snapshot");
         assert_eq!(
@@ -268,8 +439,54 @@ mod tests {
     }
 
     #[test]
+    fn viewers_cannot_write() {
+        let view = viewer();
+        assert!(matches!(
+            view.encrypt_delta(7, 0, 3, b"ops"),
+            Err(CryptoError::ReadOnly)
+        ));
+        assert!(matches!(
+            view.encrypt_snapshot(&[(7, 3)], b"snapshot"),
+            Err(CryptoError::ReadOnly)
+        ));
+    }
+
+    /// What a viewer could do with the read key alone: encrypt a record
+    /// correctly and sign it with a key of their own.
+    #[test]
+    fn records_signed_by_anyone_else_are_refused() {
+        let key = key();
+        let header = encode_delta_header(7, 0, 3, key.key_id(), &[1; IV_LEN]);
+        let salt = [2; SALT_LEN];
+        let ct = key
+            .cipher(&salt, RECORD_CONTEXT)
+            .encrypt(
+                &Nonce::from([1; IV_LEN]),
+                Payload {
+                    msg: b"forged",
+                    aad: &header,
+                },
+            )
+            .unwrap();
+        let mut body = [&salt[..], &ct].concat();
+        let forger = SigningKey::from_bytes(&[3; 32]);
+        body.extend_from_slice(&forger.sign(&signed_message(&header, &body)).to_bytes());
+        let forged = encode_record(&header, &body);
+        assert!(matches!(
+            key.decrypt_record(&forged),
+            Err(CryptoError::BadSignature)
+        ));
+
+        let unsigned = encode_record(&header, &body[..body.len() - SIGNATURE_LEN]);
+        assert!(matches!(
+            viewer().decrypt_record(&unsigned),
+            Err(CryptoError::BadSignature | CryptoError::Truncated)
+        ));
+    }
+
+    #[test]
     fn wrong_key_is_a_mismatch() {
-        let record = key().encrypt_delta(7, 0, 3, b"ops");
+        let record = key().encrypt_delta(7, 0, 3, b"ops").unwrap();
         let other = other_key();
         assert!(matches!(
             other.decrypt_record(&record),
@@ -280,18 +497,23 @@ mod tests {
     #[test]
     fn tampering_is_detected() {
         let key = key();
-        let record = key.encrypt_delta(7, 0, 3, b"ops");
+        let record = key.encrypt_delta(7, 0, 3, b"ops").unwrap();
 
+        // The signature is last; flip a ciphertext byte before it.
         let mut ct = record.clone();
-        *ct.last_mut().unwrap() ^= 1;
-        assert!(matches!(key.decrypt_record(&ct), Err(CryptoError::Decrypt)));
+        let at = ct.len() - SIGNATURE_LEN - 1;
+        ct[at] ^= 1;
+        assert!(matches!(
+            key.decrypt_record(&ct),
+            Err(CryptoError::BadSignature)
+        ));
 
-        // The header is authenticated too: claiming other ops must fail.
+        // The header is signed too: claiming other ops must fail.
         let mut header = record.clone();
         header[4] = 4;
         assert!(matches!(
             key.decrypt_record(&header),
-            Err(CryptoError::Decrypt)
+            Err(CryptoError::BadSignature)
         ));
 
         assert!(matches!(
@@ -301,11 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn every_message_gets_its_own_salt() {
+        let key = key();
+        let a = key.seal(b"blob", BLOB_CONTEXT);
+        let b = key.seal(b"blob", BLOB_CONTEXT);
+        assert_ne!(a[..SALT_LEN], b[..SALT_LEN]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn seal_binds_the_context() {
         let key = key();
         let sealed = key.seal(b"blob", BLOB_CONTEXT);
         assert_eq!(sealed.len(), 4 + SEAL_OVERHEAD);
         assert_eq!(key.open(&sealed, BLOB_CONTEXT).unwrap(), b"blob");
+        assert_eq!(viewer().open(&sealed, BLOB_CONTEXT).unwrap(), b"blob");
         assert!(matches!(
             key.open(&sealed, PRESENCE_CONTEXT),
             Err(CryptoError::Decrypt)

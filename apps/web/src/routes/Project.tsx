@@ -116,14 +116,10 @@ function ProjectSessionView({
         </Centered>
       );
     case "ready": {
-      const { share, assets, key } = state;
+      const { share, assets, key, canWrite } = state;
       return (
         <div className="h-svh">
-          <ProjectProvider
-            doc={project}
-            assets={assets}
-            readOnly={share.permission === "read"}
-          >
+          <ProjectProvider doc={project} assets={assets} readOnly={!canWrite}>
             <PresenceProvider ephemeral={ephemeral} identity={identity}>
               <ProjectWorkspace
                 documentTitle

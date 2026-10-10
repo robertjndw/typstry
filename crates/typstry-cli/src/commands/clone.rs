@@ -5,7 +5,7 @@ use anyhow::{Context, bail};
 
 use super::init::absolute;
 use super::{Ctx, Output, print_report, print_warnings, track_branch};
-use crate::api::{Api, Permission};
+use crate::api::Api;
 use crate::engine::{Mode, Scope, Session};
 use crate::git::{self, Repo};
 use crate::link::ShareLink;
@@ -132,7 +132,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         "Cloned {title:?} into {} ({} file(s){})",
         root.display(),
         report.written.len(),
-        if session.config.permission == Permission::Read {
+        if !session.can_write() {
             ", view-only"
         } else {
             ""

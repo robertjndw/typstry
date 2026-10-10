@@ -2,7 +2,12 @@ import type { TreeID } from "loro-crdt";
 import { DownloadIcon, FileIcon, Loader2Icon } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { fileCategory, mimeOf, PREVIEWABLE_IMAGE } from "@/assets/file-types";
+import {
+  fileCategory,
+  inertBlobType,
+  mimeOf,
+  PREVIEWABLE_IMAGE,
+} from "@/assets/file-types";
 import { Button } from "@/components/ui/button";
 import { ownBuffer } from "@/crypto/project-key";
 import { basename } from "@/doc/names";
@@ -182,6 +187,17 @@ function FontPreview({ url }: { url: string }) {
   );
 }
 
+function svgDataUrl(bytes: Uint8Array): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+    reader.readAsDataURL(
+      new Blob([ownBuffer(bytes)], { type: "image/svg+xml" }),
+    );
+  });
+}
+
 /**
  * Blobs are stored encrypted, so the browser cannot load them by URL; this
  * decrypts one into an object URL that lives as long as the view.
@@ -197,17 +213,27 @@ function useDecryptedUrl(
     if (!assets || !hash) return;
     let url: string | null = null;
     let active = true;
-    assets.load(hash).then(
-      (bytes) => {
+    assets
+      .load(hash)
+      .then(async (bytes) => {
         if (!active) return;
-        url = URL.createObjectURL(new Blob([ownBuffer(bytes)], { type: mime }));
+        if (mime === "image/svg+xml") {
+          // An SVG object URL opened in a tab would be a document on our
+          // origin. A data URL renders the same in <img>, and browsers
+          // refuse to navigate to one.
+          const dataUrl = await svgDataUrl(bytes);
+          if (active) setState({ hash, url: dataUrl });
+          return;
+        }
+        url = URL.createObjectURL(
+          new Blob([ownBuffer(bytes)], { type: inertBlobType(mime) }),
+        );
         setState({ hash, url });
-      },
-      (err: unknown) => {
+      })
+      .catch((err: unknown) => {
         console.error(err);
         if (active) setState({ hash, url: null });
-      },
-    );
+      });
     return () => {
       active = false;
       if (url) URL.revokeObjectURL(url);

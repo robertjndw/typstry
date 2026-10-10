@@ -15,6 +15,14 @@ pub enum NameError {
     Backslash,
     ControlChar,
     TooLong,
+    /// `.git` or `.typstry` in some spelling, see [`is_reserved_segment`].
+    ReservedName,
+    /// The rest are fine on Unix but not on Windows. A project is shared
+    /// across systems, so they are refused everywhere.
+    Colon,
+    TrailingDotOrSpace,
+    /// `CON`, `NUL`, `COM1` and the like, see [`is_device_name`].
+    DeviceName,
 }
 
 impl fmt::Display for NameError {
@@ -26,6 +34,10 @@ impl fmt::Display for NameError {
             Self::Backslash => "name must not contain \"\\\"",
             Self::ControlChar => "name must not contain control characters",
             Self::TooLong => "name must be at most 255 bytes",
+            Self::ReservedName => "\".git\" and \".typstry\" are reserved",
+            Self::Colon => "name must not contain \":\"",
+            Self::TrailingDotOrSpace => "name must not end with a dot or a space",
+            Self::DeviceName => "name is reserved for a device on Windows",
         })
     }
 }
@@ -56,7 +68,86 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     if name.len() > MAX_NAME_BYTES {
         return Err(NameError::TooLong);
     }
+    if is_reserved_segment(name) {
+        return Err(NameError::ReservedName);
+    }
+    portability(name)
+}
+
+/// Folders that belong to the local checkout rather than to the project:
+/// git's and the CLI's (`STATE_DIR` in typstry-cli).
+const RESERVED_DIRS: &[&str] = &[".git", ".typstry"];
+
+/// Code points HFS+ drops when it compares names, so `.g\u{200c}it` is
+/// `.git` there. Same list as git's `is_hfs_dotgit`.
+fn is_hfs_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
+    )
+}
+
+/// Whether a path segment names one of [`RESERVED_DIRS`] on some file
+/// system.
+///
+/// An exact comparison is not enough: macOS and Windows ignore case by
+/// default, Windows drops trailing dots and spaces and also knows `.git` by
+/// its short name `GIT~1`, and HFS+ skips some invisible code points. A
+/// shared file at `.GIT/config` would otherwise land in a real `.git` and
+/// plant a git config, whose `core.fsmonitor` is a command git runs.
+pub fn is_reserved_segment(segment: &str) -> bool {
+    let visible: String = segment.chars().filter(|&c| !is_hfs_ignorable(c)).collect();
+    let name = visible.trim_end_matches(['.', ' ']);
+    name.eq_ignore_ascii_case("git~1")
+        || RESERVED_DIRS
+            .iter()
+            .any(|dir| name.eq_ignore_ascii_case(dir))
+}
+
+/// Whether Windows maps `segment` to a device instead of a file. It does
+/// so with any extension too, so `nul.txt` is the null device, and it
+/// ignores spaces before the extension.
+pub fn is_device_name(segment: &str) -> bool {
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix).is_some_and(|n| {
+                let mut digits = n.chars();
+                // Windows counts the superscript digits as well.
+                matches!(
+                    (digits.next(), digits.next()),
+                    (Some('1'..='9' | '¹' | '²' | '³'), None)
+                )
+            })
+        }),
+    }
+}
+
+/// The rules only Windows needs. The colon matters most: `C:x` is a drive
+/// relative path there and would leave the project folder.
+fn portability(name: &str) -> Result<(), NameError> {
+    if name.contains(':') {
+        return Err(NameError::Colon);
+    }
+    if name.ends_with(['.', ' ']) {
+        return Err(NameError::TrailingDotOrSpace);
+    }
+    if is_device_name(name) {
+        return Err(NameError::DeviceName);
+    }
     Ok(())
+}
+
+/// The part of [`validate_name`] that [`crate::materialize::is_safe_path`]
+/// adds on top of its own checks.
+pub(crate) fn is_portable_segment(segment: &str) -> bool {
+    !is_reserved_segment(segment) && portability(segment).is_ok()
 }
 
 /// The first segment of a path that breaks the name rules.
@@ -103,7 +194,14 @@ mod tests {
 
     #[test]
     fn validates_names_like_fs_ops() {
-        for ok in ["main.typ", ".gitignore", "...", "a b", "😀", "x~0@1.typ"] {
+        for ok in [
+            "main.typ",
+            ".gitignore",
+            ".github",
+            "a b",
+            "😀",
+            "x~0@1.typ",
+        ] {
             assert_eq!(validate_name(ok), Ok(()), "{ok}");
         }
         assert_eq!(validate_name(""), Err(NameError::Empty));
@@ -118,6 +216,62 @@ mod tests {
         assert_eq!(validate_name(&"a".repeat(256)), Err(NameError::TooLong));
         // 128 two-byte characters are 256 bytes.
         assert_eq!(validate_name(&"é".repeat(128)), Err(NameError::TooLong));
+        assert_eq!(validate_name(".GIT"), Err(NameError::ReservedName));
+        assert_eq!(validate_name("c:x"), Err(NameError::Colon));
+        assert_eq!(validate_name("..."), Err(NameError::TrailingDotOrSpace));
+        assert_eq!(validate_name("a "), Err(NameError::TrailingDotOrSpace));
+        assert_eq!(validate_name("nul.txt"), Err(NameError::DeviceName));
+    }
+
+    #[test]
+    fn reserves_git_and_state_dirs_in_any_spelling() {
+        for name in [
+            ".git",
+            ".GIT",
+            ".Git",
+            ".git.",
+            ".git ",
+            ".git. .",
+            "GIT~1",
+            "git~1",
+            ".g\u{200c}it",
+            "\u{feff}.git",
+            ".typstry",
+            ".TypStry.",
+        ] {
+            assert!(is_reserved_segment(name), "{name:?}");
+        }
+        for name in [".gitignore", "git", ".git-x", ".github", "git~2", "a.git"] {
+            assert!(!is_reserved_segment(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn knows_windows_device_names() {
+        for name in [
+            "con",
+            "CON",
+            "Nul.txt",
+            "nul .txt",
+            "aux.tar.gz",
+            "COM1",
+            "lpt9.md",
+            "com¹",
+            "CONIN$",
+        ] {
+            assert!(is_device_name(name), "{name:?}");
+        }
+        for name in [
+            "console",
+            "com0",
+            "com10",
+            "lpt",
+            "nul_",
+            "x.nul",
+            "connect.typ",
+        ] {
+            assert!(!is_device_name(name), "{name:?}");
+        }
     }
 
     #[test]
