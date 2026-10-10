@@ -57,7 +57,11 @@ struct Conn {
 pub async fn run(socket: WebSocket, state: AppState) {
     let id = state.rooms.next_conn_id();
     let (mut sink, mut stream) = socket.split();
-    let (outbox, mut rx) = Outbox::channel(OUTBOX_FRAMES, state.limits.outbox_bytes);
+    let (outbox, mut rx) = Outbox::channel(
+        OUTBOX_FRAMES,
+        state.limits.outbox_bytes,
+        state.limits.max_rooms,
+    );
     let overflow = outbox.overflow_signal();
     let shutdown = state.shutdown.clone();
 

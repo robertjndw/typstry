@@ -6,8 +6,8 @@ pub mod actor;
 pub mod elo;
 pub mod registry;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -57,15 +57,19 @@ pub struct Outbox {
     budget: Arc<Budget>,
     max_frames: usize,
     max_bytes: usize,
+    max_backfills: usize,
 }
 
-/// What budgeted frames currently sit in the queue, and the backfill
-/// bytes queued per CRDT outside that budget.
+/// What budgeted frames currently sit in the queue, and which joins have
+/// backfill queued outside that budget.
 #[derive(Debug, Default)]
 struct Budget {
     frames: AtomicUsize,
     bytes: AtomicUsize,
-    backfill: [AtomicUsize; 2],
+    /// Every frame of a backfill holds a clone of its key, as does the
+    /// join queueing it, so a key held only by this list has nothing
+    /// left in the queue and is pruned.
+    backfills: Mutex<Vec<Arc<BackfillKey>>>,
 }
 
 impl Budget {
@@ -75,19 +79,23 @@ impl Budget {
     }
 }
 
-/// Which backfill counter a CRDT's joins use. Only `%ELO` and `%EPH` are
-/// ever joined.
-fn backfill_slot(crdt: CrdtType) -> usize {
-    match crdt {
-        CrdtType::Elo => 0,
-        _ => 1,
-    }
+#[derive(Debug, PartialEq, Eq)]
+struct BackfillKey {
+    room_id: String,
+    crdt: [u8; 4],
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A join's claim on queueing its backfill, from [`Outbox::start_backfill`].
+#[derive(Debug)]
+pub struct Backfill(Arc<BackfillKey>);
+
+#[derive(Debug)]
 enum Charge {
     Budget,
-    Backfill(usize),
+    /// Never read. Holding the key is the point, see `Budget::backfills`.
+    Backfill {
+        _key: Arc<BackfillKey>,
+    },
 }
 
 #[derive(Debug)]
@@ -104,7 +112,13 @@ pub struct OutboxReceiver {
 }
 
 impl Outbox {
-    pub fn channel(max_frames: usize, max_bytes: usize) -> (Self, OutboxReceiver) {
+    /// `max_backfills` caps how many joins can have backfill queued at
+    /// once. A client that keeps reading never has more than its room limit.
+    pub fn channel(
+        max_frames: usize,
+        max_bytes: usize,
+        max_backfills: usize,
+    ) -> (Self, OutboxReceiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let budget = Arc::new(Budget::default());
         let outbox = Self {
@@ -113,6 +127,7 @@ impl Outbox {
             budget: budget.clone(),
             max_frames,
             max_bytes,
+            max_backfills,
         };
         (outbox, OutboxReceiver { rx, budget })
     }
@@ -156,36 +171,41 @@ impl Outbox {
     /// past it could never be loaded again: every fresh client would
     /// overflow, reconnect and overflow again. The backfill is bounded by
     /// the doc itself, and live relays queued behind it still get the full
-    /// budget on their own. A join is refused while the previous backfill of
-    /// the same CRDT is still queued (see [`Self::start_backfill`]), so a
-    /// stalled client holds at most one backfill per CRDT plus the budget.
-    pub fn push_backfill(&self, crdt: CrdtType, frame: Bytes) -> bool {
-        let slot = backfill_slot(crdt);
-        let cost = frame.len();
-        self.budget.backfill[slot].fetch_add(cost, Ordering::AcqRel);
-        let sent = self
-            .tx
+    /// budget on their own. [`Self::start_backfill`] bounds how many
+    /// backfills a stalled client can hold.
+    pub fn push_backfill(&self, backfill: &Backfill, frame: Bytes) -> bool {
+        self.tx
             .send(Queued {
                 frame: Outbound::Binary(frame),
-                charge: Charge::Backfill(slot),
+                charge: Charge::Backfill {
+                    _key: backfill.0.clone(),
+                },
             })
-            .is_ok();
-        if !sent {
-            self.budget.backfill[slot].fetch_sub(cost, Ordering::AcqRel);
-        }
-        sent
+            .is_ok()
     }
 
-    /// Whether a join of `crdt` may queue its backfill. A client that never
-    /// reads could otherwise rejoin over and over and have the server queue
-    /// a copy of the doc for every join, since backfill skips the budget.
-    /// False, with overflow signalled, while an earlier one is still queued.
-    pub fn start_backfill(&self, crdt: CrdtType) -> bool {
-        if self.budget.backfill[backfill_slot(crdt)].load(Ordering::Acquire) == 0 {
-            return true;
+    /// Lets a join of `crdt` in `room_id` queue its backfill. A client that
+    /// never reads could otherwise rejoin over and over and have the server
+    /// queue a copy of the doc for every join, since backfill skips the
+    /// budget. None, with overflow signalled, while an earlier backfill of
+    /// the same room and CRDT is still queued, or `max_backfills` others
+    /// are. Keyed by room so that switching projects on one socket is not
+    /// held up by the previous project's backfill.
+    pub fn start_backfill(&self, room_id: &str, crdt: CrdtType) -> Option<Backfill> {
+        let key = BackfillKey {
+            room_id: room_id.to_owned(),
+            crdt: crdt.magic_bytes(),
+        };
+        let mut queued = self.budget.backfills.lock().expect("outbox poisoned");
+        queued.retain(|other| Arc::strong_count(other) > 1);
+        if queued.len() >= self.max_backfills || queued.iter().any(|other| **other == key) {
+            drop(queued);
+            self.overflow.notify_one();
+            return None;
         }
-        self.overflow.notify_one();
-        false
+        let key = Arc::new(key);
+        queued.push(key.clone());
+        Some(Backfill(key))
     }
 
     /// Encodes and queues a message; false if it could not be sent.
@@ -203,11 +223,8 @@ impl Outbox {
 impl OutboxReceiver {
     pub async fn recv(&mut self) -> Option<Outbound> {
         let Queued { frame, charge } = self.rx.recv().await?;
-        match charge {
-            Charge::Budget => self.budget.release(frame.cost()),
-            Charge::Backfill(slot) => {
-                self.budget.backfill[slot].fetch_sub(frame.cost(), Ordering::AcqRel);
-            }
+        if let Charge::Budget = charge {
+            self.budget.release(frame.cost());
         }
         Some(frame)
     }
@@ -281,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_overflows_on_bytes_before_frames() {
-        let (outbox, mut rx) = Outbox::channel(16, 100);
+        let (outbox, mut rx) = Outbox::channel(16, 100, 8);
         let overflow = outbox.overflow_signal();
         assert!(outbox.push(frame(60)));
         assert!(!outbox.push(frame(60)), "120 bytes is over budget");
@@ -295,7 +312,7 @@ mod tests {
 
     #[test]
     fn outbox_overflows_on_frames() {
-        let (outbox, _rx) = Outbox::channel(2, usize::MAX);
+        let (outbox, _rx) = Outbox::channel(2, usize::MAX, 8);
         let overflow = outbox.overflow_signal();
         assert!(outbox.push(frame(1)));
         assert!(outbox.push(frame(1)));
@@ -308,17 +325,18 @@ mod tests {
 
     #[test]
     fn an_empty_outbox_takes_a_frame_over_budget() {
-        let (outbox, _rx) = Outbox::channel(4, 10);
+        let (outbox, _rx) = Outbox::channel(4, 10, 8);
         assert!(outbox.push(frame(50)));
         assert!(!outbox.push(frame(1)));
     }
 
     #[tokio::test]
     async fn backfill_ignores_the_limits_but_live_frames_behind_it_do_not() {
-        let (outbox, mut rx) = Outbox::channel(2, 100);
+        let (outbox, mut rx) = Outbox::channel(2, 100, 8);
         let overflow = outbox.overflow_signal();
+        let backfill = outbox.start_backfill("a", CrdtType::Elo).unwrap();
         for _ in 0..10 {
-            assert!(outbox.push_backfill(CrdtType::Elo, Bytes::from(vec![0; 60])));
+            assert!(outbox.push_backfill(&backfill, Bytes::from(vec![0; 60])));
         }
         assert!(overflow.notified().now_or_never().is_none());
 
@@ -336,19 +354,42 @@ mod tests {
         assert!(outbox.push(frame(60)));
     }
 
+    /// Starts a backfill and queues one frame of it.
+    fn queue_backfill(outbox: &Outbox, room_id: &str, crdt: CrdtType) -> bool {
+        let Some(backfill) = outbox.start_backfill(room_id, crdt) else {
+            return false;
+        };
+        outbox.push_backfill(&backfill, Bytes::from(vec![0; 60]))
+    }
+
     #[tokio::test]
-    async fn a_join_is_refused_while_its_crdt_has_backfill_queued() {
-        let (outbox, mut rx) = Outbox::channel(16, 100);
+    async fn a_join_is_refused_while_its_room_has_backfill_queued() {
+        let (outbox, mut rx) = Outbox::channel(16, 100, 8);
         let overflow = outbox.overflow_signal();
-        assert!(outbox.start_backfill(CrdtType::Elo));
-        assert!(outbox.push_backfill(CrdtType::Elo, Bytes::from(vec![0; 60])));
-        // Presence has its own backfill and is not held up by the doc's.
-        assert!(outbox.start_backfill(CrdtType::LoroEphemeralStore));
+        assert!(queue_backfill(&outbox, "a", CrdtType::Elo));
+        // Presence and other rooms have their own and are not held up.
+        assert!(queue_backfill(&outbox, "a", CrdtType::LoroEphemeralStore));
+        assert!(queue_backfill(&outbox, "b", CrdtType::Elo));
         assert!(overflow.notified().now_or_never().is_none());
 
-        assert!(!outbox.start_backfill(CrdtType::Elo));
+        assert!(outbox.start_backfill("a", CrdtType::Elo).is_none());
         assert!(overflow.notified().now_or_never().is_some());
         assert!(rx.recv().await.is_some());
-        assert!(outbox.start_backfill(CrdtType::Elo));
+        assert!(queue_backfill(&outbox, "a", CrdtType::Elo));
+    }
+
+    #[tokio::test]
+    async fn backfills_queued_at_once_are_capped() {
+        let (outbox, mut rx) = Outbox::channel(16, 100, 2);
+        let overflow = outbox.overflow_signal();
+        assert!(queue_backfill(&outbox, "a", CrdtType::Elo));
+        assert!(queue_backfill(&outbox, "b", CrdtType::Elo));
+        assert!(outbox.start_backfill("c", CrdtType::Elo).is_none());
+        assert!(overflow.notified().now_or_never().is_some());
+
+        // A join whose backfill was empty, or failed, holds nothing.
+        assert!(rx.recv().await.is_some());
+        drop(outbox.start_backfill("c", CrdtType::Elo).unwrap());
+        assert!(queue_backfill(&outbox, "d", CrdtType::Elo));
     }
 }
