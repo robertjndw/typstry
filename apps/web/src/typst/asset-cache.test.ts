@@ -47,13 +47,26 @@ describe("AssetCache", () => {
     );
   });
 
-  it("evicts the least recently used entry", async () => {
+  it("evicts the least recently used entry once over its byte budget", async () => {
     const fetch = fakeFetch();
-    const cache = new AssetCache({ fetch, caches: null, capacity: 1 });
+    // HASH is 3 bytes and OTHER 2, so both together do not fit.
+    const cache = new AssetCache({ fetch, caches: null, maxBytes: 4 });
+    await cache.get("tok", HASH);
+    await cache.get("tok", OTHER);
+    await cache.get("tok", OTHER);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await cache.get("tok", HASH);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps several blobs that fit the budget together", async () => {
+    const fetch = fakeFetch();
+    const cache = new AssetCache({ fetch, caches: null, maxBytes: 5 });
     await cache.get("tok", HASH);
     await cache.get("tok", OTHER);
     await cache.get("tok", HASH);
-    expect(fetch).toHaveBeenCalledTimes(3);
+    await cache.get("tok", OTHER);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("forgets failures so they can be retried", async () => {
