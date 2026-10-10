@@ -102,6 +102,8 @@ export class CompilerClient {
    */
   private fontKey: string | null = "";
   private projectFonts: Uint8Array[] = [];
+  /** Asset and font loads still on their way to the worker. */
+  private readonly loading = new Set<Promise<void>>();
   private readonly dirty = new Set<TreeID>();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -142,7 +144,7 @@ export class CompilerClient {
     this.unsubscribeDoc = project.doc.subscribe((batch) =>
       this.onDocEvent(batch),
     );
-    this.syncStructure();
+    if (this.syncStructure()) this.requestCompile();
     // Fetched alongside the compiler instead of on the first result, which
     // narrows the window where a dropped connection leaves no renderer.
     void this.loadRenderer().catch(() => undefined);
@@ -172,12 +174,21 @@ export class CompilerClient {
     this.post({ type: "reinit", fonts });
   }
 
-  /** Compiles the main file to a PDF, including edits not yet compiled. */
-  exportPdf(): Promise<Uint8Array> {
-    if (this.disposed) return Promise.reject(new Error("compiler disposed"));
+  /**
+   * Compiles the main file to a PDF, including edits not yet compiled and
+   * assets still loading. The preview can show a first result without an
+   * image and catch up, but an exported file cannot.
+   */
+  async exportPdf(): Promise<Uint8Array> {
+    if (this.disposed) throw new Error("compiler disposed");
+    if (this.mainPath() === undefined)
+      throw new Error("the project has no main file");
+    // Loads finishing can start new ones (a doc change in between), so wait
+    // until none are left.
+    while (this.loading.size > 0) await Promise.all(this.loading);
+    if (this.disposed) throw new Error("compiler disposed");
     const mainPath = this.mainPath();
-    if (mainPath === undefined)
-      return Promise.reject(new Error("the project has no main file"));
+    if (mainPath === undefined) throw new Error("the project has no main file");
     // Edits still waiting out the debounce would be missing otherwise.
     this.flushTexts();
     const id = this.nextPdfId++;
@@ -261,8 +272,21 @@ export class CompilerClient {
         structural = true;
       }
     }
-    if (structural) this.syncStructure();
-    if (edited) this.scheduleFlush();
+    if (structural) {
+      // A checkout or a collaborator's merged edits can change the file set
+      // and file contents in one batch. Compiling the new file set while the
+      // texts still wait out the debounce reports errors that never existed,
+      // like an #include of a file the same batch removed.
+      const changed = this.syncStructure();
+      if (edited) {
+        if (this.flushTimer !== null) clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+        this.flushTexts();
+      }
+      if (changed || edited) this.requestCompile();
+    } else if (edited) {
+      this.scheduleFlush();
+    }
   }
 
   private scheduleFlush(): void {
@@ -293,7 +317,8 @@ export class CompilerClient {
   }
 
   /** Recomputes paths and sends the worker the difference. */
-  private syncStructure(): void {
+  /** Mirrors files, paths and the main file; true when anything changed. */
+  private syncStructure(): boolean {
     const index = buildPathIndex(this.project);
     let changed = false;
 
@@ -347,7 +372,7 @@ export class CompilerClient {
       this.mainId = mainId;
       changed = true;
     }
-    if (changed) this.requestCompile();
+    return changed;
   }
 
   private syncAssets(byId: ReturnType<typeof buildPathIndex>["byId"]): boolean {
@@ -367,16 +392,18 @@ export class CompilerClient {
       if (this.assets.get(entry.path) === hash) continue;
       this.assets.set(entry.path, hash);
       const path = entry.path;
-      void loader(hash, path).then(
-        (data) => {
-          // The file may have been replaced or removed while loading.
-          if (this.assets.get(path) !== hash) return;
-          this.post({ type: "setAsset", path: typstPath(path), data }, [
-            data.buffer,
-          ]);
-          this.requestCompile();
-        },
-        (err: unknown) => console.error(`failed to load asset ${path}`, err),
+      this.track(
+        loader(hash, path).then(
+          (data) => {
+            // The file may have been replaced or removed while loading.
+            if (this.assets.get(path) !== hash) return;
+            this.post({ type: "setAsset", path: typstPath(path), data }, [
+              data.buffer,
+            ]);
+            this.requestCompile();
+          },
+          (err: unknown) => console.error(`failed to load asset ${path}`, err),
+        ),
       );
     }
     for (const path of [...this.assets.keys()]) {
@@ -399,17 +426,25 @@ export class CompilerClient {
     const key = sorted.join(",");
     if (key === this.fontKey) return;
     this.fontKey = key;
-    void Promise.all(sorted.map((hash) => loader(hash, fonts.get(hash)!))).then(
-      (data) => {
-        if (this.fontKey !== key) return; // superseded while loading
-        this.projectFonts = data;
-        this.postFonts();
-      },
-      (err: unknown) => {
-        console.error("failed to load project fonts", err);
-        if (this.fontKey === key) this.fontKey = null;
-      },
+    this.track(
+      Promise.all(sorted.map((hash) => loader(hash, fonts.get(hash)!))).then(
+        (data) => {
+          if (this.fontKey !== key) return; // superseded while loading
+          this.projectFonts = data;
+          this.postFonts();
+        },
+        (err: unknown) => {
+          console.error("failed to load project fonts", err);
+          if (this.fontKey === key) this.fontKey = null;
+        },
+      ),
     );
+  }
+
+  /** `load` must not reject; failures are reported where they happen. */
+  private track(load: Promise<void>): void {
+    this.loading.add(load);
+    void load.finally(() => this.loading.delete(load));
   }
 
   /** Project path of the main file, if it is a mirrored text file. */

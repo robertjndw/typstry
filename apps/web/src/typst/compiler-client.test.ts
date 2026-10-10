@@ -177,6 +177,39 @@ describe("CompilerClient mirroring", () => {
     ]);
   });
 
+  it("compiles a batch that edits and removes files only once it is all applied", async () => {
+    const { project, worker } = setup();
+    const main = mainId(project);
+    const extra = createFile(project, null, "extra.typ", "text", "x");
+    getText(project, main).insert(0, '#include "extra.typ"\n');
+    project.doc.commit();
+    await settle();
+    worker.take();
+
+    // Like checking out an older version: the include and its file go
+    // away in the same batch.
+    getText(project, main).delete(0, '#include "extra.typ"\n'.length);
+    deleteNode(project, extra);
+    project.doc.commit();
+    // No settle: the compile must not wait for the text debounce, nor run
+    // before the text arrived.
+    await Promise.resolve();
+    const sent = worker.take();
+    const compile = sent.findIndex((m) => m.type === "compile");
+    const remove = sent.findIndex(
+      (m) => m.type === "remove" && m.path === "/extra.typ",
+    );
+    const text = sent.findIndex(
+      (m) => m.type === "setText" && m.path === "/main.typ",
+    );
+    expect(remove).toBeGreaterThanOrEqual(0);
+    expect(text).toBeGreaterThanOrEqual(0);
+    expect(compile).toBeGreaterThan(Math.max(remove, text));
+    expect(sent[text]).not.toMatchObject({
+      text: expect.stringMatching(/include/),
+    });
+  });
+
   it("removes a freed path before another file takes it over", async () => {
     const { project, worker } = setup();
     const a = createFile(project, null, "a.typ", "text", "old");
@@ -289,6 +322,48 @@ describe("CompilerClient mirroring", () => {
       path: "/logo.png",
       data: new Uint8Array([1, 2, 3]),
     });
+  });
+});
+
+describe("CompilerClient PDF export", () => {
+  it("waits for assets still loading before it compiles", async () => {
+    const project = initProject(newProject(1), { title: "T" });
+    createAsset(project, null, "logo.png", {
+      hash: "abc",
+      size: 3,
+      mime: "image/png",
+    });
+    const worker = new FakeWorker();
+    let finish!: (data: Uint8Array) => void;
+    const client = new CompilerClient(project, {
+      worker,
+      assetLoader: () => new Promise((resolve) => (finish = resolve)),
+      createRenderer: async () => fakeRenderer().renderer,
+    });
+    worker.take();
+
+    const pdf = client.exportPdf();
+    await settle();
+    expect(worker.take().map((m) => m.type)).not.toContain("exportPdf");
+
+    finish(new Uint8Array([1]));
+    await settle();
+    const sent = worker.take().map((m) => m.type);
+    expect(sent.indexOf("setAsset")).toBeGreaterThanOrEqual(0);
+    expect(sent.indexOf("exportPdf")).toBeGreaterThan(sent.indexOf("setAsset"));
+
+    worker.emit({ type: "pdf", id: 1, data: new Uint8Array([9]) });
+    await expect(pdf).resolves.toEqual(new Uint8Array([9]));
+  });
+
+  it("rejects without a main file", async () => {
+    const project = initProject(newProject(1), { title: "T" });
+    setMainFile(project, null);
+    const client = new CompilerClient(project, {
+      worker: new FakeWorker(),
+      createRenderer: async () => fakeRenderer().renderer,
+    });
+    await expect(client.exportPdf()).rejects.toThrow("no main file");
   });
 });
 
