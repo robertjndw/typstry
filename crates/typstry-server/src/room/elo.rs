@@ -61,14 +61,24 @@ pub struct LoadError {
 
 /// What [`DocIndex::rollback`] restores. Deltas are only ever appended
 /// between snapshots, so until a snapshot lands, cutting the list back and
-/// restoring the coverage maps is enough. A snapshot drops deltas, so the
-/// first one staged saves the records it may need to put back.
+/// undoing the coverage of the peers touched is enough. Coverage holds
+/// every peer that ever wrote, so it is not copied per batch. A snapshot
+/// drops deltas and recomputes every peer, so the first one staged saves
+/// the records and maps it may need to put back.
 #[derive(Debug)]
 struct Journal {
     deltas: usize,
+    /// Each peer's coverage and gap before it was first touched.
+    touched: HashMap<PeerId, (Option<u64>, bool)>,
+    before_snapshot: Option<BeforeSnapshot>,
+}
+
+#[derive(Debug)]
+struct BeforeSnapshot {
+    snapshot: Option<StoredSnapshot>,
+    deltas: Vec<StoredDelta>,
     coverage: Version,
     gapped: HashSet<PeerId>,
-    before_snapshot: Option<(Option<StoredSnapshot>, Vec<StoredDelta>)>,
 }
 
 /// What the room holds for one project, mirroring the `doc_records` rows.
@@ -146,8 +156,7 @@ impl DocIndex {
         debug_assert!(self.journal.is_none(), "staging already in progress");
         self.journal = Some(Journal {
             deltas: self.deltas.len(),
-            coverage: self.coverage.clone(),
-            gapped: self.gapped.clone(),
+            touched: HashMap::new(),
             before_snapshot: None,
         });
     }
@@ -163,14 +172,41 @@ impl DocIndex {
             return;
         };
         match journal.before_snapshot {
-            Some((snapshot, deltas)) => {
-                self.snapshot = snapshot;
-                self.deltas = deltas;
+            Some(before) => {
+                self.snapshot = before.snapshot;
+                self.deltas = before.deltas;
+                self.coverage = before.coverage;
+                self.gapped = before.gapped;
             }
             None => self.deltas.truncate(journal.deltas),
         }
-        self.coverage = journal.coverage;
-        self.gapped = journal.gapped;
+        // Peers touched before the snapshot are in the maps restored above
+        // with their staged values; this puts back what they had before.
+        for (peer, (covered, gap)) in journal.touched {
+            match covered {
+                Some(covered) => self.coverage.insert(peer, covered),
+                None => self.coverage.remove(&peer),
+            };
+            if gap {
+                self.gapped.insert(peer);
+            } else {
+                self.gapped.remove(&peer);
+            }
+        }
+    }
+
+    /// Notes `peer`'s coverage before staging changes it, once per batch.
+    fn touch(&mut self, peer: PeerId) {
+        if let Some(journal) = &mut self.journal
+            && journal.before_snapshot.is_none()
+        {
+            journal.touched.entry(peer).or_insert_with(|| {
+                (
+                    self.coverage.get(&peer).copied(),
+                    self.gapped.contains(&peer),
+                )
+            });
+        }
     }
 
     pub fn add_delta(&mut self, seq: i64, peer: PeerId, start: u64, end: u64, bytes: Bytes) {
@@ -181,6 +217,7 @@ impl DocIndex {
             end,
             bytes,
         });
+        self.touch(peer);
         let covered = get(&self.coverage, peer);
         if start > covered {
             self.gapped.insert(peer);
@@ -229,10 +266,12 @@ impl DocIndex {
         if let Some(journal) = &mut self.journal
             && journal.before_snapshot.is_none()
         {
-            journal.before_snapshot = Some((
-                self.snapshot.clone(),
-                self.deltas[..journal.deltas].to_vec(),
-            ));
+            journal.before_snapshot = Some(BeforeSnapshot {
+                snapshot: self.snapshot.clone(),
+                deltas: self.deltas[..journal.deltas].to_vec(),
+                coverage: self.coverage.clone(),
+                gapped: self.gapped.clone(),
+            });
         }
         self.deltas.retain(|delta| delta.end > get(&vv, delta.peer));
         self.snapshot = Some(StoredSnapshot { seq, vv, bytes });
