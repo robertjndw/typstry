@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 
 import { languageFor } from "./language";
 import { fillParent } from "./setup";
+import { editorTheme, syntaxTheme } from "./theme";
 
 export interface DiffViewProps {
   /** The older text. */
@@ -33,6 +34,8 @@ export function DiffView({ original, text, path, className }: DiffViewProps) {
           lineNumbers(),
           languageFor(path),
           fillParent,
+          editorTheme,
+          syntaxTheme,
           EditorState.readOnly.of(true),
           EditorView.editable.of(false),
           unifiedMergeView({

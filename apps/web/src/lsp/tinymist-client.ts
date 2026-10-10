@@ -32,16 +32,8 @@ const lspTooltipTheme = EditorView.theme({
     maxWidth: "min(40em, 80vw)",
     maxHeight: "20em",
     overflowY: "auto",
-    fontSize: "90%",
   },
   ".cm-lsp-documentation pre": { whiteSpace: "pre-wrap" },
-  ".cm-completionDetail": {
-    display: "inline-block",
-    maxWidth: "24em",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    verticalAlign: "bottom",
-  },
 });
 
 /** Long enough for the first request, which waits for wasm and a compile. */

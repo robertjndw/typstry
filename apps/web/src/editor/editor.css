@@ -1,0 +1,111 @@
+/*
+ * Syntax colors and editor-only tokens. They live in plain CSS rather than in
+ * an EditorView.theme because style-mod cannot express "inside .dark", and
+ * CodeMirror's own &dark switch needs a non-reactive facet. Keyed on the
+ * .dark class, the editor follows the app theme without a reconfigure.
+ */
+.cm-editor {
+  --cm-selection: oklch(0.88 0.06 250 / 0.75);
+  --cm-selection-blur: color-mix(in oklch, var(--foreground) 9%, transparent);
+  --cm-active-line: color-mix(in oklch, var(--foreground) 3%, transparent);
+  --cm-match: oklch(0.88 0.06 250 / 0.45);
+
+  --tok-comment: oklch(0.58 0.01 260);
+  --tok-keyword: oklch(0.53 0.19 15);
+  --tok-function: oklch(0.5 0.16 262);
+  --tok-string: oklch(0.52 0.13 150);
+  --tok-number: oklch(0.56 0.15 50);
+  --tok-escape: oklch(0.52 0.09 205);
+  --tok-interp: oklch(0.52 0.17 305);
+  --tok-math: oklch(0.52 0.12 175);
+  --tok-raw: oklch(0.48 0.06 70);
+  --tok-raw-bg: color-mix(in oklch, var(--foreground) 5%, transparent);
+  --tok-punct: color-mix(in oklch, var(--foreground) 55%, transparent);
+  --tok-heading: oklch(0.32 0.06 262);
+  --tok-link: var(--tok-function);
+}
+
+.dark .cm-editor {
+  --cm-selection: oklch(0.42 0.08 255 / 0.7);
+  --cm-selection-blur: color-mix(in oklch, var(--foreground) 14%, transparent);
+  --cm-active-line: color-mix(in oklch, var(--foreground) 4%, transparent);
+  --cm-match: oklch(0.42 0.08 255 / 0.45);
+
+  --tok-comment: oklch(0.62 0.01 260);
+  --tok-keyword: oklch(0.74 0.14 15);
+  --tok-function: oklch(0.76 0.11 258);
+  --tok-string: oklch(0.79 0.12 150);
+  --tok-number: oklch(0.8 0.12 65);
+  --tok-escape: oklch(0.78 0.09 200);
+  --tok-interp: oklch(0.76 0.12 305);
+  --tok-math: oklch(0.79 0.1 175);
+  --tok-raw: oklch(0.8 0.06 75);
+  --tok-raw-bg: color-mix(in oklch, var(--foreground) 7%, transparent);
+  --tok-punct: color-mix(in oklch, var(--foreground) 55%, transparent);
+  --tok-heading: oklch(0.93 0.03 262);
+}
+
+/*
+ * The language package ships its own light-only colors and falls back to
+ * CodeMirror's default style (underlined headings and so on). Those come as
+ * single generated classes, so the extra .cm-editor here is what lets these
+ * rules win regardless of stylesheet order.
+ */
+.cm-editor .tok-comment {
+  color: var(--tok-comment);
+  font-style: italic;
+}
+.cm-editor .tok-keyword {
+  color: var(--tok-keyword);
+}
+.cm-editor .tok-function {
+  color: var(--tok-function);
+}
+.cm-editor .tok-string {
+  color: var(--tok-string);
+}
+.cm-editor .tok-number {
+  color: var(--tok-number);
+}
+.cm-editor .tok-escape {
+  color: var(--tok-escape);
+}
+.cm-editor .tok-interp {
+  color: var(--tok-interp);
+}
+.cm-editor .tok-math {
+  color: var(--tok-math);
+}
+.cm-editor .tok-marker {
+  color: var(--tok-interp);
+  font-weight: 600;
+}
+.cm-editor .tok-punct,
+.cm-editor .tok-operator {
+  color: var(--tok-punct);
+}
+.cm-editor .tok-raw {
+  color: var(--tok-raw);
+  background-color: var(--tok-raw-bg);
+  border-radius: 3px;
+}
+.cm-editor .tok-heading {
+  color: var(--tok-heading);
+  font-weight: 700;
+  text-decoration: none;
+}
+.cm-editor .tok-strong {
+  font-weight: 700;
+}
+.cm-editor .tok-emph {
+  font-style: italic;
+}
+.cm-editor .tok-link {
+  color: var(--tok-link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, currentColor 45%, transparent);
+  text-underline-offset: 2px;
+}
+.cm-editor .tok-invalid {
+  color: var(--destructive);
+}
