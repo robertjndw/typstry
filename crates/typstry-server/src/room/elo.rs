@@ -9,9 +9,10 @@
 use std::collections::{HashMap, HashSet};
 
 use loro::VersionVector;
-use loro_protocol::{
-    BytesReader, BytesWriter, EloHeader, decode_elo_container, parse_elo_record_header,
-};
+use loro_protocol::{BytesReader, EloHeader, decode_elo_container, parse_elo_record_header};
+#[cfg(test)]
+use typstry_wire::elo::encode_container;
+use typstry_wire::elo::parse_peer_id;
 
 pub type PeerId = u64;
 
@@ -31,20 +32,6 @@ pub const CONTAINER_LIMIT: usize = 200 * 1024;
 pub enum Record {
     Delta { peer: PeerId, start: u64, end: u64 },
     Snapshot { vv: Version },
-}
-
-/// Parses a peer id as the client writes it: the decimal form of a u64.
-/// Only the canonical spelling is accepted, so one peer can never show up
-/// under two ids and get coverage tracked twice.
-pub fn parse_peer_id(bytes: &[u8]) -> Option<PeerId> {
-    let canonical = !bytes.is_empty()
-        && bytes.iter().all(u8::is_ascii_digit)
-        && (bytes.len() == 1 || bytes[0] != b'0');
-    if !canonical {
-        return None;
-    }
-    // Digits only, so this is valid UTF-8 and has no sign for parse to allow.
-    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn counter(value: u64) -> Result<u64, String> {
@@ -105,39 +92,10 @@ pub fn parse_container(payload: &[u8]) -> Result<Vec<(Record, &[u8])>, String> {
         .collect()
 }
 
-pub fn encode_container(records: &[&[u8]]) -> Vec<u8> {
-    let mut writer = BytesWriter::new();
-    writer.push_uleb128(records.len() as u64);
-    for record in records {
-        writer.push_var_bytes(record);
-    }
-    writer.finalize()
-}
-
-fn uleb_len(n: usize) -> usize {
-    (usize::BITS - n.leading_zeros()).max(1).div_ceil(7) as usize
-}
-
 /// Groups records into as few containers as [`CONTAINER_LIMIT`] allows,
 /// keeping their order.
 pub fn pack(records: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut batch: Vec<&[u8]> = Vec::new();
-    let mut size = 0;
-    for record in records {
-        let cost = record.len() + uleb_len(record.len());
-        if !batch.is_empty() && size + cost > CONTAINER_LIMIT {
-            out.push(encode_container(&batch));
-            batch.clear();
-            size = 0;
-        }
-        batch.push(record);
-        size += cost;
-    }
-    if !batch.is_empty() {
-        out.push(encode_container(&batch));
-    }
-    out
+    typstry_wire::elo::pack(records, CONTAINER_LIMIT)
 }
 
 /// A Loro version vector as sent in a JoinRequest. Counters are i32 there;
@@ -374,6 +332,8 @@ impl DocIndex {
 
 #[cfg(test)]
 mod tests {
+    use loro_protocol::BytesWriter;
+
     use super::*;
 
     fn delta(peer: &[u8], start: u64, end: u64, ct: &[u8]) -> Vec<u8> {
@@ -404,23 +364,6 @@ mod tests {
 
     fn version(pairs: &[(PeerId, u64)]) -> Version {
         pairs.iter().copied().collect()
-    }
-
-    #[test]
-    fn peer_ids_must_be_canonical_decimal_u64() {
-        assert_eq!(parse_peer_id(b"0"), Some(0));
-        assert_eq!(parse_peer_id(b"18446744073709551615"), Some(u64::MAX));
-        for bad in [
-            &b""[..],
-            b"18446744073709551616",
-            b"+1",
-            b"-1",
-            b"01",
-            b"1a",
-            b" 1",
-        ] {
-            assert_eq!(parse_peer_id(bad), None, "{bad:?}");
-        }
     }
 
     #[test]

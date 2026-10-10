@@ -10,9 +10,13 @@ publish = false
 
 [workspace.dependencies]
 typstry-doc = { path = "crates/typstry-doc" }
+typstry-wire = { path = "crates/typstry-wire" }
 
+# The default getrandom feature is left off: IVs come from our own getrandom.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
 loro = "1.16.2"

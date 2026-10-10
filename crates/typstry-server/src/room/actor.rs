@@ -7,13 +7,14 @@ use loro::VersionVector;
 use loro_protocol::{BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateStatusCode};
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
+use typstry_wire::elo::encode_container;
+use typstry_wire::fragment::encode_update;
 
 use super::elo::{self, DocIndex, PeerId, Record, Version};
 use super::registry::Inner;
 use super::{ConnId, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
 use crate::store::docs;
 use crate::store::projects::Permission;
-use crate::ws::fragment::encode_update;
 
 /// A connection's latest presence. Each blob is that client's whole state,
 /// encrypted, so the newest one replaces everything it sent before.
@@ -245,7 +246,7 @@ impl RoomActor {
             // What was stored before a failure still goes out: it is durable,
             // and peers would otherwise only see it on their next rejoin.
             if !fresh.is_empty() {
-                relays.push(elo::encode_container(&fresh));
+                relays.push(encode_container(&fresh));
             }
             if failed {
                 break;

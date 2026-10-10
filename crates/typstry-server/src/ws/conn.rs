@@ -15,8 +15,8 @@ use loro_protocol::{
 };
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{MissedTickBehavior, interval, timeout};
+use typstry_wire::fragment::Reassembler;
 
-use super::fragment::Reassembler;
 use super::rate::TokenBucket;
 use crate::http::AppState;
 use crate::room::{ConnId, JoinOutcome, Outbound, Outbox, RoomCmd};
