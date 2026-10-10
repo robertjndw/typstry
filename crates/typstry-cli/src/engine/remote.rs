@@ -217,7 +217,7 @@ impl Conn {
         for range in pack_ranges(&bytes, CONTAINER_BUDGET) {
             let container = encode_container(&bytes[range.clone()]);
             let spans = records[range].iter().map(|&(span, _)| span).collect();
-            let id = self.client.send_update(&container).await?;
+            let id = self.client.send_update(container).await?;
             self.in_flight.insert(id, InFlight::Deltas(spans));
         }
         // Only after everything went out: a send that is cancelled halfway
@@ -244,7 +244,7 @@ impl Conn {
             .context("exporting a snapshot")?;
         let record = key.encrypt_snapshot(&vv, &snapshot)?;
         let container = encode_container(&[&record]);
-        let id = self.client.send_update(&container).await?;
+        let id = self.client.send_update(container).await?;
         self.in_flight.insert(id, InFlight::Snapshot);
         self.deltas = 0;
         Ok(())

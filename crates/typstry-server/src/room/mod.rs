@@ -13,7 +13,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use loro_protocol::{BatchId, CrdtType, ProtocolMessage, encode};
 use tokio::sync::{Notify, mpsc, oneshot};
-use typstry_wire::fragment::encode_update_owned;
+use typstry_wire::fragment::encode_update;
 
 use crate::store::projects::Permission;
 
@@ -174,7 +174,7 @@ impl OutboxReceiver {
 
 /// The frames that carry one update to a client.
 pub(crate) fn update_frames(crdt: CrdtType, room_id: &str, update: Vec<u8>) -> Vec<Bytes> {
-    encode_update_owned(crdt, room_id, update)
+    encode_update(crdt, room_id, update)
         .into_iter()
         .map(Bytes::from)
         .collect()

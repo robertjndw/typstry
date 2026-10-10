@@ -835,7 +835,7 @@ async fn large_records_are_fragmented_and_packed() {
     let ct: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
     let big = delta(1, 0, 1, &ct);
     let update = container(&[&big]);
-    let frames = encode_update(CrdtType::Elo, &room, &update);
+    let frames = encode_update(CrdtType::Elo, &room, update.as_slice());
     assert!(frames.len() > 2);
     let ProtocolMessage::DocUpdateFragmentHeader { batch_id, .. } = decode(&frames[0]).unwrap()
     else {

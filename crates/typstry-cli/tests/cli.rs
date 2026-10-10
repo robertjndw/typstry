@@ -759,7 +759,7 @@ async fn inject_foreign_record(link: &str) {
         .await
         .unwrap();
     client
-        .send_update(&encode_container(&[&record]))
+        .send_update(encode_container(&[&record]))
         .await
         .unwrap();
     loop {

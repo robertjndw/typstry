@@ -188,12 +188,9 @@ impl Client {
 
     /// Sends one container, split into fragments when needed. The server
     /// answers with an [`Event::Ack`] carrying the returned batch id.
-    pub async fn send_update(&mut self, container: &[u8]) -> anyhow::Result<BatchId> {
+    pub async fn send_update(&mut self, container: Vec<u8>) -> anyhow::Result<BatchId> {
         let (reply, sent) = oneshot::channel();
-        self.command(Command::Send {
-            container: container.to_vec(),
-            reply,
-        })?;
+        self.command(Command::Send { container, reply })?;
         sent.await
             .map_err(|_| anyhow::anyhow!("the connection to the server broke"))?
     }
@@ -260,7 +257,7 @@ impl Actor {
                     self.send_frame(Message::Binary(request.into())).await
                 }
                 Wake::Command(Some(Command::Send { container, reply })) => {
-                    let result = self.send_update(&container).await;
+                    let result = self.send_update(container).await;
                     let failed = result.as_ref().err().map(|err| anyhow::anyhow!("{err:#}"));
                     let _ = reply.send(result);
                     failed.map_or(Ok(()), Err)
@@ -357,7 +354,7 @@ impl Actor {
         Ok(())
     }
 
-    async fn send_update(&mut self, container: &[u8]) -> anyhow::Result<BatchId> {
+    async fn send_update(&mut self, container: Vec<u8>) -> anyhow::Result<BatchId> {
         let batch = random_batch_id();
         for frame in encode_batch(CrdtType::Elo, &self.room, batch, container) {
             self.send_frame(Message::Binary(frame.into())).await?;
@@ -511,7 +508,7 @@ mod tests {
         let update = vec![7u8; 1 << 20];
         let mut stuck = false;
         for _ in 0..512 {
-            let sent = client.send_update(&update);
+            let sent = client.send_update(update.clone());
             if tokio::time::timeout(Duration::from_millis(500), sent)
                 .await
                 .is_err()
