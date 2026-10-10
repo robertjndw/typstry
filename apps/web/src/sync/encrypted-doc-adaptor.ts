@@ -17,6 +17,7 @@ import {
   type ProjectKey,
 } from "@/crypto/project-key";
 import { toError } from "@/lib/errors";
+import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
 /** Per peer, the end of the op counter range known to be stored. */
@@ -191,8 +192,11 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     this.unsubscribe = this.options.canWrite
       ? this.doc.subscribeLocalUpdates(() => this.schedulePush())
       : undefined;
+    // A tab being closed or backgrounded may never run the push timer.
     if (this.options.canWrite && !this.stopPageListeners) {
-      this.listenForPageExit();
+      this.stopPageListeners = onPageExit(() => {
+        if (this.pushTimer !== null) void this.flush();
+      });
     }
   }
 
@@ -240,28 +244,6 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       this.pushTimer = null;
       void this.enqueuePush();
     }, this.options.pushDelayMs);
-  }
-
-  /**
-   * A tab being closed or backgrounded may never run the push timer, and a
-   * hidden tab's timers can be throttled for minutes.
-   */
-  private listenForPageExit(): void {
-    if (typeof window === "undefined" || typeof document === "undefined") {
-      return;
-    }
-    const onPageHide = () => {
-      if (this.pushTimer !== null) void this.flush();
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "hidden") onPageHide();
-    };
-    window.addEventListener("pagehide", onPageHide);
-    document.addEventListener("visibilitychange", onVisibility);
-    this.stopPageListeners = () => {
-      window.removeEventListener("pagehide", onPageHide);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
   }
 
   async handleJoinOk(res: JoinResponseOk): Promise<void> {

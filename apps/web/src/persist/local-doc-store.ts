@@ -6,6 +6,7 @@
 // browser (sync encrypts on its own).
 import { VersionVector, decodeImportBlobMeta, type LoroDoc } from "loro-crdt";
 
+import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
 export interface StoredDoc {
@@ -289,23 +290,11 @@ export class LocalDocStore {
     const schedule = () => this.schedule();
     const unsubscribeDoc = this.doc.subscribe(schedule);
     const unsubscribeLocal = this.doc.subscribeLocalUpdates(schedule);
-    // A closing tab gets no second chance; hidden is the last reliable
-    // moment, especially on mobile where pagehide may never fire.
-    const onHide = () => {
-      if (document.visibilityState === "hidden") void this.flush();
-    };
-    const onPageHide = () => void this.flush();
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", onHide);
-      window.addEventListener("pagehide", onPageHide);
-    }
+    const stopPageExit = onPageExit(() => void this.flush());
     this.stopListening = () => {
       unsubscribeDoc();
       unsubscribeLocal();
-      if (typeof document !== "undefined") {
-        document.removeEventListener("visibilitychange", onHide);
-        window.removeEventListener("pagehide", onPageHide);
-      }
+      stopPageExit();
     };
   }
 
