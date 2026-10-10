@@ -221,8 +221,8 @@ export interface LocalDocStoreOptions {
   /** Writes at least this often while edits keep coming. */
   maxFlushDelayMs?: number;
   /**
-   * Fold the update log into a snapshot once it outgrows this share of the
-   * snapshot's size, and `compactMinBytes`.
+   * Fold the update log into a snapshot once it outgrows both this share of
+   * the snapshot's size and `compactMinBytes`.
    */
   compactRatio?: number;
   /** Keeps a small project from compacting every few edits. */

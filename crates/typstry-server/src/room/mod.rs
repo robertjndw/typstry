@@ -45,8 +45,8 @@ impl Outbound {
 /// and the connection closes so the client resyncs on reconnect.
 ///
 /// Full means either too many frames or too many bytes. Frames can be up to
-/// 256 KiB, so a frame count alone would let one stalled client pin far more
-/// memory than its backfill ever needs.
+/// 256 KiB, so a frame count alone would let one stalled client pin over
+/// 100 MiB.
 ///
 /// Join backfill bypasses both limits (see [`Self::push_backfill`]), so the
 /// channel itself is unbounded and the limits are enforced on the counters.
@@ -156,9 +156,9 @@ impl Outbox {
     /// past it could never be loaded again: every fresh client would
     /// overflow, reconnect and overflow again. The backfill is bounded by
     /// the doc itself, and live relays queued behind it still get the full
-    /// budget on their own. A join only starts once the last backfill of
-    /// the same CRDT is out (see [`Self::start_backfill`]), so a stalled
-    /// client holds at most one backfill per CRDT plus the budget.
+    /// budget on their own. A join is refused while the previous backfill of
+    /// the same CRDT is still queued (see [`Self::start_backfill`]), so a
+    /// stalled client holds at most one backfill per CRDT plus the budget.
     pub fn push_backfill(&self, crdt: CrdtType, frame: Bytes) -> bool {
         let slot = backfill_slot(crdt);
         let cost = frame.len();
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_join_waits_for_the_last_backfill_of_its_crdt() {
+    async fn a_join_is_refused_while_its_crdt_has_backfill_queued() {
         let (outbox, mut rx) = Outbox::channel(16, 100);
         let overflow = outbox.overflow_signal();
         assert!(outbox.start_backfill(CrdtType::Elo));

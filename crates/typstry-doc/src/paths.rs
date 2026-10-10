@@ -117,8 +117,8 @@ pub(crate) fn resolve_sibling_names(mut siblings: Vec<LiveNode>) -> Vec<ShownNod
     // TreeID's derived Ord compares peer (u64) first, then counter.
     siblings.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     let mut out: Vec<ShownNode> = Vec::with_capacity(siblings.len());
-    // Index in `out` of the current group's winner, which keeps its own
-    // name, so it is the name every later member of the group shares.
+    // Index in `out` of the current group's winner. It keeps its own name,
+    // and every later member of the group has that same name.
     let mut winner = 0;
     for live in siblings {
         // A derived name could in theory equal a real sibling's name

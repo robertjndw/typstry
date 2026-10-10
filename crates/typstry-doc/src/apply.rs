@@ -645,9 +645,9 @@ fn pair_renames<'a>(
     renames
 }
 
-/// Only called for a node whose content differs from `content`, or that was
-/// just created and is empty, so the text is not compared first: `update`
-/// diffs it anyway, and writes nothing for equal text.
+/// Only called for a node whose content differs from `content`, or a fresh
+/// empty one, so the text is not compared first. `update` diffs anyway and
+/// writes nothing for equal text.
 fn write_content(doc: &LoroDoc, id: TreeID, content: &FileContent) -> LoroResult<()> {
     let data = doc.get_tree(root::FS).get_meta(id)?;
     match content {
