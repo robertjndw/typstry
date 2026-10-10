@@ -1,6 +1,7 @@
 //! The three-way merge between the base, the folder and the doc.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use loro::{ExportMode, Frontiers, LoroDoc, VersionVector};
@@ -26,7 +27,7 @@ const PUSH_MESSAGE: &str = "cli push";
 /// The inputs of a reconcile once both sides are read, for the steps that
 /// write the result.
 struct Plan {
-    base: Files,
+    base: Arc<Files>,
     local: LocalSide,
     local_changes: BTreeMap<String, ChangeKind>,
     remote_changes: BTreeMap<String, ChangeKind>,
@@ -36,8 +37,8 @@ struct Plan {
 }
 
 struct Sides {
-    base: Files,
-    remote: Files,
+    base: Arc<Files>,
+    remote: Arc<Files>,
     local: LocalSide,
     skipped: Vec<Skipped>,
     remote_changes: BTreeMap<String, ChangeKind>,
@@ -59,6 +60,10 @@ impl BaseKey {
         }
     }
 
+    fn is_of(&self, base: &Base) -> bool {
+        self.frontiers == base.frontiers && self.pins == base.pins
+    }
+
     fn state_of(&self, path: &str) -> &Frontiers {
         self.pins.get(path).unwrap_or(&self.frontiers)
     }
@@ -71,8 +76,8 @@ impl BaseKey {
 pub(super) struct BaseFiles {
     key: BaseKey,
     /// The files at `key.frontiers`, before putting in pinned ones.
-    unpinned: Files,
-    files: Files,
+    unpinned: Arc<Files>,
+    files: Arc<Files>,
 }
 
 /// What a local path holds as far as a reconcile is concerned.
@@ -143,32 +148,31 @@ impl LocalSide {
 impl Session {
     /// The files at the base: what the folder held after the last sync,
     /// each file as of the doc state its copy on disk matches.
-    pub fn base_files(&self) -> anyhow::Result<Files> {
+    pub fn base_files(&self) -> anyhow::Result<Arc<Files>> {
         Ok(self.base_entry()?.1)
     }
 
     /// The files at the base's frontiers and the base files, from the
     /// cache when the base did not move since.
-    fn base_entry(&self) -> anyhow::Result<(Files, Files)> {
-        let key = BaseKey::of(&self.base);
+    fn base_entry(&self) -> anyhow::Result<(Arc<Files>, Arc<Files>)> {
         if let Some(cached) = self.base_files.lock().expect("never poisoned").as_ref()
-            && cached.key == key
+            && cached.key.is_of(&self.base)
         {
-            return Ok((cached.unpinned.clone(), cached.files.clone()));
+            return Ok((Arc::clone(&cached.unpinned), Arc::clone(&cached.files)));
         }
-        let unpinned = if !self.doc_past_base() {
+        let unpinned = Arc::new(if !self.doc_past_base() {
             self.remote_files()
         } else {
             to_map(materialize(&self.fork_base()?))
-        };
-        let files = self.pin_files(unpinned.clone(), None)?;
-        self.remember_base(key, unpinned.clone(), files.clone());
+        });
+        let files = self.pin_files(Arc::clone(&unpinned), None)?;
+        self.remember_base(Arc::clone(&unpinned), Arc::clone(&files));
         Ok((unpinned, files))
     }
 
-    fn remember_base(&self, key: BaseKey, unpinned: Files, files: Files) {
+    fn remember_base(&self, unpinned: Arc<Files>, files: Arc<Files>) {
         *self.base_files.lock().expect("never poisoned") = Some(BaseFiles {
-            key,
+            key: BaseKey::of(&self.base),
             unpinned,
             files,
         });
@@ -186,12 +190,14 @@ impl Session {
     /// whose state did not change, so only the others take a fork.
     fn pin_files(
         &self,
-        mut files: Files,
+        mut shared: Arc<Files>,
         known: Option<(&BaseKey, &Files)>,
-    ) -> anyhow::Result<Files> {
-        // Frontiers have no order or hash, and there are only ever a few
-        // distinct states.
-        let mut pinned: Vec<(&Frontiers, Vec<&str>)> = Vec::new();
+    ) -> anyhow::Result<Arc<Files>> {
+        if self.base.pins.is_empty() {
+            return Ok(shared);
+        }
+        let files = Arc::make_mut(&mut shared);
+        let mut to_fork = Vec::new();
         for (path, state) in &self.base.pins {
             if let Some((then, then_files)) = known
                 && then.state_of(path) == state
@@ -200,15 +206,11 @@ impl Session {
                     Some(content) => files.insert(path.clone(), content.clone()),
                     None => files.remove(path),
                 };
-                continue;
-            }
-            if let Some((_, paths)) = pinned.iter_mut().find(|(then, _)| *then == state) {
-                paths.push(path);
             } else {
-                pinned.push((state, vec![path]));
+                to_fork.push((state, path.as_str()));
             }
         }
-        for (state, paths) in pinned {
+        for (state, paths) in group_by_state::<_, Vec<_>>(to_fork) {
             let then = to_map(materialize(&self.fork_at(state)?));
             for path in paths {
                 match then.get(path) {
@@ -217,7 +219,7 @@ impl Session {
                 };
             }
         }
-        Ok(files)
+        Ok(shared)
     }
 
     /// A doc at the base state that can be edited without touching ours.
@@ -320,7 +322,7 @@ impl Session {
         if let FileContent::Text(text) = content
             && let Some(local) = &file.text
         {
-            return Ok(local.as_str() == &**text);
+            return Ok(local == text);
         }
         Ok(self.content_digest(content).await? == file.digest)
     }
@@ -398,7 +400,7 @@ impl Session {
         let remote = if !self.doc_past_base() {
             unpinned
         } else {
-            self.remote_files()
+            Arc::new(self.remote_files())
         };
         let remote_changes = self.remote_changes(&base, &remote).await?;
         let extra = remote_changes.keys().cloned().collect();
@@ -584,7 +586,7 @@ impl Session {
                     }
                 }
                 let merged = if report.applied.changed {
-                    self.remote_files()
+                    Arc::new(self.remote_files())
                 } else {
                     remote
                 };
@@ -610,8 +612,8 @@ impl Session {
         if mode == Mode::Push || report.status.local.is_empty() {
             self.base.git = git;
         }
-        report.base = self.pin_files(fin.clone(), Some((&then, &plan.base)))?;
-        self.remember_base(BaseKey::of(&self.base), fin, report.base.clone());
+        report.base = self.pin_files(Arc::clone(&fin), Some((&then, &plan.base)))?;
+        self.remember_base(fin, Arc::clone(&report.base));
         if flush == Flush::Now {
             self.save()?;
         }
@@ -658,7 +660,7 @@ impl Session {
                 _ => file.text.clone(),
             };
             let content = match as_text {
-                Some(text) => FileContent::Text(text.into()),
+                Some(text) => FileContent::Text(text),
                 None => {
                     let by_digest = by_digest.get_or_insert_with(|| {
                         // Reversed so that, like a scan, the first hash wins.
@@ -685,17 +687,14 @@ impl Session {
         &mut self,
         changes: BTreeMap<String, Option<FileContent>>,
     ) -> anyhow::Result<ApplyReport> {
-        // Frontiers have no order or hash, and there are only ever a few
-        // distinct states.
-        let mut groups: Vec<(Frontiers, BTreeMap<String, Option<FileContent>>)> = Vec::new();
-        for (path, content) in changes {
-            let state = self.base.state_of(&path);
-            if let Some((_, group)) = groups.iter_mut().find(|(then, _)| then == state) {
-                group.insert(path, content);
-            } else {
-                groups.push((state.clone(), BTreeMap::from([(path, content)])));
-            }
-        }
+        let groups: Vec<(Frontiers, BTreeMap<String, Option<FileContent>>)> = group_by_state(
+            changes
+                .into_iter()
+                .map(|(path, content)| (self.base.state_of(&path), (path, content))),
+        )
+        .into_iter()
+        .map(|(state, group)| (state.clone(), group))
+        .collect();
         let main = self.base.frontiers.clone();
         let mut report = ApplyReport::default();
         for (state, changes) in groups {
@@ -910,4 +909,24 @@ impl Session {
 
 fn to_map(files: Vec<MaterializedFile>) -> Files {
     files.into_iter().map(|f| (f.path, f.content)).collect()
+}
+
+/// Groups `items` by the doc state they belong to, in order of first
+/// appearance. Frontiers have no order or hash, and there are only ever a
+/// few distinct states, so a linear scan is all it takes.
+fn group_by_state<'a, T, C: Default + Extend<T>>(
+    items: impl IntoIterator<Item = (&'a Frontiers, T)>,
+) -> Vec<(&'a Frontiers, C)> {
+    let mut groups: Vec<(&Frontiers, C)> = Vec::new();
+    for (state, item) in items {
+        let at = match groups.iter().position(|(then, _)| *then == state) {
+            Some(at) => at,
+            None => {
+                groups.push((state, C::default()));
+                groups.len() - 1
+            }
+        };
+        groups[at].1.extend([item]);
+    }
+    groups
 }

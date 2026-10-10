@@ -34,7 +34,9 @@ pub struct LocalFile {
     pub digest: Digest,
     pub size: u64,
     /// The content if it may be stored as a text node, see [`as_text`].
-    pub text: Option<String>,
+    /// Shared, so the stat cache and doc entries hand it out without
+    /// copying.
+    pub text: Option<Arc<str>>,
 }
 
 impl LocalFile {
@@ -44,7 +46,7 @@ impl LocalFile {
         Self {
             digest,
             size,
-            text: as_text(bytes),
+            text: as_text(bytes).map(Arc::from),
         }
     }
 }

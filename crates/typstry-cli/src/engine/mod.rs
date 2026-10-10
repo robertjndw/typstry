@@ -19,6 +19,7 @@ mod remote;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -173,7 +174,7 @@ pub struct Report {
     pub warnings: Vec<String>,
     /// The files at the new base, as [`Session::base_files`] would return
     /// them, for callers that track what the folder holds.
-    pub base: Files,
+    pub base: Arc<Files>,
 }
 
 /// What [`Session::reconcile_holding`] did.

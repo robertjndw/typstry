@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::{Files, Session};
@@ -106,7 +107,7 @@ pub enum Seen {
 #[derive(Debug, Default)]
 pub struct Synced {
     /// The base files the digests were taken of.
-    files: Files,
+    files: Arc<Files>,
     digests: BTreeMap<String, Option<Known>>,
 }
 
@@ -131,7 +132,11 @@ impl Synced {
     /// only files whose content differs from last time are hashed. Assets
     /// whose bytes we never saw have no digest; events for them always
     /// count as changes, which costs a reconcile but never loses an edit.
-    pub fn update(&mut self, session: &Session, files: Files) {
+    pub fn update(&mut self, session: &Session, files: Arc<Files>) {
+        // The base cache hands out the same map until the base moves.
+        if Arc::ptr_eq(&self.files, &files) {
+            return;
+        }
         let mut before = std::mem::take(&mut self.digests);
         self.digests = files
             .iter()
