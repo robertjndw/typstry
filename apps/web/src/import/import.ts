@@ -153,11 +153,10 @@ export function assertImportable(source: ImportSource): void {
       source.skipped,
     );
   }
+  // Text is capped far below the asset limit, so anything this large is
+  // uploaded as an asset.
   const tooLarge = [...source.files]
-    .filter(
-      // Size first: decoding a large text file just to skip it is wasted.
-      ([path, bytes]) => bytes.length > MAX_ASSET_BYTES && !isText(path, bytes),
-    )
+    .filter(([, bytes]) => bytes.length > MAX_ASSET_BYTES)
     .map(([path]) => path)
     .sort();
   if (tooLarge.length > 0) {
@@ -168,10 +167,6 @@ export function assertImportable(source: ImportSource): void {
       tooLarge,
     );
   }
-}
-
-function isText(path: string, bytes: Uint8Array): boolean {
-  return decodeText(basename(path), bytes) !== null;
 }
 
 /**

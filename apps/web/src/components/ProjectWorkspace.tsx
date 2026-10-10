@@ -219,6 +219,7 @@ export function ProjectWorkspace({
           {mobile && status}
           <WorkspaceMenu
             layout={layout}
+            panelsDisabled={!!viewing}
             onHistory={() => setHistoryOpen(true)}
             onTagVersion={tag && (() => tag({ kind: "current" }))}
             onQuickOpen={() => setQuickOpen(true)}
@@ -306,7 +307,17 @@ async function syncWithFeedback(
   // One toast id, so repeated presses update a single toast instead of
   // stacking them.
   toast.loading("Syncing…", { id: SYNC_TOAST });
-  const result = await run();
+  let result: SyncNowResult;
+  try {
+    result = await run();
+  } catch (err) {
+    // E.g. the local save failed; the loading toast must not stay up.
+    console.error(err);
+    toast.error("Syncing failed. See the console for details.", {
+      id: SYNC_TOAST,
+    });
+    return;
+  }
   if (result === "synced") {
     toast.success(readOnly ? "Up to date" : "All changes synced", {
       id: SYNC_TOAST,

@@ -35,6 +35,7 @@ import { useProject } from "@/project/context";
 /** The workspace's overflow menu: everything that needs no toolbar spot. */
 export function WorkspaceMenu({
   layout,
+  panelsDisabled = false,
   onHistory,
   onTagVersion,
   onQuickOpen,
@@ -42,6 +43,8 @@ export function WorkspaceMenu({
   onSyncNow,
 }: {
   layout: WorkspaceLayoutState;
+  /** While a version is open the live panels are not on screen. */
+  panelsDisabled?: boolean;
   onHistory: () => void;
   /** Absent without write access. */
   onTagVersion?: () => void;
@@ -118,6 +121,7 @@ export function WorkspaceMenu({
             <DropdownMenuGroup>
               <DropdownMenuCheckboxItem
                 checked={!layout.isHidden("files")}
+                disabled={panelsDisabled}
                 onCheckedChange={() => layout.toggle("files")}
               >
                 Files panel
@@ -127,6 +131,7 @@ export function WorkspaceMenu({
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
                 checked={!layout.isHidden("preview")}
+                disabled={panelsDisabled}
                 onCheckedChange={() => layout.toggle("preview")}
               >
                 Preview panel

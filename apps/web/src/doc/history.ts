@@ -310,8 +310,7 @@ export function tagAt(
   const { doc } = project;
   doc.commit();
   const target = frontiers ?? doc.oplogFrontiers();
-  const targetVV = doc.frontiersToVV(target);
-  let changes: ChangeInfo[] | null = null;
+  const targetVV = doc.frontiersToVV(target).toJSON();
   // Newest first: the most recent tag is the likeliest match.
   for (const version of listVersions(project).reverse()) {
     let cmp: number | undefined;
@@ -322,11 +321,17 @@ export function tagAt(
     }
     if (cmp !== 0 && cmp !== -1) continue;
     const versionVV = doc.frontiersToVV(version.frontiers);
-    changes ??= readChanges(doc);
-    const onlyMetaSince = changes.every((c) => {
-      const inTarget = (targetVV.get(c.peer) ?? 0) > c.counter;
-      const inVersion = (versionVV.get(c.peer) ?? 0) > c.counter;
-      return !inTarget || inVersion || isMeta(changedContainers(doc, c));
+    // Op ranges rather than whole changes: Loro merges a peer's consecutive
+    // ops into one change, which can start before the tag and end after it.
+    // Same as tag_at in crates/typstry-doc/src/versions.rs.
+    const onlyMetaSince = [...targetVV].every(([peer, end]) => {
+      const start = versionVV.get(peer) ?? 0;
+      return (
+        start >= end ||
+        isMeta(
+          doc.getChangedContainersIn({ peer, counter: start }, end - start),
+        )
+      );
     });
     if (onlyMetaSince) return version;
   }
