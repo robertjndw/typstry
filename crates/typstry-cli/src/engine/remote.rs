@@ -76,11 +76,7 @@ impl Conn {
     fn new(client: Client, joined: Joined) -> Self {
         Self {
             client,
-            server: joined
-                .version
-                .iter()
-                .map(|(&peer, &counter)| (peer, counter.max(0) as u64))
-                .collect(),
+            server: ends(&joined.version).collect(),
             target: joined.version,
             deltas: joined.deltas,
             snapshot_sent: false,
@@ -100,9 +96,9 @@ impl Conn {
         }
         self.unreadable > 0
             && self.target.iter().all(|(peer, &end)| {
-                let have = have.get(peer).copied().unwrap_or(0).max(0) as u64;
+                let have = end_of(have.get(peer).copied().unwrap_or(0));
                 let seen = self.seen.get(peer).copied().unwrap_or(0);
-                have.max(seen) >= end.max(0) as u64
+                have.max(seen) >= end_of(end)
             })
     }
 
@@ -203,10 +199,8 @@ impl Conn {
     /// records packed into containers of at most [`CONTAINER_BUDGET`].
     async fn send_missing(&mut self, doc: &LoroDoc, key: &ProjectKey) -> anyhow::Result<()> {
         let vv = doc.oplog_vv();
-        let mut spans: Vec<(u64, u64, u64)> = vv
-            .iter()
-            .filter_map(|(&peer, &end)| {
-                let end = end.max(0) as u64;
+        let mut spans: Vec<(u64, u64, u64)> = ends(&vv)
+            .filter_map(|(peer, end)| {
                 let start = self.server.get(&peer).copied().unwrap_or(0);
                 (end > start).then_some((peer, start, end))
             })
@@ -244,11 +238,7 @@ impl Conn {
     /// deltas. At most once per connection, also when it fails.
     async fn send_snapshot(&mut self, doc: &LoroDoc, key: &ProjectKey) -> anyhow::Result<()> {
         self.snapshot_sent = true;
-        let vv: Vec<(u64, u64)> = doc
-            .oplog_vv()
-            .iter()
-            .map(|(&peer, &counter)| (peer, counter.max(0) as u64))
-            .collect();
+        let vv: Vec<(u64, u64)> = ends(&doc.oplog_vv()).collect();
         let snapshot = doc
             .export(ExportMode::Snapshot)
             .context("exporting a snapshot")?;
@@ -307,12 +297,10 @@ impl Session {
         self.conn = Some(Conn::new(client, joined));
 
         while !self.caught_up() {
-            match tokio::time::timeout(STALL_TIMEOUT, self.next_remote()).await {
-                Ok(result) => {
-                    result?;
-                }
-                Err(_) => bail!("the server stopped sending the project before it was complete"),
-            }
+            self.next_remote_within(
+                "the server stopped sending the project before it was complete",
+            )
+            .await?;
         }
         // One bad record is skipped, but nothing readable at all means the
         // key in the link is not the project's.
@@ -471,14 +459,19 @@ impl Session {
 
     async fn wait_for_acks(&mut self) -> anyhow::Result<()> {
         while !self.conn.as_ref().context(NOT_CONNECTED)?.settled() {
-            match tokio::time::timeout(STALL_TIMEOUT, self.next_remote()).await {
-                Ok(result) => {
-                    result?;
-                }
-                Err(_) => bail!("the server did not confirm the changes in time"),
-            }
+            self.next_remote_within("the server did not confirm the changes in time")
+                .await?;
         }
         Ok(())
+    }
+
+    /// [`Self::next_remote`], failing with `stalled` when the server goes
+    /// quiet for [`STALL_TIMEOUT`].
+    async fn next_remote_within(&mut self, stalled: &'static str) -> anyhow::Result<()> {
+        match tokio::time::timeout(STALL_TIMEOUT, self.next_remote()).await {
+            Ok(result) => result.map(drop),
+            Err(_) => bail!(stalled),
+        }
     }
 
     /// The server cannot compact what it cannot read, so writers replace
@@ -552,6 +545,17 @@ fn cover(record: &Record, map: &mut HashMap<u64, u64>) {
 fn raise(map: &mut HashMap<u64, u64>, peer: u64, end: u64) {
     let entry = map.entry(peer).or_default();
     *entry = (*entry).max(end);
+}
+
+/// Loro counts ops in `i32` but the wire speaks `u64`; a negative counter
+/// reads as no ops at all.
+fn end_of(counter: i32) -> u64 {
+    counter.max(0) as u64
+}
+
+/// Each peer of `vv` with how many of its ops it holds.
+fn ends(vv: &VersionVector) -> impl Iterator<Item = (u64, u64)> + '_ {
+    vv.iter().map(|(&peer, &counter)| (peer, end_of(counter)))
 }
 
 fn covers(have: &VersionVector, target: &VersionVector) -> bool {

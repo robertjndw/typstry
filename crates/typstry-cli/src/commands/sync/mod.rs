@@ -14,11 +14,12 @@ use tokio::sync::mpsc;
 
 use crate::engine::{Flush, Mode, Reconciled, RemoteEvent, Report, Scope, Session, SyncError};
 use crate::mailbox::Mailbox;
+use crate::state::remove_if_exists;
 use crate::watch::{Change, Seen, Synced, Watcher};
 
 use super::{Ctx, Output, print_applied, print_report, print_warnings};
 
-use self::git_pause::{Pause, remove_marker};
+use self::git_pause::Pause;
 
 /// Remote changes are written this long after the first one arrives, so a
 /// burst of keystrokes in the browser becomes one write.
@@ -336,7 +337,7 @@ impl Live {
         self.poll_git().await;
         let marker = self.hold_marker();
         if publish {
-            remove_marker(&marker)?;
+            remove_if_exists(&marker)?;
             self.outbound = Outbound::Published;
         }
         match &mut self.pause {
@@ -348,7 +349,7 @@ impl Live {
                 if !publish && (marker.exists() || self.session.git_switched()) {
                     self.check_tree().await;
                     if !self.holding() {
-                        remove_marker(&marker)?;
+                        remove_if_exists(&marker)?;
                     }
                 }
                 if !self.holding() {

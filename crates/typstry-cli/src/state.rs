@@ -3,7 +3,6 @@
 //! blobs, and a lock so two commands never run on the same folder at once.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -398,12 +397,7 @@ impl StateDir {
         // count as synced. A crash before the removal leaves entries the
         // snapshot already has, which import as no-ops.
         atomic_write(&self.dir.join(DOC), &bytes, true)?;
-        let log = self.dir.join(DOC_LOG);
-        match fs::remove_file(&log) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("removing {}", log.display())),
-        }
+        remove_if_exists(&self.dir.join(DOC_LOG))?;
         Ok(bytes.len() as u64)
     }
 
@@ -588,11 +582,17 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("OS random source unavailable");
-    buf.iter()
-        .fold(String::with_capacity(bytes * 2), |mut out, b| {
-            let _ = write!(out, "{b:02x}");
-            out
-        })
+    crate::hash::to_hex(&buf)
+}
+
+/// Removes `path`; one that is already gone is just as good.
+pub(crate) fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Makes renames and removals in `dir` durable. Only unix can fsync a

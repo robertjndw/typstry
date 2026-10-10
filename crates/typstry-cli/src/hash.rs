@@ -8,16 +8,19 @@ use std::fmt::{self, Write as _};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-/// `sha256:<hex>`, the same spelling the server uses for blob hashes.
-fn sha256(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(7 + 64);
-    out.push_str("sha256:");
-    for b in hash {
+/// Lowercase hex, two digits per byte.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// `sha256:<hex>`, the same spelling the server uses for blob hashes.
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("sha256:{}", to_hex(&Sha256::digest(bytes)))
 }
 
 /// The hash of an asset's ciphertext: what the doc stores and the server

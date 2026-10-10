@@ -57,6 +57,16 @@ pub struct Skipped {
     pub reason: String,
 }
 
+fn too_large(path: String) -> Skipped {
+    Skipped {
+        path,
+        reason: format!(
+            "larger than the {} MB upload limit",
+            MAX_UPLOAD_BYTES / 1024 / 1024
+        ),
+    }
+}
+
 impl std::fmt::Display for Skipped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.path.is_empty() {
@@ -206,13 +216,6 @@ impl Worktree {
             if !file_type.is_file() {
                 continue;
             }
-            let too_large = Skipped {
-                reason: format!(
-                    "larger than the {} MB upload limit",
-                    MAX_UPLOAD_BYTES / 1024 / 1024
-                ),
-                path: path.clone(),
-            };
             let seen = SystemTime::now();
             let meta = match entry.metadata() {
                 Ok(meta) => meta,
@@ -227,7 +230,7 @@ impl Worktree {
             // Anything past the asset limit is past the text limit too, so
             // it is skipped without reading what may be a huge video.
             if meta.len() > MAX_ASSET_BYTES as u64 {
-                scan.skipped.push(too_large);
+                scan.skipped.push(too_large(path));
                 continue;
             }
             // The walker follows no links, so the file's folders are real
@@ -235,7 +238,7 @@ impl Worktree {
             match self.read_known(&path, &meta, seen) {
                 Ok(Some(file)) => {
                     if file.size as usize > MAX_ASSET_BYTES && file.text.is_none() {
-                        scan.skipped.push(too_large);
+                        scan.skipped.push(too_large(path));
                     } else {
                         scan.files.insert(path, file);
                     }

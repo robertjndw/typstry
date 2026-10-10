@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::commands::{Output, track_branch};
 use crate::engine::Scope;
 use crate::git::{GitMark, Head};
+use crate::state::remove_if_exists;
 use crate::watch::GitState;
 
 use super::{ANNOUNCE_BUSY_AFTER, Live, Notice, Outbound};
@@ -195,7 +196,7 @@ impl Live {
     pub(super) fn release(&mut self) {
         self.outbound = Outbound::Open;
         self.blocked = None;
-        if let Err(err) = remove_marker(&self.hold_marker()) {
+        if let Err(err) = remove_if_exists(&self.hold_marker()) {
             eprintln!("warning: {err:#}");
         }
         self.notify(Notice::Released);
@@ -240,13 +241,5 @@ impl Live {
 
     pub(super) fn hold_marker(&self) -> PathBuf {
         self.session.state().dir().join(HOLD_MARKER)
-    }
-}
-
-pub(super) fn remove_marker(path: &std::path::Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::Error::new(err).context(format!("removing {}", path.display()))),
     }
 }
