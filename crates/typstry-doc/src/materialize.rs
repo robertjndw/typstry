@@ -47,7 +47,6 @@ pub(crate) fn materialize_indexed(
     doc: &LoroDoc,
     index: &PathIndex,
 ) -> Vec<(TreeID, MaterializedFile)> {
-    let tree = doc.get_tree(root::FS);
     let mut files = Vec::with_capacity(index.by_path.len());
     // by_path rather than by_id: it is already sorted and its keys are
     // unique even in the pathological case described in resolve_sibling_names.
@@ -58,39 +57,41 @@ pub(crate) fn materialize_indexed(
         if !is_safe_path(path) {
             continue;
         }
-        let Ok(meta) = tree.get_meta(*id) else {
-            continue;
-        };
-        let content = match entry.kind {
-            FileKind::Dir => continue,
-            FileKind::Text => {
-                let text = text_content(doc, *id)
-                    .map(|t| t.to_string())
-                    .unwrap_or_default();
-                FileContent::Text(text)
-            }
-            FileKind::Asset => {
-                let Some(hash) = string_value(meta.get(node::HASH)).filter(|h| !h.is_empty())
-                else {
-                    continue;
-                };
-                FileContent::Asset {
-                    hash,
-                    size: number(meta.get(node::SIZE)).unwrap_or(0),
-                    mime: string_value(meta.get(node::MIME))
-                        .unwrap_or_else(|| "application/octet-stream".to_owned()),
-                }
-            }
-        };
-        files.push((
-            *id,
-            MaterializedFile {
-                path: path.clone(),
-                content,
-            },
-        ));
+        if let Some(content) = file_content(doc, *id, entry.kind) {
+            files.push((
+                *id,
+                MaterializedFile {
+                    path: path.clone(),
+                    content,
+                },
+            ));
+        }
     }
     files
+}
+
+/// What [`materialize`] would list for a node, ignoring its path. None for
+/// directories and for assets without a hash.
+pub(crate) fn file_content(doc: &LoroDoc, id: TreeID, kind: FileKind) -> Option<FileContent> {
+    let meta = doc.get_tree(root::FS).get_meta(id).ok()?;
+    match kind {
+        FileKind::Dir => None,
+        FileKind::Text => {
+            let text = text_content(doc, id)
+                .map(|t| t.to_string())
+                .unwrap_or_default();
+            Some(FileContent::Text(text))
+        }
+        FileKind::Asset => {
+            let hash = string_value(meta.get(node::HASH)).filter(|h| !h.is_empty())?;
+            Some(FileContent::Asset {
+                hash,
+                size: number(meta.get(node::SIZE)).unwrap_or(0),
+                mime: string_value(meta.get(node::MIME))
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            })
+        }
+    }
 }
 
 /// Like [`materialize`], but for the state at `frontiers`. Works on a fork,

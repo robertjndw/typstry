@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e99b620af3503bafa44549c0c2be8609d8ddd9b68d99c4940dd819ab91c8f54c # shrinks to start = [MaterializedFile { path: ".hidden/b.typ", content: Text("") }, MaterializedFile { path: ".hidden/.hidden", content: Text("") }], other = [MaterializedFile { path: "a", content: Text("") }, MaterializedFile { path: ".hidden", content: Text("") }], writes = [MaterializedFile { path: ".hidden", content: Text("") }], deletes = []

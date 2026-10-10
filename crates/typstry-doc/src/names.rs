@@ -59,11 +59,40 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
+/// The first segment of a path that breaks the name rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSegment<'a> {
+    pub segment: &'a str,
+    pub error: NameError,
+}
+
+impl fmt::Display for InvalidSegment<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.segment, self.error)
+    }
+}
+
+impl std::error::Error for InvalidSegment<'_> {}
+
+/// A `/`-separated relative path is valid when every segment is, so empty
+/// segments (leading, trailing or doubled slashes) are rejected too.
+pub fn validate_path(path: &str) -> Result<(), InvalidSegment<'_>> {
+    path.split('/').try_for_each(|segment| {
+        validate_name(segment).map_err(|error| InvalidSegment { segment, error })
+    })
+}
+
+/// What JS counts as whitespace in `String.trim` and `/\s/`: Unicode
+/// White_Space plus the byte order mark, minus U+0085, which Rust counts and
+/// JS does not.
+pub(crate) fn is_js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
 /// Trimmed `raw` when it is 1 to `max` characters long. Counts code points
 /// like the TS side, so an emoji is one character.
 pub fn normalize_bounded(raw: &str, max: usize) -> Option<&str> {
-    // JS String.trim also strips the byte order mark, Rust's trim does not.
-    let value = raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let value = raw.trim_matches(is_js_whitespace);
     let len = value.chars().count();
     (1..=max).contains(&len).then_some(value)
 }
@@ -92,10 +121,28 @@ mod tests {
     }
 
     #[test]
+    fn validates_paths_segment_by_segment() {
+        assert_eq!(validate_path("chapters/intro.typ"), Ok(()));
+        let invalid = |segment, error| Err(InvalidSegment { segment, error });
+        assert_eq!(validate_path(""), invalid("", NameError::Empty));
+        assert_eq!(validate_path("/abs.typ"), invalid("", NameError::Empty));
+        assert_eq!(validate_path("a//b"), invalid("", NameError::Empty));
+        assert_eq!(validate_path("dir/"), invalid("", NameError::Empty));
+        assert_eq!(validate_path("../x"), invalid("..", NameError::Reserved));
+        assert_eq!(
+            validate_path("ok/a\\b/c"),
+            invalid("a\\b", NameError::Backslash)
+        );
+    }
+
+    #[test]
     fn bounds_by_code_points() {
         assert_eq!(normalize_bounded("  v1 ", 100), Some("v1"));
         assert_eq!(normalize_bounded("   ", 100), None);
         assert_eq!(normalize_bounded(&"😀".repeat(3), 3), Some("😀😀😀"));
         assert_eq!(normalize_bounded(&"😀".repeat(4), 3), None);
+        assert_eq!(normalize_bounded("\u{feff} v1\u{3000}", 100), Some("v1"));
+        // NEL is not whitespace to JS, so it is part of the name there.
+        assert_eq!(normalize_bounded("\u{85}v1", 100), Some("\u{85}v1"));
     }
 }

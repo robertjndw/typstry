@@ -1,14 +1,17 @@
 //! `apply_files` against `materialize`: applying what materialize returns
 //! must be a no-op, applying any valid file list must make materialize
 //! return exactly that list, and edits made on forks of a common base must
-//! merge.
+//! merge. `apply_changes` must agree with `apply_files` on the paths it
+//! names.
+
+use std::collections::BTreeMap;
 
 use loro::{ExportMode, LoroDoc, TreeID};
 use proptest::prelude::*;
-use typstry_doc::apply::{ApplyReport, Renamed, SkipReason, apply_files};
+use typstry_doc::apply::{ApplyReport, Renamed, SkipReason, apply_changes, apply_files};
 
 const MESSAGE: &str = "test apply";
-use typstry_doc::init::{init_project, init_project_with, set_main_file};
+use typstry_doc::init::{init_bare_project, init_project, set_main_file};
 use typstry_doc::materialize::{FileContent, MaterializedFile, materialize};
 use typstry_doc::names::NameError;
 use typstry_doc::paths::build_path_index;
@@ -364,10 +367,142 @@ fn edits_on_forks_of_a_base_merge() {
 #[test]
 fn seeds_a_bare_project_from_files() {
     let doc = replica(1);
-    init_project_with(&doc, "Bare", false).unwrap();
+    init_bare_project(&doc, "Bare").unwrap();
     apply(&doc, &[text("thesis.typ", "= T")]);
     set_main_file(&doc, Some(id_of(&doc, "thesis.typ"))).unwrap();
     assert_eq!(main_file(&doc), Some(id_of(&doc, "thesis.typ")));
+}
+
+type Changes = BTreeMap<String, Option<FileContent>>;
+
+fn changes(entries: &[(&str, Option<&str>)]) -> Changes {
+    entries
+        .iter()
+        .map(|&(path, body)| (path.to_owned(), body.map(|b| FileContent::Text(b.into()))))
+        .collect()
+}
+
+/// The current files with `changes` laid over them, the list
+/// `apply_files` would need to get the same result.
+fn overlay(doc: &LoroDoc, changes: &Changes) -> Vec<MaterializedFile> {
+    let mut files: BTreeMap<String, FileContent> = materialize(doc)
+        .into_iter()
+        .map(|f| (f.path, f.content))
+        .collect();
+    for (path, content) in changes {
+        match content {
+            Some(content) => files.insert(path.clone(), content.clone()),
+            None => files.remove(path),
+        };
+    }
+    files
+        .into_iter()
+        .map(|(path, content)| MaterializedFile { path, content })
+        .collect()
+}
+
+#[test]
+fn changes_touch_only_what_they_name() {
+    let doc = project();
+    apply(
+        &doc,
+        &[
+            text("main.typ", "m"),
+            text("ch/a.typ", "a"),
+            text("ch/b.typ", "b"),
+            text("old.typ", "moved"),
+        ],
+    );
+    let vv = doc.oplog_vv();
+    let same = changes(&[("main.typ", Some("m")), ("gone.typ", None), ("ch", None)]);
+    let report = apply_changes(&doc, &same, MESSAGE).unwrap();
+    assert_eq!(report, ApplyReport::default());
+    assert_eq!(doc.oplog_vv(), vv);
+
+    let old = id_of(&doc, "old.typ");
+    let report = apply_changes(
+        &doc,
+        &changes(&[
+            ("main.typ", Some("m2")),
+            ("ch/a.typ", None),
+            ("ch/b.typ", None),
+            ("new/old.typ", Some("moved")),
+            ("x.typ", Some("x")),
+            ("old.typ", None),
+            ("x.typ/in.typ", Some("")),
+            ("bad\\name.typ", Some("")),
+        ]),
+        MESSAGE,
+    )
+    .unwrap();
+    assert_eq!(report.modified, ["main.typ"]);
+    assert_eq!(report.created, ["x.typ"]);
+    assert_eq!(report.deleted, ["ch/a.typ", "ch/b.typ"]);
+    assert_eq!(
+        report.renamed,
+        [Renamed {
+            from: "old.typ".into(),
+            to: "new/old.typ".into()
+        }]
+    );
+    let skipped: Vec<&str> = report.skipped.iter().map(|s| s.path.as_str()).collect();
+    assert_eq!(skipped, ["bad\\name.typ", "x.typ/in.typ"]);
+    assert_eq!(id_of(&doc, "new/old.typ"), old);
+    let paths: Vec<String> = build_path_index(&doc).by_path.into_keys().collect();
+    assert_eq!(paths, ["main.typ", "new", "new/old.typ", "x.typ"]);
+}
+
+#[test]
+fn changes_block_on_untouched_files_only() {
+    let doc = project();
+    apply(&doc, &[text("a", "file"), text("d/x.typ", "x")]);
+    // "a" stays a file, so nothing can go inside it.
+    let report = apply_changes(&doc, &changes(&[("a/b.typ", Some(""))]), MESSAGE).unwrap();
+    assert_eq!(
+        report.skipped[0].reason,
+        SkipReason::InsideFile { file: "a".into() }
+    );
+    assert!(!report.changed);
+    // Deleted in the same change, it can.
+    let report = apply_changes(
+        &doc,
+        &changes(&[("a", None), ("a/b.typ", Some(""))]),
+        MESSAGE,
+    )
+    .unwrap();
+    assert_eq!(report.created, ["a/b.typ"]);
+    assert_eq!(report.deleted, ["a"]);
+    // A file replacing a folder takes the folder's files with it.
+    let report = apply_changes(&doc, &changes(&[("d", Some("now a file"))]), MESSAGE).unwrap();
+    assert_eq!(report.created, ["d"]);
+    assert_eq!(report.deleted, ["d/x.typ"]);
+    assert!(report.skipped.is_empty());
+}
+
+#[test]
+fn changes_keep_files_with_names_the_rules_reject() {
+    // The browser allows backslashes, the push side does not.
+    let doc = project();
+    let odd = add(&doc, None, "a\\b.typ", FileKind::Text);
+    apply_changes(&doc, &changes(&[("main.typ", Some("m"))]), MESSAGE).unwrap();
+    assert_eq!(id_of(&doc, "a\\b.typ"), odd);
+    // A full list without it deletes it, as before.
+    let report = apply(&doc, &[text("main.typ", "m")]);
+    assert_eq!(report.deleted, ["a\\b.typ"]);
+}
+
+#[test]
+fn changes_keep_untouched_clash_paths() {
+    let a = replica(1);
+    let b = replica(2);
+    add(&a, None, "x.typ", FileKind::Text);
+    let fb = add(&b, None, "x.typ", FileKind::Text);
+    sync(&a, &b);
+    // Deleting the winner would let the other one fall back to "x.typ"
+    // even though the change never mentioned it.
+    let report = apply_changes(&a, &changes(&[("x.typ", None)]), MESSAGE).unwrap();
+    assert_eq!(report.deleted, ["x.typ"]);
+    assert_eq!(id_of(&a, "x~0@2.typ"), fb);
 }
 
 const SEGMENTS: [&str; 4] = ["a", "b.typ", ".hidden", "c"];
@@ -405,6 +540,59 @@ proptest! {
                 .any(|s| matches!(s.reason, SkipReason::InvalidName { .. }));
             prop_assert!(!invalid);
         }
+    }
+
+    /// `apply_changes` lands where `apply_files` with the full list does,
+    /// clashes included, and reports the same.
+    #[test]
+    fn changes_match_full_lists(
+        start in prop::collection::vec(file(), 0..6),
+        other in prop::collection::vec(file(), 0..6),
+        writes in prop::collection::vec(file(), 0..6),
+        deletes in prop::collection::vec(0..16usize, 0..4),
+    ) {
+        // Concurrent pushes, so the start has clashes to resolve.
+        let a = project();
+        let b = replica(2);
+        configure(&b);
+        b.import(&a.export(ExportMode::Snapshot).unwrap()).unwrap();
+        apply_files(&a, &start, MESSAGE).unwrap();
+        apply_files(&b, &other, MESSAGE).unwrap();
+        sync(&a, &b);
+
+        let current = materialize(&a);
+        let mut changes: Changes = BTreeMap::new();
+        for i in deletes {
+            if let Some(file) = current.get(i % current.len().max(1)) {
+                changes.insert(file.path.clone(), None);
+            }
+        }
+        for file in writes {
+            changes.insert(file.path, Some(file.content));
+        }
+        let full = overlay(&a, &changes);
+        let patched = a.fork();
+        let listed = a.fork();
+        for doc in [&patched, &listed] {
+            doc.set_peer_id(3).unwrap();
+            configure(doc);
+        }
+        let mut by_changes = apply_changes(&patched, &changes, MESSAGE).unwrap();
+        let by_list = apply_files(&listed, &full, MESSAGE).unwrap();
+        // Untouched files a new file displaces are skipped by the full
+        // list only.
+        by_changes.skipped.retain(|s| changes.contains_key(&s.path));
+        let mut by_list_skipped = by_list.clone();
+        by_list_skipped.skipped.retain(|s| changes.contains_key(&s.path));
+        prop_assert_eq!(&by_changes, &by_list_skipped);
+        prop_assert_eq!(materialize(&patched), materialize(&listed));
+        prop_assert_eq!(main_file(&patched), main_file(&listed));
+        let skipped: Vec<&str> = by_list.skipped.iter().map(|s| s.path.as_str()).collect();
+        let expected: Vec<MaterializedFile> = full
+            .into_iter()
+            .filter(|f| !skipped.contains(&f.path.as_str()))
+            .collect();
+        prop_assert_eq!(materialize(&patched), expected);
     }
 
     /// Two folders forked from the same base, pushed one after the other:

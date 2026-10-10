@@ -17,16 +17,26 @@ pub fn starter_content(title: &str) -> String {
     )
 }
 
-/// Seeds an empty doc with the schema version, title and a `main.typ`.
-/// Does nothing if the doc already carries a schema version.
+/// Seeds an empty doc with the schema version, title and a `main.typ`, like
+/// a project created in the browser. Does nothing if the doc already
+/// carries a schema version.
 pub fn init_project(doc: &LoroDoc, title: &str) -> LoroResult<()> {
-    init_project_with(doc, title, true)
+    seed(doc, title, true)
 }
 
-/// Like [`init_project`], but `starter: false` writes only the schema
-/// version and title and leaves `meta.mainFile` unset, for projects whose
-/// files come from somewhere else.
+/// Like [`init_project`], but writes only the schema version and title and
+/// leaves `meta.mainFile` unset, for projects whose files come from
+/// somewhere else.
+pub fn init_bare_project(doc: &LoroDoc, title: &str) -> LoroResult<()> {
+    seed(doc, title, false)
+}
+
+/// The old entry point, kept until the CLI moves to [`init_bare_project`].
 pub fn init_project_with(doc: &LoroDoc, title: &str, starter: bool) -> LoroResult<()> {
+    seed(doc, title, starter)
+}
+
+fn seed(doc: &LoroDoc, title: &str, starter: bool) -> LoroResult<()> {
     if schema_version(doc).is_some() {
         return Ok(());
     }
@@ -161,7 +171,7 @@ mod tests {
     #[test]
     fn seeds_without_starter() {
         let doc = LoroDoc::new();
-        init_project_with(&doc, "Bare", false).unwrap();
+        init_bare_project(&doc, "Bare").unwrap();
         let json = doc.get_deep_value().to_json_value();
         assert_eq!(json[root::META][meta::SCHEMA], SCHEMA_VERSION as f64);
         assert_eq!(json[root::META][meta::TITLE], "Bare");
@@ -173,7 +183,7 @@ mod tests {
     #[test]
     fn sets_and_clears_main_file() {
         let doc = LoroDoc::new();
-        init_project_with(&doc, "M", false).unwrap();
+        init_bare_project(&doc, "M").unwrap();
         let text = crate::testing::add(&doc, None, "a.typ", FileKind::Text);
         let dir = crate::testing::add(&doc, None, "d", FileKind::Dir);
 
