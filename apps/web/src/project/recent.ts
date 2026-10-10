@@ -1,11 +1,10 @@
 // Per-browser memory of projects: a "recent" list for the home page, the
 // share links of projects created here, the encryption key of every project
 // opened here, and what each share token resolved to (so a project opens
-// offline). The server never hands out a view token for an edit token, so
-// the creator's browser is the only place that knows both.
+// offline).
 import { isRawProjectKey } from "@/crypto/project-key";
 import { getStorage, readJson, writeJson } from "@/lib/storage";
-import type { ShareInfo } from "@/sync/api";
+import { parseShareInfo, type ShareInfo } from "@/sync/api";
 
 export const RECENT_KEY = "typstry:recent";
 const LINKS_PREFIX = "typstry:links:";
@@ -144,16 +143,7 @@ export function loadShare(
   token: string,
   storage: Storage | null = getStorage(),
 ): ShareInfo | null {
-  const value = readJson(
-    SHARE_PREFIX + token,
-    storage,
-  ) as Partial<ShareInfo> | null;
-  if (
-    typeof value?.projectId !== "string" ||
-    (value.permission !== "write" && value.permission !== "read")
-  )
-    return null;
-  return { projectId: value.projectId, permission: value.permission };
+  return parseShareInfo(readJson(SHARE_PREFIX + token, storage));
 }
 
 export function forgetShare(

@@ -19,6 +19,8 @@ pub struct CreatedProject {
 pub struct ShareInfo {
     project_id: String,
     permission: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view_token: Option<String>,
 }
 
 /// `POST /api/projects`. Takes no body: the title belongs to the encrypted
@@ -42,10 +44,11 @@ pub async fn share(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<Json<ShareInfo>, StatusCode> {
-    match projects::resolve_token(&state.db, &token).await {
-        Ok(Some((project_id, permission))) => Ok(Json(ShareInfo {
-            project_id,
-            permission: permission.as_str(),
+    match projects::resolve_share(&state.db, &token).await {
+        Ok(Some(found)) => Ok(Json(ShareInfo {
+            project_id: found.project_id,
+            permission: found.permission.as_str(),
+            view_token: found.view_token,
         })),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(err) => Err(internal(err)),

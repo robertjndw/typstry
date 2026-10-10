@@ -51,26 +51,49 @@ pub async fn create(pool: &SqlitePool) -> sqlx::Result<NewProject> {
     Ok(project)
 }
 
+/// A resolved share token. `view_token` is only set for write access: the
+/// edit token already grants more than the view token, so handing it to edit
+/// holders leaks nothing, while view holders must never learn the edit link.
+pub struct ResolvedShare {
+    pub project_id: String,
+    pub permission: Permission,
+    pub view_token: Option<String>,
+}
+
 /// Resolves a share token to its project and the access it grants.
 pub async fn resolve_token(
     pool: &SqlitePool,
     token: &str,
 ) -> sqlx::Result<Option<(String, Permission)>> {
+    Ok(resolve_share(pool, token)
+        .await?
+        .map(|r| (r.project_id, r.permission)))
+}
+
+/// Like [`resolve_token`], plus the view token for edit-token holders.
+pub async fn resolve_share(pool: &SqlitePool, token: &str) -> sqlx::Result<Option<ResolvedShare>> {
     if !token::looks_valid(token) {
         return Ok(None);
     }
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, edit_token FROM projects WHERE edit_token = ?1 OR view_token = ?1",
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT id, edit_token, view_token FROM projects WHERE edit_token = ?1 OR view_token = ?1",
     )
     .bind(token)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, edit_token)| {
-        let permission = if edit_token == token {
-            Permission::Write
+    Ok(row.map(|(project_id, edit_token, view_token)| {
+        if edit_token == token {
+            ResolvedShare {
+                project_id,
+                permission: Permission::Write,
+                view_token: Some(view_token),
+            }
         } else {
-            Permission::Read
-        };
-        (id, permission)
+            ResolvedShare {
+                project_id,
+                permission: Permission::Read,
+                view_token: None,
+            }
+        }
     }))
 }

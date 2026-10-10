@@ -363,6 +363,12 @@ async fn project_and_share_endpoints() {
             serde_json::from_slice(&to_bytes(res.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(body["projectId"], id);
         assert_eq!(body["permission"], expected);
+        if expected == "write" {
+            assert_eq!(body["viewToken"], view);
+        } else {
+            assert!(body.get("viewToken").is_none());
+            assert!(!body.to_string().contains(&edit));
+        }
     }
 
     for bad in ["nope", "0000000000000000000000"] {

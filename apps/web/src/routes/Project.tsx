@@ -135,6 +135,7 @@ function ProjectSessionView({
                       token={token}
                       projectKey={key}
                       permission={share.permission}
+                      viewToken={share.viewToken}
                     />
                     <IdentityControl
                       identity={identity}
