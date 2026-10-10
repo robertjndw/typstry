@@ -49,13 +49,15 @@ docker run -d -p 8787:8787 -v typstry-data:/data typstry
 └─────────────────────────────────────────┘          └────────────────────────────────┘
 ```
 
-Each project is a single Loro document holding the file tree, file contents and version list. Clients encrypt every update before it leaves the browser and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
+Each project is a single Loro document holding the file tree, file contents and version list. The browser and the `typstry` CLI encrypt every update before it leaves your machine and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
 
 Because the key is part of the share link, anyone with the link can read the project. Treat edit links like passwords.
 
 ## Working locally with git
 
 The `typstry` CLI links a folder to a project. It encrypts and decrypts on your machine like the browser does, so the server still only sees ciphertext.
+
+It isn't part of the Docker image. Install it from a checkout with [Rust](https://rustup.rs) 1.94 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli
@@ -112,10 +114,19 @@ Without the live mode, the same day is `typstry pull`, edit, then `typstry push`
 | `export [--at <version>] <dir>` | Write the project, now or at a named version, to a plain folder                      |
 | `track <branch>`                | Change the git branch typstry syncs on (stop `sync` first)                           |
 
+Every command takes `-C <dir>` to run as if started in another folder, and `--name <name>` to set the author name shown in the project history (defaults to `git config user.name`). `typstry <command> --help` shows all options.
+
+| Variable          | Used for                                                        |
+| ----------------- | --------------------------------------------------------------- |
+| `TYPSTRY_LINK`    | The share link for `clone` when the argument is left out        |
+| `TYPSTRY_SERVER`  | The server for `init` when `--server` is left out               |
+| `TYPSTRY_BROWSER` | The program `open` starts instead of the system default browser |
+| `TYPSTRY_LOG`     | Log filter in `RUST_LOG` syntax, `warn` by default              |
+
 ### Things to know
 
 - **The tracked branch.** typstry syncs on one git branch, the one checked out when the folder was first linked. On any other branch, or while git is merging or rebasing, `sync` pauses and `pull`/`push` refuse unless you pass `--force`.
-- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then type `push` in the sync terminal (or run `typstry push --force`) to publish. Committing on the tracked branch before switching avoids this.
+- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then publish by typing `push` in the sync terminal, running `typstry push --force`, or starting `sync` with `--publish`. Committing on the tracked branch before switching avoids this.
 - **Commands next to `sync`.** While `sync` runs, `status`, `info`, `version list`, `version save` and `push` in the same folder ask it instead of failing. `version save` and `push` publish what is on disk right away, so a version saved just after a save includes it. Both refuse while `sync` is paused, and need `--force` while it holds back changes after a branch switch, like the one-shot versions. `pull` only says that `sync` already pulls. `track` and `export` refuse to start until `sync` is stopped.
 - **The key lives in `.typstry/`.** That folder holds the link and a local cache. It ignores itself with its own `.gitignore` and is also added to `.git/info/exclude`. Never commit it. To keep the link out of your shell history, pass it on standard input (`pbpaste | typstry clone - thesis`) or in `TYPSTRY_LINK`.
 - **Ignored files.** `.gitignore` and an optional `.typstryignore` decide which files are synced, so build output such as PDFs stays local. git's own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`) and `.typstryignore` itself are not synced either; re-include one with a negated pattern in `.typstryignore`, such as `!.gitignore`. An ignored file is never written to the folder, and removing or editing it locally never changes the project. A file the project gets from someone else never replaces a local file that is not synced, or one whose name only differs in case on macOS and Windows.
@@ -184,7 +195,7 @@ This starts the Vite dev server for the frontend and the Rust server on port 878
 | Server binary  | `cargo build --release -p typstry-server`               |
 | CLI binary     | `cargo build --release -p typstry-cli`                  |
 
-CI runs on every push to `main` and on pull requests: everything in the table except `pnpm format:check` and the release server build, plus a Docker build with a smoke test.
+CI runs on every push to `main` and on pull requests: everything in the table except `pnpm format:check` and the release builds, plus a Docker build with a smoke test.
 
 The end-to-end tests drive the production build in Chromium through [Playwright](https://playwright.dev). They start the server on port 4787 with a throwaway data directory, or reuse one already running there. Install the browser once with `pnpm --filter web exec playwright install chromium`.
 
