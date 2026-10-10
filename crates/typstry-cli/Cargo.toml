@@ -38,6 +38,8 @@ typstry-wire = { workspace = true, features = ["crypto"] }
 axum.workspace = true
 tempfile.workspace = true
 typstry-server.workspace = true
+# The compat fixture generator seals with fixed salts and IVs.
+typstry-wire = { workspace = true, features = ["crypto", "test-util"] }
 
 [lints]
 workspace = true

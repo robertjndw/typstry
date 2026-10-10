@@ -1,0 +1,17 @@
+{
+  "branch": "main",
+  "git": {
+    "branch": "main",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "reflog": 3
+  },
+  "lastSync": 1700000000005,
+  "name": "Ada",
+  "pins": {
+    "main.typ": "First draft"
+  },
+  "projectId": "compat-project-0",
+  "server": "https://typstry.example",
+  "token": "compatEditToken0",
+  "viewToken": "compatViewToken0"
+}

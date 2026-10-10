@@ -1,0 +1,13 @@
+{
+  "base": 1,
+  "config": 1,
+  "docLog": 1,
+  "mailbox": 1,
+  "minProtocol": 1,
+  "protocol": 1,
+  "record": 1,
+  "schema": 1,
+  "seal": 1,
+  "secretEdit": 1,
+  "secretView": 2
+}
