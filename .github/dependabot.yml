@@ -1,0 +1,61 @@
+version: 2
+updates:
+  # Workflows use major tags, so this only ever proposes major bumps. "/"
+  # doesn't include the composite action, hence the second entry.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Covers the whole pnpm workspace through the root lockfile.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    # Bad releases tend to get yanked within a few days.
+    cooldown:
+      default-days: 7
+    ignore:
+      # patches/ targets this exact version, bump it by hand.
+      - dependency-name: loro-websocket
+      # Has to match the loro-protocol crate's wire format, bump both by hand.
+      - dependency-name: loro-protocol
+      # Follows the Node major we run on.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # Released together, versions have to match.
+      typst-ts:
+        patterns: ["@myriaddreamin/*"]
+      codemirror:
+        patterns: ["@codemirror/*", "codemirror"]
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    ignore:
+      # See the npm entry.
+      - dependency-name: loro-protocol
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # Doesn't cover the pnpm version in the Dockerfile, keep that in sync with
+  # packageManager by hand.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      images:
+        patterns: ["*"]
