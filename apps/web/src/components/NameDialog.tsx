@@ -66,6 +66,7 @@ function NameForm({
       onEscapeKeyDown={finish}
       onPointerDownOutside={finish}
       showCloseButton={false}
+      className="sm:max-w-md"
     >
       <form onSubmit={onSubmit} className="grid gap-4">
         <DialogHeader>
@@ -99,7 +100,7 @@ function NameForm({
               aria-label={c}
               onClick={() => setColor(c)}
               className={cn(
-                "flex size-7 items-center justify-center rounded-full text-white outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+                "flex size-7 items-center justify-center rounded-full text-white transition-transform outline-none hover:scale-110 focus-visible:ring-3 focus-visible:ring-ring/50",
                 c === color &&
                   "ring-2 ring-foreground ring-offset-2 ring-offset-background",
               )}

@@ -53,17 +53,21 @@ export function AssetView({
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
       <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
-        <span className="truncate font-mono" title={path}>
+        <span className="truncate font-mono text-foreground" title={path}>
           {path}
         </span>
-        <span className="ml-auto shrink-0 text-muted-foreground">
+        <span className="ml-auto shrink-0 text-muted-foreground tabular-nums">
           {mime}
           {typeof size === "number" && ` · ${formatSize(size)}`}
         </span>
       </div>
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-auto bg-muted/30 p-4">
         {url === "loading" ? (
-          <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
+          <Loader2Icon
+            role="status"
+            aria-label="Loading file"
+            className="size-6 animate-spin text-muted-foreground"
+          />
         ) : url ? (
           <AssetPreview url={url} name={name} mime={mime} />
         ) : (
@@ -104,7 +108,7 @@ function AssetPreview({
         <img
           src={url}
           alt={name}
-          className="max-h-full max-w-full object-contain shadow-sm"
+          className="max-h-full max-w-full rounded-sm object-contain shadow-sm ring-1 ring-border"
         />
       );
     case "pdf":
@@ -112,7 +116,7 @@ function AssetPreview({
         <iframe
           src={url}
           title={name}
-          className="min-h-0 w-full flex-1 rounded border bg-background"
+          className="min-h-0 w-full flex-1 rounded-md border bg-background"
         />
       );
     case "audio":
@@ -130,8 +134,10 @@ function AssetPreview({
 function NoPreview({ message }: { message: string }) {
   return (
     <>
-      <FileIcon className="size-8 text-muted-foreground" />
-      <p className="text-sm text-muted-foreground">{message}</p>
+      <FileIcon aria-hidden className="size-8 text-muted-foreground/70" />
+      <p className="max-w-xs text-center text-sm text-muted-foreground">
+        {message}
+      </p>
     </>
   );
 }
