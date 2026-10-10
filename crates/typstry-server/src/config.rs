@@ -68,90 +68,78 @@ impl Config {
             config.web_dist = dir.into();
         }
 
+        let parse = |var, expected| Var {
+            text: &text,
+            var,
+            expected,
+        };
+
         if let Some(bytes) =
-            parse_min(text, "TYPSTRY_MAX_UPLOAD_BYTES", 1, "a positive byte count")?
+            parse("TYPSTRY_MAX_UPLOAD_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
         {
             config.max_upload_bytes = bytes;
         }
-        if let Some(secs) = parse(text, "TYPSTRY_ROOM_UNLOAD_SECS", "whole seconds")? {
+        if let Some(secs) = parse("TYPSTRY_ROOM_UNLOAD_SECS", "whole seconds").get()? {
             config.rooms.unload_after = Duration::from_secs(secs);
         }
         // Zero would expire every cursor on the next tick.
-        if let Some(secs) = parse_min(
-            text,
-            "TYPSTRY_PRESENCE_TIMEOUT_SECS",
-            1,
-            "positive whole seconds",
-        )? {
+        if let Some(secs) = parse("TYPSTRY_PRESENCE_TIMEOUT_SECS", "positive whole seconds")
+            .get_where(|&n| n >= 1)?
+        {
             config.rooms.ephemeral_timeout = Duration::from_secs(secs);
         }
         // A bucket that never holds a whole token refuses every update.
-        if let Some(burst) = parse_min(text, "TYPSTRY_UPDATE_BURST", 1, "a positive whole number")?
+        if let Some(burst) =
+            parse("TYPSTRY_UPDATE_BURST", "a positive whole number").get_where(|&n| n >= 1)?
         {
             config.limits.update_burst = burst;
         }
-        if let Some(rate) = parse::<f64>(text, "TYPSTRY_UPDATES_PER_SEC", "a positive number")? {
-            // Zero would never refill the bucket, and NaN poisons it.
-            if !(rate.is_finite() && rate > 0.0) {
-                return Err(ConfigError::Invalid {
-                    var: "TYPSTRY_UPDATES_PER_SEC",
-                    expected: "a positive number",
-                    value: rate.to_string(),
-                });
-            }
+        // Zero would never refill the bucket, and NaN poisons it.
+        if let Some(rate) = parse("TYPSTRY_UPDATES_PER_SEC", "a positive number")
+            .get_where(|&r: &f64| r.is_finite() && r > 0.0)?
+        {
             config.limits.updates_per_sec = rate;
         }
         // The app joins two rooms per project: the doc and presence.
-        if let Some(rooms) = parse_min(
-            text,
-            "TYPSTRY_MAX_ROOMS_PER_CONN",
-            2,
-            "a whole number of at least 2",
-        )? {
+        if let Some(rooms) = parse("TYPSTRY_MAX_ROOMS_PER_CONN", "a whole number of at least 2")
+            .get_where(|&n| n >= 2)?
+        {
             config.limits.max_rooms = rooms;
         }
-        if let Some(bytes) = parse_min(text, "TYPSTRY_OUTBOX_BYTES", 1, "a positive byte count")? {
+        if let Some(bytes) =
+            parse("TYPSTRY_OUTBOX_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        {
             config.limits.outbox_bytes = bytes;
         }
         Ok(config)
     }
 }
 
-/// [`parse`] for counts that are only meaningful from `min` up.
-fn parse_min<T: FromStr + PartialOrd>(
-    text: impl Fn(&str) -> Option<String>,
+/// One numeric variable and how to say what it should hold.
+struct Var<'a, F> {
+    text: &'a F,
     var: &'static str,
-    min: T,
     expected: &'static str,
-) -> Result<Option<T>, ConfigError> {
-    let Some(value) = parse(&text, var, expected)? else {
-        return Ok(None);
-    };
-    if value < min {
-        return Err(ConfigError::Invalid {
-            var,
-            expected,
-            value: text(var).unwrap_or_default(),
-        });
-    }
-    Ok(Some(value))
 }
 
-fn parse<T: FromStr>(
-    text: impl Fn(&str) -> Option<String>,
-    var: &'static str,
-    expected: &'static str,
-) -> Result<Option<T>, ConfigError> {
-    let Some(value) = text(var) else {
-        return Ok(None);
-    };
-    match value.trim().parse() {
-        Ok(parsed) => Ok(Some(parsed)),
-        Err(_) => Err(ConfigError::Invalid {
-            var,
-            expected,
-            value,
-        }),
+impl<F: Fn(&str) -> Option<String>> Var<'_, F> {
+    fn get<T: FromStr>(&self) -> Result<Option<T>, ConfigError> {
+        self.get_where(|_| true)
+    }
+
+    /// The parsed value, if set, refusing one that is not `valid`.
+    fn get_where<T: FromStr>(&self, valid: impl Fn(&T) -> bool) -> Result<Option<T>, ConfigError> {
+        let Some(value) = (self.text)(self.var) else {
+            return Ok(None);
+        };
+        match value.trim().parse() {
+            Ok(parsed) if valid(&parsed) => Ok(Some(parsed)),
+            _ => Err(ConfigError::Invalid {
+                var: self.var,
+                expected: self.expected,
+                value,
+            }),
+        }
     }
 }
 
