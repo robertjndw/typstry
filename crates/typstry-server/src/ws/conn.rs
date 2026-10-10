@@ -4,26 +4,28 @@
 //! encrypted doc) and `%EPH` (encrypted presence) of the same project.
 //! Room ids are project ids and the join auth is the share token as UTF-8.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use loro_protocol::{
     BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateStatusCode, try_decode,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval, timeout};
+use typstry_wire::elo::decode_container;
 use typstry_wire::fragment::Reassembler;
 
 use super::rate::TokenBucket;
-use crate::http::AppState;
-use crate::room::{ConnId, JoinOutcome, Outbound, Outbox, RoomCmd};
+use crate::room::{ConnId, JoinOutcome, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
+use crate::state::AppState;
 use crate::store::projects::{self, Permission};
 
 /// Frames buffered per connection before the client counts as too slow.
-const OUTBOX_CAPACITY: usize = 1024;
+/// Only small frames ever reach this many; big ones hit the byte budget in
+/// [`super::ConnLimits::outbox_bytes`] first.
+const OUTBOX_FRAMES: usize = 512;
 
 /// The JS client pings every 30 s, so silence this long means a dead peer.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -34,6 +36,8 @@ const CLOSE_PROTOCOL_ERROR: u16 = 1002;
 const CLOSE_GOING_AWAY: u16 = 1001;
 
 struct Joined {
+    crdt: CrdtType,
+    room_id: String,
     room: mpsc::Sender<RoomCmd>,
     permission: Permission,
 }
@@ -42,7 +46,9 @@ struct Conn {
     id: ConnId,
     state: AppState,
     outbox: Outbox,
-    joined: HashMap<([u8; 4], String), Joined>,
+    /// A handful at most (`max_rooms`), so a scan beats hashing an owned key
+    /// for every update.
+    joined: Vec<Joined>,
     fragments: Reassembler,
     doc_updates: TokenBucket,
     presence_updates: TokenBucket,
@@ -51,8 +57,9 @@ struct Conn {
 pub async fn run(socket: WebSocket, state: AppState) {
     let id = state.rooms.next_conn_id();
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<Outbound>(OUTBOX_CAPACITY);
-    let overflow = Arc::new(Notify::new());
+    let (outbox, mut rx) = Outbox::channel(OUTBOX_FRAMES, state.limits.outbox_bytes);
+    let overflow = outbox.overflow_signal();
+    let shutdown = state.shutdown.clone();
 
     let mut writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -81,11 +88,8 @@ pub async fn run(socket: WebSocket, state: AppState) {
         doc_updates: bucket.clone(),
         presence_updates: bucket,
         state,
-        outbox: Outbox {
-            tx,
-            overflow: overflow.clone(),
-        },
-        joined: HashMap::new(),
+        outbox,
+        joined: Vec::new(),
         fragments: Reassembler::default(),
     };
 
@@ -108,6 +112,10 @@ pub async fn run(socket: WebSocket, state: AppState) {
             },
             () = overflow.notified() => {
                 overflowed = true;
+                break;
+            }
+            () = shutdown.cancelled() => {
+                conn.close(CLOSE_GOING_AWAY, "server shutdown");
                 break;
             }
             _ = sweep.tick() => conn.expire_fragments(),
@@ -176,6 +184,14 @@ impl Conn {
                     self.ack(crdt, &room_id, batch_id, status);
                     return;
                 }
+                // The actor refuses oversized presence anyway; this keeps a
+                // client from making us buffer megabytes of it first.
+                if crdt == CrdtType::LoroEphemeralStore
+                    && total_size_bytes > MAX_PRESENCE_BYTES as u64
+                {
+                    self.ack(crdt, &room_id, batch_id, UpdateStatusCode::PayloadTooLarge);
+                    return;
+                }
                 if let Err(status) =
                     self.fragments
                         .start(crdt, &room_id, batch_id, fragment_count, total_size_bytes)
@@ -198,7 +214,8 @@ impl Conn {
                 Err(status) => self.ack(crdt, &room_id, batch_id, status),
             },
             ProtocolMessage::Leave { crdt, room_id } => {
-                if let Some(joined) = self.joined.remove(&(crdt.magic_bytes(), room_id)) {
+                if let Some(i) = self.find(crdt, &room_id) {
+                    let joined = self.joined.swap_remove(i);
                     leave(&joined.room, self.id, crdt).await;
                 }
             }
@@ -245,12 +262,13 @@ impl Conn {
         };
 
         // A repeated join (the client's rejoin path) replaces the old one.
-        let key = (crdt.magic_bytes(), room_id.clone());
-        if !self.joined.contains_key(&key) && self.joined.len() >= self.state.limits.max_rooms {
+        let existing = self.find(crdt, &room_id);
+        if existing.is_none() && self.joined.len() >= self.state.limits.max_rooms {
             self.join_error(crdt, &room_id, JoinErrorCode::AppError, "too many rooms");
             return;
         }
-        if let Some(old) = self.joined.remove(&key) {
+        if let Some(i) = existing {
+            let old = self.joined.swap_remove(i);
             leave(&old.room, self.id, crdt).await;
         }
 
@@ -268,7 +286,12 @@ impl Conn {
             .await;
         match outcome {
             JoinOutcome::Joined(room) => {
-                self.joined.insert(key, Joined { room, permission });
+                self.joined.push(Joined {
+                    crdt,
+                    room_id,
+                    room,
+                    permission,
+                });
             }
             JoinOutcome::Refused => {}
             JoinOutcome::Unavailable => {
@@ -277,10 +300,16 @@ impl Conn {
         }
     }
 
+    fn find(&self, crdt: CrdtType, room_id: &str) -> Option<usize> {
+        self.joined
+            .iter()
+            .position(|joined| joined.crdt == crdt && joined.room_id == room_id)
+    }
+
     fn writable(&self, crdt: CrdtType, room_id: &str) -> Result<&Joined, UpdateStatusCode> {
         let joined = self
-            .joined
-            .get(&(crdt.magic_bytes(), room_id.to_owned()))
+            .find(crdt, room_id)
+            .map(|i| &self.joined[i])
             .ok_or(UpdateStatusCode::PermissionDenied)?;
         // Viewers may still publish presence so others can see where they
         // are looking; only the document itself is write-protected.
@@ -307,11 +336,22 @@ impl Conn {
         // Refused with an ack rather than a disconnect. The edit stays in
         // the client's doc and reaches the server on the next rejoin, which
         // sends every span the server's coverage lacks.
-        let bucket = match crdt {
-            CrdtType::Elo => &mut self.doc_updates,
-            _ => &mut self.presence_updates,
+        //
+        // Charged per record rather than per message: one message can carry
+        // thousands of tiny records, and each is a row to store and index.
+        // An undecodable payload costs one; the room rejects it anyway.
+        let (bucket, cost) = match crdt {
+            CrdtType::Elo => {
+                let records: usize = updates
+                    .iter()
+                    .map(|update| decode_container(update).map_or(1, |records| records.len()))
+                    .sum();
+                (&mut self.doc_updates, records)
+            }
+            _ => (&mut self.presence_updates, updates.len()),
         };
-        if !bucket.try_take(Instant::now()) {
+        let cost = u32::try_from(cost.max(1)).unwrap_or(u32::MAX);
+        if !bucket.try_take(Instant::now(), cost) {
             tracing::debug!(conn = self.id, room = %room_id, "update rate limited");
             self.ack(crdt, &room_id, batch_id, UpdateStatusCode::RateLimited);
             return;
@@ -320,10 +360,12 @@ impl Conn {
             conn: self.id,
             crdt,
             batch_id,
-            updates,
+            updates: updates.into_iter().map(Bytes::from).collect(),
         };
         if room.send(cmd).await.is_err() {
-            self.joined.remove(&(crdt.magic_bytes(), room_id.clone()));
+            if let Some(i) = self.find(crdt, &room_id) {
+                self.joined.swap_remove(i);
+            }
             self.ack(crdt, &room_id, batch_id, UpdateStatusCode::Unknown);
         }
     }
@@ -335,9 +377,8 @@ impl Conn {
     }
 
     async fn leave_all(&mut self) {
-        for ((magic, _), joined) in self.joined.drain() {
-            let crdt = CrdtType::from_magic_bytes(magic).expect("joined rooms have known magic");
-            leave(&joined.room, self.id, crdt).await;
+        for joined in std::mem::take(&mut self.joined) {
+            leave(&joined.room, self.id, joined.crdt).await;
         }
     }
 

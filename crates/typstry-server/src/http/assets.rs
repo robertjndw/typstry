@@ -6,8 +6,8 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 
-use super::{AppState, internal};
-use crate::store::blobs::{self, WriteError};
+use super::{AppError, AppState};
+use crate::store::blobs;
 use crate::store::projects::{self, Permission};
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -29,13 +29,12 @@ pub async fn upload(
     Path(token): Path<String>,
     headers: HeaderMap,
     body: Body,
-) -> Result<(StatusCode, Json<Uploaded>), StatusCode> {
+) -> Result<(StatusCode, Json<Uploaded>), AppError> {
     let (project_id, permission) = projects::resolve_token(&state.db, &token)
-        .await
-        .map_err(internal)?
+        .await?
         .ok_or(StatusCode::NOT_FOUND)?;
     if permission != Permission::Write {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     let declared_len = headers
@@ -43,25 +42,15 @@ pub async fn upload(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared_len.is_some_and(|len| len > state.blobs.max_size()) {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
     }
 
-    let stored = match state.blobs.write(body.into_data_stream()).await {
-        Ok(stored) => stored,
-        Err(WriteError::TooLarge(_)) => return Err(StatusCode::PAYLOAD_TOO_LARGE),
-        Err(WriteError::Body(err)) => {
-            tracing::debug!(%err, "upload body aborted");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        Err(WriteError::Io(err)) => return Err(internal(err)),
-    };
+    let stored = state.blobs.write(body.into_data_stream()).await?;
 
     // The hash names the ciphertext, the only form the server ever sees.
     // Clients keep the plaintext's metadata inside the encrypted doc.
     let hash = stored.hash();
-    blobs::record(&state.db, &project_id, &hash, stored.size)
-        .await
-        .map_err(internal)?;
+    blobs::record(&state.db, &project_id, &hash, stored.size).await?;
     Ok((
         StatusCode::CREATED,
         Json(Uploaded {
@@ -75,18 +64,16 @@ pub async fn blob(
     State(state): State<AppState>,
     Path((token, hash)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, AppError> {
     let hex = blobs::parse_hash(&hash).ok_or(StatusCode::BAD_REQUEST)?;
     let (project_id, _) = projects::resolve_token(&state.db, &token)
-        .await
-        .map_err(internal)?
+        .await?
         .ok_or(StatusCode::NOT_FOUND)?;
     let size = blobs::lookup(&state.db, &project_id, &hash)
-        .await
-        .map_err(internal)?
+        .await?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let etag = HeaderValue::from_str(&format!("\"{hash}\"")).map_err(internal)?;
+    let etag = HeaderValue::from_str(&format!("\"{hash}\"")).map_err(AppError::internal)?;
     let cache_headers = [
         (header::ETAG, etag.clone()),
         (header::CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE)),
@@ -119,7 +106,8 @@ pub async fn blob(
                 HeaderValue::from_static(SANDBOX_CSP),
             ),
         ],
-        Body::from_stream(ReaderStream::new(file)),
+        // The default 4 KiB reads would mean thousands of chunks per asset.
+        Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024)),
     )
         .into_response())
 }

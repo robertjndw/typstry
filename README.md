@@ -138,14 +138,21 @@ Every command takes `-C <dir>` to run as if started in another folder, and `--na
 
 The server is configured through environment variables:
 
-| Variable           | Default          | Description                                                  |
-| ------------------ | ---------------- | ------------------------------------------------------------ |
-| `TYPSTRY_ADDR`     | `127.0.0.1:8787` | Address to listen on (the Docker image uses `0.0.0.0:8787`). |
-| `TYPSTRY_DATA_DIR` | `data`           | Directory for the SQLite database and uploaded blobs.        |
-| `TYPSTRY_WEB_DIST` | `apps/web/dist`  | Built frontend to serve. Static serving is off if missing.   |
-| `RUST_LOG`         | `info`           | Log filter, see [`tracing-subscriber`][env-filter].          |
+| Variable                        | Default             | Description                                                                              |
+| ------------------------------- | ------------------- | ---------------------------------------------------------------------------------------- |
+| `TYPSTRY_ADDR`                  | `127.0.0.1:8787`    | Address to listen on (the Docker image uses `0.0.0.0:8787`).                             |
+| `TYPSTRY_DATA_DIR`              | `data`              | Directory for the SQLite database and uploaded blobs.                                    |
+| `TYPSTRY_WEB_DIST`              | `apps/web/dist`     | Built frontend to serve. Static serving is off if missing.                               |
+| `TYPSTRY_MAX_UPLOAD_BYTES`      | `26214400` (25 MiB) | Largest asset upload.                                                                    |
+| `TYPSTRY_ROOM_UNLOAD_SECS`      | `60`                | How long a project stays loaded after its last client left.                              |
+| `TYPSTRY_PRESENCE_TIMEOUT_SECS` | `30`                | How long a client's cursor stays visible without a refresh.                              |
+| `TYPSTRY_UPDATE_BURST`          | `200`               | Document records (and presence updates) one connection may send in a burst.              |
+| `TYPSTRY_UPDATES_PER_SEC`       | `50`                | Sustained records per second per connection, after the burst.                            |
+| `TYPSTRY_MAX_ROOMS_PER_CONN`    | `8`                 | Rooms one connection may join; a project takes two.                                      |
+| `TYPSTRY_OUTBOX_BYTES`          | `67108864` (64 MiB) | Live updates queued for a slow client before it is dropped. Does not limit the doc size. |
+| `RUST_LOG`                      | `info`              | Log filter, see [`tracing-subscriber`][env-filter].                                      |
 
-Uploads are limited to 25 MB each. The container exposes `GET /healthz` for health checks.
+The container exposes `GET /healthz` for health checks.
 
 [env-filter]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
 

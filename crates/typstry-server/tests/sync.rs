@@ -24,9 +24,9 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tower::ServiceExt;
+use typstry_server::config::Config;
 use typstry_server::http::{AppState, router};
 use typstry_server::room::RoomConfig;
-use typstry_server::store::blobs::BlobStore;
 use typstry_server::store::docs;
 use typstry_server::ws::ConnLimits;
 use typstry_wire::elo::{
@@ -53,8 +53,13 @@ impl Server {
 
     async fn start_with(data: &Path, config: RoomConfig, limits: ConnLimits) -> Self {
         let pool = common::open_db(data).await;
-        let mut state = AppState::with_room_config(pool, BlobStore::new(data), config);
-        state.limits = limits;
+        let config = Config {
+            data_dir: data.to_owned(),
+            rooms: config,
+            limits,
+            ..Config::default()
+        };
+        let state = AppState::from_config(pool, &config);
         let app = common::app(state.clone(), data);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -814,7 +819,12 @@ async fn state_survives_restart_and_unload() {
 #[tokio::test]
 async fn large_records_are_fragmented_and_packed() {
     let dir = tempfile::tempdir().unwrap();
-    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    // 300 records in quick succession is past the default per-record burst.
+    let limits = ConnLimits {
+        update_burst: 1000,
+        ..ConnLimits::default()
+    };
+    let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
     let (room, edit, _) = server.create_project().await;
 
     let mut a = server.connect().await;
@@ -862,6 +872,43 @@ async fn large_records_are_fragmented_and_packed() {
     }
     assert_eq!(got, small);
     assert_eq!(containers, 2);
+}
+
+#[tokio::test]
+async fn a_backfill_larger_than_the_outbox_budget_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ConnLimits {
+        outbox_bytes: 64 * 1024,
+        ..ConnLimits::default()
+    };
+    let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
+    let (room, edit, _) = server.create_project().await;
+
+    let mut a = server.connect().await;
+    a.join_doc(&room, &edit, &[]).await;
+    let records: Vec<Vec<u8>> = (0..8u64)
+        .map(|i| delta(1, i, i + 1, &[i as u8; 50 * 1024]))
+        .collect();
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(
+            a.send_records(&room, &[record], i as u8).await,
+            UpdateStatusCode::Ok
+        );
+    }
+
+    // 400 KiB of backfill against a 64 KiB budget, queued before the
+    // client reads any of it.
+    let mut c = server.connect().await;
+    c.join_doc(&room, &edit, &[]).await;
+    let live = delta(1, 8, 9, b"live");
+    assert_eq!(
+        a.send_records(&room, &[&live], 100).await,
+        UpdateStatusCode::Ok
+    );
+    let mut expected = records;
+    expected.push(live);
+    assert_eq!(c.recv_records(expected.len()).await, expected);
+    c.assert_quiet().await;
 }
 
 #[tokio::test]
@@ -1043,4 +1090,192 @@ async fn rooms_per_connection_are_capped() {
     );
     // Rejoining a room it already holds is not a new room.
     c.join_presence(&room, &edit).await;
+}
+
+#[tokio::test]
+async fn a_batch_is_stored_whole_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let (room, edit, _) = server.create_project().await;
+
+    let mut a = server.connect().await;
+    let mut b = server.connect().await;
+    a.join_doc(&room, &edit, &[]).await;
+    b.join_doc(&room, &edit, &[]).await;
+
+    // Fails the insert of one particular record, which stands in for the
+    // disk filling up halfway through a batch.
+    sqlx::query(
+        "CREATE TRIGGER fail_poison BEFORE INSERT ON doc_records \
+         WHEN instr(NEW.data, CAST('poison' AS BLOB)) > 0 \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(&server.state.db)
+    .await
+    .unwrap();
+    let good = delta(1, 0, 1, b"good");
+    let poison = delta(2, 0, 1, b"poison");
+    assert_eq!(
+        a.send_update(
+            CrdtType::Elo,
+            &room,
+            vec![container(&[&good]), container(&[&poison])],
+            1
+        )
+        .await,
+        UpdateStatusCode::Unknown
+    );
+    assert_eq!(server.records(&room).await, 0);
+    b.assert_quiet().await;
+
+    // The failed batch left nothing behind in the room either: the same
+    // record is still new to it.
+    sqlx::query("DROP TRIGGER fail_poison")
+        .execute(&server.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        a.send_records(&room, &[&good], 2).await,
+        UpdateStatusCode::Ok
+    );
+    assert_eq!(b.recv_records(1).await, [good]);
+    let joined = server.connect().await.join_doc(&room, &edit, &[]).await;
+    assert_eq!(joined.coverage, coverage(&[(1, 1)]));
+}
+
+#[tokio::test]
+async fn many_records_in_one_message_are_relayed_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ConnLimits {
+        update_burst: 5000,
+        ..ConnLimits::default()
+    };
+    let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
+    let (room, edit, _) = server.create_project().await;
+
+    let mut a = server.connect().await;
+    let mut b = server.connect().await;
+    a.join_doc(&room, &edit, &[]).await;
+    b.join_doc(&room, &edit, &[]).await;
+
+    // More rows than one multi-row insert takes, to cover the chunking.
+    let records: Vec<Vec<u8>> = (0..1000u64).map(|i| delta(i + 1, 0, 1, b"x")).collect();
+    let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+    let update = container(&refs);
+    assert_eq!(
+        a.send_update(CrdtType::Elo, &room, vec![update.clone()], 1)
+            .await,
+        UpdateStatusCode::Ok
+    );
+    assert_eq!(b.recv_update(CrdtType::Elo).await, update);
+    assert_eq!(server.records(&room).await, 1000);
+
+    // A snapshot that prunes everything stored so far, then a new span.
+    let snap_vv: Vec<(u64, u64)> = (1..=1000).map(|peer| (peer, 1)).collect();
+    let snap = snapshot(&snap_vv, b"snap");
+    let after = delta(1, 1, 2, b"after");
+    assert_eq!(
+        a.send_records(&room, &[&snap, &after], 2).await,
+        UpdateStatusCode::Ok
+    );
+    assert_eq!(b.recv_records(1).await, slice::from_ref(&after));
+    assert_eq!(server.records(&room).await, 2);
+
+    // Deltas and a snapshot pruning them in the same batch.
+    let d1 = delta(1, 2, 3, b"d1");
+    let d2 = delta(1, 3, 4, b"d2");
+    let mut vv = snap_vv.clone();
+    vv[0] = (1, 4);
+    let snap2 = snapshot(&vv, b"snap2");
+    assert_eq!(
+        a.send_records(&room, &[&d1, &d2, &snap2], 3).await,
+        UpdateStatusCode::Ok
+    );
+    assert_eq!(b.recv_records(2).await, [d1, d2]);
+    assert_eq!(server.records(&room).await, 1);
+    let mut c = server.connect().await;
+    let joined = c.join_doc(&room, &edit, &[]).await;
+    assert_eq!(joined.deltas, 0);
+    assert_eq!(c.recv_records(1).await, [snap2]);
+}
+
+#[tokio::test]
+async fn doc_updates_are_charged_per_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ConnLimits {
+        update_burst: 5,
+        updates_per_sec: 0.001,
+        ..ConnLimits::default()
+    };
+    let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
+    let (room, edit, _) = server.create_project().await;
+
+    let mut a = server.connect().await;
+    a.join_doc(&room, &edit, &[]).await;
+    for (batch, peer) in [(1, 1), (2, 2)] {
+        let records: Vec<Vec<u8>> = (0..3).map(|i| delta(peer, i, i + 1, b"x")).collect();
+        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        // The second batch costs more than is left and goes into debt.
+        assert_eq!(
+            a.send_records(&room, &refs, batch).await,
+            UpdateStatusCode::Ok
+        );
+    }
+    assert_eq!(
+        a.send_records(&room, &[&delta(3, 0, 1, b"x")], 3).await,
+        UpdateStatusCode::RateLimited
+    );
+    assert_eq!(server.records(&room).await, 6);
+}
+
+#[tokio::test]
+async fn oversized_presence_is_refused_before_reassembly() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let (room, edit, _) = server.create_project().await;
+
+    let mut a = server.connect().await;
+    a.join_presence(&room, &edit).await;
+    let batch_id = BatchId([3; 8]);
+    a.send(&ProtocolMessage::DocUpdateFragmentHeader {
+        crdt: CrdtType::LoroEphemeralStore,
+        room_id: room.clone(),
+        batch_id,
+        fragment_count: 2,
+        total_size_bytes: 1024 * 1024,
+    })
+    .await;
+    assert_eq!(a.ack(batch_id).await, UpdateStatusCode::PayloadTooLarge);
+}
+
+#[tokio::test]
+async fn shutdown_closes_sockets_and_stops_rooms() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let (room, edit, _) = server.create_project().await;
+
+    let mut a = server.connect().await;
+    a.join_doc(&room, &edit, &[]).await;
+    assert_eq!(server.state.rooms.loaded_rooms(), 1);
+
+    tokio::time::timeout(TIMEOUT, server.state.stop(TIMEOUT))
+        .await
+        .expect("shutdown hung");
+    assert_eq!(server.state.rooms.loaded_rooms(), 0);
+    let close = loop {
+        match tokio::time::timeout(TIMEOUT, a.ws.next()).await.unwrap() {
+            Some(Ok(Message::Close(frame))) => break frame.expect("close frame"),
+            Some(Ok(_)) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    };
+    assert_eq!(u16::from(close.code), 1001);
+    assert_eq!(close.reason.as_str(), "server shutdown");
+
+    // A stopped registry loads no new rooms, and a socket that still gets
+    // through is closed straight away.
+    assert!(server.state.rooms.get(&room).is_none());
+    let mut late = server.connect().await;
+    let next = tokio::time::timeout(TIMEOUT, late.ws.next()).await.unwrap();
+    assert!(matches!(next, Some(Ok(Message::Close(_)))), "{next:?}");
 }

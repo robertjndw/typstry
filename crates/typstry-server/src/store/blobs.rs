@@ -4,6 +4,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -16,6 +17,8 @@ use crate::token;
 
 pub const DEFAULT_MAX_SIZE: u64 = 25 * 1024 * 1024;
 const HASH_PREFIX: &str = "sha256:";
+/// Scratch files older than this belong to no running upload.
+const STALE_UPLOAD_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct BlobStore {
@@ -47,10 +50,41 @@ pub enum WriteError {
 }
 
 impl BlobStore {
+    /// Also clears out uploads a crash or kill left half-written.
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-        Self {
+        let store = Self {
             data_dir: data_dir.into(),
             max_size: DEFAULT_MAX_SIZE,
+        };
+        store.clear_stale_uploads(STALE_UPLOAD_AGE);
+        store
+    }
+
+    /// Only files untouched for `age` go: during a rolling restart another
+    /// server may share this data dir and be in the middle of an upload,
+    /// and a live upload writes to its file far more often than that.
+    fn clear_stale_uploads(&self, age: Duration) {
+        let tmp_dir = self.tmp_dir();
+        let entries = match std::fs::read_dir(&tmp_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+            Err(err) => {
+                tracing::warn!(%err, path = %tmp_dir.display(), "could not list stale uploads");
+                return;
+            }
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified)
+                        .is_ok_and(|elapsed| elapsed >= age)
+                });
+            if stale && let Err(err) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(%err, path = %entry.path().display(), "could not clear stale upload");
+            }
         }
     }
 
@@ -88,12 +122,10 @@ impl BlobStore {
     {
         let tmp_dir = self.tmp_dir();
         fs::create_dir_all(&tmp_dir).await?;
-        let tmp = tmp_dir.join(format!("upload-{}", token::generate()));
-        let result = self.write_tmp(&tmp, body).await;
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp).await;
-        }
-        result
+        let tmp = TmpFile::new(tmp_dir.join(format!("upload-{}", token::generate())));
+        let stored = self.write_tmp(&tmp.path, body).await?;
+        tmp.keep();
+        Ok(stored)
     }
 
     async fn write_tmp<S, E>(&self, tmp: &Path, mut body: S) -> Result<StoredBlob, WriteError>
@@ -129,6 +161,34 @@ impl BlobStore {
             fs::rename(tmp, &target).await?;
         }
         Ok(StoredBlob { hex, size })
+    }
+}
+
+/// Deletes an upload's scratch file unless it made it into the store. Drop
+/// also runs when the request is cancelled mid-upload, which no error path
+/// would see.
+struct TmpFile {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TmpFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    /// The file was renamed into the store or already removed.
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if !self.keep {
+            // Blocking, but a single unlink; Drop cannot await.
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -195,6 +255,60 @@ mod tests {
         assert_eq!(parse_hash(&format!("sha256:{}", "A".repeat(64))), None);
         assert_eq!(parse_hash(&format!("sha256:{}", "a".repeat(63))), None);
         assert_eq!(parse_hash("sha256:../../../../etc/passwd"), None);
+    }
+
+    #[tokio::test]
+    async fn failed_and_cancelled_uploads_leave_no_scratch_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path()).with_max_size(4);
+        let body =
+            futures_util::stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"too long"))]);
+        assert!(matches!(
+            store.write(body).await,
+            Err(WriteError::TooLarge(4))
+        ));
+
+        // A body that never ends, dropped mid-upload like a cancelled request.
+        let pending = futures_util::stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"ab"))])
+            .chain(futures_util::stream::pending());
+        let upload = store.write(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), upload)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(store.tmp_dir()).unwrap().count(), 0);
+
+        let stored = store
+            .write(futures_util::stream::iter([Ok::<_, io::Error>(
+                Bytes::from_static(b"ok"),
+            )]))
+            .await
+            .unwrap();
+        assert!(store.path(&stored.hex).is_file());
+        assert_eq!(std::fs::read_dir(store.tmp_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn new_clears_only_stale_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let stale = tmp.join("upload-stale");
+        std::fs::write(&stale, b"half").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_UPLOAD_AGE - Duration::from_secs(60))
+            .unwrap();
+        // Another server on the same data dir could be writing this one.
+        let live = tmp.join("upload-live");
+        std::fs::write(&live, b"half").unwrap();
+
+        BlobStore::new(dir.path());
+        assert!(!stale.exists());
+        assert!(live.exists());
     }
 
     #[test]

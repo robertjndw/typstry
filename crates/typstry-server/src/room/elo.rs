@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use axum::body::Bytes;
 use loro::VersionVector;
 use typstry_wire::elo::{PeerId, Record, Version, parse_record};
 
@@ -34,20 +35,40 @@ fn get(version: &Version, peer: PeerId) -> u64 {
     version.get(&peer).copied().unwrap_or(0)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StoredSnapshot {
     seq: i64,
     vv: Version,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StoredDelta {
     seq: i64,
     peer: PeerId,
     start: u64,
     end: u64,
-    bytes: Vec<u8>,
+    bytes: Bytes,
+}
+
+/// A stored record whose header no longer parses, so the room cannot load.
+#[derive(Debug, thiserror::Error)]
+#[error("stored record {seq} is malformed: {reason}")]
+pub struct LoadError {
+    pub seq: i64,
+    pub reason: String,
+}
+
+/// What [`DocIndex::rollback`] restores. Deltas are only ever appended
+/// between snapshots, so until a snapshot lands, cutting the list back and
+/// restoring the coverage maps is enough. A snapshot drops deltas, so the
+/// first one staged saves the records it may need to put back.
+#[derive(Debug)]
+struct Journal {
+    deltas: usize,
+    coverage: Version,
+    gapped: HashSet<PeerId>,
+    before_snapshot: Option<(Option<StoredSnapshot>, Vec<StoredDelta>)>,
 }
 
 /// What the room holds for one project, mirroring the `doc_records` rows.
@@ -64,14 +85,17 @@ pub struct DocIndex {
     /// these need a rescan when coverage grows, which keeps the common
     /// in-order case O(1).
     gapped: HashSet<PeerId>,
+    journal: Option<Journal>,
 }
 
 impl DocIndex {
     /// Rebuilds the index from stored records in sequence order.
-    pub fn load(records: Vec<(i64, Vec<u8>)>) -> Result<Self, String> {
+    pub fn load(records: Vec<(i64, Vec<u8>)>) -> Result<Self, LoadError> {
         let mut index = Self::default();
         for (seq, bytes) in records {
-            match parse_record(&bytes).map_err(|err| format!("record {seq}: {err}"))? {
+            let bytes = Bytes::from(bytes);
+            let record = parse_record(&bytes).map_err(|reason| LoadError { seq, reason })?;
+            match record {
                 Record::Delta { peer, start, end } => index.deltas.push(StoredDelta {
                     seq,
                     peer,
@@ -114,7 +138,42 @@ impl DocIndex {
         end <= get(&self.coverage, peer)
     }
 
-    pub fn add_delta(&mut self, seq: i64, peer: PeerId, start: u64, end: u64, bytes: Vec<u8>) {
+    /// Starts staging changes the store has not committed yet. Until
+    /// [`Self::commit`] or [`Self::rollback`], the index answers as if they
+    /// were stored, so later records of the same batch are judged against
+    /// earlier ones.
+    pub fn begin(&mut self) {
+        debug_assert!(self.journal.is_none(), "staging already in progress");
+        self.journal = Some(Journal {
+            deltas: self.deltas.len(),
+            coverage: self.coverage.clone(),
+            gapped: self.gapped.clone(),
+            before_snapshot: None,
+        });
+    }
+
+    /// Keeps everything staged since [`Self::begin`].
+    pub fn commit(&mut self) {
+        self.journal = None;
+    }
+
+    /// Undoes everything staged since [`Self::begin`].
+    pub fn rollback(&mut self) {
+        let Some(journal) = self.journal.take() else {
+            return;
+        };
+        match journal.before_snapshot {
+            Some((snapshot, deltas)) => {
+                self.snapshot = snapshot;
+                self.deltas = deltas;
+            }
+            None => self.deltas.truncate(journal.deltas),
+        }
+        self.coverage = journal.coverage;
+        self.gapped = journal.gapped;
+    }
+
+    pub fn add_delta(&mut self, seq: i64, peer: PeerId, start: u64, end: u64, bytes: Bytes) {
         self.deltas.push(StoredDelta {
             seq,
             peer,
@@ -166,7 +225,15 @@ impl DocIndex {
 
     /// Applies a snapshot that [`Self::snapshot_replaces`] accepted, after
     /// the store dropped the records it named.
-    pub fn install_snapshot(&mut self, seq: i64, vv: Version, bytes: Vec<u8>) {
+    pub fn install_snapshot(&mut self, seq: i64, vv: Version, bytes: Bytes) {
+        if let Some(journal) = &mut self.journal
+            && journal.before_snapshot.is_none()
+        {
+            journal.before_snapshot = Some((
+                self.snapshot.clone(),
+                self.deltas[..journal.deltas].to_vec(),
+            ));
+        }
         self.deltas.retain(|delta| delta.end > get(&vv, delta.peer));
         self.snapshot = Some(StoredSnapshot { seq, vv, bytes });
         self.recompute_all();
@@ -182,13 +249,13 @@ impl DocIndex {
                 .iter()
                 .all(|(&peer, &count)| get(client, peer) >= count)
         {
-            out.push(snapshot.bytes.as_slice());
+            out.push(&snapshot.bytes[..]);
         }
         out.extend(
             self.deltas
                 .iter()
                 .filter(|delta| delta.end > get(client, delta.peer))
-                .map(|delta| delta.bytes.as_slice()),
+                .map(|delta| &delta.bytes[..]),
         );
         out
     }
@@ -267,11 +334,11 @@ mod tests {
     #[test]
     fn coverage_waits_for_gaps_to_fill() {
         let mut index = DocIndex::default();
-        index.add_delta(1, 1, 0, 5, vec![]);
-        index.add_delta(2, 1, 10, 15, vec![]);
+        index.add_delta(1, 1, 0, 5, Bytes::new());
+        index.add_delta(2, 1, 10, 15, Bytes::new());
         assert_eq!(index.coverage(), &version(&[(1, 5)]));
         assert!(!index.covers(1, 15));
-        index.add_delta(3, 1, 5, 10, vec![]);
+        index.add_delta(3, 1, 5, 10, Bytes::new());
         assert_eq!(index.coverage(), &version(&[(1, 15)]));
         assert!(index.gapped.is_empty());
     }
@@ -279,8 +346,8 @@ mod tests {
     #[test]
     fn snapshot_must_dominate_and_prune() {
         let mut index = DocIndex::default();
-        index.add_delta(1, 1, 0, 5, vec![]);
-        index.add_delta(2, 2, 0, 5, vec![]);
+        index.add_delta(1, 1, 0, 5, Bytes::new());
+        index.add_delta(2, 2, 0, 5, Bytes::new());
         assert_eq!(index.snapshot_replaces(&version(&[(1, 5)])), None);
         assert_eq!(
             index.snapshot_replaces(&version(&[(1, 5), (2, 4)])),
@@ -289,13 +356,13 @@ mod tests {
         );
         let full = version(&[(1, 5), (2, 5)]);
         assert_eq!(index.snapshot_replaces(&full), Some(vec![1, 2]));
-        index.install_snapshot(3, full.clone(), b"snap".to_vec());
+        index.install_snapshot(3, full.clone(), Bytes::from_static(b"snap"));
         assert_eq!(index.delta_count(), 0);
         assert_eq!(index.coverage(), &full);
 
         // Nothing left to prune, so the same version again is pointless.
         assert_eq!(index.snapshot_replaces(&full), None);
-        index.add_delta(4, 1, 5, 6, b"d".to_vec());
+        index.add_delta(4, 1, 5, 6, Bytes::from_static(b"d"));
         assert_eq!(
             index.snapshot_replaces(&version(&[(1, 6), (2, 5)])),
             Some(vec![4, 3])
@@ -303,6 +370,43 @@ mod tests {
 
         assert_eq!(index.backfill(&full), vec![&b"d"[..]]);
         assert_eq!(index.backfill(&Version::new()), vec![&b"snap"[..], b"d"]);
+    }
+
+    #[test]
+    fn rollback_undoes_staged_deltas_and_snapshots() {
+        let mut index = DocIndex::default();
+        index.add_delta(1, 1, 0, 5, Bytes::from_static(b"a"));
+        index.add_delta(2, 2, 3, 4, Bytes::from_static(b"gap"));
+
+        index.begin();
+        index.add_delta(3, 2, 0, 3, Bytes::from_static(b"fill"));
+        assert_eq!(index.coverage(), &version(&[(1, 5), (2, 4)]));
+        index.rollback();
+        assert_eq!(index.coverage(), &version(&[(1, 5)]));
+        assert!(index.gapped.contains(&2));
+        assert_eq!(index.delta_count(), 2);
+
+        index.begin();
+        index.add_delta(3, 2, 0, 3, Bytes::from_static(b"fill"));
+        let vv = version(&[(1, 5), (2, 4)]);
+        assert_eq!(index.snapshot_replaces(&vv), Some(vec![1, 2, 3]));
+        index.install_snapshot(4, vv, Bytes::from_static(b"snap"));
+        index.add_delta(5, 1, 5, 6, Bytes::from_static(b"b"));
+        index.rollback();
+        assert_eq!(index.backfill(&Version::new()), vec![&b"a"[..], b"gap"]);
+        assert_eq!(index.coverage(), &version(&[(1, 5)]));
+
+        index.begin();
+        index.add_delta(3, 1, 5, 6, Bytes::from_static(b"b"));
+        index.commit();
+        index.rollback();
+        assert_eq!(index.delta_count(), 3);
+    }
+
+    #[test]
+    fn load_names_the_bad_record() {
+        let err = DocIndex::load(vec![(7, b"junk".to_vec())]).unwrap_err();
+        assert_eq!(err.seq, 7);
     }
 
     #[test]
