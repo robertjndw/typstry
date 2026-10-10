@@ -78,15 +78,35 @@ async function settle() {
   await vi.advanceTimersByTimeAsync(50);
 }
 
-function setup() {
+/** `createRenderer` gets the fake renderer, to resolve with or not. */
+function setup(
+  createRenderer: (
+    renderer: PreviewRenderer,
+  ) => Promise<PreviewRenderer> = async (renderer) => renderer,
+) {
   const project = initProject(newProject(1), { title: "T" });
   const worker = new FakeWorker();
   const r = fakeRenderer();
   const client = new CompilerClient(project, {
     worker,
-    createRenderer: async () => r.renderer,
+    createRenderer: () => createRenderer(r.renderer),
   });
   return { project, worker, client, ...r };
+}
+
+function emitResult(
+  worker: FakeWorker,
+  id: number,
+  action: "reset" | "merge" = "reset",
+) {
+  worker.emit({
+    type: "result",
+    id,
+    mainPath: "/main.typ",
+    diagnostics: [],
+    update: { action, data: new Uint8Array([id]) },
+    compileMs: 1,
+  });
 }
 
 function mainId(project: ProjectDoc): TreeID {
@@ -426,17 +446,8 @@ describe("CompilerClient results", () => {
     worker.emit({ type: "compiling", id: 1 });
     worker.emit({ type: "compiling", id: 2 });
     setSvg(svgDoc("new"));
-    const result = (id: number, action: "reset" | "merge") =>
-      worker.emit({
-        type: "result",
-        id,
-        mainPath: "/main.typ",
-        diagnostics: [],
-        update: { action, data: new Uint8Array([id]) },
-        compileMs: 1,
-      });
-    result(1, "reset");
-    result(2, "merge");
+    emitResult(worker, 1, "reset");
+    emitResult(worker, 2, "merge");
     await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
     expect(applied.map((u) => u.action)).toEqual(["reset", "merge"]);
     expect(client.getState().document?.pages.map((p) => p.tid)).toEqual([
@@ -462,6 +473,51 @@ describe("CompilerClient results", () => {
     await vi.waitFor(() => expect(client.getState().status).toBe("error"));
     expect(client.getState().error).toMatch(/bad delta/);
     expect(worker.sent).toContainEqual({ type: "resync" });
+  });
+
+  it("retries a failed renderer load and resyncs once back online", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let online = false;
+    const createRenderer = vi.fn(async (renderer: PreviewRenderer) => {
+      if (!online) throw new TypeError("Failed to fetch");
+      return renderer;
+    });
+    const { worker, client, setSvg } = setup(createRenderer);
+    setSvg(svgDoc("p1"));
+    worker.take();
+
+    worker.emit({ type: "compiling", id: 1 });
+    emitResult(worker, 1);
+    await vi.waitFor(() => expect(client.getState().status).toBe("error"));
+    expect(client.getState().error).toMatch(/Could not load the preview/);
+    // Resyncing now would only recompile into the same failure.
+    expect(worker.take()).not.toContainEqual({ type: "resync" });
+
+    online = true;
+    window.dispatchEvent(new Event("online"));
+    expect(worker.take()).toContainEqual({ type: "resync" });
+
+    worker.emit({ type: "compiling", id: 2 });
+    emitResult(worker, 2);
+    await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
+    expect(client.getState().document?.pages.map((p) => p.tid)).toEqual(["p1"]);
+    // The eager load at startup, the failed one for result 1, the retry.
+    expect(createRenderer).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops waiting for the connection once disposed", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { worker, client } = setup(() =>
+      Promise.reject(new TypeError("Failed to fetch")),
+    );
+    worker.emit({ type: "compiling", id: 1 });
+    emitResult(worker, 1);
+    await vi.waitFor(() => expect(client.getState().status).toBe("error"));
+
+    client.dispose();
+    worker.take();
+    window.dispatchEvent(new Event("online"));
+    expect(worker.take()).toEqual([]);
   });
 });
 
