@@ -4,62 +4,23 @@
 
 mod common;
 
+use common::{Server, cached_doc, git, has_git, typstry};
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use clap::Parser;
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
-use typstry_cli::commands::{self, Cli};
 use typstry_cli::engine::{Identity, set_peer_info};
 use typstry_cli::link::ShareLink;
-use typstry_cli::state::STATE_DIR;
+use typstry_cli::state::{STATE_DIR, StateDir};
 use typstry_doc::init::starter_content;
 use typstry_doc::paths::build_path_index;
 use typstry_doc::versions::save_version;
-use typstry_server::http::{AppState, router};
-use typstry_server::store::blobs::BlobStore;
-use typstry_server::store::db;
 
 /// Nothing listens here, so a command that tries the network fails.
 const DEAD_SERVER: &str = "http://127.0.0.1:9";
-
-struct Server {
-    origin: String,
-    task: JoinHandle<()>,
-    _data: TempDir,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl Server {
-    async fn start() -> Self {
-        let data = tempfile::tempdir().unwrap();
-        let pool = db::open(&data.path().join("test.db")).await.unwrap();
-        let state = AppState::new(pool, BlobStore::new(data.path()));
-        let app = router(state, &data.path().join("no-dist"));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        Self {
-            origin: format!("http://{addr}"),
-            task,
-            _data: data,
-        }
-    }
-
-    async fn seeded_project(&self, title: &str) -> (String, String) {
-        common::seeded_project(&self.origin, title).await
-    }
-}
 
 /// A temp folder by its canonical path, so paths compare cleanly on macOS
 /// where the temp dir sits behind a symlink.
@@ -69,36 +30,10 @@ fn temp() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
-async fn typstry(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
-    assert!(dir.is_absolute());
-    let mut argv = vec!["typstry", "-C", dir.to_str().unwrap(), "--name", "Tester"];
-    argv.extend(args);
-    commands::run(Cli::try_parse_from(argv)?).await
-}
-
 /// Runs the real binary in `dir`, off the runtime thread so the
 /// in-process server keeps serving it. Stdin is never a terminal.
 async fn binary(dir: &Path, args: &[&str]) -> Output {
-    assert!(dir.is_absolute());
-    let dir = dir.to_path_buf();
-    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_typstry"))
-            .arg("-C")
-            .arg(&dir)
-            .args(["--name", "Tester"])
-            .args(&args)
-            .current_dir(&dir)
-            .stdin(Stdio::null())
-            .env_remove("TYPSTRY_SERVER")
-            // Fails loudly instead of opening anything, should a test ever
-            // reach the real opener.
-            .env("TYPSTRY_BROWSER", "/nonexistent/typstry-test-browser")
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap()
+    binary_with(dir, args, "", &[]).await
 }
 
 fn stdout(out: &Output) -> String {
@@ -112,39 +47,6 @@ fn stdout(out: &Output) -> String {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8(out.stderr.clone()).unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap()
-}
-
-fn has_git() -> bool {
-    let ok = typstry_cli::git::available();
-    if !ok {
-        eprintln!("git is not installed, skipping");
-    }
-    ok
-}
-
-fn cached_doc(dir: &Path) -> loro::LoroDoc {
-    let doc = loro::LoroDoc::new();
-    doc.import(&fs::read(dir.join(STATE_DIR).join("doc.bin")).unwrap())
-        .unwrap();
-    doc
 }
 
 fn config(dir: &Path) -> serde_json::Value {
@@ -180,13 +82,7 @@ fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 
 /// The edit link `init` printed, read back from the folder's config.
 fn edit_link(dir: &Path) -> String {
-    let config = config(dir);
-    ShareLink::new(
-        config["server"].as_str().unwrap(),
-        config["token"].as_str().unwrap(),
-        config["key"].as_str().unwrap(),
-    )
-    .to_string()
+    StateDir::peek_config(dir).unwrap().link().to_string()
 }
 
 fn png() -> Vec<u8> {
@@ -522,6 +418,40 @@ async fn info_works_offline() {
     assert!(!binary(&a, &["info"]).await.status.success());
 }
 
+#[tokio::test]
+async fn status_says_when_git_is_busy() {
+    if !has_git() {
+        return;
+    }
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Busy").await;
+    let (_work, work) = temp();
+    typstry(&work, &["clone", &edit, "repo", "--git"])
+        .await
+        .unwrap();
+    let repo = work.join("repo");
+
+    // git only looks at whether MERGE_HEAD exists, and so does typstry.
+    let merge_head = repo.join(".git/MERGE_HEAD");
+    fs::write(&merge_head, git(&repo, &["rev-parse", "HEAD"])).unwrap();
+    let status = stdout(&binary(&repo, &["status", "--offline"]).await);
+    assert!(
+        status.contains("git is in the middle of a merge"),
+        "{status}"
+    );
+    let push = binary(&repo, &["push"]).await;
+    assert!(!push.status.success());
+    assert!(
+        stderr(&push).contains("middle of a merge"),
+        "{}",
+        stderr(&push)
+    );
+
+    fs::remove_file(&merge_head).unwrap();
+    let status = stdout(&binary(&repo, &["status", "--offline"]).await);
+    assert!(!status.contains("middle of"), "{status}");
+}
+
 /// Runs the real binary with `input` on stdin and extra environment.
 async fn binary_with(dir: &Path, args: &[&str], input: &str, env: &[(&str, &str)]) -> Output {
     use std::io::Write;
@@ -544,6 +474,10 @@ async fn binary_with(dir: &Path, args: &[&str], input: &str, env: &[(&str, &str)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_remove("TYPSTRY_LINK")
+            .env_remove("TYPSTRY_SERVER")
+            // Fails loudly instead of opening anything, should a test ever
+            // reach the real opener.
+            .env("TYPSTRY_BROWSER", "/nonexistent/typstry-test-browser")
             .envs(env)
             .spawn()
             .unwrap();

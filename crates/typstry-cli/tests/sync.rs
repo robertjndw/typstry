@@ -4,6 +4,8 @@
 
 mod common;
 
+use common::{cached_doc, typstry};
+
 use std::fs;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -11,12 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-use clap::Parser;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use typstry_cli::commands::Ctx;
 use typstry_cli::commands::sync::{self, Control, Notice};
-use typstry_cli::commands::{self, Cli, Ctx};
 use typstry_cli::state::STATE_DIR;
 use typstry_server::http::{AppState, router};
 use typstry_server::store::blobs::BlobStore;
@@ -104,12 +105,6 @@ async fn bind(addr: Option<SocketAddr>) -> tokio::net::TcpListener {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("cannot bind {addr}");
-}
-
-async fn typstry(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let mut argv = vec!["typstry", "-C", dir.to_str().unwrap(), "--name", "Tester"];
-    argv.extend(args);
-    commands::run(Cli::try_parse_from(argv)?).await
 }
 
 async fn clone(link: &str, parent: &Path, name: &str) -> PathBuf {
@@ -204,10 +199,11 @@ fn checkout(dir: &Path, branch: &str) {
 
 /// Total ops in the doc a folder cached on its last command.
 fn op_count(dir: &Path) -> i64 {
-    let doc = loro::LoroDoc::new();
-    doc.import(&fs::read(dir.join(STATE_DIR).join("doc.bin")).unwrap())
-        .unwrap();
-    doc.oplog_vv().iter().map(|(_, &n)| i64::from(n)).sum()
+    cached_doc(dir)
+        .oplog_vv()
+        .iter()
+        .map(|(_, &n)| i64::from(n))
+        .sum()
 }
 
 struct Live {
