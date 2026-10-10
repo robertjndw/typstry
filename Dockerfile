@@ -51,25 +51,24 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p typstry-server
+# Copied into the runtime image, which has no shell to mkdir with.
+RUN mkdir /src/data
 
-FROM debian:trixie-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home /data typstry \
-    && mkdir /data && chown typstry /data
+# The server only needs glibc and libgcc_s, which the cc variant has. It
+# makes no outbound TLS connections, so no CA certificates either.
+FROM gcr.io/distroless/cc-debian13
+# Not distroless's nonroot user (65532): volumes from the old Debian-based
+# image are owned by 10001.
+COPY --from=server --chown=10001:10001 /src/data /data
 COPY --from=server /src/target/release/typstry-server /usr/local/bin/typstry-server
 COPY --from=web /src/apps/web/dist /app/web
 ENV TYPSTRY_ADDR=0.0.0.0:8787 \
     TYPSTRY_DATA_DIR=/data \
     TYPSTRY_WEB_DIST=/app/web \
     RUST_LOG=info
-USER typstry
+USER 10001:10001
 VOLUME /data
 EXPOSE 8787
-# The server shuts down gracefully (and compacts) on ctrl-c only, and as PID 1
-# it would otherwise ignore Docker's default SIGTERM until the kill timeout.
-STOPSIGNAL SIGINT
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD curl -fsS http://127.0.0.1:8787/healthz || exit 1
+    CMD ["typstry-server", "healthcheck"]
 CMD ["typstry-server"]
