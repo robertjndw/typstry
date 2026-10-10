@@ -162,6 +162,30 @@ describe("Presence", () => {
     expect(pa.getPeers()[0]?.anchor).toBeUndefined();
   });
 
+  it("keeps the summary stable while only selections move", () => {
+    const { b, pa, pb } = setup();
+    pa.start();
+    pb.start();
+    pb.setFile("0@1" as TreeID);
+    tick();
+    const text = b.getText("t");
+    const summary = pa.getSummary();
+    expect(summary).toEqual([
+      { peerId: "2", name: "Bob", color: PALETTE[1], fileId: "0@1" },
+    ]);
+
+    const peers = pa.getPeers();
+    pb.setSelection("0@1" as TreeID, text, 1, 1);
+    tick();
+    expect(pa.getPeers()).not.toBe(peers);
+    expect(pa.getSummary()).toBe(summary);
+
+    pb.setFile("1@1" as TreeID);
+    tick();
+    expect(pa.getSummary()).not.toBe(summary);
+    expect(pa.getSummary()[0]?.fileId).toBe("1@1");
+  });
+
   it("removes its key on dispose and republishes on restart", () => {
     const { ea, pa, pb } = setup();
     pa.start();

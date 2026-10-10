@@ -118,6 +118,52 @@ describe("remoteCursors", () => {
     view.destroy();
   });
 
+  it("follows local typing without redrawing", async () => {
+    const { b, source, view } = setup();
+    source.set([bob(b, 6, 6)]);
+    await flush();
+
+    view.dispatch({ changes: { from: 0, insert: ">> " } });
+    const dispatch = vi.spyOn(view, "dispatch");
+    await flush();
+
+    // Mapping through the change is enough; a recompute would dispatch.
+    expect(dispatch).not.toHaveBeenCalled();
+    const pos = remoteCaretPositions(view)[0]!.pos;
+    expect(view.state.doc.sliceString(pos, pos + 5)).toBe("world");
+    view.destroy();
+  });
+
+  it("maps carets and selections through local typing like Loro does", async () => {
+    const { b, source, view } = setup();
+    // "hello" selected, caret after it.
+    source.set([bob(b, 0, 5)]);
+    await flush();
+
+    view.dispatch({ changes: { from: 5, insert: "!" } });
+    const dispatch = vi.spyOn(view, "dispatch");
+    await flush();
+    expect(dispatch).not.toHaveBeenCalled();
+    const mapped = {
+      caret: remoteCaretPositions(view),
+      selection: view.dom.querySelector(".cm-remote-selection")?.textContent,
+    };
+
+    // A recompute resolves the Loro cursors and must not move anything.
+    source.set([...source.peers]);
+    await flush();
+    expect(dispatch).toHaveBeenCalled();
+    expect(remoteCaretPositions(view)).toEqual(mapped.caret);
+    expect(view.dom.querySelector(".cm-remote-selection")?.textContent).toBe(
+      mapped.selection,
+    );
+    expect(mapped).toEqual({
+      caret: [{ name: "Bob", pos: 6 }],
+      selection: "hello!",
+    });
+    view.destroy();
+  });
+
   it("removes carets of peers that leave", async () => {
     const { b, source, view } = setup();
     source.set([bob(b, 1, 1)]);

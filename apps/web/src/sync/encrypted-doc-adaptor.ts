@@ -36,16 +36,40 @@ export interface EncryptedDocAdaptorOptions {
    */
   canWrite: boolean;
   /**
-   * Upload a compaction snapshot once the server reports holding this many
-   * delta records. The server cannot compact what it cannot read, so
-   * writers do it for it.
+   * Upload a compaction snapshot once the server holds this many delta
+   * records, as reported at join plus what this client sent since. The
+   * server cannot compact what it cannot read, so writers do it for it.
    */
   compactAfterDeltas?: number;
+  /**
+   * Least time between two compactions while connected. The one right
+   * after joining does not wait for it.
+   */
+  compactIntervalMs?: number;
+  /**
+   * How long local commits gather before they go up together. Each send
+   * becomes one stored record, so sending per keystroke would grow the
+   * server log (and everyone's backfill) by one record per character.
+   */
+  pushDelayMs?: number;
   /** Delay before resending spans the server refused for a passing reason. */
   retryMs?: number;
   /** A record could not be decrypted: wrong key, unsigned or tampered. */
   onDecryptError?: (error: Error) => void;
 }
+
+// Each send is one stored record, so at the default push throttle steady
+// typing reaches 200 records in well under a minute. Exporting, encrypting
+// and uploading a full snapshot runs on the main thread and grows with the
+// project, so mid-session compaction waits a few minutes between rounds;
+// the backlog it leaves is a few thousand small records at worst, which a
+// joining client compacts right away.
+const COMPACT_INTERVAL_MS = 5 * 60 * 1000;
+
+// A local commit landing during every encryption could keep the pre-snapshot
+// push going forever; past this many rounds the compaction waits for the
+// next chance instead.
+const SNAPSHOT_PUSH_ROUNDS = 5;
 
 // One container per send keeps each update well under the server's limit
 // for a reassembled update.
@@ -62,6 +86,17 @@ function missingSpans(have: VersionVector, server: Counters): Span[] {
     if (end > start) spans.push({ peer, start, end });
   }
   return spans;
+}
+
+function holdsSnapshot(container: Uint8Array): boolean {
+  try {
+    return decodeEloContainer(container).some(
+      (record) =>
+        parseEloRecordHeader(record).header.kind === EloRecordKind.Snapshot,
+    );
+  } catch {
+    return false;
+  }
 }
 
 function raise(map: Counters, peer: PeerID, end: number) {
@@ -117,7 +152,15 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
   private targetReached = false;
   private serverDeltas = 0;
   private snapshotSent = false;
+  /** When the last compaction was started, for `compactIntervalMs`. */
+  private lastCompactAt = 0;
+  /** Pushes queued or running, which `hasPendingPush` has to cover. */
+  private queuedPushes = 0;
+  /** Set once the server refused a snapshot for a reason that will not pass. */
+  private compactionRefused = false;
   private retry: ReturnType<typeof setTimeout> | null = null;
+  private pushTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopPageListeners?: () => void;
   // Encryption and decryption are async. Running every step through one
   // chain keeps sends in op order and imports in arrival order.
   private readonly enqueue = createSerialQueue("encrypted sync step failed");
@@ -126,11 +169,16 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
 
   constructor(doc: LoroDoc, options: EncryptedDocAdaptorOptions) {
     this.doc = doc;
+    // Spelled out instead of spread over defaults: an option passed as
+    // `undefined` would otherwise replace its default.
     this.options = {
-      compactAfterDeltas: 200,
-      retryMs: 2000,
-      ...options,
+      key: options.key,
       canWrite: options.canWrite && options.key.sign !== null,
+      compactAfterDeltas: options.compactAfterDeltas ?? 200,
+      compactIntervalMs: options.compactIntervalMs ?? COMPACT_INTERVAL_MS,
+      pushDelayMs: options.pushDelayMs ?? 150,
+      retryMs: options.retryMs ?? 2000,
+      onDecryptError: options.onDecryptError,
     };
     this.synced = new Promise((resolve) => {
       this.resolveSynced = resolve;
@@ -141,8 +189,79 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     this.ctx = ctx;
     this.unsubscribe?.();
     this.unsubscribe = this.options.canWrite
-      ? this.doc.subscribeLocalUpdates(() => this.enqueue(() => this.push()))
+      ? this.doc.subscribeLocalUpdates(() => this.schedulePush())
       : undefined;
+    if (this.options.canWrite && !this.stopPageListeners) {
+      this.listenForPageExit();
+    }
+  }
+
+  /**
+   * Sends whatever local commits have not gone up yet. Resolves once they
+   * were handed to the socket, after any push already queued.
+   */
+  flush(): Promise<void> {
+    if (this.pushTimer !== null) clearTimeout(this.pushTimer);
+    this.pushTimer = null;
+    return this.enqueuePush();
+  }
+
+  /**
+   * True while local commits have not been handed to the socket: waiting
+   * for the push timer, or for a push that is queued or still encrypting.
+   */
+  get hasPendingPush(): boolean {
+    if (this.pushTimer !== null || this.queuedPushes > 0) return true;
+    if (this.destroyed || !this.joined || !this.options.canWrite) return false;
+    return missingSpans(this.doc.oplogVersion(), this.server).length > 0;
+  }
+
+  private enqueuePush(): Promise<void> {
+    this.queuedPushes++;
+    return this.enqueue(async () => {
+      try {
+        await this.push();
+      } finally {
+        this.queuedPushes--;
+      }
+    });
+  }
+
+  private schedulePush(): void {
+    if (this.destroyed) return;
+    if (this.options.pushDelayMs <= 0) {
+      void this.enqueuePush();
+      return;
+    }
+    // A throttle, not a debounce: steady typing still goes out every
+    // pushDelayMs instead of waiting for a pause.
+    if (this.pushTimer !== null) return;
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = null;
+      void this.enqueuePush();
+    }, this.options.pushDelayMs);
+  }
+
+  /**
+   * A tab being closed or backgrounded may never run the push timer, and a
+   * hidden tab's timers can be throttled for minutes.
+   */
+  private listenForPageExit(): void {
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return;
+    }
+    const onPageHide = () => {
+      if (this.pushTimer !== null) void this.flush();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") onPageHide();
+    };
+    window.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibility);
+    this.stopPageListeners = () => {
+      window.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }
 
   async handleJoinOk(res: JoinResponseOk): Promise<void> {
@@ -161,7 +280,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     this.snapshotSent = false;
     this.joined = true;
     // Edits made offline (or before a reconnect) go up first.
-    await this.enqueue(() => this.push());
+    await this.enqueuePush();
     this.checkReached();
   }
 
@@ -184,6 +303,10 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       errorCode === UpdateStatusCode.Unknown;
     if (!retryable) {
       console.error("server refused an encrypted update", errorCode);
+      // Every delta a snapshot would replace is already stored, so only the
+      // compaction is lost, and sending the next one would hit the same
+      // limit.
+      if (updates.some(holdsSnapshot)) this.compactionRefused = true;
       return;
     }
     // The ops are still in the doc; forget that the server has them so the
@@ -200,7 +323,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     if (this.retry !== null) return;
     this.retry = setTimeout(() => {
       this.retry = null;
-      void this.enqueue(() => this.push());
+      void this.enqueuePush();
     }, this.options.retryMs);
   }
 
@@ -218,12 +341,19 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     this.destroyed = true;
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.stopPageListeners?.();
+    this.stopPageListeners = undefined;
     if (this.retry !== null) clearTimeout(this.retry);
     this.retry = null;
+    if (this.pushTimer !== null) clearTimeout(this.pushTimer);
+    this.pushTimer = null;
     this.ctx = undefined;
   }
 
-  /** Sends every op the server does not have yet. */
+  /**
+   * Sends every op the server does not have yet, as of when it starts.
+   * Commits landing while it encrypts are left to the next push.
+   */
   private async push(): Promise<void> {
     if (this.destroyed || !this.joined || !this.options.canWrite) return;
     const spans = missingSpans(this.doc.oplogVersion(), this.server);
@@ -234,6 +364,10 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     const flush = () => {
       if (batch.length === 0) return;
       this.ctx?.send([encodeEloContainer(batch)]);
+      // Counted optimistically like `server`; a span the server already
+      // holds is not stored again, so this can only run ahead of it, which
+      // at worst compacts a little early.
+      this.serverDeltas += batch.length;
       batch = [];
       size = 0;
     };
@@ -248,6 +382,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       }
     }
     flush();
+    this.maybeCompact(false);
   }
 
   /**
@@ -322,16 +457,24 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     if (cmp === undefined || cmp < 0) return;
     this.targetReached = true;
     this.resolveSynced();
-    this.maybeCompact();
+    this.maybeCompact(true);
   }
 
-  private maybeCompact(): void {
+  private maybeCompact(afterJoin: boolean): void {
     if (
       !this.options.canWrite ||
+      // Before the backfill is in, a snapshot would miss ops the server
+      // holds, and the server would drop it.
+      !this.targetReached ||
+      this.compactionRefused ||
       this.snapshotSent ||
       this.serverDeltas < this.options.compactAfterDeltas
     )
       return;
+    const now = Date.now();
+    if (!afterJoin && now - this.lastCompactAt < this.options.compactIntervalMs)
+      return;
+    this.lastCompactAt = now;
     this.snapshotSent = true;
     void this.enqueue(() => this.sendSnapshot());
   }
@@ -342,18 +485,36 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
    * is taken right after.
    */
   private async sendSnapshot(): Promise<void> {
-    await this.push();
-    if (this.destroyed || !this.joined) return;
+    try {
+      await this.uploadSnapshot();
+    } finally {
+      // Lets the log compact again once it regrows, also after a failed
+      // attempt.
+      this.snapshotSent = false;
+    }
+  }
+
+  private async uploadSnapshot(): Promise<void> {
+    // The server takes the snapshot's version as covered and drops (and
+    // never relays) deltas inside it afterwards, while the snapshot itself
+    // only goes to later joiners. So every op in it must have gone out as a
+    // delta first, and push() leaves out commits made while it encrypts.
+    // Checking and exporting in one synchronous step pins the snapshot to
+    // exactly what was sent.
+    for (let round = 0; ; round++) {
+      await this.push();
+      if (this.destroyed || !this.joined) return;
+      if (missingSpans(this.doc.oplogVersion(), this.server).length === 0)
+        break;
+      if (round + 1 >= SNAPSHOT_PUSH_ROUNDS) return;
+    }
     const vv = [...this.doc.oplogVersion().toJSON()]
       // The protocol wants entries sorted by peer id bytes; peer ids are
       // ASCII digits, so string order is byte order.
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([peer, counter]) => ({ peerId: encoder.encode(peer), counter }));
-    const record = await encryptSnapshot(
-      this.options.key,
-      vv,
-      this.doc.export({ mode: "snapshot" }),
-    );
+    const snapshot = this.doc.export({ mode: "snapshot" });
+    const record = await encryptSnapshot(this.options.key, vv, snapshot);
     if (this.destroyed) return;
     this.ctx?.send([encodeEloContainer([record])]);
     this.serverDeltas = 0;
