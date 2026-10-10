@@ -522,10 +522,44 @@ async fn a_branch_switch_while_sync_was_stopped_is_held() {
     fs::write(a.join("main.typ"), "= Draft only\n").unwrap();
     reflog(&a, "checkout: moving from draft to main");
 
-    let live = Live::start(&a).await;
+    let mut live = Live::start(&a).await;
     assert!(a.join(STATE_DIR).join("hold").exists());
     settle().await;
     assert_eq!(pulled(&b, "main.typ").await, Some(original));
+
+    // The reflog still shows the switch after publishing, which must not
+    // put the hold straight back.
+    live.control.send(Control::Publish).unwrap();
+    live.wait_for(Notice::Released).await;
+    eventually(15, "publishing sends the held change", || async {
+        pulled(&b, "main.typ").await.as_deref() == Some("= Draft only\n")
+    })
+    .await;
+    assert!(!a.join(STATE_DIR).join("hold").exists());
+    live.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_on_start_sends_a_change_held_after_a_branch_switch() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project().await;
+    let work = tempfile::tempdir().unwrap();
+    let a = clone(&edit, work.path(), "a").await;
+    let b = clone(&edit, work.path(), "b").await;
+    fake_git(&a, "main");
+    reflog(&a, "commit (initial): import");
+    Live::start(&a).await.stop().await;
+
+    reflog(&a, "checkout: moving from main to draft");
+    fs::write(a.join("main.typ"), "= Draft only\n").unwrap();
+    reflog(&a, "checkout: moving from draft to main");
+
+    let live = Live::start_with(&a, sync::Args { publish: true }).await;
+    eventually(15, "--publish sends the held change", || async {
+        pulled(&b, "main.typ").await.as_deref() == Some("= Draft only\n")
+    })
+    .await;
+    assert!(!a.join(STATE_DIR).join("hold").exists());
     live.stop().await;
 }
 
