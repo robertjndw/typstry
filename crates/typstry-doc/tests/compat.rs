@@ -4,56 +4,28 @@
 //! which wrote them.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use loro::{LoroDoc, LoroValue, ToJson};
 use serde_json::{Value, json};
-use typstry_doc::materialize::{FileContent, MaterializedFile, materialize, materialize_at};
+use typstry_doc::materialize::{MaterializedFile, materialize, materialize_at};
 use typstry_doc::paths::build_path_index;
 use typstry_doc::peers::peer_name;
+use typstry_doc::testing::file_json;
 use typstry_doc::versions::named_versions;
 use typstry_doc::{
     FileKind, SCHEMA_VERSION, ensure_supported, main_file, migrate, root, schema_version, title,
     version,
 };
 
-fn compat_dirs() -> Vec<(u32, PathBuf)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/compat");
-    let mut dirs: Vec<_> = fs::read_dir(root)
-        .expect("fixtures/compat is missing")
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            let n = path
-                .file_name()?
-                .to_str()?
-                .strip_prefix('v')?
-                .parse()
-                .ok()?;
-            path.is_dir().then_some((n, path))
-        })
-        .collect();
-    dirs.sort();
-    assert!(!dirs.is_empty(), "no compat/v<N> fixtures found");
-    dirs
-}
+#[path = "../../../fixtures/compat/support.rs"]
+mod support;
 
-fn read_json(path: &Path) -> Value {
-    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-}
-
-fn str_of(value: &Value) -> &str {
-    value.as_str().unwrap()
-}
+use support::{compat_dirs, read_json, str_of};
 
 fn files_json(files: &[MaterializedFile]) -> Value {
     files
         .iter()
-        .map(|f| match &f.content {
-            FileContent::Text(text) => json!({ "path": f.path, "kind": "text", "text": &**text }),
-            FileContent::Asset { hash, size, mime } => json!({
-                "path": f.path, "kind": "asset", "hash": hash, "size": size, "mime": mime,
-            }),
-        })
+        .map(|f| file_json(&f.path, &f.content))
         .collect()
 }
 

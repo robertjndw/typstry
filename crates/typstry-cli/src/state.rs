@@ -51,17 +51,9 @@ type Migration = fn(&mut serde_json::Value);
 const _: () = assert!(CONFIG_MIGRATIONS.len() as u32 == CONFIG_VERSION - 1);
 const _: () = assert!(BASE_MIGRATIONS.len() as u32 == BASE_VERSION - 1);
 
-fn first_version() -> u32 {
-    1
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
-    /// Format of the file, see [`CONFIG_VERSION`]. Always written as the
-    /// current one.
-    #[serde(default = "first_version")]
-    pub version: u32,
     /// The http origin the link points at.
     pub server: String,
     pub project_id: String,
@@ -103,13 +95,9 @@ impl Config {
 }
 
 /// What the working tree looked like after the last successful sync.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Base {
-    /// Format of the file, see [`BASE_VERSION`]. Always written as the
-    /// current one.
-    #[serde(default = "first_version")]
-    pub version: u32,
     /// The doc state the folder matches. On disk, `Frontiers::encode()` as
     /// base64url, and empty for the empty doc.
     #[serde(default, with = "encoded_frontiers")]
@@ -137,19 +125,6 @@ pub struct Base {
     /// base, to notice a branch switch that happened while nothing ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitMark>,
-}
-
-impl Default for Base {
-    fn default() -> Self {
-        Self {
-            version: BASE_VERSION,
-            frontiers: Frontiers::default(),
-            assets: BTreeMap::new(),
-            last_sync: None,
-            pins: BTreeMap::new(),
-            git: None,
-        }
-    }
 }
 
 impl Base {
@@ -404,22 +379,18 @@ impl StateDir {
         write_versioned(&self.dir.join(BASE), base, BASE_VERSION)
     }
 
-    /// The cached doc, or an empty one before the first sync. A log entry
-    /// that a crash cut off is dropped from the file, so the next append
-    /// does not land behind it. A damaged entry with more after it is an
-    /// error instead, see [`log_entries`].
-    pub fn load_doc(&self) -> anyhow::Result<LoroDoc> {
-        self.load_doc_noting().map(|(doc, _)| doc)
-    }
-
-    /// [`Self::load_doc`], plus a warning when it had to drop the log.
+    /// The cached doc, or an empty one before the first sync, plus a
+    /// warning when it had to drop the log. A log entry that a crash cut
+    /// off is dropped from the file, so the next append does not land
+    /// behind it. A damaged entry with more after it is an error instead,
+    /// see [`log_entries`].
     ///
     /// A log from before the preamble is folded into a fresh snapshot right
     /// away, so nothing gets appended to it. One from a newer typstry is
     /// dropped. It is only a cache over `doc.bin`, and what of it reached
     /// the server comes back on the next connect. `base.json` stays, it
     /// describes the folder.
-    pub fn load_doc_noting(&self) -> anyhow::Result<(LoroDoc, Option<String>)> {
+    pub fn load_doc(&self) -> anyhow::Result<(LoroDoc, Option<String>)> {
         let (doc, log) = read_doc_and_log(&self.dir)?;
         let path = self.dir.join(DOC_LOG);
         match log.format {
@@ -615,12 +586,13 @@ fn log_frame(update: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// The intact entries at the start of `log`. Only the last append can be
-/// torn, since each one is synced before the next, so the first damaged
-/// entry is taken for a torn one only when no intact entry follows it.
+/// The intact entries at the start of `log`, and how many bytes they take.
+/// Only the last append can be torn, since each one is synced before the
+/// next, so the first damaged entry is taken for a torn one only when no
+/// intact entry follows it.
 /// Otherwise cutting there would lose entries that were synced; that is
 /// `Err` with its offset, for someone to look at.
-fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
+fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, usize), usize> {
     let mut entries = Vec::new();
     let mut at = 0;
     while at < log.len() {
@@ -633,12 +605,7 @@ fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
         entries.push(body);
         at += LOG_HEADER + body.len();
     }
-    let read = LogRead {
-        format: LogFormat::Current,
-        valid: at as u64,
-        torn: at < log.len(),
-    };
-    Ok((entries, read))
+    Ok((entries, at))
 }
 
 /// The update of the intact entry starting at `at`, if there is one.
@@ -693,7 +660,7 @@ fn read_doc_and_log(dir: &Path) -> anyhow::Result<(LoroDoc, LogRead)> {
             }
             _ => {}
         }
-        let (entries, found) = log_entries(&log[start..]).map_err(|at| {
+        let (entries, intact) = log_entries(&log[start..]).map_err(|at| {
             anyhow::anyhow!(
                 "{} is corrupt: the entry at byte {} is damaged and more follow it",
                 path.display(),
@@ -704,10 +671,11 @@ fn read_doc_and_log(dir: &Path) -> anyhow::Result<(LoroDoc, LogRead)> {
             doc.import_batch(&entries.iter().map(|e| e.to_vec()).collect::<Vec<_>>())
                 .with_context(|| format!("{} is corrupt", path.display()))?;
         }
+        let valid = start + intact;
         read = LogRead {
             format,
-            valid: start as u64 + found.valid,
-            torn: found.torn,
+            valid: valid as u64,
+            torn: valid < log.len(),
         };
     }
     Ok((doc, read))
@@ -729,7 +697,8 @@ fn read_versioned<T: DeserializeOwned>(
     let malformed = || format!("{} is malformed", path.display());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).with_context(malformed)?;
     let version = match value.get("version") {
-        None => first_version(),
+        // Files from before versions existed.
+        None => 1,
         Some(v) => v
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
@@ -745,14 +714,11 @@ fn read_versioned<T: DeserializeOwned>(
     for step in &migrations[version as usize - 1..] {
         step(&mut value);
     }
-    if let Some(object) = value.as_object_mut() {
-        object.insert("version".to_owned(), current.into());
-    }
     serde_json::from_value(value).with_context(malformed)
 }
 
-/// Writes `value` with its `version` set to `current`, whatever the struct
-/// says, so a file always claims the format it is actually in.
+/// Writes `value` with `version` set to `current`. Only the file has a
+/// version; the structs don't carry one.
 fn write_versioned<T: Serialize>(path: &Path, value: &T, current: u32) -> anyhow::Result<()> {
     let mut value = serde_json::to_value(value)?;
     if let Some(object) = value.as_object_mut() {
@@ -844,7 +810,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -861,9 +827,8 @@ mod tests {
         assert_eq!(found.root(), dir.path().canonicalize().unwrap());
     }
 
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         Config {
-            version: CONFIG_VERSION,
             server: "http://x".into(),
             project_id: "p".into(),
             token: "t".into(),
@@ -886,17 +851,10 @@ mod tests {
         .unwrap();
         fs::write(state.dir().join(BASE), r#"{"frontiers":""}"#).unwrap();
         let config = state.load_config().unwrap();
-        assert_eq!(config.version, 1);
         assert_eq!(config.project_id, "p");
         assert_eq!(state.load_base().unwrap(), Base::default());
 
-        // Saving writes the version, whatever the struct holds.
-        state
-            .save_config(&Config {
-                version: 0,
-                ..config
-            })
-            .unwrap();
+        state.save_config(&config).unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(state.dir().join(CONFIG)).unwrap()).unwrap();
         assert_eq!(saved["version"], CONFIG_VERSION);
@@ -949,11 +907,11 @@ mod tests {
             read_doc(state.dir()).unwrap().get_text("t").to_string(),
             "snapshot logged"
         );
-        let (loaded, note) = state.load_doc_noting().unwrap();
+        let (loaded, note) = state.load_doc().unwrap();
         assert_eq!(loaded.get_text("t").to_string(), "snapshot logged");
         assert_eq!(note, None);
         assert!(!log.exists());
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot logged");
     }
 
@@ -976,7 +934,7 @@ mod tests {
             read_doc(state.dir()).unwrap().get_text("t").to_string(),
             "snapshot"
         );
-        let (loaded, note) = state.load_doc_noting().unwrap();
+        let (loaded, note) = state.load_doc().unwrap();
         assert_eq!(loaded.get_text("t").to_string(), "snapshot");
         assert!(note.unwrap().contains("newer typstry"));
         assert!(!log.exists());
@@ -999,7 +957,7 @@ mod tests {
             .append_doc(&doc.export(loro::ExportMode::all_updates()).unwrap())
             .unwrap();
         assert!(fs::read(&log).unwrap().starts_with(LOG_MAGIC));
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "after");
     }
 
@@ -1040,7 +998,7 @@ mod tests {
             state.append_doc(&update).unwrap();
             saved = doc.oplog_vv();
         }
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
 
         // A crash halfway through the next append.
@@ -1053,18 +1011,18 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
         file.write_all(&frame[..frame.len() / 2]).unwrap();
         drop(file);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
         // Cut back to the whole entries, so the next one is readable.
         assert_eq!(fs::metadata(&log).unwrap().len(), whole);
         state.append_doc(&update).unwrap();
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
 
         // A snapshot covers the log and replaces it.
         state.save_doc(&doc).unwrap();
         assert!(!log.exists());
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
     }
 
@@ -1100,7 +1058,7 @@ mod tests {
         let log = state.dir().join(DOC_LOG);
         // Garbage in the last entry's body, as a crash can leave.
         flip_byte(&log, fs::metadata(&log).unwrap().len() - 1);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two");
         assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
@@ -1141,7 +1099,7 @@ mod tests {
         let starts = three_entry_log(&state);
         let log = state.dir().join(DOC_LOG);
         flip_byte(&log, starts[2] + 3);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two");
         assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
@@ -1156,7 +1114,7 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
         file.write_all(&[0; 64]).unwrap();
         drop(file);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two three");
         assert_eq!(fs::metadata(&log).unwrap().len(), whole);
     }
@@ -1165,7 +1123,7 @@ mod tests {
     fn base_keeps_its_on_disk_format() {
         let mut base = Base::default();
         let json = serde_json::to_string(&base).unwrap();
-        assert_eq!(json, r#"{"version":1,"frontiers":"","assets":{}}"#);
+        assert_eq!(json, r#"{"frontiers":"","assets":{}}"#);
         assert_eq!(serde_json::from_str::<Base>("{}").unwrap(), base);
 
         let f: Frontiers = loro::ID::new(7, 3).into();
@@ -1177,7 +1135,7 @@ mod tests {
         assert_eq!(
             json,
             format!(
-                r#"{{"version":1,"frontiers":"{encoded}","assets":{{}},"pins":{{"a.typ":"","b.typ":"{encoded}"}}}}"#
+                r#"{{"frontiers":"{encoded}","assets":{{}},"pins":{{"a.typ":"","b.typ":"{encoded}"}}}}"#
             )
         );
         assert_eq!(serde_json::from_str::<Base>(&json).unwrap(), base);

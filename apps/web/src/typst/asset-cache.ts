@@ -3,8 +3,6 @@ import { apiFetch, ApiError, blobUrl } from "@/sync/api";
 
 import { BLOB_CACHE } from "./cache-names";
 
-export { BLOB_CACHE };
-
 /** `sha256:<hex>`, the server's name for a blob. */
 export async function contentHash(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(

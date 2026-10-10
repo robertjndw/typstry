@@ -7,7 +7,9 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_VERSION, protocol_supported};
+use typstry_wire::{
+    MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, protocol_supported,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,7 +36,7 @@ struct TooOld {
 }
 
 /// 426 for both the HTTP API and the WebSocket handshake.
-pub fn too_old() -> Response {
+fn too_old() -> Response {
     (
         StatusCode::UPGRADE_REQUIRED,
         Json(TooOld {
@@ -51,17 +53,31 @@ pub fn too_old() -> Response {
 /// versioning send none. Raising [`MIN_PROTOCOL_VERSION`] won't stop those
 /// old clients; if they ever need to be cut off, `None` has to count as too
 /// old too.
-pub fn accepts(version: Option<u32>) -> bool {
+fn accepts(version: Option<u32>) -> bool {
     version.is_none_or(protocol_supported)
 }
 
-/// Gates the HTTP API on the `X-Typstry-Protocol` header.
+/// Gates the HTTP API and the WebSocket on the client's protocol version,
+/// sent in the `X-Typstry-Protocol` header or, on the WebSocket handshake
+/// where browsers cannot set headers, as a query parameter. An outdated
+/// client gets a plain 426 before the upgrade rather than a socket whose
+/// messages it may misread.
 pub async fn gate(req: Request, next: Next) -> Response {
-    let version = match req.headers().get(PROTOCOL_HEADER) {
+    let declared = req
+        .headers()
+        .get(PROTOCOL_HEADER)
+        .map(|value| value.to_str().unwrap_or_default())
+        .or_else(|| {
+            req.uri()
+                .query()?
+                .split('&')
+                .find_map(|pair| pair.strip_prefix(PROTOCOL_QUERY)?.strip_prefix('='))
+        });
+    let version = match declared {
         None => None,
-        Some(value) => match value.to_str().ok().and_then(|v| v.trim().parse().ok()) {
-            Some(v) => Some(v),
-            None => return StatusCode::BAD_REQUEST.into_response(),
+        Some(value) => match value.trim().parse() {
+            Ok(v) => Some(v),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         },
     };
     if !accepts(version) {

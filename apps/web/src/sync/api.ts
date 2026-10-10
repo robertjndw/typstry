@@ -3,7 +3,7 @@
 // travels encrypted, so these calls carry tokens and ciphertext alone.
 import { ownBuffer } from "@/crypto/project-key";
 
-import { protocolHeaders, RELOAD_MESSAGE } from "./protocol";
+import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
 
 export interface CreatedProject {
   projectId: string;
@@ -45,8 +45,7 @@ export async function apiFetch(
   fetchFn: typeof fetch = (...args) => fetch(...args),
 ): Promise<Response> {
   const headers = new Headers(init.headers);
-  for (const [name, value] of Object.entries(protocolHeaders()))
-    headers.set(name, value);
+  headers.set(PROTOCOL_HEADER, String(PROTOCOL_VERSION));
   const res = await fetchFn(url, { ...init, headers });
   if (res.status === 426) throw new OutdatedClientError();
   return res;

@@ -500,27 +500,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_outdated_typstry_is_told_to_upgrade() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            let _ = socket.read(&mut request).await;
-            let _ = socket
-                .write_all(
-                    b"HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\n\
-                      connection: close\r\n\r\n",
-                )
-                .await;
-        });
-        let url = crate::link::ws_url(&format!("http://{addr}")).unwrap();
+        let (origin, _) = crate::api::tests::fake_server(crate::api::tests::UPGRADE_REQUIRED).await;
+        let addr = origin.trim_start_matches("http://");
+        let url = crate::link::ws_url(&origin).unwrap();
         let err = Client::connect(&url, "room").await.err().unwrap();
         assert!(
             matches!(
                 SyncError::fatal(&err),
-                Some(SyncError::ProtocolTooOld { server }) if *server == addr.to_string()
+                Some(SyncError::ProtocolTooOld { server }) if server == addr
             ),
             "{err:#}"
         );

@@ -98,14 +98,12 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         .merge(api)
         .route("/api/p/{token}/assets", post(assets::upload))
         .route("/api/p/{token}/blobs/{hash}", get(assets::blob))
+        .route("/ws", get(ws::handler))
         .layer(middleware::from_fn(protocol::gate));
-    // The WebSocket checks its version itself: browsers cannot set headers
-    // on it, so it comes as a query parameter.
     let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/info", get(protocol::info))
-        .merge(gated)
-        .route("/ws", get(ws::handler));
+        .merge(gated);
 
     // In dev the Vite server serves the frontend, so a missing dist is normal.
     if web_dist.is_dir() {

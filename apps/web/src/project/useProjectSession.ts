@@ -15,12 +15,7 @@ import {
   secretKind,
   type ProjectKey,
 } from "@/crypto/project-key";
-import {
-  isSchemaTooNew,
-  migrate,
-  ProjectDoc,
-  SCHEMA_VERSION,
-} from "@/doc/schema";
+import { isSchemaTooNew, migrate, ProjectDoc } from "@/doc/schema";
 import { defaultBackend, LocalDocStore } from "@/persist/local-doc-store";
 import { OutdatedClientError, resolveShare, type ShareInfo } from "@/sync/api";
 import {
@@ -313,8 +308,9 @@ export function useProjectSession(
   // project. A newer doc never gets here, it is the TOO_NEW error above.
   const canMigrate = synced && state.phase === "ready" && state.canWrite;
   useEffect(() => {
-    if (canMigrate && schema !== null && schema < SCHEMA_VERSION)
-      migrate(project);
+    // migrate() itself skips a doc that is already current. schema is a
+    // dependency so the effect runs again once a pull changes it.
+    if (canMigrate) migrate(project);
   }, [canMigrate, schema, project]);
 
   const syncNow = useCallback(

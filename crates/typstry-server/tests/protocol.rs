@@ -1,6 +1,6 @@
 //! Protocol versions: outdated clients get a 426 instead of odd failures.
 
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use tokio_tungstenite::connect_async;
@@ -8,15 +8,13 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tower::ServiceExt;
 use typstry_server::http::AppState;
 use typstry_server::store::blobs::BlobStore;
-use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_VERSION};
+use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION};
 
 mod common;
 
-const TOO_OLD: u32 = MIN_PROTOCOL_VERSION - 1;
+use common::json;
 
-async fn json(res: axum::response::Response) -> Value {
-    serde_json::from_slice(&to_bytes(res.into_body(), 4096).await.unwrap()).unwrap()
-}
+const TOO_OLD: u32 = MIN_PROTOCOL_VERSION - 1;
 
 #[tokio::test]
 async fn info_names_the_versions() {
@@ -95,7 +93,7 @@ async fn the_websocket_refuses_outdated_clients() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    match connect_async(format!("ws://{addr}/ws?protocol={TOO_OLD}")).await {
+    match connect_async(format!("ws://{addr}/ws?{PROTOCOL_QUERY}={TOO_OLD}")).await {
         Err(WsError::Http(res)) => {
             assert_eq!(res.status(), StatusCode::UPGRADE_REQUIRED);
             let body: Value = serde_json::from_slice(res.body().as_deref().unwrap()).unwrap();
@@ -104,7 +102,10 @@ async fn the_websocket_refuses_outdated_clients() {
         other => panic!("expected a 426, got {other:?}"),
     }
 
-    for query in [format!("?protocol={PROTOCOL_VERSION}"), String::new()] {
+    for query in [
+        format!("?{PROTOCOL_QUERY}={PROTOCOL_VERSION}"),
+        String::new(),
+    ] {
         let (mut ws, _) = connect_async(format!("ws://{addr}/ws{query}"))
             .await
             .unwrap();

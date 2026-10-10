@@ -13,10 +13,6 @@ export const PROTOCOL_QUERY = "protocol";
 export const RELOAD_MESSAGE =
   "A newer version of typstry is available. Reload the page.";
 
-export function protocolHeaders(): Record<string, string> {
-  return { [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) };
-}
-
 export interface ServerInfo {
   protocol: number;
   minProtocol: number;

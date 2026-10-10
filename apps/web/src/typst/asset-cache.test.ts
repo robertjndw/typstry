@@ -1,7 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
 
-import { AssetCache, BLOB_CACHE, contentHash } from "./asset-cache";
+import { AssetCache, contentHash } from "./asset-cache";
+import { BLOB_CACHE } from "./cache-names";
 
 const BYTES = new Uint8Array([1, 2, 3]);
 const OTHER_BYTES = new Uint8Array([4, 5]);

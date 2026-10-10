@@ -4,7 +4,6 @@
 //! which wrote them.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -15,36 +14,13 @@ use typstry_wire::crypto::{
 };
 use typstry_wire::elo::{Record, Version};
 
-fn compat_dirs() -> Vec<(u32, PathBuf)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/compat");
-    let mut dirs: Vec<_> = fs::read_dir(root)
-        .expect("fixtures/compat is missing")
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            let n = path
-                .file_name()?
-                .to_str()?
-                .strip_prefix('v')?
-                .parse()
-                .ok()?;
-            path.is_dir().then_some((n, path))
-        })
-        .collect();
-    dirs.sort();
-    assert!(!dirs.is_empty(), "no compat/v<N> fixtures found");
-    dirs
-}
+#[path = "../../../fixtures/compat/support.rs"]
+mod support;
 
-fn read_json(path: &Path) -> Value {
-    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-}
+use support::{compat_dirs, read_json, str_of};
 
 fn bytes(value: &Value) -> Vec<u8> {
     URL_SAFE_NO_PAD.decode(value.as_str().unwrap()).unwrap()
-}
-
-fn str_of(value: &Value) -> &str {
-    value.as_str().unwrap()
 }
 
 #[test]

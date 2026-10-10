@@ -33,7 +33,7 @@ use typstry_wire::crypto::ProjectKey;
 use crate::api::{Api, ShareInfo};
 use crate::git::Repo;
 use crate::link::ShareLink;
-use crate::state::{Base, CONFIG_VERSION, Config, StateDir};
+use crate::state::{Base, Config, StateDir};
 use crate::worktree::{Skipped, Worktree};
 
 use self::reconcile::BaseFiles;
@@ -310,7 +310,7 @@ impl Session {
         let state = StateDir::discover(start)?;
         let config = state.load_config()?;
         let base = state.load_base()?;
-        let (doc, note) = state.load_doc_noting()?;
+        let (doc, note) = state.load_doc()?;
         // Checked here so read-only commands refuse too: they would
         // misread a layout this build does not know.
         typstry_doc::ensure_supported(&doc).map_err(SyncError::from)?;
@@ -344,7 +344,6 @@ impl Session {
     ) -> anyhow::Result<Self> {
         let state = StateDir::create(root)?;
         let config = Config {
-            version: CONFIG_VERSION,
             server: link.origin.clone(),
             project_id: share.project_id.clone(),
             token: link.token.clone(),
@@ -607,17 +606,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::create(dir.path()).unwrap();
         state
-            .save_config(&Config {
-                version: CONFIG_VERSION,
-                server: "http://x".into(),
-                project_id: "p".into(),
-                token: "t".into(),
-                key: "k".into(),
-                permission: crate::api::Permission::Write,
-                view_token: None,
-                name: None,
-                branch: None,
-            })
+            .save_config(&crate::state::tests::test_config())
             .unwrap();
         let doc = LoroDoc::new();
         doc.get_map(typstry_doc::root::META)

@@ -33,6 +33,7 @@ use typstry_doc::init::init_project;
 use typstry_doc::materialize::{FileContent, materialize, materialize_at};
 use typstry_doc::paths::build_path_index;
 use typstry_doc::peers::set_peer;
+use typstry_doc::testing::file_json;
 use typstry_doc::versions::{named_versions, save_version};
 use typstry_doc::{SCHEMA_VERSION, root, text_content};
 use typstry_wire::crypto::{
@@ -41,33 +42,10 @@ use typstry_wire::crypto::{
 };
 use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 
-fn compat_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/compat")
-}
+#[path = "../../../fixtures/compat/support.rs"]
+mod support;
 
-/// Every `v<N>` directory, oldest first.
-fn compat_dirs() -> Vec<(u32, PathBuf)> {
-    let mut dirs: Vec<_> = fs::read_dir(compat_root())
-        .expect("fixtures/compat is missing")
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            let n = path
-                .file_name()?
-                .to_str()?
-                .strip_prefix('v')?
-                .parse()
-                .ok()?;
-            path.is_dir().then_some((n, path))
-        })
-        .collect();
-    dirs.sort();
-    assert!(!dirs.is_empty(), "no compat/v<N> fixtures found");
-    dirs
-}
-
-fn read_json(path: &Path) -> Value {
-    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-}
+use support::{compat_dirs, compat_root, read_json};
 
 /// Copies a fixture's `cli/` into a fresh folder's state directory, so the
 /// loaders can repair or rewrite files without touching the fixture.
@@ -103,7 +81,6 @@ fn cli_reads_every_compat_fixture() {
         let peeked = StateDir::peek_config(&root).unwrap();
         let state = StateDir::discover(&root).unwrap();
         let config = state.load_config().unwrap();
-        assert_eq!(config.version, CONFIG_VERSION, "v{n}");
         assert_eq!(peeked.key, config.key, "v{n}");
         assert_eq!(config.server, expected["server"], "v{n}");
         assert_eq!(config.project_id, expected["projectId"], "v{n}");
@@ -125,7 +102,6 @@ fn cli_reads_every_compat_fixture() {
         }
 
         let base = state.load_base().unwrap();
-        assert_eq!(base.version, BASE_VERSION, "v{n}");
         assert_eq!(base.frontiers, reference.oplog_frontiers(), "v{n}");
         assert_eq!(base.last_sync, expected["lastSync"].as_u64(), "v{n}");
         let pins: BTreeMap<String, Frontiers> = expected["pins"]
@@ -157,7 +133,7 @@ fn cli_reads_every_compat_fixture() {
 
         // doc.bin plus every doc.log entry has to add up to the whole doc.
         // A log mistaken for a newer format would be dropped with a warning.
-        let (doc, warning) = state.load_doc_noting().unwrap();
+        let (doc, warning) = state.load_doc().unwrap();
         assert_eq!(warning, None, "v{n}");
         assert_eq!(doc.oplog_vv(), reference.oplog_vv(), "v{n}");
         assert_eq!(doc.get_deep_value(), reference.get_deep_value(), "v{n}");
@@ -320,7 +296,6 @@ fn write_fixture(out: &Path) {
     let state = StateDir::create(work.path()).unwrap();
     state
         .save_config(&Config {
-            version: CONFIG_VERSION,
             server: SERVER.to_owned(),
             project_id: PROJECT_ID.to_owned(),
             token: EDIT_TOKEN.to_owned(),
@@ -338,7 +313,6 @@ fn write_fixture(out: &Path) {
     };
     state
         .save_base(&Base {
-            version: BASE_VERSION,
             frontiers: doc.oplog_frontiers(),
             assets: BTreeMap::from([(blob_hash.clone(), Digest::of(BLOB_PLAINTEXT))]),
             last_sync: Some(1_700_000_000_005),
@@ -376,15 +350,6 @@ fn write_fixture(out: &Path) {
 fn write_json(dir: &Path, name: &str, value: &Value) {
     let text = serde_json::to_string_pretty(value).unwrap() + "\n";
     fs::write(dir.join(name), text).unwrap();
-}
-
-fn file_json(path: &str, content: &FileContent) -> Value {
-    match content {
-        FileContent::Text(text) => json!({ "path": path, "kind": "text", "text": &**text }),
-        FileContent::Asset { hash, size, mime } => json!({
-            "path": path, "kind": "asset", "hash": hash, "size": size, "mime": mime,
-        }),
-    }
 }
 
 fn doc_json(doc: &LoroDoc, deleted_key: &str) -> Value {

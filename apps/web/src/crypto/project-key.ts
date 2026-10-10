@@ -144,9 +144,15 @@ export function fromBase64Url(text: string): Uint8Array<ArrayBuffer> | null {
  * What a link fragment holds: an edit or view secret, one of a kind only a
  * newer typstry knows, or nothing usable.
  */
-export function secretKind(raw: string): "edit" | "view" | "newer" | null {
+export function secretKind(raw: string): SecretKind | null {
   const bytes = fromBase64Url(raw);
-  if (!bytes?.length) return null;
+  return bytes && kindOf(bytes);
+}
+
+type SecretKind = "edit" | "view" | "newer";
+
+function kindOf(bytes: Uint8Array): SecretKind | null {
+  if (!bytes.length) return null;
   const kind = bytes[0];
   const keyLength = bytes.length - 1;
   if (kind === SECRET_EDIT_V1)
@@ -224,12 +230,12 @@ function importHkdf(bytes: Uint8Array): Promise<CryptoKey> {
  * NewerVersionError for a kind only a newer typstry knows.
  */
 export async function importProjectKey(raw: string): Promise<ProjectKey> {
-  const kind = secretKind(raw);
   const bytes = fromBase64Url(raw);
+  const kind = bytes && kindOf(bytes);
   let readBytes: Uint8Array<ArrayBuffer>;
   let publicBytes: Uint8Array<ArrayBuffer>;
   let sign: CryptoKey | null = null;
-  if (!bytes || kind === null) throw new Error("malformed project key");
+  if (!bytes || !kind) throw new Error("malformed project key");
   if (kind === "newer") throw new NewerVersionError(bytes[0]!);
   if (kind === "edit") {
     const edit = await importHkdf(bytes.subarray(1));

@@ -76,7 +76,7 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
     let id = random_hex(8);
     let request_path = dir.join(format!("{id}{REQUEST}"));
     let response_path = dir.join(format!("{id}{RESPONSE}"));
-    write_json(&request_path, &envelope(request)?)?;
+    write_json(&request_path, &Envelope::new(request))?;
 
     let started = Instant::now();
     let mut taken = false;
@@ -128,15 +128,22 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
     }
 }
 
-/// `request` as it goes into the mailbox, with the protocol next to the
-/// command.
-fn envelope(request: &Request) -> anyhow::Result<serde_json::Value> {
-    let mut value = serde_json::to_value(request)?;
-    value
-        .as_object_mut()
-        .context("a request is a JSON object")?
-        .insert(PROTOCOL_KEY.to_owned(), PROTOCOL.into());
-    Ok(value)
+/// A request as it goes into the mailbox, with the protocol next to the
+/// command. The field name must match [`PROTOCOL_KEY`].
+#[derive(Serialize)]
+struct Envelope<'a> {
+    protocol: u32,
+    #[serde(flatten)]
+    request: &'a Request,
+}
+
+impl<'a> Envelope<'a> {
+    fn new(request: &'a Request) -> Self {
+        Self {
+            protocol: PROTOCOL,
+            request,
+        }
+    }
 }
 
 /// Checks the protocol before parsing the command, so a mismatch gets the
@@ -250,7 +257,7 @@ mod tests {
             name: "v1".into(),
             force: true,
         };
-        let json = envelope(&request).unwrap();
+        let json = serde_json::to_value(Envelope::new(&request)).unwrap();
         assert_eq!(json[PROTOCOL_KEY], PROTOCOL);
         let (_dir, mailbox) = mailbox_with(&json.to_string());
         assert_eq!(take_one(&mailbox).unwrap(), request);
