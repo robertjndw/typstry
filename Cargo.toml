@@ -10,15 +10,28 @@ publish = false
 
 [workspace.dependencies]
 typstry-doc = { path = "crates/typstry-doc" }
+typstry-wire = { path = "crates/typstry-wire" }
+typstry-server = { path = "crates/typstry-server" }
 
+# The default getrandom feature is left off: IVs come from our own getrandom.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
+ignore = "0.4.33"
 loro = "1.16.2"
 # 0.x: pinned exactly, the wire format must match the npm loro-protocol client.
 loro-protocol = "=0.3.0"
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+# Only ring is compiled in, so rustls never has to guess a crypto provider
+# and nothing needs the aws-lc C toolchain.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

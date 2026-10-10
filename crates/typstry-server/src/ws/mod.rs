@@ -1,5 +1,4 @@
 pub mod conn;
-pub mod fragment;
 pub mod rate;
 
 use axum::extract::State;

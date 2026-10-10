@@ -22,6 +22,8 @@ export interface ShareDialogProps {
   /** Encryption key; part of every link, never sent to the server. */
   projectKey: string;
   permission: SharePermission;
+  /** From the share lookup; set for edit links, so any editor can pass on a view link. */
+  viewToken?: string;
 }
 
 export function ShareDialog({
@@ -29,6 +31,7 @@ export function ShareDialog({
   token,
   projectKey,
   permission,
+  viewToken: resolvedViewToken,
 }: ShareDialogProps) {
   const [open, setOpen] = useState(false);
   // Read on open so links saved in another tab show up.
@@ -36,7 +39,7 @@ export function ShareDialog({
   const editToken =
     permission === "write" ? (links?.editToken ?? token) : undefined;
   const viewToken =
-    permission === "read" ? token : (links?.viewToken ?? undefined);
+    permission === "read" ? token : (links?.viewToken ?? resolvedViewToken);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>

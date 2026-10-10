@@ -1,4 +1,4 @@
-//! `%ELO` records and the per-room index built from their plaintext headers.
+//! The per-room index built from `%ELO` record headers.
 //!
 //! Clients encrypt every change with a key the server never gets, so all it
 //! can know about a record is what the header says: which peer's ops it
@@ -9,135 +9,17 @@
 use std::collections::{HashMap, HashSet};
 
 use loro::VersionVector;
-use loro_protocol::{
-    BytesReader, BytesWriter, EloHeader, decode_elo_container, parse_elo_record_header,
-};
-
-pub type PeerId = u64;
-
-/// Per peer, an exclusive op counter: `{p: c}` means ops `[0, c)` of `p`.
-pub type Version = HashMap<PeerId, u64>;
-
-/// Loro op counters are i32, so a larger one cannot come from a real doc
-/// and would not survive encoding the coverage as a Loro version vector.
-const MAX_COUNTER: u64 = i32::MAX as u64;
+use typstry_wire::elo::{PeerId, Record, Version, parse_record};
 
 /// Backfill containers stay below this so most go out as a single message
 /// without fragmenting. A lone larger record still gets a container of its
 /// own and is fragmented on the way out.
 pub const CONTAINER_LIMIT: usize = 200 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Record {
-    Delta { peer: PeerId, start: u64, end: u64 },
-    Snapshot { vv: Version },
-}
-
-/// Parses a peer id as the client writes it: the decimal form of a u64.
-/// Only the canonical spelling is accepted, so one peer can never show up
-/// under two ids and get coverage tracked twice.
-pub fn parse_peer_id(bytes: &[u8]) -> Option<PeerId> {
-    let canonical = !bytes.is_empty()
-        && bytes.iter().all(u8::is_ascii_digit)
-        && (bytes.len() == 1 || bytes[0] != b'0');
-    if !canonical {
-        return None;
-    }
-    // Digits only, so this is valid UTF-8 and has no sign for parse to allow.
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-fn counter(value: u64) -> Result<u64, String> {
-    if value > MAX_COUNTER {
-        return Err(format!("counter {value} does not fit a Loro counter"));
-    }
-    Ok(value)
-}
-
-/// Reads the leading uleb128 count and checks it against the bytes left.
-/// The library pre-allocates from that count, so a hostile one like 2^60
-/// would abort the process before any bounds check runs.
-fn plausible_count(reader: &mut BytesReader<'_>, min_entry_bytes: usize) -> Result<(), String> {
-    let count = reader.read_uleb128()?;
-    let room = (reader.remaining() / min_entry_bytes) as u64;
-    if count > room {
-        return Err(format!("count {count} exceeds the remaining bytes"));
-    }
-    Ok(())
-}
-
-pub fn parse_record(record: &[u8]) -> Result<Record, String> {
-    if record.first() == Some(&0x01) {
-        // Each vv entry is at least a one-byte length and a one-byte counter.
-        plausible_count(&mut BytesReader::new(&record[1..]), 2)?;
-    }
-    match parse_elo_record_header(record)?.header {
-        EloHeader::Delta(delta) => Ok(Record::Delta {
-            peer: parse_peer_id(&delta.peer_id).ok_or("invalid delta peer id")?,
-            start: counter(delta.start)?,
-            end: counter(delta.end)?,
-        }),
-        EloHeader::Snapshot(snapshot) => {
-            let mut vv = Version::with_capacity(snapshot.vv.len());
-            for (peer, count) in snapshot.vv {
-                let peer = parse_peer_id(&peer).ok_or("invalid snapshot peer id")?;
-                if vv.insert(peer, counter(count)?).is_some() {
-                    return Err("snapshot lists a peer twice".into());
-                }
-            }
-            Ok(Record::Snapshot { vv })
-        }
-    }
-}
-
-/// Parses every record of one update payload. All or nothing: a single bad
-/// record rejects the whole payload, so the room never stores half of it.
-pub fn parse_container(payload: &[u8]) -> Result<Vec<(Record, &[u8])>, String> {
-    // Every record is at least its one-byte length prefix.
-    plausible_count(&mut BytesReader::new(payload), 1)?;
-    let records = decode_elo_container(payload)?;
-    if records.is_empty() {
-        return Err("empty container".into());
-    }
-    records
-        .into_iter()
-        .map(|bytes| Ok((parse_record(bytes)?, bytes)))
-        .collect()
-}
-
-pub fn encode_container(records: &[&[u8]]) -> Vec<u8> {
-    let mut writer = BytesWriter::new();
-    writer.push_uleb128(records.len() as u64);
-    for record in records {
-        writer.push_var_bytes(record);
-    }
-    writer.finalize()
-}
-
-fn uleb_len(n: usize) -> usize {
-    (usize::BITS - n.leading_zeros()).max(1).div_ceil(7) as usize
-}
-
 /// Groups records into as few containers as [`CONTAINER_LIMIT`] allows,
 /// keeping their order.
 pub fn pack(records: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut batch: Vec<&[u8]> = Vec::new();
-    let mut size = 0;
-    for record in records {
-        let cost = record.len() + uleb_len(record.len());
-        if !batch.is_empty() && size + cost > CONTAINER_LIMIT {
-            out.push(encode_container(&batch));
-            batch.clear();
-            size = 0;
-        }
-        batch.push(record);
-        size += cost;
-    }
-    if !batch.is_empty() {
-        out.push(encode_container(&batch));
-    }
-    out
+    typstry_wire::elo::pack(records, CONTAINER_LIMIT)
 }
 
 /// A Loro version vector as sent in a JoinRequest. Counters are i32 there;
@@ -220,7 +102,7 @@ impl DocIndex {
     pub fn coverage_vv(&self) -> VersionVector {
         let mut vv = VersionVector::new();
         for (&peer, &count) in &self.coverage {
-            // Every counter was checked against MAX_COUNTER on the way in.
+            // The parser checked every counter against MAX_COUNTER.
             vv.insert(peer, count as i32);
         }
         vv
@@ -374,93 +256,12 @@ impl DocIndex {
 
 #[cfg(test)]
 mod tests {
+    use loro_protocol::decode_elo_container;
+
     use super::*;
-
-    fn delta(peer: &[u8], start: u64, end: u64, ct: &[u8]) -> Vec<u8> {
-        let mut w = BytesWriter::new();
-        w.push_byte(0x00);
-        w.push_var_bytes(peer);
-        w.push_uleb128(start);
-        w.push_uleb128(end);
-        w.push_var_string("k1");
-        w.push_var_bytes(&[0; 12]);
-        w.push_var_bytes(ct);
-        w.finalize()
-    }
-
-    fn snapshot(vv: &[(&[u8], u64)]) -> Vec<u8> {
-        let mut w = BytesWriter::new();
-        w.push_byte(0x01);
-        w.push_uleb128(vv.len() as u64);
-        for (peer, count) in vv {
-            w.push_var_bytes(peer);
-            w.push_uleb128(*count);
-        }
-        w.push_var_string("k1");
-        w.push_var_bytes(&[0; 12]);
-        w.push_var_bytes(b"ct");
-        w.finalize()
-    }
 
     fn version(pairs: &[(PeerId, u64)]) -> Version {
         pairs.iter().copied().collect()
-    }
-
-    #[test]
-    fn peer_ids_must_be_canonical_decimal_u64() {
-        assert_eq!(parse_peer_id(b"0"), Some(0));
-        assert_eq!(parse_peer_id(b"18446744073709551615"), Some(u64::MAX));
-        for bad in [
-            &b""[..],
-            b"18446744073709551616",
-            b"+1",
-            b"-1",
-            b"01",
-            b"1a",
-            b" 1",
-        ] {
-            assert_eq!(parse_peer_id(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn parses_and_rejects_containers() {
-        let d = delta(b"7", 0, 3, b"x");
-        let s = snapshot(&[(b"7", 3)]);
-        let container = encode_container(&[&d, &s]);
-        let parsed = parse_container(&container).unwrap();
-        assert_eq!(
-            parsed[0],
-            (
-                Record::Delta {
-                    peer: 7,
-                    start: 0,
-                    end: 3
-                },
-                d.as_slice()
-            )
-        );
-        assert_eq!(
-            parsed[1].0,
-            Record::Snapshot {
-                vv: version(&[(7, 3)])
-            }
-        );
-
-        let too_big = MAX_COUNTER + 1;
-        for bad in [
-            encode_container(&[]),
-            encode_container(&[&delta(b"07", 0, 1, b"x")]),
-            encode_container(&[&delta(b"7", 0, too_big, b"x")]),
-            encode_container(&[&snapshot(&[(b"7", too_big)])]),
-            encode_container(&[&snapshot(&[(b"7", 1), (b"7", 2)])]),
-            encode_container(&[&d, b"\x05garbage"]),
-            b"\xff\xff\xff\xff\xff\xff\xff\xff\x0f".to_vec(),
-            // A snapshot claiming 2^35 vv entries in zero bytes.
-            b"\x01\x07\x01\x80\x80\x80\x80\x80\x01".to_vec(),
-        ] {
-            assert!(parse_container(&bad).is_err(), "{bad:?}");
-        }
     }
 
     #[test]

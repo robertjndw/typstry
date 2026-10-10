@@ -14,6 +14,8 @@ export type SharePermission = "write" | "read";
 export interface ShareInfo {
   projectId: string;
   permission: SharePermission;
+  /** Only present for edit tokens; view tokens never learn the edit link. */
+  viewToken?: string;
 }
 
 export class ApiError extends Error {
@@ -60,7 +62,26 @@ export async function resolveShare(
   if (res.status === 404) return null;
   if (!res.ok)
     throw new ApiError(res.status, `resolving share failed: ${res.status}`);
-  return (await res.json()) as ShareInfo;
+  const share = parseShareInfo(await res.json());
+  if (!share)
+    throw new ApiError(res.status, "resolving share returned a malformed body");
+  return share;
+}
+
+/**
+ * Checks an untrusted value (a response body, a cached copy) against the
+ * `ShareInfo` shape, dropping fields of the wrong type.
+ */
+export function parseShareInfo(value: unknown): ShareInfo | null {
+  const v = value as Partial<ShareInfo> | null;
+  if (
+    typeof v?.projectId !== "string" ||
+    (v.permission !== "write" && v.permission !== "read")
+  )
+    return null;
+  const share: ShareInfo = { projectId: v.projectId, permission: v.permission };
+  if (typeof v.viewToken === "string") share.viewToken = v.viewToken;
+  return share;
 }
 
 /** Upload limit enforced by the server (413 above it). */

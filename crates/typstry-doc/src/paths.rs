@@ -35,13 +35,13 @@ pub fn disambiguated_name(name: &str, id: TreeID) -> String {
     format!("{stem}~{}@{}{ext}", id.counter, id.peer)
 }
 
-struct LiveNode {
-    id: TreeID,
-    name: String,
-    kind: FileKind,
+pub(crate) struct LiveNode {
+    pub(crate) id: TreeID,
+    pub(crate) name: String,
+    pub(crate) kind: FileKind,
 }
 
-fn read_node(tree: &LoroTree, id: TreeID) -> Option<LiveNode> {
+pub(crate) fn read_node(tree: &LoroTree, id: TreeID) -> Option<LiveNode> {
     let meta = tree.get_meta(id).ok()?;
     let name = string_value(meta.get(node::NAME)).filter(|n| !n.is_empty())?;
     let kind = string_value(meta.get(node::KIND))?.parse().ok()?;
@@ -92,7 +92,7 @@ pub fn build_path_index(doc: &LoroDoc) -> PathIndex {
     index
 }
 
-fn resolve_sibling_names(siblings: Vec<LiveNode>) -> Vec<(LiveNode, String, bool)> {
+pub(crate) fn resolve_sibling_names(siblings: Vec<LiveNode>) -> Vec<(LiveNode, String, bool)> {
     let mut groups: BTreeMap<String, Vec<LiveNode>> = BTreeMap::new();
     for live in siblings {
         groups.entry(live.name.clone()).or_default().push(live);

@@ -2,12 +2,12 @@
 //! (zip, PDF, git) are meant to go through here, so paths come from
 //! [`build_path_index`] and clash renames apply.
 
-use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, ValueOrContainer};
+use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, TreeID, ValueOrContainer};
 
-use crate::paths::build_path_index;
+use crate::paths::{PathIndex, build_path_index};
 use crate::{FileKind, node, root, string_value, text_content};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FileContent {
     Text(String),
     /// Bytes live in the blob store; only the reference is in the doc.
@@ -35,8 +35,18 @@ pub struct MaterializedFile {
 /// nothing to export for them, and so are files whose path is unsafe to
 /// write to a real file system (see [`is_safe_path`]).
 pub fn materialize(doc: &LoroDoc) -> Vec<MaterializedFile> {
-    let index = build_path_index(doc);
-    let tree = doc.get_tree(root::FS);
+    materialize_indexed(doc, &build_path_index(doc))
+        .into_iter()
+        .map(|(_, file)| file)
+        .collect()
+}
+
+/// [`materialize`] with the node behind each file, for callers that already
+/// built the index.
+pub(crate) fn materialize_indexed(
+    doc: &LoroDoc,
+    index: &PathIndex,
+) -> Vec<(TreeID, MaterializedFile)> {
     let mut files = Vec::with_capacity(index.by_path.len());
     // by_path rather than by_id: it is already sorted and its keys are
     // unique even in the pathological case described in resolve_sibling_names.
@@ -47,36 +57,41 @@ pub fn materialize(doc: &LoroDoc) -> Vec<MaterializedFile> {
         if !is_safe_path(path) {
             continue;
         }
-        let Ok(meta) = tree.get_meta(*id) else {
-            continue;
-        };
-        let content = match entry.kind {
-            FileKind::Dir => continue,
-            FileKind::Text => {
-                let text = text_content(doc, *id)
-                    .map(|t| t.to_string())
-                    .unwrap_or_default();
-                FileContent::Text(text)
-            }
-            FileKind::Asset => {
-                let Some(hash) = string_value(meta.get(node::HASH)).filter(|h| !h.is_empty())
-                else {
-                    continue;
-                };
-                FileContent::Asset {
-                    hash,
-                    size: number(meta.get(node::SIZE)).unwrap_or(0),
-                    mime: string_value(meta.get(node::MIME))
-                        .unwrap_or_else(|| "application/octet-stream".to_owned()),
-                }
-            }
-        };
-        files.push(MaterializedFile {
-            path: path.clone(),
-            content,
-        });
+        if let Some(content) = file_content(doc, *id, entry.kind) {
+            files.push((
+                *id,
+                MaterializedFile {
+                    path: path.clone(),
+                    content,
+                },
+            ));
+        }
     }
     files
+}
+
+/// What [`materialize`] would list for a node, ignoring its path. None for
+/// directories and for assets without a hash.
+pub(crate) fn file_content(doc: &LoroDoc, id: TreeID, kind: FileKind) -> Option<FileContent> {
+    let meta = doc.get_tree(root::FS).get_meta(id).ok()?;
+    match kind {
+        FileKind::Dir => None,
+        FileKind::Text => {
+            let text = text_content(doc, id)
+                .map(|t| t.to_string())
+                .unwrap_or_default();
+            Some(FileContent::Text(text))
+        }
+        FileKind::Asset => {
+            let hash = string_value(meta.get(node::HASH)).filter(|h| !h.is_empty())?;
+            Some(FileContent::Asset {
+                hash,
+                size: number(meta.get(node::SIZE)).unwrap_or(0),
+                mime: string_value(meta.get(node::MIME))
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            })
+        }
+    }
 }
 
 /// Like [`materialize`], but for the state at `frontiers`. Works on a fork,
@@ -99,7 +114,7 @@ pub fn is_safe_path(path: &str) -> bool {
 }
 
 /// Sizes written by the browser arrive as doubles.
-fn number(value: Option<ValueOrContainer>) -> Option<u64> {
+pub(crate) fn number(value: Option<ValueOrContainer>) -> Option<u64> {
     match value? {
         ValueOrContainer::Value(LoroValue::I64(n)) => u64::try_from(n).ok(),
         ValueOrContainer::Value(LoroValue::Double(n)) if n >= 0.0 && n.is_finite() => {
@@ -115,7 +130,6 @@ mod tests {
     use crate::init::{init_project, starter_content};
     use crate::testing::add;
     use crate::text_content;
-    use loro::TreeID;
 
     fn set_text(doc: &LoroDoc, id: TreeID, text: &str) {
         let content = text_content(doc, id).unwrap();

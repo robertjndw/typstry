@@ -18,6 +18,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **History** - save named versions, browse the edit history, diff and restore.
 - **Sharing** - separate edit and view-only links, no accounts required.
 - **Export** - download the compiled PDF or the whole project as a ZIP.
+- **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
 
 ## Quick start
 
@@ -51,6 +52,74 @@ docker run -d -p 8787:8787 -v typstry-data:/data typstry
 Each project is a single Loro document holding the file tree, file contents and version list. Clients encrypt every update before it leaves the browser and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
 
 Because the key is part of the share link, anyone with the link can read the project. Treat edit links like passwords.
+
+## Working locally with git
+
+The `typstry` CLI links a folder to a project. It encrypts and decrypts on your machine like the browser does, so the server still only sees ciphertext.
+
+```sh
+cargo install --path crates/typstry-cli
+```
+
+typstry moves the current state of the files between people, live. Git keeps the snapshots you decide to commit. The CLI never commits for you (except the first commit of `clone --git`), so branches, rebase, hooks and remotes work as usual.
+
+Pick one way to get edits from your co-authors. If they use typstry, don't also `git pull` the same edits from a shared remote, or they arrive twice. Your git history can be your own, or one person can keep the shared repository for the group.
+
+### A normal day
+
+```sh
+# Once, joining an existing project
+typstry clone 'https://typstry.example/p/<token>#<key>' thesis --git
+# Once, starting from a repository you already have
+cd thesis && typstry init --server https://typstry.example   # prints the links to share
+
+# Writing: keep sync running and use any editor
+typstry sync
+#   ↓ chapters/intro.typ
+#   ↑ chapters/method.typ
+
+# Checkpoints, in another terminal while sync runs.
+# Co-author edits show up as normal changes.
+git status
+git commit -am "method section draft"
+
+# A private draft: sync pauses while you are off the tracked branch
+git commit -am "before rewrite"
+git switch -c rewrite-results
+git commit -am "restructure results"
+git switch main                 # sync resumes and catches up
+git merge rewrite-results       # published to everyone as one edit
+
+# Backup and milestones
+git push
+typstry version save "sent to supervisor"
+git tag sent-to-supervisor
+```
+
+Without the live mode, the same day is `typstry pull`, edit, then `typstry push`. `pull` leaves files that changed on both sides alone and lists them. `push` merges your changes with anything edited in the meantime and lists files changed on both sides so you can review them with `git diff`.
+
+### Commands
+
+| Command                         | What it does                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------ |
+| `clone <link> [dir] [--git]`    | Copy a project into a new folder. `--git` also creates a repository and commits it   |
+| `init [dir]`                    | Turn a folder (for example an existing git repository) into a new project            |
+| `sync`                          | Keep the folder and the project in sync until Ctrl+C                                 |
+| `status`, `pull`, `push`        | One-shot sync: show, receive or publish changes. While `sync` runs, it answers them  |
+| `link`, `open`                  | Print the edit and view links, or open the project in the browser                    |
+| `info`                          | Project, permission, tracked branch and pending changes                              |
+| `version list`, `version save`  | Named versions, shared with the browser's history panel. Also work while `sync` runs |
+| `export [--at <version>] <dir>` | Write the project, now or at a named version, to a plain folder                      |
+| `track <branch>`                | Change the git branch typstry syncs on (stop `sync` first)                           |
+
+### Things to know
+
+- **The tracked branch.** typstry syncs on one git branch, the one checked out when the folder was first linked. On any other branch, or while git is merging or rebasing, `sync` pauses and `pull`/`push` refuse unless you pass `--force`.
+- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then type `push` in the sync terminal (or run `typstry push --force`) to publish. Committing on the tracked branch before switching avoids this.
+- **Commands next to `sync`.** While `sync` runs, `status`, `info`, `version list`, `version save` and `push` in the same folder ask it instead of failing. `version save` and `push` publish what is on disk right away, so a version saved just after a save includes it. Both refuse while `sync` is paused, and need `--force` while it holds back changes after a branch switch, like the one-shot versions. `pull` only says that `sync` already pulls. `track` and `export` refuse to start until `sync` is stopped.
+- **The key lives in `.typstry/`.** That folder holds the link and a local cache. It ignores itself with its own `.gitignore` and is also added to `.git/info/exclude`. Never commit it. To keep the link out of your shell history, pass it on standard input (`pbpaste | typstry clone - thesis`) or in `TYPSTRY_LINK`.
+- **Ignored files.** `.gitignore` and an optional `.typstryignore` decide which files are synced, so build output such as PDFs stays local. git's own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`) and `.typstryignore` itself are not synced either; re-include one with a negated pattern in `.typstryignore`, such as `!.gitignore`. An ignored file is never written to the folder, and removing or editing it locally never changes the project. A file the project gets from someone else never replaces a local file that is not synced, or one whose name only differs in case on macOS and Windows.
+- **Editors.** Files can change on disk while you edit them. Let your editor reload changed files automatically (VS Code does this for files without unsaved changes).
 
 ## Configuration
 
@@ -113,6 +182,7 @@ This starts the Vite dev server for the frontend and the Rust server on port 878
 | Rust lint      | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Production web | `pnpm build`                                            |
 | Server binary  | `cargo build --release -p typstry-server`               |
+| CLI binary     | `cargo build --release -p typstry-cli`                  |
 
 CI runs on every push to `main` and on pull requests: everything in the table except `pnpm format:check` and the release server build, plus a Docker build with a smoke test.
 
@@ -122,8 +192,10 @@ The end-to-end tests drive the production build in Chromium through [Playwright]
 
 ```
 apps/web/              React + Vite frontend (editor, sync, encryption, Typst and tinymist workers)
+crates/typstry-cli/    The typstry CLI: clone, sync, push and pull a project with a local folder
 crates/typstry-doc/    Shared Loro document schema, mirrored in apps/web/src/doc/schema.ts
 crates/typstry-server/ Axum server: WebSocket rooms, REST API, SQLite and blob storage
+crates/typstry-wire/   Encrypted record format and fragmentation, shared by the server and the CLI
 ```
 
 The document schema exists on both sides. Changes to one must be reflected in the other, and incompatible layout changes bump `SCHEMA_VERSION`.

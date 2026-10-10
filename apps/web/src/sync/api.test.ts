@@ -49,6 +49,23 @@ describe("resolveShare", () => {
     expect(fetch.mock.calls[0]![0]).toBe("http://x/api/share/tok%2Fen");
   });
 
+  it("passes the view token through for edit tokens", async () => {
+    mockFetch(200, { projectId: "p", permission: "write", viewToken: "v" });
+    await expect(resolveShare("e")).resolves.toEqual({
+      projectId: "p",
+      permission: "write",
+      viewToken: "v",
+    });
+  });
+
+  it("ignores a malformed view token", async () => {
+    mockFetch(200, { projectId: "p", permission: "write", viewToken: 5 });
+    await expect(resolveShare("e")).resolves.toEqual({
+      projectId: "p",
+      permission: "write",
+    });
+  });
+
   it("returns null for unknown tokens", async () => {
     mockFetch(404);
     await expect(resolveShare("nope")).resolves.toBeNull();

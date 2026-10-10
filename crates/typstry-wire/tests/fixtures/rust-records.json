@@ -1,0 +1,33 @@
+{
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "keyId": "Yw3NKWbEM2aR",
+  "delta": {
+    "peer": "18446744073709551615",
+    "start": 4,
+    "end": 9,
+    "record": "ABQxODQ0Njc0NDA3MzcwOTU1MTYxNQQJDFl3M05LV2JFTTJhUgxiZwGfrQ2f5QpkZEAfJ5YS9g4JA4XCJneO1GGLVNZZT9ioWoGQnxHvRVgRhg",
+    "plaintext": "ZGVsdGEgZnJvbSBydXN0"
+  },
+  "snapshot": {
+    "vv": [
+      [
+        "10",
+        3
+      ],
+      [
+        "9",
+        2
+      ],
+      [
+        "18446744073709551615",
+        1
+      ]
+    ],
+    "record": "AQMCMTADFDE4NDQ2NzQ0MDczNzA5NTUxNjE1AQE5AgxZdzNOS1diRU0yYVIMGPwsk2hOeuBCTSrpIvqVopIiExOCl2JE9WRyZoP4JrRXj4CWJKFD7RDCydL2LgE",
+    "plaintext": "c25hcHNob3QgZnJvbSBydXN0"
+  },
+  "blob": {
+    "sealed": "QnnHDrI3mmzxYglkLkn3B8hlNUSD70dwxTF3KLbsCyixtte1JFgzX3x3i_tbrVUUvEI",
+    "plaintext": "I3NldCB0ZXh0KGxhbmc6ICJkZSIpCg"
+  }
+}

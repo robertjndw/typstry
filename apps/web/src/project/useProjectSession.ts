@@ -53,7 +53,11 @@ const TOO_NEW =
 
 function sameShare(a: ShareInfo | null | undefined, b: ShareInfo | null) {
   if (!a || !b) return a === b;
-  return a.projectId === b.projectId && a.permission === b.permission;
+  return (
+    a.projectId === b.projectId &&
+    a.permission === b.permission &&
+    a.viewToken === b.viewToken
+  );
 }
 
 /**

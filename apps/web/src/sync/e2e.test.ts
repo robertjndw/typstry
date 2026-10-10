@@ -87,6 +87,7 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     expect(await resolveShare(created.editToken, { baseUrl })).toEqual({
       projectId: created.projectId,
       permission: "write",
+      viewToken: created.viewToken,
     });
 
     // The creator uploads the seed on first connect.

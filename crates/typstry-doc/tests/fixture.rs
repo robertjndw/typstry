@@ -1,12 +1,18 @@
-//! Cross-language check of the path rule. `clash.loro` and the expected
-//! paths are written by `apps/web/src/doc/fixture.test.ts` (regenerate with
-//! `pnpm --filter web fixtures`); this side must derive the same list.
+//! Cross-language checks. `clash.loro`, the expected paths and
+//! `version.js.loro` are written by `apps/web/src/doc/fixture.test.ts`
+//! (regenerate with `pnpm --filter web fixtures`); this side must derive the
+//! same paths and read the same version. `version.rust.loro` goes the other
+//! way and is rewritten by running this test with `TYPSTRY_WRITE_FIXTURES=1`.
 
-use loro::LoroDoc;
+use std::path::Path;
+
+use loro::{ExportMode, LoroDoc};
 use serde::Deserialize;
-use typstry_doc::materialize::{FileContent, materialize};
+use typstry_doc::init::init_project;
+use typstry_doc::materialize::{FileContent, materialize, materialize_at};
 use typstry_doc::paths::build_path_index;
-use typstry_doc::{node, root};
+use typstry_doc::versions::{NamedVersion, named_versions, save_version};
+use typstry_doc::{node, root, title};
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct Expected {
@@ -75,4 +81,42 @@ fn materializes_typescript_fixture() {
             .unwrap();
         assert_eq!(text, &content.to_string(), "{}", file.path);
     }
+}
+
+#[test]
+fn reads_version_saved_by_typescript() {
+    let doc = LoroDoc::from_snapshot(include_bytes!("fixtures/version.js.loro")).unwrap();
+    let versions = named_versions(&doc);
+    assert_eq!(versions.len(), 1);
+    let version = &versions[0];
+    assert_eq!(version.index, 0);
+    assert_eq!(version.name, "Draft from JS");
+    assert_eq!(version.created_at, 1_700_000_000_123);
+    assert_eq!(version.author, "10");
+    let files = materialize_at(&doc, &version.frontiers).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "main.typ");
+}
+
+fn rust_saved_version() -> (LoroDoc, NamedVersion) {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(7).unwrap();
+    init_project(&doc, "From Rust").unwrap();
+    let version = save_version(&doc, "Draft from Rust", 1_700_000_000_456).unwrap();
+    (doc, version)
+}
+
+/// The JS side reads `version.rust.loro`. Snapshots carry change
+/// timestamps, so the file is only rewritten on request; otherwise this
+/// checks that the committed one still holds what Rust would write now.
+#[test]
+fn version_fixture_for_typescript_is_current() {
+    let (doc, version) = rust_saved_version();
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/version.rust.loro");
+    if std::env::var("TYPSTRY_WRITE_FIXTURES").as_deref() == Ok("1") {
+        std::fs::write(&file, doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    }
+    let committed = LoroDoc::from_snapshot(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(named_versions(&committed), [version]);
+    assert_eq!(title(&committed).as_deref(), Some("From Rust"));
 }

@@ -28,7 +28,17 @@ pub fn random_batch_id() -> BatchId {
 /// Encodes one update as a single `DocUpdate`, or as a header plus fragments
 /// when it would not fit in one message.
 pub fn encode_update(crdt: CrdtType, room_id: &str, update: &[u8]) -> Vec<Vec<u8>> {
-    let batch_id = random_batch_id();
+    encode_batch(crdt, room_id, random_batch_id(), update)
+}
+
+/// [`encode_update`] under a batch id the caller picked, for senders that
+/// match acks to what they sent.
+pub fn encode_batch(
+    crdt: CrdtType,
+    room_id: &str,
+    batch_id: BatchId,
+    update: &[u8],
+) -> Vec<Vec<u8>> {
     if update.len() <= FRAGMENT_LIMIT {
         let msg = ProtocolMessage::DocUpdate {
             crdt,

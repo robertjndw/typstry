@@ -26,11 +26,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tower::ServiceExt;
 use typstry_server::http::{AppState, router};
 use typstry_server::room::RoomConfig;
-use typstry_server::room::elo::encode_container as container;
 use typstry_server::store::blobs::BlobStore;
 use typstry_server::store::docs;
 use typstry_server::ws::ConnLimits;
-use typstry_server::ws::fragment::{Reassembler, encode_update};
+use typstry_wire::elo::{
+    encode_container as container, encode_delta_header, encode_record, encode_snapshot_header,
+};
+use typstry_wire::fragment::{Reassembler, encode_update};
 
 mod common;
 
@@ -305,9 +307,10 @@ fn vv(pairs: &[(u64, i32)]) -> Vec<u8> {
 }
 
 fn delta(peer: u64, start: u64, end: u64, ct: &[u8]) -> Vec<u8> {
-    delta_raw(peer.to_string().as_bytes(), start, end, ct)
+    encode_record(&encode_delta_header(peer, start, end, "k1", &[7; 12]), ct)
 }
 
+/// A delta with a peer id the encoder would never write.
 fn delta_raw(peer: &[u8], start: u64, end: u64, ct: &[u8]) -> Vec<u8> {
     let mut w = BytesWriter::new();
     w.push_byte(0x00);
@@ -321,20 +324,7 @@ fn delta_raw(peer: &[u8], start: u64, end: u64, ct: &[u8]) -> Vec<u8> {
 }
 
 fn snapshot(vv: &[(u64, u64)], ct: &[u8]) -> Vec<u8> {
-    // The wire format wants entries sorted by the peer id's bytes.
-    let mut entries: Vec<(String, u64)> = vv.iter().map(|&(p, c)| (p.to_string(), c)).collect();
-    entries.sort();
-    let mut w = BytesWriter::new();
-    w.push_byte(0x01);
-    w.push_uleb128(entries.len() as u64);
-    for (peer, count) in entries {
-        w.push_var_bytes(peer.as_bytes());
-        w.push_uleb128(count);
-    }
-    w.push_var_string("k1");
-    w.push_var_bytes(&[9; 12]);
-    w.push_var_bytes(ct);
-    w.finalize()
+    encode_record(&encode_snapshot_header(vv, "k1", &[9; 12]), ct)
 }
 
 fn records_of(container: &[u8]) -> Vec<Vec<u8>> {
@@ -373,6 +363,12 @@ async fn project_and_share_endpoints() {
             serde_json::from_slice(&to_bytes(res.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(body["projectId"], id);
         assert_eq!(body["permission"], expected);
+        if expected == "write" {
+            assert_eq!(body["viewToken"], view);
+        } else {
+            assert!(body.get("viewToken").is_none());
+            assert!(!body.to_string().contains(&edit));
+        }
     }
 
     for bad in ["nope", "0000000000000000000000"] {
