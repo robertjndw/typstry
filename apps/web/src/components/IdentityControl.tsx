@@ -30,7 +30,7 @@ export function IdentityControl({
             type="button"
             aria-label={`You are ${identity.name}. Change name or color`}
             onClick={() => setEditing(true)}
-            className="cursor-pointer rounded-full outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            className="flex shrink-0 cursor-pointer rounded-full outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           >
             <PersonAvatar identity={identity} />
           </button>

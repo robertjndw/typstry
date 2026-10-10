@@ -15,7 +15,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **Autocompletion and docs** - [tinymist](https://github.com/Myriad-Dreamin/tinymist) runs in a second Web Worker for completions, hover docs and signature help, including your own functions and labels. File paths in `#include`, `#image` and similar calls complete from the project's files.
 - **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
 - **Multi-file projects** - file tree, tabs, and uploads for images, fonts and data files. Images can also be pasted or dropped into the editor.
-- **History** - save named versions, browse the edit history, diff and restore.
+- **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
 - **Sharing** - separate edit and view-only links, no accounts required.
 - **Export** - download the compiled PDF or the whole project as a ZIP.
 - **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
@@ -104,17 +104,17 @@ Without the live mode, the same day is `typstry pull`, edit, then `typstry push`
 
 ### Commands
 
-| Command                         | What it does                                                                         |
-| ------------------------------- | ------------------------------------------------------------------------------------ |
-| `clone <link> [dir] [--git]`    | Copy a project into a new folder. `--git` also creates a repository and commits it   |
-| `init [dir]`                    | Turn a folder (for example an existing git repository) into a new project            |
-| `sync`                          | Keep the folder and the project in sync until Ctrl+C                                 |
-| `status`, `pull`, `push`        | One-shot sync: show, receive or publish changes. While `sync` runs, it answers them  |
-| `link`, `open`                  | Print the edit and view links, or open the project in the browser                    |
-| `info`                          | Project, permission, tracked branch and pending changes                              |
-| `version list`, `version save`  | Named versions, shared with the browser's history panel. Also work while `sync` runs |
-| `export [--at <version>] <dir>` | Write the project, now or at a named version, to a plain folder                      |
-| `track <branch>`                | Change the git branch typstry syncs on (stop `sync` first)                           |
+| Command                         | What it does                                                                        |
+| ------------------------------- | ----------------------------------------------------------------------------------- |
+| `clone <link> [dir] [--git]`    | Copy a project into a new folder. `--git` also creates a repository and commits it  |
+| `init [dir]`                    | Turn a folder (for example an existing git repository) into a new project           |
+| `sync`                          | Keep the folder and the project in sync until Ctrl+C                                |
+| `status`, `pull`, `push`        | One-shot sync: show, receive or publish changes. While `sync` runs, it answers them |
+| `link`, `open`                  | Print the edit and view links, or open the project in the browser                   |
+| `info`                          | Project, permission, tracked branch and pending changes                             |
+| `version list`, `version save`  | Named versions (tags in the browser's history panel). Also work while `sync` runs   |
+| `export [--at <version>] <dir>` | Write the project, now or at a named version, to a plain folder                     |
+| `track <branch>`                | Change the git branch typstry syncs on (stop `sync` first)                          |
 
 Every command takes `-C <dir>` to run as if started in another folder, and `--name <name>` to set the author name shown in the project history (defaults to `git config user.name`). `typstry <command> --help` shows all options.
 

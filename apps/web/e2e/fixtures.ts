@@ -44,8 +44,17 @@ export async function createProject(page: Page, title: string) {
   await page.getByLabel("Project title").fill(title);
   await page.getByRole("button", { name: "New project" }).click();
   await expect(page).toHaveURL(/\/p\/[^/#]+#.+/);
-  await expect(page.getByRole("status").getByText("Connected")).toBeVisible();
+  await expect(syncStatus(page)).toHaveText("Connected");
   return page.url();
+}
+
+/**
+ * The sync indicator in the toolbar. While connected it shows only a dot,
+ * with the label kept for screen readers, so check its text rather than
+ * the label's visibility.
+ */
+export function syncStatus(page: Page) {
+  return page.getByRole("banner").getByRole("status");
 }
 
 export function editor(page: Page) {
@@ -99,7 +108,7 @@ export async function openElsewhere(
   // No stored identity here, so the name prompt comes up first.
   await page.getByLabel("Your name").fill(name);
   await page.getByRole("button", { name: "Join" }).click();
-  await expect(page.getByRole("status").getByText("Connected")).toBeVisible();
+  await expect(syncStatus(page)).toHaveText("Connected");
   return page;
 }
 

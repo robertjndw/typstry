@@ -85,8 +85,8 @@ test("the view link opens the project read-only", async ({ page, browser }) => {
   await expect(
     viewer
       .getByRole("dialog", { name: "History" })
-      .getByRole("button", { name: "Save version" }),
-  ).toBeHidden();
+      .getByRole("button", { name: /Tag (current|this) version/ }),
+  ).toHaveCount(0);
   await versions(viewer).getByRole("button").first().click();
   await expect(
     viewer.getByRole("button", { name: "Back to live" }),

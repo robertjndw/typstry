@@ -1,5 +1,11 @@
 import { EphemeralStore, LoroDoc } from "loro-crdt";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
 import { projectAssets, type ProjectAssets } from "@/assets/project-assets";
 import {
@@ -11,7 +17,11 @@ import {
 import { ProjectDoc, SCHEMA_VERSION } from "@/doc/schema";
 import { defaultBackend, LocalDocStore } from "@/persist/local-doc-store";
 import { resolveShare, type ShareInfo } from "@/sync/api";
-import { connectProject, type SyncStatus } from "@/sync/connection";
+import {
+  connectProject,
+  type SyncNowResult,
+  type SyncStatus,
+} from "@/sync/connection";
 
 import {
   forgetShare,
@@ -54,6 +64,8 @@ export interface ProjectSession {
   status: SyncStatus;
   project: ProjectDoc;
   ephemeral: EphemeralStore;
+  /** Saves locally and pushes pending edits to the server right away. */
+  syncNow: () => Promise<SyncNowResult>;
 }
 
 const WRONG_KEY =
@@ -111,6 +123,7 @@ export function useProjectSession(
   const [synced, setSynced] = useState(false);
   const [slow, setSlow] = useState(false);
   const [status, setStatus] = useState<SyncStatus>("connecting");
+  const syncRef = useRef<(() => Promise<SyncNowResult>) | null>(null);
   const schema = useSyncExternalStore(
     useCallback((onChange) => project.meta.subscribe(onChange), [project]),
     () => project.schemaVersion,
@@ -179,6 +192,11 @@ export function useProjectSession(
         },
       });
       const stopStatus = conn.subscribe((s) => setStatus(s));
+      const store = local;
+      syncRef.current = async () => {
+        await store.flush();
+        return conn.syncNow();
+      };
       const slowTimer = setTimeout(() => setSlow(true), SLOW_SYNC_MS);
       conn.synced.then(
         () => {
@@ -202,6 +220,7 @@ export function useProjectSession(
 
     return () => {
       active = false;
+      syncRef.current = null;
       close?.();
       void local?.stop();
     };
@@ -261,5 +280,11 @@ export function useProjectSession(
       canWrite: share.permission === "write" && projectKey.sign !== null,
     };
 
-  return { state, status, project, ephemeral };
+  const syncNow = useCallback(
+    async (): Promise<SyncNowResult> =>
+      (await syncRef.current?.()) ?? "offline",
+    [],
+  );
+
+  return { state, status, project, ephemeral, syncNow };
 }

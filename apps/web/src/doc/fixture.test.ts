@@ -18,7 +18,7 @@ import {
 import { buildPathIndex, type PathIndex } from "./paths";
 import { initProject, ProjectDoc } from "./schema";
 import { fork, newProject, sync } from "./test-utils";
-import { listVersions, saveVersion } from "./versions";
+import { deleteVersion, listVersions, saveVersion } from "./versions";
 
 const FIXTURES = path.resolve(
   import.meta.dirname,
@@ -27,6 +27,7 @@ const FIXTURES = path.resolve(
 const SNAPSHOT = path.join(FIXTURES, "clash.loro");
 const EXPECTED = path.join(FIXTURES, "clash.paths.json");
 const JS_VERSION = path.join(FIXTURES, "version.js.loro");
+const JS_DELETED_VERSION = path.join(FIXTURES, "version-deleted.js.loro");
 // Written by crates/typstry-doc/tests/fixture.rs.
 const RUST_VERSION = path.join(FIXTURES, "version.rust.loro");
 
@@ -117,6 +118,32 @@ describe("version fixture", () => {
       writeFileSync(JS_VERSION, project.doc.export({ mode: "snapshot" }));
     },
   );
+
+  it.runIf(process.env.TYPSTRY_WRITE_FIXTURES === "1")(
+    "regenerates the JS-deleted version",
+    () => {
+      const project = initProject(newProject(11n), { title: "Deleted" });
+      saveVersion(project, "Kept", { now: 1700000000001 });
+      const gone = saveVersion(project, "Gone", { now: 1700000000002 });
+      saveVersion(project, "Also kept", { now: 1700000000003 });
+      deleteVersion(project, gone, { now: 1700000000004 });
+      writeFileSync(
+        JS_DELETED_VERSION,
+        project.doc.export({ mode: "snapshot" }),
+      );
+    },
+  );
+
+  it("hides the version deleted in the committed fixture", () => {
+    const doc = new LoroDoc();
+    doc.import(readFileSync(JS_DELETED_VERSION));
+    expect(
+      listVersions(new ProjectDoc(doc)).map((v) => [v.index, v.name]),
+    ).toEqual([
+      [0, "Kept"],
+      [2, "Also kept"],
+    ]);
+  });
 
   it("reads a version saved by Rust", () => {
     const doc = new LoroDoc();

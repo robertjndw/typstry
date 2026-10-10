@@ -1,4 +1,17 @@
-import { createProject, expect, test } from "./fixtures";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { strToU8, zipSync } from "fflate";
+
+import {
+  createProject,
+  expect,
+  fileTree,
+  firstPage,
+  openElsewhere,
+  shareLink,
+  syncStatus,
+  test,
+} from "./fixtures";
 
 test("created projects are listed and can be removed", async ({ page }) => {
   await createProject(page, "Listed");
@@ -35,4 +48,71 @@ test("an unknown token shows not found", async ({ page }) => {
   await expect(
     page.getByRole("heading", { name: "Project not found" }),
   ).toBeVisible();
+});
+
+test("a zip imports as a new project, assets included", async ({
+  page,
+  browser,
+}) => {
+  const png = await readFile(path.join(import.meta.dirname, "files/red.png"));
+  const zip = zipSync({
+    "thesis/main.typ": strToU8('#image("figures/red.png", width: 2cm)\n'),
+    "thesis/figures/red.png": png,
+    "thesis/.DS_Store": new Uint8Array([0]),
+  });
+
+  await page.goto("/");
+  const chooser = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Import" }).click();
+  await (
+    await chooser
+  ).setFiles({
+    name: "export.zip",
+    mimeType: "application/zip",
+    buffer: Buffer.from(zip),
+  });
+
+  await expect(page).toHaveURL(/\/p\/[^/#]+#.+/);
+  await expect(syncStatus(page)).toHaveText("Connected");
+  await expect(
+    page.getByRole("button", { name: /Project title: thesis\./ }),
+  ).toBeVisible();
+  await expect(
+    fileTree(page).getByRole("treeitem", { name: "main.typ" }),
+  ).toBeVisible();
+  await expect(
+    fileTree(page).getByRole("treeitem", { name: ".DS_Store" }),
+  ).toBeHidden();
+  await expect(firstPage(page).locator("image")).toHaveCount(1);
+
+  // A collaborator only gets the image from the server, so this checks the
+  // upload actually happened.
+  const other = await openElsewhere(browser, await shareLink(page, "Can edit"));
+  await expect(firstPage(other).locator("image")).toHaveCount(1);
+  await other.context().close();
+});
+
+test("dropping a zip on the start page imports it", async ({ page }) => {
+  const zip = zipSync({ "paper/main.typ": strToU8("= Dropped\n") });
+
+  await page.goto("/");
+  const data = await page.evaluateHandle((bytes) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(
+      new File([new Uint8Array(bytes)], "paper.zip", {
+        type: "application/zip",
+      }),
+    );
+    return transfer;
+  }, Array.from(zip));
+  await page.dispatchEvent("main", "dragenter", { dataTransfer: data });
+  await expect(page.getByText("Drop to import")).toBeVisible();
+  await page.dispatchEvent("main", "drop", { dataTransfer: data });
+
+  await expect(page).toHaveURL(/\/p\/[^/#]+#.+/);
+  await expect(syncStatus(page)).toHaveText("Connected");
+  await expect(
+    page.getByRole("button", { name: /Project title: paper\./ }),
+  ).toBeVisible();
+  await expect(firstPage(page)).toBeVisible();
 });

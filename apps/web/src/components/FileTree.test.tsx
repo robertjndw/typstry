@@ -108,6 +108,23 @@ describe("FileTree", () => {
     expect(screen.queryByRole("treeitem")).toBeNull();
   });
 
+  it("offers to create a file when the project is empty", () => {
+    const project = setup();
+    fireEvent.keyDown(item("main.typ"), { key: "Delete" });
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Delete",
+      }),
+    );
+    expect(screen.getByText("No files yet")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Create a file" }));
+    typeAndEnter("New file name", "fresh.typ");
+
+    expect(paths(project)).toEqual(["fresh.typ"]);
+    expect(screen.queryByText("No files yet")).toBeNull();
+  });
+
   it("sets the main file from the context menu", async () => {
     const project = setup();
     let other;

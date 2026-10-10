@@ -9,11 +9,15 @@ import {
   openElsewhere,
   preview,
   shareLink,
+  syncStatus,
   test,
 } from "./fixtures";
 
-function syncStatus(page: Page) {
-  return page.getByRole("banner").getByRole("status");
+// The app picks Cmd or Ctrl from the user agent, and the "Desktop Chrome"
+// device reports Windows even on a Mac host, so ControlOrMeta would send
+// Cmd there and miss.
+function syncNow(page: Page) {
+  return page.keyboard.press("Control+s");
 }
 
 test("edits made offline sync once back online", async ({
@@ -53,9 +57,10 @@ test("a project opens from local storage without the server", async ({
   await createProject(page, "Local");
   await appendLine(page, "Kept in this browser");
   await expect(editor(page)).toContainText("Kept in this browser");
-  // Edits reach IndexedDB after a short debounce (300 ms in LocalDocStore),
-  // and there is nothing on the page that says when.
-  await page.waitForTimeout(1_000);
+  // Syncing by hand writes IndexedDB before it reports back, so there is no
+  // need to wait out LocalDocStore's debounce.
+  await syncNow(page);
+  await expect(page.getByText("All changes synced")).toBeVisible();
 
   // The page itself still loads, but the API and sync socket are gone, as
   // if the server were down.
@@ -66,6 +71,21 @@ test("a project opens from local storage without the server", async ({
   await expect(editor(page)).toContainText("Kept in this browser");
   await expect(syncStatus(page)).not.toHaveText("Connected");
   await expect(firstPage(page)).toContainText("Kept in this browser");
+});
+
+test("Mod+S syncs right away and says when the server is unreachable", async ({
+  page,
+  context,
+}) => {
+  await createProject(page, "Sync now");
+  await appendLine(page, "Pushed by hand");
+  await syncNow(page);
+  await expect(page.getByText("All changes synced")).toBeVisible();
+
+  await context.setOffline(true);
+  await expect(syncStatus(page)).toHaveText("Offline");
+  await syncNow(page);
+  await expect(page.getByText(/saved on this device/)).toBeVisible();
 });
 
 test("the preview recovers if its renderer failed to load", async ({

@@ -1,7 +1,8 @@
 import { LoroDoc } from "loro-crdt";
 
-import { generateEditSecret } from "@/crypto/project-key";
-import { initProject } from "@/doc/schema";
+import { projectAssets, type ProjectAssets } from "@/assets/project-assets";
+import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { initProject, type ProjectDoc } from "@/doc/schema";
 import {
   defaultBackend,
   LocalDocStore,
@@ -25,16 +26,45 @@ export interface NewProject {
 }
 
 /**
+ * Fills a freshly initialized doc, e.g. with imported files. Assets it
+ * stores go to the new project's blob store.
+ */
+export type ProjectSeed = (
+  project: ProjectDoc,
+  assets: ProjectAssets,
+) => Promise<void>;
+
+/**
  * Registers a project with the server and seeds its doc in this browser.
- * The server only hands out ids and tokens; the title and starter file are
- * written locally and reach it encrypted when the project is first opened.
+ * The server only hands out ids and tokens; the title and files are written
+ * locally and reach it encrypted when the project is first opened. Without
+ * a `seed`, the project starts with the starter main.typ.
  */
 export async function createLocalProject(
   title: string,
-  opts: ApiOptions & { backend?: DocBackend } = {},
+  opts: ApiOptions & { backend?: DocBackend; seed?: ProjectSeed } = {},
 ): Promise<NewProject> {
   const created = await createProject(opts);
   const key = generateEditSecret();
+
+  const doc = new LoroDoc();
+  const backend = opts.backend ?? (await defaultBackend());
+  const store = new LocalDocStore(created.projectId, doc, backend);
+  // Load first: the store only writes what changed after it loaded.
+  await store.load();
+  const project = initProject(doc, { title, starter: !opts.seed });
+  if (opts.seed) {
+    const assets = projectAssets(
+      created.editToken,
+      await importProjectKey(key),
+      { baseUrl: opts.baseUrl },
+    );
+    await opts.seed(project, assets);
+  }
+  await store.flush();
+
+  // Only remembered once seeding worked, so a failed import leaves no
+  // half-filled project behind in the recent list.
   saveShareLinks(created.projectId, created);
   saveProjectKey(created.projectId, key);
   rememberShare(created.editToken, {
@@ -45,18 +75,6 @@ export async function createLocalProject(
     projectId: created.projectId,
     permission: "read",
   });
-
-  const doc = new LoroDoc();
-  const store = new LocalDocStore(
-    created.projectId,
-    doc,
-    opts.backend ?? (await defaultBackend()),
-  );
-  // Load first: the store only writes what changed after it loaded.
-  await store.load();
-  initProject(doc, { title });
-  await store.flush();
-
   rememberProject({
     projectId: created.projectId,
     token: created.editToken,

@@ -3,9 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- No icon yet; an empty one stops the browser requesting /favicon.ico. -->
-    <link rel="icon" href="data:," />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="color-scheme" content="light dark" />
     <title>typstry</title>
+    <!-- Blocking on purpose: it must set the theme class before first paint.
+         A separate file because the CSP forbids inline script. -->
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>

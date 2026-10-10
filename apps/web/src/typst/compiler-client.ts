@@ -120,6 +120,8 @@ export class CompilerClient {
   private fontFiles = new Map<string, string>();
   /** Bumped per font load, so only the latest one posts a reinit. */
   private fontLoad = 0;
+  /** Asset and font loads still on their way to the worker. */
+  private readonly loading = new Set<Promise<void>>();
   private readonly dirty = new Set<TreeID>();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   /** Set while the preview is hidden, see pause(). */
@@ -165,7 +167,8 @@ export class CompilerClient {
     );
     const state = this.index.state;
     this.files = state;
-    this.syncStructure(state, [], [...state.texts.values()], true);
+    if (this.syncStructure(state, [], [...state.texts.values()], true))
+      this.requestCompile();
     // Fetched alongside the compiler instead of on the first result, which
     // narrows the window where a dropped connection leaves no renderer.
     void this.loadRenderer().catch(() => undefined);
@@ -217,18 +220,20 @@ export class CompilerClient {
     }
     // Async even without font files: a delete and an add in back to back
     // batches then cost one reinit, not two.
-    void Promise.all(files.map(([hash, path]) => loader(hash, path))).then(
-      (data) => {
-        if (load !== this.fontLoad) return;
-        this.retry.succeeded("fonts");
-        this.postFonts(data);
-      },
-      (err: unknown) => {
-        console.error("failed to load project fonts", err);
-        if (load !== this.fontLoad) return;
-        this.fontKey = null;
-        this.retry.schedule("fonts", () => this.syncAssets(this.files));
-      },
+    this.track(
+      Promise.all(files.map(([hash, path]) => loader(hash, path))).then(
+        (data) => {
+          if (load !== this.fontLoad) return;
+          this.retry.succeeded("fonts");
+          this.postFonts(data);
+        },
+        (err: unknown) => {
+          console.error("failed to load project fonts", err);
+          if (load !== this.fontLoad) return;
+          this.fontKey = null;
+          this.retry.schedule("fonts", () => this.syncAssets(this.files));
+        },
+      ),
     );
   }
 
@@ -247,12 +252,21 @@ export class CompilerClient {
     this.post({ type: "reinit", fonts }, [...transfer]);
   }
 
-  /** Compiles the main file to a PDF, including edits not yet compiled. */
-  exportPdf(): Promise<Uint8Array> {
-    if (this.disposed) return Promise.reject(new Error("compiler disposed"));
+  /**
+   * Compiles the main file to a PDF, including edits not yet compiled and
+   * assets still loading. The preview can show a first result without an
+   * image and catch up, but an exported file cannot.
+   */
+  async exportPdf(): Promise<Uint8Array> {
+    if (this.disposed) throw new Error("compiler disposed");
+    if (this.mainPath() === undefined)
+      throw new Error("the project has no main file");
+    // Loads finishing can start new ones (a doc change in between), so wait
+    // until none are left.
+    while (this.loading.size > 0) await Promise.all(this.loading);
+    if (this.disposed) throw new Error("compiler disposed");
     const mainPath = this.mainPath();
-    if (mainPath === undefined)
-      return Promise.reject(new Error("the project has no main file"));
+    if (mainPath === undefined) throw new Error("the project has no main file");
     // Edits still waiting out the debounce would be missing otherwise.
     this.flushTexts();
     const id = this.nextPdfId++;
@@ -328,14 +342,25 @@ export class CompilerClient {
     }
     if (change.structural) {
       this.files = change.state;
-      this.syncStructure(
+      const changed = this.syncStructure(
         change.state,
         change.textsRemoved,
         change.textsAdded,
         change.assetsRemoved.length > 0 || change.assetsAdded.length > 0,
       );
+      // A checkout or a collaborator's merged edits can change the file set
+      // and file contents in one batch. Compiling the new file set while the
+      // texts still wait out the debounce reports errors that never existed,
+      // like an #include of a file the same batch removed.
+      if (edited) {
+        if (this.flushTimer !== null) clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+        this.flushTexts();
+      }
+      if (changed || edited) this.requestCompile();
+    } else if (edited) {
+      this.scheduleFlush();
     }
-    if (edited) this.scheduleFlush();
   }
 
   private scheduleFlush(): void {
@@ -365,13 +390,16 @@ export class CompilerClient {
     this.post({ type: "setText", path: typstPath(file.path), text });
   }
 
-  /** Sends the worker what a structural change did to the files. */
+  /**
+   * Sends the worker what a structural change did to the files; true when
+   * the compile input changed.
+   */
   private syncStructure(
     state: ProjectIndexState,
     textsRemoved: readonly IndexedText[],
     textsAdded: readonly IndexedText[],
     assetsChanged: boolean,
-  ): void {
+  ): boolean {
     let changed = textsRemoved.length > 0 || textsAdded.length > 0;
 
     // One batch can hand a path from one file to another (a swap, or a
@@ -396,7 +424,7 @@ export class CompilerClient {
       this.mainId = mainId;
       changed = true;
     }
-    if (changed) this.requestCompile();
+    return changed;
   }
 
   private syncAssets(state: ProjectIndexState): boolean {
@@ -408,24 +436,26 @@ export class CompilerClient {
       if (isCompilerFont(path)) fonts.set(hash, path);
       if (this.assets.get(path) === hash) continue;
       this.assets.set(path, hash);
-      void loader(hash, path).then(
-        (data) => {
-          // The file may have been replaced or removed while loading.
-          if (this.assets.get(path) !== hash) return;
-          this.retry.succeeded(`asset:${path}`);
-          this.post({ type: "setAsset", path: typstPath(path), data }, [
-            data.buffer,
-          ]);
-          this.requestCompile();
-        },
-        (err: unknown) => {
-          console.error(`failed to load asset ${path}`, err);
-          if (this.assets.get(path) !== hash) return;
-          this.assets.set(path, FAILED_LOAD);
-          this.retry.schedule(`asset:${path}`, () => {
-            if (this.syncAssets(this.files)) this.requestCompile();
-          });
-        },
+      this.track(
+        loader(hash, path).then(
+          (data) => {
+            // The file may have been replaced or removed while loading.
+            if (this.assets.get(path) !== hash) return;
+            this.retry.succeeded(`asset:${path}`);
+            this.post({ type: "setAsset", path: typstPath(path), data }, [
+              data.buffer,
+            ]);
+            this.requestCompile();
+          },
+          (err: unknown) => {
+            console.error(`failed to load asset ${path}`, err);
+            if (this.assets.get(path) !== hash) return;
+            this.assets.set(path, FAILED_LOAD);
+            this.retry.schedule(`asset:${path}`, () => {
+              if (this.syncAssets(this.files)) this.requestCompile();
+            });
+          },
+        ),
       );
     }
     for (const path of [...this.assets.keys()]) {
@@ -449,6 +479,12 @@ export class CompilerClient {
     this.fontKey = key;
     this.fontFiles = fonts;
     this.loadFonts();
+  }
+
+  /** `load` must not reject; failures are reported where they happen. */
+  private track(load: Promise<void>): void {
+    this.loading.add(load);
+    void load.finally(() => this.loading.delete(load));
   }
 
   /** Project path of the main file, if it is a mirrored text file. */

@@ -31,6 +31,7 @@ import {
 import { toast } from "sonner";
 
 import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
+import { ToolbarButton } from "@/components/ToolbarButton";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -298,9 +299,10 @@ export function FileTree({ className }: { className?: string }) {
                   tabIndex={0}
                   draggable={!readOnly}
                   className={cn(
-                    "group flex h-7 cursor-default items-center gap-1.5 rounded-sm pr-2 text-sm outline-none select-none hover:bg-accent/60 focus-visible:ring-1 focus-visible:ring-ring",
-                    entry.id === selectedId && "bg-accent",
-                    entry.id === openFileId && "font-medium",
+                    "group flex h-7 cursor-default items-center gap-1.5 rounded-md pr-2 text-sm text-foreground/85 outline-none select-none hover:bg-accent/60 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60",
+                    entry.id === selectedId &&
+                      "bg-accent text-accent-foreground hover:bg-accent",
+                    entry.id === openFileId && "font-medium text-foreground",
                     dropTarget === entry.id &&
                       "bg-primary/10 ring-1 ring-primary/40",
                   )}
@@ -330,6 +332,7 @@ export function FileTree({ className }: { className?: string }) {
                     kind={entry.kind}
                     name={entry.displayName}
                     open={expanded}
+                    className={cn(entry.id === openFileId && "text-foreground")}
                   />
                   <span
                     className="min-w-0 flex-1 truncate"
@@ -339,7 +342,7 @@ export function FileTree({ className }: { className?: string }) {
                   </span>
                   {entry.id === mainFile && (
                     <Badge tip="Main file: the preview compiles this one">
-                      <span className="rounded bg-primary/10 px-1 text-[10px] leading-4 font-medium text-primary uppercase">
+                      <span className="rounded-sm border border-border bg-muted px-1 text-[10px] leading-3.5 font-semibold tracking-wider text-muted-foreground uppercase">
                         main
                       </span>
                     </Badge>
@@ -351,7 +354,7 @@ export function FileTree({ className }: { className?: string }) {
                     >
                       <TriangleAlertIcon
                         aria-label="Name conflict"
-                        className="size-3.5 text-amber-500"
+                        className="size-3.5 text-warning"
                       />
                     </Badge>
                   )}
@@ -404,7 +407,7 @@ export function FileTree({ className }: { className?: string }) {
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
       <div className="flex h-9 shrink-0 items-center gap-0.5 border-b pr-1 pl-3">
-        <span className="flex-1 text-xs font-medium tracking-wide text-muted-foreground uppercase">
+        <span className="flex-1 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase select-none">
           Files
         </span>
         {!readOnly && (
@@ -491,6 +494,14 @@ export function FileTree({ className }: { className?: string }) {
               {createRow(null, 0)}
               {renderEntries(tree, 0)}
             </div>
+            {tree.length === 0 && editing?.mode !== "create" && (
+              <EmptyState
+                readOnly={readOnly}
+                canUpload={canUpload}
+                onCreate={() => startCreate(null, "text")}
+                onUpload={() => startUpload(null)}
+              />
+            )}
           </ScrollArea>
         </ContextMenuTrigger>
         <ContextMenuContent className="w-52" onCloseAutoFocus={keepFocus}>
@@ -525,6 +536,49 @@ export function FileTree({ className }: { className?: string }) {
           if (id) attempt(() => deleteNode(project, id));
         }}
       />
+    </div>
+  );
+}
+
+function EmptyState({
+  readOnly,
+  canUpload,
+  onCreate,
+  onUpload,
+}: {
+  readOnly: boolean;
+  canUpload: boolean;
+  onCreate: () => void;
+  onUpload: () => void;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-3 px-4 py-8 text-center">
+      <FileIcon aria-hidden className="size-6 text-muted-foreground/70" />
+      <div className="grid gap-1">
+        <p className="text-sm font-medium">No files yet</p>
+        {!readOnly && (
+          <p className="text-xs text-muted-foreground">
+            {canUpload
+              ? "Create a file, or drop files here to upload them."
+              : "Create a file to start writing."}
+          </p>
+        )}
+      </div>
+      {!readOnly && (
+        // Labels differ from the toolbar's so each button name stays unique.
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button variant="outline" size="sm" onClick={onCreate}>
+            <FilePlusIcon />
+            Create a file
+          </Button>
+          {canUpload && (
+            <Button variant="ghost" size="sm" onClick={onUpload}>
+              <UploadIcon />
+              Upload
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -647,35 +701,6 @@ function Badge({ tip, children }: { tip: string; children: ReactNode }) {
         <span className="flex shrink-0 items-center">{children}</span>
       </TooltipTrigger>
       <TooltipContent side="right">{tip}</TooltipContent>
-    </Tooltip>
-  );
-}
-
-function ToolbarButton({
-  label,
-  disabled,
-  onClick,
-  children,
-}: {
-  label: string;
-  disabled?: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={label}
-          disabled={disabled}
-          onClick={onClick}
-        >
-          {children}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
     </Tooltip>
   );
 }

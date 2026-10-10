@@ -2,11 +2,12 @@ import { useRef, useState, type KeyboardEvent } from "react";
 
 import { Input } from "@/components/ui/input";
 import { setTitle } from "@/doc/fs-ops";
+import { cn } from "@/lib/utils";
 import { useProject } from "@/project/context";
 import { attempt } from "@/project/tree";
 
 /** The project title in the toolbar; click to rename (with write access). */
-export function ProjectTitle() {
+export function ProjectTitle({ className }: { className?: string }) {
   const { title, project, readOnly } = useProject();
   const [draft, setDraft] = useState<string | null>(null);
   // Leaving edit mode unmounts the focused input, and some browsers fire a
@@ -24,7 +25,15 @@ export function ProjectTitle() {
 
   if (readOnly) {
     return (
-      <span className="truncate text-sm text-muted-foreground">{shown}</span>
+      <span
+        title={shown}
+        className={cn(
+          "min-w-0 truncate px-1 text-sm font-medium text-foreground",
+          className,
+        )}
+      >
+        {shown}
+      </span>
     );
   }
 
@@ -33,9 +42,12 @@ export function ProjectTitle() {
       <button
         type="button"
         aria-label={`Project title: ${shown}. Click to rename`}
-        title="Rename project"
+        title={`${shown} (click to rename)`}
         onClick={start}
-        className="max-w-80 truncate rounded px-1 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
+        className={cn(
+          "h-7 min-w-0 truncate rounded-md px-1.5 text-sm font-medium outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50",
+          className,
+        )}
       >
         {shown}
       </button>
@@ -67,7 +79,7 @@ export function ProjectTitle() {
       onChange={(e) => setDraft(e.target.value)}
       onKeyDown={onKeyDown}
       onBlur={commit}
-      className="h-7 w-64 text-sm"
+      className={cn("h-7 w-64 min-w-0 text-sm", className)}
     />
   );
 }

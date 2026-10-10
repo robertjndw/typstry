@@ -7,11 +7,9 @@ import {
 import { defaultKeymap, indentWithTab } from "@codemirror/commands";
 import {
   bracketMatching,
-  defaultHighlightStyle,
   foldGutter,
   foldKeymap,
   indentOnInput,
-  syntaxHighlighting,
 } from "@codemirror/language";
 import { lintKeymap } from "@codemirror/lint";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
@@ -29,6 +27,8 @@ import {
   rectangularSelection,
 } from "@codemirror/view";
 
+import { editorTheme, foldMarker, syntaxTheme } from "./theme";
+
 /**
  * `basicSetup` from the codemirror package without `history()` and its
  * keymap, since undo is handled by Loro (see undo.ts).
@@ -37,12 +37,11 @@ export const editorBasics: Extension = [
   lineNumbers(),
   highlightActiveLineGutter(),
   highlightSpecialChars(),
-  foldGutter(),
+  foldGutter({ markerDOM: foldMarker }),
   drawSelection(),
   dropCursor(),
   EditorState.allowMultipleSelections.of(true),
   indentOnInput(),
-  syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
   bracketMatching(),
   closeBrackets(),
   autocompletion(),
@@ -59,6 +58,8 @@ export const editorBasics: Extension = [
     ...lintKeymap,
     indentWithTab,
   ]),
+  editorTheme,
+  syntaxTheme,
 ];
 
 export const fillParent = EditorView.theme({

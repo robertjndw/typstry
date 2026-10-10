@@ -70,18 +70,28 @@ export function freeName(
   }
 }
 
+function isTextCandidate(name: string, size: number): boolean {
+  return TEXT_EXTENSIONS.has(extensionOf(name)) && size <= MAX_TEXT_BYTES;
+}
+
 /** The file's text, or null when it should be stored as a blob instead. */
-async function readText(file: File): Promise<string | null> {
-  if (!TEXT_EXTENSIONS.has(extensionOf(file.name))) return null;
-  if (file.size > MAX_TEXT_BYTES) return null;
+export function decodeText(name: string, bytes: Uint8Array): string | null {
+  if (!isTextCandidate(name, bytes.length)) return null;
   try {
     // fatal: a Latin-1 .bib decoded leniently would be silently corrupted;
     // as a blob its bytes at least stay intact.
     const decoder = new TextDecoder("utf-8", { fatal: true });
-    return normalizeNewlines(decoder.decode(await file.arrayBuffer()));
+    return normalizeNewlines(decoder.decode(bytes));
   } catch {
     return null;
   }
+}
+
+async function readText(file: File): Promise<string | null> {
+  // Checked before reading, so a big binary is not read here and then again
+  // for the upload.
+  if (!isTextCandidate(file.name, file.size)) return null;
+  return decodeText(file.name, new Uint8Array(await file.arrayBuffer()));
 }
 
 /**

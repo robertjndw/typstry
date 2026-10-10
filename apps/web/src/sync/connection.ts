@@ -17,6 +17,11 @@ import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
 
 export type SyncStatus = "connecting" | "connected" | "disconnected";
 
+/** "offline": the server could not be reached in time; edits stay queued. */
+export type SyncNowResult = "synced" | "offline";
+
+const SYNC_NOW_TIMEOUT_MS = 5000;
+
 export interface ConnectOptions {
   projectId: string;
   /** Edit or view token; the server derives the permission from it. */
@@ -42,6 +47,11 @@ export interface ProjectConnection {
    * join succeeded. Rejects if that join fails (e.g. an unknown token).
    */
   readonly synced: Promise<void>;
+  /**
+   * Reconnects right away if the socket is down (skipping the backoff),
+   * sends every pending edit and waits for the server to have received them.
+   */
+  syncNow(timeoutMs?: number): Promise<SyncNowResult>;
   /** Stops syncing for good. The doc and the store stay usable. */
   close(): void;
 }
@@ -124,6 +134,38 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
   const synced = docJoin.then((room) => room.waitForReachingServerVersion());
   synced.catch(() => {});
 
+  const untilConnected = (timeoutMs: number) =>
+    new Promise<boolean>((resolve) => {
+      if (status === "connected") return resolve(true);
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        listeners.delete(listener);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => done(false), timeoutMs);
+      const listener = (s: SyncStatus) => {
+        if (s === "connected") done(true);
+      };
+      listeners.add(listener);
+    });
+
+  async function syncNow(
+    timeoutMs = SYNC_NOW_TIMEOUT_MS,
+  ): Promise<SyncNowResult> {
+    if (finished) return "offline";
+    if (socket !== "connected") client.retryNow().catch(() => {});
+    if (!(await untilConnected(timeoutMs))) return "offline";
+    try {
+      await docAdaptor.flush();
+      // The socket is ordered, so a pong means the server has read every
+      // update sent before the ping.
+      await client.ping(timeoutMs);
+      return "synced";
+    } catch {
+      return "offline";
+    }
+  }
+
   function shutdown() {
     stopSocketStatus();
     // Destroying the adaptors only unsubscribes them from the doc and store;
@@ -141,6 +183,7 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
       return () => listeners.delete(listener);
     },
     synced,
+    syncNow,
     close() {
       if (finished) return;
       finished = true;

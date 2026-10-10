@@ -277,6 +277,15 @@ async fn versions_are_saved_listed_and_exported() {
     typstry(&a, &["version", "save", "  first draft "])
         .await
         .unwrap();
+    // Nothing changed since, so the state already has its name.
+    let err = typstry(&a, &["version", "save", "again"])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(r#"already saved as version #0 "first draft""#),
+        "{err}"
+    );
     fs::write(a.join("main.typ"), format!("{starter}v2\n")).unwrap();
     fs::remove_file(a.join("extra.typ")).unwrap();
     typstry(&a, &["push"]).await.unwrap();

@@ -23,7 +23,7 @@ export function PresenceBar() {
     <div
       role="list"
       aria-label="People in this project"
-      className="flex items-center -space-x-1.5"
+      className="flex shrink-0 items-center -space-x-1.5"
     >
       {shown.map((peer) => {
         const path = peer.fileId

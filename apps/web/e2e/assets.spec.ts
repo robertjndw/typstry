@@ -79,7 +79,8 @@ test("the project downloads as a zip with every file", async ({ page }) => {
   await upload(page, RED_PNG);
 
   const download = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download", exact: true }).click();
+  await page.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitem", { name: "Download as zip" }).click();
   const file = await (await download).path();
 
   const entries = unzipSync(await readFile(file));

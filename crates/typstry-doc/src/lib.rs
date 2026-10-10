@@ -113,6 +113,10 @@ pub mod root {
     pub const FS: &str = "fs";
     /// Append-only list of named versions, see [`super::version`].
     pub const VERSIONS: &str = "versions";
+    /// Map of deleted named versions: the entry's list element id
+    /// (`counter@peer`) to the deletion time in unix ms. Entries stay in
+    /// `versions` so that later indexes never shift.
+    pub const DELETED_VERSIONS: &str = "deletedVersions";
 }
 
 /// Keys of each entry in the `versions` list. An entry names a point in

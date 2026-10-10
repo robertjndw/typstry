@@ -26,7 +26,7 @@ export function ConfirmDeleteDialog({
 }) {
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
-      <DialogContent showCloseButton={false}>
+      <DialogContent showCloseButton={false} className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>

@@ -18,7 +18,13 @@ const DESCRIPTIONS: Record<SyncStatus, string> = {
   disconnected: "Edits sync when back online",
 };
 
+/**
+ * Sync state in the toolbar. Just a dot while all is well; the label only
+ * shows when something needs attention. It stays in the DOM (visually
+ * hidden when connected) so the live region announces every change.
+ */
 export function ConnectionStatus({ status }: { status: SyncStatus }) {
+  const quiet = status === "connected";
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -27,21 +33,32 @@ export function ConnectionStatus({ status }: { status: SyncStatus }) {
           role="status"
           tabIndex={0}
           aria-description={DESCRIPTIONS[status]}
-          className="flex cursor-default items-center gap-1.5 rounded-sm text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "flex h-7 shrink-0 cursor-default items-center gap-1.5 rounded-md text-xs outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+            quiet ? "justify-center px-1.5" : "px-2",
+            // Amber text on a light background is too faint, so the dot carries
+            // the color here.
+            status === "connecting" && "bg-warning/15 text-foreground",
+            status === "disconnected" && "bg-destructive/10 text-destructive",
+          )}
         >
           <span
             aria-hidden
             className={cn(
-              "size-2 rounded-full",
-              status === "connected" && "bg-emerald-500",
-              status === "connecting" && "animate-pulse bg-amber-500",
-              status === "disconnected" && "bg-red-500",
+              "size-2 shrink-0 rounded-full",
+              status === "connected" && "bg-success",
+              status === "connecting" && "animate-pulse bg-warning",
+              status === "disconnected" && "bg-destructive",
             )}
           />
-          {LABELS[status]}
+          <span className={cn("font-medium", quiet && "sr-only")}>
+            {LABELS[status]}
+          </span>
         </span>
       </TooltipTrigger>
-      <TooltipContent side="bottom">{DESCRIPTIONS[status]}</TooltipContent>
+      <TooltipContent side="bottom">
+        {LABELS[status]}: {DESCRIPTIONS[status].toLowerCase()}
+      </TooltipContent>
     </Tooltip>
   );
 }

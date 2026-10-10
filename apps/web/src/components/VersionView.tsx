@@ -8,13 +8,14 @@ import {
   HistoryIcon,
   RotateCcwIcon,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { DownloadButton, PdfDownloadButton } from "@/components/DownloadButton";
 import { EditorPane } from "@/components/EditorPane";
 import { FileTree } from "@/components/FileTree";
 import { PreviewPane } from "@/components/PreviewPane";
+import { WorkspaceLayout } from "@/components/WorkspaceLayout";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -26,11 +27,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  ResizableHandle,
-  ResizablePanel,
-  ResizablePanelGroup,
-} from "@/components/ui/resizable";
-import {
   compareVersions,
   fileText,
   restoreVersion,
@@ -40,6 +36,7 @@ import {
 import type { ProjectAssets } from "@/assets/project-assets";
 import { ProjectDoc } from "@/doc/schema";
 import { DiffView } from "@/editor/DiffView";
+import { useWorkspaceLayout } from "@/hooks/use-workspace-layout";
 import { cn } from "@/lib/utils";
 import { PresenceContext } from "@/presence/context";
 import type { VersionTarget } from "@/project/history-items";
@@ -54,6 +51,8 @@ export interface VersionViewProps {
   assets: ProjectAssets | null;
   canRestore: boolean;
   onClose: () => void;
+  /** Open on the diff of the first changed file instead of the main file. */
+  showChangesOnOpen?: boolean;
 }
 
 /**
@@ -110,15 +109,30 @@ function VersionBody({
   canRestore,
   onClose,
   previous,
+  showChangesOnOpen = false,
 }: VersionViewProps & { previous: ProjectDoc }) {
   const { project: version, openFileId, openFile, index, title } = useProject();
   const compiler = useProjectCompiler();
-  const [showChanges, setShowChanges] = useState(false);
+  const [showChanges, setShowChanges] = useState(showChangesOnOpen);
   const [confirming, setConfirming] = useState(false);
+  const layout = useWorkspaceLayout("version");
   const changes = useMemo(
     () => compareVersions(previous, version),
     [previous, version],
   );
+
+  // The main file opens by default, but it may not have changed at all,
+  // which would make the diff look empty.
+  const pickedChange = useRef(!showChangesOnOpen);
+  useEffect(() => {
+    if (pickedChange.current) return;
+    pickedChange.current = true;
+    const diffable = changes.filter(
+      (c) => c.kind === "text" && c.changes[0] !== "deleted",
+    );
+    if (diffable.some((c) => c.id === openFileId)) return;
+    if (diffable[0]) openFile(diffable[0].id);
+  }, [changes, openFileId, openFile]);
 
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   const diff =
@@ -143,16 +157,16 @@ function VersionBody({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b bg-amber-50 px-3 text-sm dark:bg-amber-950/40">
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-warning/30 bg-warning/10 px-2 text-sm">
         <Button variant="ghost" size="sm" onClick={onClose}>
           <ArrowLeftIcon />
-          Back to live
+          <span className="max-md:sr-only">Back to live</span>
         </Button>
-        <HistoryIcon className="size-4 text-muted-foreground" />
-        <span className="truncate">
+        <HistoryIcon aria-hidden className="size-4 shrink-0 text-warning" />
+        <span className="min-w-0 truncate">
           Viewing <span className="font-medium">{target.label}</span>
         </span>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
           <DownloadButton
             project={version}
             assets={assets}
@@ -167,18 +181,19 @@ function VersionBody({
             onClick={() => setShowChanges((v) => !v)}
           >
             <DiffIcon />
-            Show changes
+            <span className="max-md:sr-only">Show changes</span>
           </Button>
           {canRestore && (
             <Button size="sm" onClick={() => setConfirming(true)}>
               <RotateCcwIcon />
-              Restore this version
+              <span className="max-md:sr-only">Restore this version</span>
             </Button>
           )}
         </div>
       </div>
-      <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
-        <ResizablePanel id="version-files" defaultSize="20" minSize="160px">
+      <WorkspaceLayout
+        layout={layout}
+        files={
           <div className="flex h-full min-h-0 flex-col">
             <ChangeList
               changes={changes}
@@ -188,32 +203,26 @@ function VersionBody({
                 setShowChanges(true);
               }}
             />
-            <section aria-label="Files" className="min-h-0 flex-1">
+            <div className="min-h-0 flex-1">
               <FileTree />
-            </section>
+            </div>
           </div>
-        </ResizablePanel>
-        <ResizableHandle />
-        <ResizablePanel id="version-editor" defaultSize="40" minSize="20">
-          <section aria-label="Editor" className="h-full">
-            {diff ? <DiffView {...diff} /> : <EditorPane compiler={compiler} />}
-          </section>
-        </ResizablePanel>
-        <ResizableHandle />
-        <ResizablePanel id="version-preview" defaultSize="40" minSize="20">
-          <section aria-label="Preview" className="h-full">
-            <PreviewPane
-              client={compiler}
-              actions={
-                <PdfDownloadButton
-                  compiler={compiler}
-                  name={[title, target.label]}
-                />
-              }
-            />
-          </section>
-        </ResizablePanel>
-      </ResizablePanelGroup>
+        }
+        editor={
+          diff ? <DiffView {...diff} /> : <EditorPane compiler={compiler} />
+        }
+        preview={
+          <PreviewPane
+            client={compiler}
+            actions={
+              <PdfDownloadButton
+                compiler={compiler}
+                name={[title, target.label]}
+              />
+            }
+          />
+        }
+      />
 
       <Dialog open={confirming} onOpenChange={setConfirming}>
         <DialogContent>
@@ -284,7 +293,7 @@ function ChangeList({
                   <Icon
                     className={cn(
                       "size-3.5 shrink-0",
-                      change.changes[0] === "added" && "text-emerald-600",
+                      change.changes[0] === "added" && "text-success",
                       deleted && "text-destructive",
                     )}
                   />
