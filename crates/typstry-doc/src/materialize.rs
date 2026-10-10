@@ -3,6 +3,7 @@
 //! [`build_path_index`] and clash renames apply.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, TreeID, ValueOrContainer};
 
@@ -12,7 +13,9 @@ use crate::{FileKind, node, node_text, root, string_value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FileContent {
-    Text(String),
+    /// Shared, since callers keep several copies of a project's files
+    /// around and compare them; equal clones compare by pointer.
+    Text(Arc<str>),
     /// Bytes live in the blob store; only the reference is in the doc.
     Asset {
         hash: String,
@@ -97,7 +100,7 @@ pub(crate) fn file_content(doc: &LoroDoc, id: TreeID, kind: FileKind) -> Option<
         FileKind::Dir => None,
         FileKind::Text => {
             let text = node_text(&meta).map(|t| t.to_string()).unwrap_or_default();
-            Some(FileContent::Text(text))
+            Some(FileContent::Text(text.into()))
         }
         FileKind::Asset => {
             let hash = string_value(meta.get(node::HASH)).filter(|h| !h.is_empty())?;
@@ -194,7 +197,10 @@ mod tests {
                 mime: "image/png".into()
             }
         );
-        assert_eq!(files[2].content, FileContent::Text(starter_content("T")));
+        assert_eq!(
+            files[2].content,
+            FileContent::Text(starter_content("T").into())
+        );
     }
 
     #[test]
@@ -256,7 +262,10 @@ mod tests {
 
         let old = materialize_at(&doc, &before).unwrap();
         assert_eq!(paths(&old), ["main.typ"]);
-        assert_eq!(old[0].content, FileContent::Text(starter_content("Old")));
+        assert_eq!(
+            old[0].content,
+            FileContent::Text(starter_content("Old").into())
+        );
 
         let now = materialize(&doc);
         assert_eq!(paths(&now), ["extra.typ", "main.typ"]);

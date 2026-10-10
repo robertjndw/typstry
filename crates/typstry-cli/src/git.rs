@@ -4,8 +4,11 @@
 //! write is the `.typstry/` line in `info/exclude`.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -59,6 +62,121 @@ pub struct Repo {
     /// Shared state like `info/exclude`. Same as `git_dir` except in
     /// linked worktrees.
     pub common_dir: PathBuf,
+    /// Sync looks at the reflog several times a second, and it only ever
+    /// grows, so what was read of it is kept. Shared between clones.
+    reflog: ReflogCache,
+}
+
+/// What the reflog says, one flag per entry: whether it moved files.
+#[derive(Debug, Clone, Default)]
+struct Reflog {
+    /// Entries that end in a newline.
+    entries: Vec<bool>,
+    /// A last line without its newline yet; it still counts, as with
+    /// `lines`.
+    partial: Option<bool>,
+}
+
+impl Reflog {
+    fn count(&self) -> u64 {
+        (self.entries.len() + usize::from(self.partial.is_some())) as u64
+    }
+
+    fn moves_files_after(&self, seen: u64) -> bool {
+        self.entries
+            .iter()
+            .chain(&self.partial)
+            .skip(seen as usize)
+            .any(|&moves| moves)
+    }
+}
+
+/// The reflog as last read, and how to tell whether the file moved on.
+#[derive(Debug)]
+struct ReadReflog {
+    log: Reflog,
+    /// Bytes up to the end of the last whole entry.
+    parsed: u64,
+    /// That entry, which must still be there, right before `parsed`, for
+    /// the file to count as only appended to. Inode, mtime and length
+    /// alone miss `git reflog expire` followed by enough new entries,
+    /// most of all where there is no inode to compare.
+    last_entry: Vec<u8>,
+    len: u64,
+    mtime: Option<SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReflogCache(Arc<Mutex<Option<ReadReflog>>>);
+
+/// A cache says nothing about which repo it is.
+impl PartialEq for ReflogCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ReflogCache {}
+
+fn entry_moves_files(line: &str) -> bool {
+    moves_files(line.split_once('\t').map_or("", |(_, msg)| msg))
+}
+
+fn whole_entries_len(text: &str) -> u64 {
+    text.rfind('\n').map_or(0, |end| end as u64 + 1)
+}
+
+/// The last whole entry in `text`, newline included; empty if there is
+/// none.
+fn last_whole_entry(text: &str) -> &[u8] {
+    let whole = &text[..whole_entries_len(text) as usize];
+    let start = whole
+        .strip_suffix('\n')
+        .and_then(|rest| rest.rfind('\n'))
+        .map_or(0, |end| end + 1);
+    &whole.as_bytes()[start..]
+}
+
+/// Adds the entries in `text` to `log`; a last line without a newline
+/// becomes its partial entry.
+fn parse_reflog(text: &str, log: &mut Reflog) {
+    let (whole, partial) = match text.rfind('\n') {
+        Some(end) => text.split_at(end + 1),
+        None => ("", text),
+    };
+    log.entries
+        .extend(reflog_entries(whole).map(entry_moves_files));
+    log.partial = (!partial.is_empty()).then(|| entry_moves_files(partial));
+}
+
+/// Adds what was appended to the reflog since `read`. False, with `read`
+/// untouched, when the file no longer holds what was read before, so it
+/// has to be read in full.
+fn read_appended(file: &mut fs::File, read: &mut ReadReflog, mtime: Option<SystemTime>) -> bool {
+    // From the start of the last whole entry: it is the check, and a
+    // partial entry after it is read again in full.
+    let start = read.parsed - read.last_entry.len() as u64;
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    let Some(tail) = bytes.strip_prefix(read.last_entry.as_slice()) else {
+        return false;
+    };
+    let Ok(tail) = std::str::from_utf8(tail) else {
+        return false;
+    };
+    parse_reflog(tail, &mut read.log);
+    let whole = whole_entries_len(tail);
+    if whole > 0 {
+        read.last_entry = last_whole_entry(tail).to_vec();
+    }
+    read.len = read.parsed + tail.len() as u64;
+    read.parsed += whole;
+    read.mtime = mtime;
+    true
 }
 
 impl Repo {
@@ -78,6 +196,7 @@ impl Repo {
                     workdir: dir.to_path_buf(),
                     git_dir,
                     common_dir,
+                    reflog: ReflogCache::default(),
                 });
             }
             current = dir.parent();
@@ -116,18 +235,59 @@ impl Repo {
         })
     }
 
-    /// HEAD's reflog as it is on disk. None without a reflog.
-    fn reflog(&self) -> Option<String> {
-        fs::read_to_string(self.git_dir.join("logs").join("HEAD")).ok()
+    /// HEAD's reflog as it is on disk. None without a reflog. Git only
+    /// appends to it, so a file that grew is read from where the last read
+    /// stopped. Anything else (`git reflog expire`, a new file) is read
+    /// from the start.
+    fn reflog(&self) -> Option<Reflog> {
+        let path = self.git_dir.join("logs").join("HEAD");
+        let mut cache = self.reflog.0.lock().expect("never poisoned");
+        let Ok(mut file) = fs::File::open(&path) else {
+            *cache = None;
+            return None;
+        };
+        let meta = file.metadata().ok()?;
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+        let (len, mtime) = (meta.len(), meta.modified().ok());
+        let same_file = |read: &ReadReflog| {
+            #[cfg(unix)]
+            if read.ino != ino {
+                return false;
+            }
+            read.mtime.is_some() && len >= read.len
+        };
+        let current = match cache.as_mut() {
+            Some(read) if same_file(read) && read.len == len && read.mtime == mtime => true,
+            Some(read) if same_file(read) => read_appended(&mut file, read, mtime),
+            _ => false,
+        };
+        if !current {
+            let mut text = String::new();
+            file.seek(SeekFrom::Start(0)).ok()?;
+            file.read_to_string(&mut text).ok()?;
+            let mut log = Reflog::default();
+            parse_reflog(&text, &mut log);
+            *cache = Some(ReadReflog {
+                log,
+                parsed: whole_entries_len(&text),
+                last_entry: last_whole_entry(&text).to_vec(),
+                len: text.len() as u64,
+                mtime,
+                #[cfg(unix)]
+                ino,
+            });
+        }
+        cache.as_ref().map(|read| read.log.clone())
     }
 
     pub fn mark(&self) -> GitMark {
-        self.mark_with(self.reflog().as_deref())
+        self.mark_with(self.reflog().as_ref())
     }
 
     /// [`Self::mark`] with the reflog already read, so callers that also
     /// look at its entries read it only once.
-    fn mark_with(&self, reflog: Option<&str>) -> GitMark {
+    fn mark_with(&self, reflog: Option<&Reflog>) -> GitMark {
         let head = self.read_head();
         GitMark {
             branch: match parse_head(head.as_deref()) {
@@ -135,7 +295,7 @@ impl Repo {
                 Head::Detached => None,
             },
             commit: head.as_deref().and_then(|head| self.commit_of(head)),
-            reflog: reflog.map(|log| reflog_entries(log).count() as u64),
+            reflog: reflog.map(Reflog::count),
         }
     }
 
@@ -145,16 +305,13 @@ impl Repo {
     /// reflog to tell, any move of HEAD counts.
     pub fn switched_since(&self, then: &GitMark) -> bool {
         let log = self.reflog();
-        let now = self.mark_with(log.as_deref());
+        let now = self.mark_with(log.as_ref());
         if now == *then {
             return false;
         }
         match (then.reflog, now.reflog, log) {
             (Some(seen), Some(count), Some(log)) if count >= seen => {
-                now.branch != then.branch
-                    || reflog_entries(&log)
-                        .skip(seen as usize)
-                        .any(|line| moves_files(line.split_once('\t').map_or("", |(_, msg)| msg)))
+                now.branch != then.branch || log.moves_files_after(seen)
             }
             _ => true,
         }
@@ -369,6 +526,58 @@ mod tests {
         fs::remove_file(git.join("logs/HEAD")).unwrap();
         assert_eq!(repo.head_commit().as_deref(), Some(two.as_str()));
         assert!(repo.switched_since(&mark));
+    }
+
+    #[test]
+    fn reads_only_what_was_appended_to_the_reflog() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        fake_repo(dir.path(), "ref: refs/heads/main\n");
+        fs::create_dir_all(dir.path().join(".git/logs")).unwrap();
+        let path = dir.path().join(".git/logs/HEAD");
+        fs::write(&path, "a\tcommit: one\nb\tcheckout: moving").unwrap();
+        let repo = Repo::discover(dir.path()).unwrap();
+        let log = repo.reflog().unwrap();
+        assert_eq!(log.count(), 2);
+        assert!(log.moves_files_after(1));
+        assert!(!log.moves_files_after(2));
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b" from a to b\nc\tcommit: two\n").unwrap();
+        drop(file);
+        let log = repo.clone().reflog().unwrap();
+        assert_eq!(log.count(), 3);
+        assert_eq!(log.entries, [false, true, false]);
+        assert!(!log.moves_files_after(2));
+
+        // Expiring rewrites the file shorter; it is read again in full.
+        fs::write(&path, "c\tcommit: two\n").unwrap();
+        assert_eq!(repo.reflog().unwrap().entries, [false]);
+    }
+
+    #[test]
+    fn rereads_a_reflog_rewritten_to_the_same_length() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        fake_repo(dir.path(), "ref: refs/heads/main\n");
+        fs::create_dir_all(dir.path().join(".git/logs")).unwrap();
+        let path = dir.path().join(".git/logs/HEAD");
+        fs::write(&path, "a\tcommit: one\nb\tcommit: two\n").unwrap();
+        let repo = Repo::discover(dir.path()).unwrap();
+        assert_eq!(repo.reflog().unwrap().entries, [false, false]);
+
+        // Expired down to one entry, then appended back to the old length.
+        // Truncating in place keeps the inode, which is what HEAD.lock
+        // reuse can amount to.
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(0).unwrap();
+        file.write_all(b"b\tcommit: two\nc\tcheckout: m\n").unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        drop(file);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 28);
+        assert_eq!(repo.reflog().unwrap().entries, [false, true]);
     }
 
     #[test]

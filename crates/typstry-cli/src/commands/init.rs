@@ -9,9 +9,12 @@ use typstry_doc::names::validate_path;
 use typstry_doc::paths::build_path_index;
 use typstry_wire::crypto::ProjectKey;
 
-use super::{Ctx, Output, link::print_links, print_warnings, track_branch};
+use super::{
+    Ctx, Output, link::print_links, print_not_applied, print_report_warnings, print_warnings,
+    track_branch,
+};
 use crate::api::{Api, Permission, ShareInfo};
-use crate::engine::{Mode, Scope, Session, set_peer_info};
+use crate::engine::{Flush, Mode, Scope, Session, set_peer_info};
 use crate::git::{self, Head, Repo};
 use crate::link::{ShareLink, ws_url};
 use crate::state::{STATE_DIR, StateDir};
@@ -52,9 +55,8 @@ pub struct Args {
     /// the top level.
     #[arg(long, value_name = "FILE")]
     pub main: Option<String>,
-    /// The typstry server, e.g. https://typst.example.org; defaults to
-    /// $TYPSTRY_SERVER.
-    #[arg(long, value_name = "URL")]
+    /// The typstry server, e.g. https://typst.example.org.
+    #[arg(long, value_name = "URL", env = "TYPSTRY_SERVER")]
     pub server: Option<String>,
     /// Show what would be uploaded and stop.
     #[arg(long)]
@@ -82,31 +84,32 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         Some(dir) => ctx.dir.join(dir),
         None => ctx.dir.clone(),
     };
-    let server = match args.server.clone().or_else(|| {
-        std::env::var("TYPSTRY_SERVER")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }) {
+    // clap hands over a set but empty TYPSTRY_SERVER as a value; it means
+    // no server, like leaving it unset.
+    let server = args
+        .server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_owned());
+    match &server {
         Some(server) => {
-            let server = server.trim().trim_end_matches('/').to_owned();
-            ws_url(&server).context("--server must be an http(s) URL")?;
-            Some(server)
+            ws_url(server).context("--server must be an http(s) URL")?;
         }
         // A dry run never talks to a server, so it may as well work
         // without one.
-        None if args.dry_run => None,
+        None if args.dry_run => {}
         None => {
             bail!("no server given; pass --server https://your-typstry-host or set TYPSTRY_SERVER")
         }
-    };
+    }
 
     let plan = plan(&root, &args)?;
     print_preview(&plan, server.as_deref());
-    if args.dry_run {
+    let Some(server) = server.filter(|_| !args.dry_run) else {
         println!("Dry run: nothing was uploaded.");
         return Ok(());
-    }
-    let server = server.expect("checked above");
+    };
     if !args.yes && !confirm(&format!("Create the project on {server} and upload it?"))? {
         bail!("cancelled; nothing was uploaded");
     }
@@ -367,7 +370,8 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
 }
 
 async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Result<Session> {
-    let created = Api::new(server)?.create_project().await?;
+    let api = Api::new(server)?;
+    let created = api.create_project().await?;
     let link = ShareLink::new(server, &created.edit_token, &ProjectKey::generate_raw());
     let share = ShareInfo {
         project_id: created.project_id,
@@ -379,13 +383,13 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     if let Some((repo, _)) = &plan.repo {
         repo.exclude_state_dir()?;
     }
-    let mut session = Session::create(root, &link, &share, ctx.name.as_deref())?;
+    let mut session = Session::create_with_api(root, &link, &share, api, ctx.name.as_deref())?;
     session.connect().await?;
 
     // The seed and the files go out together after the assets, so nobody
     // ever sees a project whose assets are still missing.
-    set_peer_info(&session.doc, session.identity())?;
-    init_bare_project(&session.doc, &plan.title)?;
+    set_peer_info(session.doc(), session.identity())?;
+    init_bare_project(session.doc(), &plan.title)?;
     // The starter goes up like any other file, so there is only one way a
     // file gets into a new project.
     let paths: BTreeSet<String> = if plan.starter {
@@ -398,28 +402,26 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     };
     // Only the previewed paths, so whatever appeared since is not uploaded
     // unseen and skipped files stay skipped.
-    let report = session.reconcile(&Scope::Paths(paths), Mode::Push).await?;
-    for skipped in &report.applied.skipped {
-        eprintln!(
-            "warning: not uploading {}: {}",
-            skipped.path, skipped.reason
-        );
-    }
-    for warning in &report.warnings {
-        eprintln!("warning: {warning}");
-    }
+    let report = session
+        .reconcile(&Scope::Paths(paths), Mode::Push, Flush::Now)
+        .await?;
+    let mut out = Output::terminal();
+    // The preview already listed what goes up, so only what did not.
+    print_not_applied(&mut out, &report.applied, "uploading");
+    print_report_warnings(&mut out, &report);
     if let Some(main) = &plan.main {
-        match build_path_index(&session.doc).by_path.get(main) {
-            Some(&id) => set_main_file(&session.doc, Some(id))?,
-            None => eprintln!("warning: {main} was not uploaded, so there is no main file"),
+        match build_path_index(session.doc()).by_path.get(main) {
+            Some(&id) => set_main_file(session.doc(), Some(id))?,
+            None => out.err(format!(
+                "warning: {main} was not uploaded, so there is no main file"
+            )),
         }
     }
     // Only meta changed since the reconcile, so the folder still matches.
     // Taken before sending, which may import someone else's ops.
-    session.base.set_frontiers(&session.doc.oplog_frontiers());
+    session.set_base_to_doc();
     session.push_local().await?;
     session.disconnect().await;
-    let mut out = Output::terminal();
     print_warnings(&mut out, &mut session);
     session.save()?;
     track_branch(&mut session, &mut out)?;

@@ -2,12 +2,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use typstry_doc::materialize::{materialize, materialize_at};
+use typstry_doc::materialize::{FileContent, materialize, materialize_at};
 
 use super::clone::check_empty;
 use super::init::absolute;
 use super::version::{find_version, format_ms};
-use super::{Ctx, Output, print_warnings};
+use super::{Ctx, Fetch, Output};
 use crate::worktree::{Worktree, case_clashes};
 
 /// Write the project's files, now or at a named version, to a new folder.
@@ -20,9 +20,8 @@ pub struct Args {
     /// `typstry version list`. Defaults to the current state.
     #[arg(long, value_name = "VERSION")]
     pub at: Option<String>,
-    /// Use the cached copy of the project instead of fetching.
-    #[arg(long)]
-    pub offline: bool,
+    #[command(flatten)]
+    pub fetch: Fetch,
     /// Where to write the files; must be new or empty.
     pub dir: PathBuf,
 }
@@ -41,14 +40,13 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         );
     }
 
-    if !args.offline {
-        session.refresh().await?;
-        print_warnings(&mut Output::terminal(), &mut session);
-    }
+    args.fetch
+        .refresh(&mut session, &mut Output::terminal())
+        .await?;
     let (files, label) = match &args.at {
         Some(at) => {
-            let version = find_version(&session.doc, at)?;
-            let files = materialize_at(&session.doc, &version.frontiers)
+            let version = find_version(session.doc(), at)?;
+            let files = materialize_at(session.doc(), &version.frontiers)
                 .context("the cached project lacks the history of this version")?;
             let label = format!(
                 "version #{} {:?} ({})",
@@ -58,7 +56,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             );
             (files, label)
         }
-        None => (materialize(&session.doc), "the current state".to_owned()),
+        None => (materialize(session.doc()), "the current state".to_owned()),
     };
 
     let created = !target.exists();
@@ -76,10 +74,28 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             dropped
         })
         .collect();
+    let files: Vec<_> = files
+        .iter()
+        .filter(|f| !dropped.contains(&f.path))
+        .collect();
     let mut written = 0;
     let result: anyhow::Result<()> = async {
-        for file in files.iter().filter(|f| !dropped.contains(&f.path)) {
-            let bytes = session.content_bytes(&file.content).await?;
+        if !args.fetch.offline {
+            let assets: Vec<&str> = files
+                .iter()
+                .filter_map(|f| match &f.content {
+                    FileContent::Asset { hash, .. } => Some(hash.as_str()),
+                    FileContent::Text(_) => None,
+                })
+                .collect();
+            session.prefetch_assets(&assets).await?;
+        }
+        for file in files {
+            let bytes = if args.fetch.offline {
+                session.cached_content_bytes(&file.content)?
+            } else {
+                session.content_bytes(&file.content).await?
+            };
             out.write(&file.path, &bytes)?;
             written += 1;
         }

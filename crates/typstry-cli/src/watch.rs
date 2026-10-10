@@ -2,13 +2,18 @@
 //! that tells real edits from the echo of our own writes, and the git
 //! checks that pause syncing while git rewrites the folder.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use typstry_doc::materialize::FileContent;
+
 use crate::engine::{Files, Session};
 use crate::git::{Head, Repo};
-use crate::worktree::{Worktree, digest};
+use crate::hash::Digest;
+use crate::mailbox::MAILBOX;
+use crate::state::STATE_DIR;
+use crate::worktree::Worktree;
 use anyhow::Context;
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
@@ -25,6 +30,9 @@ pub enum Change {
     /// Events were lost or the OS gave up tracking details; only a full
     /// scan can tell what changed.
     Rescan,
+    /// A command dropped a request into the mailbox, see
+    /// [`crate::mailbox`].
+    Requests,
 }
 
 /// Watches the project folder recursively. Events arrive on the returned
@@ -36,15 +44,23 @@ pub struct Watcher {
 impl Watcher {
     pub fn start(root: &Path) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<Change>)> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let mailbox = root.join(STATE_DIR).join(MAILBOX);
         let mut debouncer = new_debouncer(DEBOUNCE, None, move |result: DebounceEventResult| {
             let change = match result {
-                Ok(events) if events.iter().any(|e| e.need_rescan()) => Change::Rescan,
-                Ok(events) => Change::Paths(
-                    events
+                Ok(events) if events.iter().any(|e| e.need_rescan()) => {
+                    let _ = tx.send(Change::Requests);
+                    Change::Rescan
+                }
+                Ok(events) => {
+                    let paths: BTreeSet<PathBuf> = events
                         .into_iter()
                         .flat_map(|event| event.event.paths)
-                        .collect(),
-                ),
+                        .collect();
+                    if paths.iter().any(|path| is_request(&mailbox, path)) {
+                        let _ = tx.send(Change::Requests);
+                    }
+                    Change::Paths(paths)
+                }
                 Err(errors) => {
                     for error in errors {
                         tracing::warn!(%error, "file watcher error");
@@ -65,6 +81,10 @@ impl Watcher {
             rx,
         ))
     }
+}
+
+fn is_request(mailbox: &Path, path: &Path) -> bool {
+    path.parent() == Some(mailbox) && path.extension().is_some_and(|ext| ext == "req")
 }
 
 /// What one watcher path means for syncing.
@@ -88,7 +108,23 @@ pub enum Seen {
 pub struct Synced {
     /// The base files the digests were taken of.
     files: Files,
-    digests: HashMap<String, Option<String>>,
+    digests: BTreeMap<String, Option<Known>>,
+}
+
+/// What a base file holds on disk, as far as it can be told without the
+/// bytes of an asset we never had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Known {
+    digest: Digest,
+    /// A file of another size is changed without reading it.
+    size: u64,
+}
+
+fn size_of(content: &FileContent) -> u64 {
+    match content {
+        FileContent::Text(text) => text.len() as u64,
+        FileContent::Asset { size, .. } => *size,
+    }
 }
 
 impl Synced {
@@ -112,8 +148,13 @@ impl Synced {
                     (Some(then), Some(known)) if then == content => known,
                     _ => None,
                 };
-                let digest = unchanged.or_else(|| session.known_digest(content));
-                (path.clone(), digest)
+                let known = unchanged.or_else(|| {
+                    Some(Known {
+                        digest: session.known_digest(content)?,
+                        size: size_of(content),
+                    })
+                });
+                (path.clone(), known)
             })
             .collect();
         self.files = files;
@@ -121,7 +162,10 @@ impl Synced {
 
     fn contains_under(&self, path: &str) -> bool {
         let prefix = format!("{path}/");
-        self.digests.keys().any(|p| p.starts_with(&prefix))
+        self.digests
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(p, _)| p.starts_with(&prefix))
     }
 
     pub fn classify(&self, worktree: &Worktree, abs: &Path) -> Seen {
@@ -136,14 +180,21 @@ impl Synced {
         match meta {
             Ok(meta) if meta.is_dir() => Seen::Folder,
             Ok(meta) if meta.is_file() => {
+                let Some(Some(known)) = self.digests.get(&path) else {
+                    return Seen::Changed(path);
+                };
+                if meta.len() != known.size {
+                    return Seen::Changed(path);
+                }
                 let current = worktree
                     .read_bytes(&path)
                     .ok()
                     .flatten()
-                    .map(|bytes| digest(&bytes));
-                match (self.digests.get(&path), current) {
-                    (Some(Some(known)), Some(current)) if *known == current => Seen::Nothing,
-                    _ => Seen::Changed(path),
+                    .map(|bytes| Digest::of(&bytes));
+                if current.as_ref() == Some(&known.digest) {
+                    Seen::Nothing
+                } else {
+                    Seen::Changed(path)
                 }
             }
             // A symlink or something else we do not sync: the reconcile
@@ -190,6 +241,26 @@ impl GitState {
         match repo.operation_in_progress() {
             Some(op) => Self::Busy(op),
             None => Self::Clear,
+        }
+    }
+
+    /// Why git keeps typstry from syncing, if it does, as the middle of a
+    /// sentence: "git is in the middle of a merge", "on branch draft,
+    /// typstry tracks main".
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Clear => None,
+            Self::Busy(op) => Some(format!("git is in the middle of {op}")),
+            Self::Elsewhere {
+                head,
+                tracked: Some(tracked),
+            } => Some(format!("on {head}, typstry tracks {tracked}")),
+            Self::Elsewhere {
+                head,
+                tracked: None,
+            } => Some(format!(
+                "on {head}, and typstry does not track a branch yet"
+            )),
         }
     }
 }

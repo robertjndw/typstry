@@ -81,7 +81,7 @@ fn materializes_typescript_fixture() {
             .unwrap()
             .into_text()
             .unwrap();
-        assert_eq!(text, &content.to_string(), "{}", file.path);
+        assert_eq!(&**text, content.to_string(), "{}", file.path);
     }
 }
 

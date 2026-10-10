@@ -1,7 +1,9 @@
-use crate::engine::{Mode, Report, Scope};
+use crate::engine::{Flush, Mode, Report, Scope};
 use crate::mailbox::Request;
 
-use super::{Ctx, Output, guard_branch, guard_switch, print_applied, print_list, print_report};
+use super::{
+    Ctx, Output, connected, guard_branch, guard_switch, print_applied, print_list, print_report,
+};
 
 /// Publish local changes, merged with whatever changed remotely.
 ///
@@ -33,9 +35,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let mut out = Output::terminal();
     guard_branch(&mut session, args.force, &mut out)?;
     guard_switch(&mut session, args.force).await?;
-    session.connect().await?;
-    let report = session.reconcile(&Scope::Full, Mode::Push).await?;
-    session.disconnect().await;
+    let report = connected(&mut session, async |session| {
+        session
+            .reconcile(&Scope::Full, Mode::Push, Flush::Now)
+            .await
+    })
+    .await?;
     print_pushed(&mut out, &report);
     Ok(())
 }

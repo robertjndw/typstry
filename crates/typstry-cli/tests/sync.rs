@@ -4,13 +4,12 @@
 
 mod common;
 
-use common::{cached_doc, typstry};
+use common::{binary, cached_doc, clone, failed, read, stdout, try_read, typstry};
 
 use std::fs;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -107,54 +106,6 @@ async fn bind(addr: Option<SocketAddr>) -> tokio::net::TcpListener {
     panic!("cannot bind {addr}");
 }
 
-async fn clone(link: &str, parent: &Path, name: &str) -> PathBuf {
-    typstry(parent, &["clone", link, name]).await.unwrap();
-    parent.join(name).canonicalize().unwrap()
-}
-
-/// Runs the real binary in `dir`, as a second terminal next to sync would,
-/// off the runtime so the in-process sync keeps answering.
-async fn binary(dir: &Path, args: &[&str]) -> Output {
-    let dir = dir.to_path_buf();
-    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_typstry"))
-            .arg("-C")
-            .arg(&dir)
-            .args(&args)
-            .current_dir(&dir)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap()
-}
-
-/// Stdout of a run that must have succeeded.
-fn ok(out: &Output) -> String {
-    assert!(
-        out.status.success(),
-        "failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout.clone()).unwrap()
-}
-
-/// Stderr of a run that must have failed.
-fn failed(out: &Output) -> String {
-    assert!(
-        !out.status.success(),
-        "succeeded: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    String::from_utf8(out.stderr.clone()).unwrap()
-}
-
-fn read(dir: &Path, path: &str) -> Option<String> {
-    fs::read_to_string(dir.join(path)).ok()
-}
-
 /// Polls `check` until it holds or `secs` pass.
 async fn eventually<F, Fut>(secs: u64, what: &str, mut check: F)
 where
@@ -174,7 +125,7 @@ where
 /// What the co-author's folder holds at `path` after a pull.
 async fn pulled(dir: &Path, path: &str) -> Option<String> {
     typstry(dir, &["pull"]).await.unwrap();
-    read(dir, path)
+    try_read(dir, path)
 }
 
 /// Writes `path` in the co-author's folder and pushes it.
@@ -289,7 +240,7 @@ async fn syncs_both_ways_without_echoes() {
 
     push_edit(&b, "notes.typ", "remote notes\n").await;
     eventually(15, "remote edit lands on disk", || async {
-        read(&a, "notes.typ").as_deref() == Some("remote notes\n")
+        try_read(&a, "notes.typ").as_deref() == Some("remote notes\n")
     })
     .await;
 
@@ -319,7 +270,7 @@ async fn a_git_lock_pauses_sync() {
     let b = clone(&edit, work.path(), "b").await;
     fake_git(&a, "main");
     let mut live = Live::start(&a).await;
-    let original = read(&a, "main.typ").unwrap();
+    let original = read(&a, "main.typ");
 
     fs::write(a.join(".git/index.lock"), "").unwrap();
     live.wait_for(Notice::Paused).await;
@@ -351,12 +302,12 @@ async fn another_branch_pauses_and_the_tracked_one_resumes() {
     live.wait_for(Notice::Paused).await;
     push_edit(&b, "notes.typ", "while on draft\n").await;
     settle().await;
-    assert_eq!(read(&a, "notes.typ"), None);
+    assert_eq!(try_read(&a, "notes.typ"), None);
 
     checkout(&a, "main");
     live.wait_for(Notice::Resumed).await;
     eventually(15, "remote edit lands after resuming", || async {
-        read(&a, "notes.typ").as_deref() == Some("while on draft\n")
+        try_read(&a, "notes.typ").as_deref() == Some("while on draft\n")
     })
     .await;
 
@@ -379,7 +330,7 @@ async fn a_changed_tree_after_a_branch_switch_is_held_until_published() {
     let b = clone(&edit, work.path(), "b").await;
     fake_git(&a, "main");
     let mut live = Live::start(&a).await;
-    let original = read(&a, "main.typ").unwrap();
+    let original = read(&a, "main.typ");
 
     // The checkout back to main leaves the folder different from the last
     // sync, like one that drops edits pulled while on the draft.
@@ -394,19 +345,19 @@ async fn a_changed_tree_after_a_branch_switch_is_held_until_published() {
     // edits made while holding.
     push_edit(&b, "notes.typ", "incoming\n").await;
     eventually(15, "remote edit lands while holding", || async {
-        read(&a, "notes.typ").as_deref() == Some("incoming\n")
+        try_read(&a, "notes.typ").as_deref() == Some("incoming\n")
     })
     .await;
     fs::write(a.join("extra.typ"), "made while holding\n").unwrap();
     settle().await;
     assert_eq!(pulled(&b, "main.typ").await, Some(original));
-    assert_eq!(read(&b, "extra.typ"), None);
+    assert_eq!(try_read(&b, "extra.typ"), None);
 
     live.control.send(Control::Publish).unwrap();
     live.wait_for(Notice::Released).await;
     eventually(15, "held changes go out after publishing", || async {
         pulled(&b, "main.typ").await.as_deref() == Some("= Not what main had\n")
-            && read(&b, "extra.typ").as_deref() == Some("made while holding\n")
+            && try_read(&b, "extra.typ").as_deref() == Some("made while holding\n")
     })
     .await;
     assert!(!a.join(STATE_DIR).join("hold").exists());
@@ -421,7 +372,7 @@ async fn a_restarted_sync_keeps_holding() {
     let a = clone(&edit, work.path(), "a").await;
     let b = clone(&edit, work.path(), "b").await;
     fake_git(&a, "main");
-    let original = read(&a, "main.typ").unwrap();
+    let original = read(&a, "main.typ");
 
     let mut live = Live::start(&a).await;
     checkout(&a, "draft");
@@ -478,11 +429,11 @@ async fn a_view_link_only_receives() {
     let b = clone(&edit, work.path(), "b").await;
     let live = Live::start(&v).await;
 
-    let original = read(&b, "main.typ").unwrap();
+    let original = read(&b, "main.typ");
     fs::write(v.join("main.typ"), "= Not allowed\n").unwrap();
     push_edit(&b, "notes.typ", "for viewers\n").await;
     eventually(15, "remote edit lands in the view clone", || async {
-        read(&v, "notes.typ").as_deref() == Some("for viewers\n")
+        try_read(&v, "notes.typ").as_deref() == Some("for viewers\n")
     })
     .await;
     assert_eq!(pulled(&b, "main.typ").await, Some(original));
@@ -515,7 +466,7 @@ async fn a_branch_switch_while_sync_was_stopped_is_held() {
     let b = clone(&edit, work.path(), "b").await;
     fake_git(&a, "main");
     reflog(&a, "commit (initial): import");
-    let original = read(&a, "main.typ").unwrap();
+    let original = read(&a, "main.typ");
     Live::start(&a).await.stop().await;
 
     reflog(&a, "checkout: moving from main to draft");
@@ -572,7 +523,7 @@ async fn a_reset_under_a_git_lock_is_checked_like_a_branch_switch() {
     let b = clone(&edit, work.path(), "b").await;
     fake_git(&a, "main");
     reflog(&a, "commit (initial): import");
-    let original = read(&a, "main.typ").unwrap();
+    let original = read(&a, "main.typ");
     let mut live = Live::start(&a).await;
 
     // `git reset --hard` rewrites files while it holds the index lock and
@@ -601,32 +552,32 @@ async fn commands_next_to_sync_ask_it() {
     // Saved right after an edit, before the watcher has reported it: the
     // version still holds it.
     fs::write(a.join("main.typ"), "= In the version\n").unwrap();
-    let saved = ok(&binary(&a, &["version", "save", "Draft 1"]).await);
+    let saved = stdout(&binary(&a, &["version", "save", "Draft 1"]).await);
     assert!(saved.contains("Saved version #0 \"Draft 1\"."), "{saved}");
     let export = work.path().join("export");
     typstry(&b, &["export", "--at", "Draft 1", export.to_str().unwrap()])
         .await
         .unwrap();
     assert_eq!(
-        read(&export, "main.typ").as_deref(),
+        try_read(&export, "main.typ").as_deref(),
         Some("= In the version\n")
     );
 
-    let list = ok(&binary(&a, &["version", "list"]).await);
+    let list = stdout(&binary(&a, &["version", "list"]).await);
     assert!(list.contains("Draft 1"), "{list}");
-    let status = ok(&binary(&a, &["status"]).await);
+    let status = stdout(&binary(&a, &["status"]).await);
     assert!(status.contains("Everything up to date."), "{status}");
-    let info = ok(&binary(&a, &["info"]).await);
+    let info = stdout(&binary(&a, &["info"]).await);
     assert!(info.contains("Sync:        running (pid "), "{info}");
     assert!(info.contains("Versions:    1 named"), "{info}");
     assert!(info.contains("Local:       up to date"), "{info}");
-    let pull = ok(&binary(&a, &["pull"]).await);
+    let pull = stdout(&binary(&a, &["pull"]).await);
     assert!(pull.contains("already pulls remote changes"), "{pull}");
 
     // An explicit push is confirmed by the server before it returns. What
     // it lists depends on whether the watcher got there first.
     fs::write(a.join("notes.typ"), "pushed by hand\n").unwrap();
-    ok(&binary(&a, &["push"]).await);
+    stdout(&binary(&a, &["push"]).await);
     assert_eq!(
         pulled(&b, "notes.typ").await.as_deref(),
         Some("pushed by hand\n")
@@ -650,7 +601,7 @@ async fn push_next_to_a_holding_sync_needs_force() {
     let b = clone(&edit, work.path(), "b").await;
     fake_git(&a, "main");
     let mut live = Live::start(&a).await;
-    let original = read(&a, "main.typ").unwrap();
+    let original = read(&a, "main.typ");
 
     // While paused on a draft, nothing may be published or named.
     checkout(&a, "draft");
@@ -659,7 +610,7 @@ async fn push_next_to_a_holding_sync_needs_force() {
     assert!(err.contains("paused (on branch draft"), "{err}");
     let err = failed(&binary(&a, &["push", "--force"]).await);
     assert!(err.contains("paused"), "{err}");
-    let status = ok(&binary(&a, &["status"]).await);
+    let status = stdout(&binary(&a, &["status"]).await);
     assert!(status.contains("sync: paused, on branch draft"), "{status}");
 
     fs::write(a.join("main.typ"), "= Held back\n").unwrap();
@@ -672,13 +623,13 @@ async fn push_next_to_a_holding_sync_needs_force() {
         err.contains("M main.typ") && err.contains("--force"),
         "{err}"
     );
-    let info = ok(&binary(&a, &["info"]).await);
+    let info = stdout(&binary(&a, &["info"]).await);
     assert!(info.contains("holding back outgoing changes"), "{info}");
     settle().await;
     assert_eq!(pulled(&b, "main.typ").await, Some(original));
 
     // ...and published with --force, which ends the hold.
-    let pushed = ok(&binary(&a, &["push", "--force"]).await);
+    let pushed = stdout(&binary(&a, &["push", "--force"]).await);
     assert!(pushed.contains("\u{2191} main.typ"), "{pushed}");
     live.wait_for(Notice::Released).await;
     assert_eq!(
@@ -687,4 +638,32 @@ async fn push_next_to_a_holding_sync_needs_force() {
     );
     assert!(!a.join(STATE_DIR).join("hold").exists());
     live.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_key_stops_sync_instead_of_retrying() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project().await;
+    let work = tempfile::tempdir().unwrap();
+    let a = clone(&edit, work.path(), "a").await;
+    // A folder that never synced, with a key that is not the project's.
+    let state = a.join(STATE_DIR);
+    let config_path = state.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    let other = typstry_wire::crypto::ProjectKey::generate_raw();
+    config["key"] = serde_json::Value::String(other.to_string());
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    for name in ["doc.bin", "doc.log", "base.json"] {
+        let _ = fs::remove_file(state.join(name));
+    }
+    fs::remove_file(a.join("main.typ")).unwrap();
+
+    let live = Live::start(&a).await;
+    let err = tokio::time::timeout(Duration::from_secs(20), live.task)
+        .await
+        .expect("sync kept retrying")
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("encrypted with key"), "{err:#}");
 }
