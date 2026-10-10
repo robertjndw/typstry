@@ -1,43 +1,83 @@
-import { ChevronLeftIcon, HistoryIcon } from "lucide-react";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import {
+  ChevronLeftIcon,
+  HistoryIcon,
+  PanelLeftIcon,
+  PanelRightIcon,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link } from "react-router";
+import { toast } from "sonner";
 
-import { DownloadButton, PdfDownloadButton } from "@/components/DownloadButton";
+import { PdfDownloadButton } from "@/components/DownloadButton";
 import { EditorPane, type RevealRequest } from "@/components/EditorPane";
 import { FileTree } from "@/components/FileTree";
 import { HistoryPanel } from "@/components/HistoryPanel";
 import { PresenceBar } from "@/components/PresenceBar";
 import { PreviewPane } from "@/components/PreviewPane";
 import { ProjectTitle } from "@/components/ProjectTitle";
-import { SaveVersionDialog } from "@/components/SaveVersionDialog";
-import { VersionView } from "@/components/VersionView";
-import { Button } from "@/components/ui/button";
+import { QuickOpen } from "@/components/QuickOpen";
 import {
-  ResizableHandle,
-  ResizablePanel,
-  ResizablePanelGroup,
-} from "@/components/ui/resizable";
+  TagVersionDialog,
+  type TagTarget,
+} from "@/components/TagVersionDialog";
+import { ShortcutsDialog } from "@/components/ShortcutsDialog";
+import { ToolbarButton } from "@/components/ToolbarButton";
+import { VersionView } from "@/components/VersionView";
+import { WorkspaceLayout } from "@/components/WorkspaceLayout";
+import { WorkspaceMenu } from "@/components/WorkspaceMenu";
+import { Separator } from "@/components/ui/separator";
+import { useShortcuts } from "@/hooks/use-shortcut";
+import { useWorkspaceLayout } from "@/hooks/use-workspace-layout";
+import { cn } from "@/lib/utils";
+import { SHORTCUTS } from "@/lib/shortcuts";
 import { useProject } from "@/project/context";
 import type { VersionTarget } from "@/project/history-items";
+import type { SyncNowResult } from "@/sync/connection";
 import { groupingFromLocation } from "@/project/useHistory";
 import type { ProjectDiagnostic } from "@/typst/diagnostics";
 import { useProjectCompiler } from "@/project/useProjectCompiler";
 import { useProjectTinymist } from "@/project/useProjectTinymist";
 
-/** The full project UI for whatever ProjectProvider is above it. */
-export function ProjectWorkspace({
-  badge,
-  documentTitle = false,
-}: {
+export interface ProjectWorkspaceProps {
+  /** Sync state indicator; stays visible on phones too. */
+  status?: ReactNode;
+  /** The prominent share action. */
+  share?: ReactNode;
+  /** Own avatar, rightmost. */
+  identity?: ReactNode;
+  /** Anything else for the toolbar, e.g. the dev split's switches. */
   badge?: ReactNode;
   /** Mirror the project title into the browser tab (one per page). */
   documentTitle?: boolean;
-}) {
+  /** Pushes pending edits now; absent without a server connection. */
+  onSyncNow?: () => Promise<SyncNowResult>;
+}
+
+/** The full project UI for whatever ProjectProvider is above it. */
+export function ProjectWorkspace({
+  status,
+  share,
+  identity,
+  badge,
+  documentTitle = false,
+  onSyncNow,
+}: ProjectWorkspaceProps) {
   const { title, project, index, openFile, assets, readOnly } = useProject();
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [tagging, setTagging] = useState<TagTarget | null>(null);
+  const [quickOpen, setQuickOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [viewing, setViewing] = useState<VersionTarget | null>(null);
+  const [viewingChanges, setViewingChanges] = useState(false);
   const [grouping] = useState(groupingFromLocation);
+  const layout = useWorkspaceLayout("workspace");
+  const root = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!documentTitle) return;
@@ -64,31 +104,115 @@ export function ProjectWorkspace({
     [index, openFile],
   );
 
+  const tag = readOnly ? undefined : setTagging;
+  const syncing = useRef(false);
+  const syncNow = onSyncNow
+    ? () => {
+        if (syncing.current) return;
+        syncing.current = true;
+        void syncWithFeedback(onSyncNow, readOnly).finally(() => {
+          syncing.current = false;
+        });
+      }
+    : undefined;
+
+  // The layout shortcuts would act on panels hidden behind an old version,
+  // so they only swallow the key then.
+  useShortcuts(
+    {
+      // Swallowed even without a connection, so the browser's "Save page"
+      // dialog never shows up in the middle of writing.
+      [SHORTCUTS.syncNow]: () => syncNow?.(),
+      [SHORTCUTS.quickOpen]: () => !viewing && setQuickOpen((open) => !open),
+      [SHORTCUTS.toggleFiles]: () => !viewing && layout.toggle("files"),
+      [SHORTCUTS.togglePreview]: () => !viewing && layout.toggle("preview"),
+    },
+    { scope: root },
+  );
+
+  const mobile = layout.isMobile;
+  const filesShown = !layout.isHidden("files");
+  const previewShown = !layout.isHidden("preview");
+
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <header className="flex h-10 shrink-0 items-center gap-3 border-b px-3">
+    <div
+      ref={root}
+      data-shortcut-scope=""
+      className="flex h-full min-h-0 flex-col"
+    >
+      <header
+        className={cn(
+          "flex shrink-0 items-center gap-1 border-b px-2",
+          mobile ? "h-12" : "h-11",
+        )}
+      >
         <Link
           to="/"
           title="All projects"
           aria-label="All projects"
-          className="-ml-1 flex items-center gap-0.5 rounded px-1 font-semibold outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
+          className="flex h-7 shrink-0 items-center gap-0.5 rounded-md pr-1.5 pl-0.5 text-sm font-semibold outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
         >
           <ChevronLeftIcon className="size-4 text-muted-foreground" />
-          typstry
+          {!mobile && "typstry"}
         </Link>
-        <ProjectTitle />
-        <div className="ml-auto flex items-center gap-3">
-          <PresenceBar />
-          <DownloadButton project={project} assets={assets} name={[title]} />
-          <Button
-            variant={historyOpen || viewing ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setHistoryOpen(true)}
-          >
-            <HistoryIcon />
-            History
-          </Button>
+        {!mobile && (
+          <span aria-hidden className="text-sm text-muted-foreground/60">
+            /
+          </span>
+        )}
+        <div className="flex min-w-0 flex-1 items-center">
+          <ProjectTitle className="max-w-80" />
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {!mobile && (
+            <>
+              <PresenceBar />
+              {status}
+              <Separator orientation="vertical" className="mx-1 h-5" />
+              <ToolbarButton
+                label="Files panel"
+                tooltip={filesShown ? "Hide files" : "Show files"}
+                shortcut={SHORTCUTS.toggleFiles}
+                aria-pressed={filesShown}
+                aria-controls={layout.ids.files}
+                disabled={!!viewing}
+                onClick={() => layout.toggle("files")}
+              >
+                <PanelLeftIcon />
+              </ToolbarButton>
+              <ToolbarButton
+                label="Preview panel"
+                tooltip={previewShown ? "Hide preview" : "Show preview"}
+                shortcut={SHORTCUTS.togglePreview}
+                aria-pressed={previewShown}
+                aria-controls={layout.ids.preview}
+                disabled={!!viewing}
+                onClick={() => layout.toggle("preview")}
+              >
+                <PanelRightIcon />
+              </ToolbarButton>
+              <ToolbarButton
+                label="History"
+                tooltip="Version history"
+                variant={historyOpen || viewing ? "secondary" : "ghost"}
+                onClick={() => setHistoryOpen(true)}
+              >
+                <HistoryIcon />
+              </ToolbarButton>
+            </>
+          )}
+          {mobile && status}
+          <WorkspaceMenu
+            layout={layout}
+            onHistory={() => setHistoryOpen(true)}
+            onTagVersion={tag && (() => tag({ kind: "current" }))}
+            onQuickOpen={() => setQuickOpen(true)}
+            onShortcuts={() => setShortcutsOpen(true)}
+            onSyncNow={syncNow}
+          />
           {badge}
+          {share && <div className="ml-1 flex items-center">{share}</div>}
+          {identity && <div className="ml-1 flex items-center">{identity}</div>}
         </div>
       </header>
       <HistoryPanel
@@ -99,64 +223,87 @@ export function ProjectWorkspace({
         selected={viewing?.key ?? null}
         onSelect={(target) => {
           setViewing(target);
+          setViewingChanges(false);
           setHistoryOpen(false);
         }}
-        // The panel stays open underneath, so the new version shows up in
-        // the list right after saving.
-        onSaveVersion={readOnly ? undefined : () => setSaving(true)}
+        onShowChanges={(target) => {
+          setViewing(target);
+          setViewingChanges(true);
+          setHistoryOpen(false);
+        }}
+        assets={assets}
+        title={title}
+        // The panel stays open underneath, so the new tag shows up in the
+        // list right after tagging.
+        onTag={tag}
       />
       {!readOnly && (
-        <SaveVersionDialog
+        <TagVersionDialog
           project={project}
-          open={saving}
-          onOpenChange={setSaving}
+          target={tagging}
+          onClose={() => setTagging(null)}
         />
       )}
+      <QuickOpen open={quickOpen} onOpenChange={setQuickOpen} />
+      <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       {viewing ? (
         <div className="min-h-0 flex-1">
           <VersionView
-            key={viewing.key}
+            // Remounted when "Show changes" is picked for the version
+            // already open, so it switches to the diff.
+            key={`${viewing.key}:${viewingChanges}`}
             project={project}
             target={viewing}
             assets={assets}
             canRestore={!readOnly}
             onClose={() => setViewing(null)}
+            showChangesOnOpen={viewingChanges}
           />
         </div>
       ) : (
-        <ResizablePanelGroup
-          orientation="horizontal"
-          className="min-h-0 flex-1"
-        >
-          <ResizablePanel id="files" defaultSize="20" minSize="160px">
-            <section aria-label="Files" className="h-full">
-              <FileTree />
-            </section>
-          </ResizablePanel>
-          <ResizableHandle />
-          <ResizablePanel id="editor" defaultSize="40" minSize="20">
-            <section aria-label="Editor" className="h-full">
-              <EditorPane
-                compiler={compiler}
-                tinymist={tinymist}
-                reveal={reveal}
-              />
-            </section>
-          </ResizablePanel>
-          <ResizableHandle />
-          <ResizablePanel id="preview" defaultSize="40" minSize="20">
-            <section aria-label="Preview" className="h-full">
-              <PreviewPane
-                client={compiler}
-                onDiagnosticClick={onDiagnosticClick}
-                actions={
-                  <PdfDownloadButton compiler={compiler} name={[title]} />
-                }
-              />
-            </section>
-          </ResizablePanel>
-        </ResizablePanelGroup>
+        <WorkspaceLayout
+          layout={layout}
+          files={<FileTree />}
+          editor={
+            <EditorPane
+              compiler={compiler}
+              tinymist={tinymist}
+              reveal={reveal}
+            />
+          }
+          preview={
+            <PreviewPane
+              client={compiler}
+              onDiagnosticClick={onDiagnosticClick}
+              actions={<PdfDownloadButton compiler={compiler} name={[title]} />}
+            />
+          }
+        />
       )}
     </div>
   );
+}
+
+const SYNC_TOAST = "sync-now";
+
+async function syncWithFeedback(
+  run: () => Promise<SyncNowResult>,
+  readOnly: boolean,
+) {
+  // One toast id, so repeated presses update a single toast instead of
+  // stacking them.
+  toast.loading("Syncing…", { id: SYNC_TOAST });
+  const result = await run();
+  if (result === "synced") {
+    toast.success(readOnly ? "Up to date" : "All changes synced", {
+      id: SYNC_TOAST,
+    });
+  } else {
+    toast.warning(
+      readOnly
+        ? "The server is unreachable. Updates arrive once it is back."
+        : "The server is unreachable. Your changes are saved on this device and sync once it is back.",
+      { id: SYNC_TOAST },
+    );
+  }
 }

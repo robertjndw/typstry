@@ -1,6 +1,7 @@
 import type { OpId, PeerID } from "loro-crdt";
 
 import type { ProjectDoc } from "@/doc/schema";
+import type { NamedVersion } from "@/doc/versions";
 
 import type { HistoryData } from "./useHistory";
 
@@ -15,11 +16,13 @@ export interface VersionTarget {
   previous: OpId[] | null;
 }
 
+/** One edit session, with the tags that point at it. */
 export interface HistoryItem {
   target: VersionTarget;
-  kind: "session" | "named";
   authors: PeerID[];
   detail: string;
+  /** Oldest first. */
+  tags: NamedVersion[];
 }
 
 const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
@@ -55,53 +58,52 @@ export function buildHistoryItems(
   data: HistoryData,
 ): HistoryItem[] {
   const { entries, versions } = data;
+  // Tags split sessions where they can (see groupChanges), so a tag usually
+  // matches a session's end exactly. Otherwise, e.g. a tag taken while
+  // another peer's concurrent edits were not synced yet, it goes to the
+  // first session that contains it.
+  const tagsAt = new Map<number, NamedVersion[]>();
+  for (const version of versions) {
+    const i = entries.findIndex((entry) => {
+      try {
+        const cmp = project.doc.cmpFrontiers(
+          entry.frontiers,
+          version.frontiers,
+        );
+        return cmp === 0 || cmp === 1;
+      } catch {
+        return false; // frontiers this doc never saw
+      }
+    });
+    if (i === -1) continue;
+    const list = tagsAt.get(i) ?? [];
+    list.push(version);
+    tagsAt.set(i, list);
+  }
+
   const items: HistoryItem[] = entries.map((entry, i) => {
     const files = entry.files.length;
+    const tags = tagsAt.get(i) ?? [];
+    const time = entry.end !== null ? absolute.format(entry.end) : null;
     return {
-      kind: "session",
       authors: entry.authors,
       detail:
         files === 0
           ? "No file changes"
           : `${files} ${files === 1 ? "file" : "files"} edited`,
+      tags,
       target: {
         key: `g:${entry.id}`,
-        label: entry.end !== null ? absolute.format(entry.end) : "Unknown time",
+        // What the version view and file names call it.
+        label:
+          tags.length > 0
+            ? tags.map((t) => t.name).join(", ")
+            : (time ?? "Unknown time"),
         time: entry.end,
         frontiers: entry.frontiers,
         previous: i > 0 ? entries[i - 1]!.frontiers : null,
       },
     };
   });
-  for (const version of versions) {
-    // Compare against the latest session that lies strictly before it.
-    let previous: OpId[] | null = null;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (
-        project.doc.cmpFrontiers(entries[i]!.frontiers, version.frontiers) ===
-        -1
-      ) {
-        previous = entries[i]!.frontiers;
-        break;
-      }
-    }
-    items.push({
-      kind: "named",
-      authors: [version.author],
-      detail: "Named version",
-      target: {
-        key: `v:${version.index}`,
-        label: version.name,
-        time: version.createdAt,
-        frontiers: version.frontiers,
-        previous,
-      },
-    });
-  }
-  // Newest first; a named version sorts above the session it names.
-  return items.sort(
-    (a, b) =>
-      (b.target.time ?? 0) - (a.target.time ?? 0) ||
-      (a.kind === "named" ? -1 : 0) - (b.kind === "named" ? -1 : 0),
-  );
+  return items.reverse();
 }

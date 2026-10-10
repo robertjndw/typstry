@@ -36,9 +36,14 @@ export function loadHistory(
   const key = versionKey(project.doc);
   const hit = cache.get(project.doc);
   if (hit && hit.key === key && hit.grouping === grouping) return hit.data;
+  const versions = listVersions(project);
   const data = {
-    entries: computeHistory(project, grouping),
-    versions: listVersions(project),
+    entries: computeHistory(
+      project,
+      grouping,
+      versions.map((v) => v.frontiers),
+    ),
+    versions,
   };
   // computeHistory commits pending ops first, so re-read the key.
   cache.set(project.doc, { key: versionKey(project.doc), grouping, data });
