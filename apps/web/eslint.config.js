@@ -24,4 +24,11 @@ export default defineConfig([
     files: ["src/components/ui/**"],
     rules: { "react-refresh/only-export-components": "off" },
   },
+  {
+    // Playwright fixtures call `use()`, which the hooks rule mistakes for
+    // React's.
+    files: ["e2e/**", "playwright.config.ts"],
+    rules: { "react-hooks/rules-of-hooks": "off" },
+    languageOptions: { globals: globals.node },
+  },
 ]);

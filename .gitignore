@@ -8,3 +8,6 @@ data/
 *.tsbuildinfo
 .DS_Store
 coverage/
+test-results/
+playwright-report/
+.playwright-cli/
