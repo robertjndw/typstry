@@ -55,6 +55,8 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
+          # github.sha is main's tip here, not necessarily the commit we built.
+          labels: org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha || github.sha }}
       - id: build
         uses: docker/build-push-action@v7
         with:
