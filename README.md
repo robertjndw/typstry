@@ -105,6 +105,7 @@ This starts the Vite dev server for the frontend and the Rust server on port 878
 | Task           | Command                                                 |
 | -------------- | ------------------------------------------------------- |
 | Web tests      | `pnpm test`                                             |
+| End-to-end     | `pnpm build && pnpm test:e2e`                           |
 | Web lint/types | `pnpm lint`, `pnpm typecheck`                           |
 | Format         | `pnpm format` (Prettier), `cargo fmt --all`             |
 | Format check   | `pnpm format:check`, `cargo fmt --all --check`          |
@@ -114,6 +115,8 @@ This starts the Vite dev server for the frontend and the Rust server on port 878
 | Server binary  | `cargo build --release -p typstry-server`               |
 
 CI runs on every push to `main` and on pull requests: everything in the table except `pnpm format:check` and the release server build, plus a Docker build with a smoke test.
+
+The end-to-end tests drive the production build in Chromium through [Playwright](https://playwright.dev). They start the server on port 4787 with a throwaway data directory, or reuse one already running there. Install the browser once with `pnpm --filter web exec playwright install chromium`.
 
 ### Project layout
 

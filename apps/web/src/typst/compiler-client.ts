@@ -116,6 +116,8 @@ export class CompilerClient {
   };
   private readonly listeners = new Set<(state: PreviewState) => void>();
   private renderer: Promise<PreviewRenderer> | null = null;
+  /** Set while a resync waits for the browser to come back online. */
+  private onlineWait: AbortController | null = null;
   private renderQueue: Promise<void> = Promise.resolve();
   private compileStartedAt = new Map<number, number>();
   private latestCompileId = 0;
@@ -141,6 +143,9 @@ export class CompilerClient {
       this.onDocEvent(batch),
     );
     this.syncStructure();
+    // Fetched alongside the compiler instead of on the first result, which
+    // narrows the window where a dropped connection leaves no renderer.
+    void this.loadRenderer().catch(() => undefined);
   }
 
   getState = (): PreviewState => this.state;
@@ -193,7 +198,40 @@ export class CompilerClient {
     this.worker.removeEventListener("message", this.onWorkerMessage);
     if (this.ownsWorker) this.worker.terminate();
     void this.renderer?.then((r) => r.dispose()).catch(() => undefined);
+    this.onlineWait?.abort();
     this.listeners.clear();
+  }
+
+  private loadRenderer(): Promise<PreviewRenderer> {
+    if (!this.renderer) {
+      const loading = this.createRenderer();
+      this.renderer = loading;
+      // Usually a fetch that failed while offline. Keeping the rejected
+      // promise would leave the preview broken until a reload.
+      loading.catch(() => {
+        if (this.renderer === loading) this.renderer = null;
+      });
+    }
+    return this.renderer;
+  }
+
+  /**
+   * A resync right away would recompile straight into the same failed
+   * renderer load, over and over while offline. If a later edit gets the
+   * renderer loaded first, its merge fails and resyncs on its own.
+   */
+  private resyncWhenOnline(): void {
+    if (this.onlineWait) return;
+    const wait = new AbortController();
+    this.onlineWait = wait;
+    window.addEventListener(
+      "online",
+      () => {
+        this.onlineWait = null;
+        this.post({ type: "resync" });
+      },
+      { once: true, signal: wait.signal },
+    );
   }
 
   private post(message: WorkerRequest, transfer?: Transferable[]): void {
@@ -436,10 +474,14 @@ export class CompilerClient {
       let document = this.state.document;
       let error: string | null = null;
       const last = msg.id === this.latestCompileId;
+      let loadFailed = false;
       try {
         if (msg.update) {
-          this.renderer ??= this.createRenderer();
-          (await this.renderer).apply(msg.update);
+          const renderer = await this.loadRenderer().catch((err: unknown) => {
+            loadFailed = true;
+            throw err;
+          });
+          renderer.apply(msg.update);
           this.unrendered = true;
         }
         // SVG work is skipped while a newer compile is already running. If
@@ -451,8 +493,14 @@ export class CompilerClient {
         }
       } catch (err) {
         console.error("preview render failed", err);
-        error = `Rendering failed: ${String(err)}`;
-        this.post({ type: "resync" });
+        if (loadFailed) {
+          error =
+            "Could not load the preview. It retries once the connection is back.";
+          this.resyncWhenOnline();
+        } else {
+          error = `Rendering failed: ${String(err)}`;
+          this.post({ type: "resync" });
+        }
       }
       if (this.disposed) return;
       // The main file may have gone away while this compile ran.
