@@ -151,6 +151,18 @@ fn leaves_hidden_nodes_alone() {
 }
 
 #[test]
+fn keeps_folders_that_still_hold_hidden_nodes() {
+    let doc = project();
+    let dir = add(&doc, None, "img", FileKind::Dir);
+    add(&doc, Some(dir), "old.typ", FileKind::Text);
+    add(&doc, Some(dir), "pending.png", FileKind::Asset);
+    let report = apply(&doc, &[text("main.typ", "m")]);
+    assert_eq!(report.deleted, ["img/old.typ"]);
+    let index = build_path_index(&doc);
+    assert!(index.by_path.contains_key("img/pending.png"));
+}
+
+#[test]
 fn rename_keeps_the_node() {
     let doc = project();
     apply(

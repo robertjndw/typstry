@@ -12,8 +12,8 @@ use crate::mailbox::{Mailbox, Request, Response};
 use crate::watch::{Change, GitState, Seen, Synced, Watcher};
 
 use super::{
-    Ctx, Output, info, print_applied, print_report, print_warnings, push, status, switch_refusal,
-    track_branch, version,
+    Ctx, Output, guard_switch, info, print_applied, print_report, print_warnings, push, status,
+    switch_refusal, track_branch, version,
 };
 
 /// Remote changes are written this long after the first one arrives, so a
@@ -642,6 +642,15 @@ impl Live {
             self.recheck_hold().await;
             return;
         }
+        // A `git reset --hard` or a quick checkout round trip can come and
+        // go between two git polls without ever showing up as a pause. The
+        // reconcile below records where HEAD is, so this only fires once.
+        if self.session.git_switched() {
+            self.check_tree().await;
+            if self.holding {
+                return;
+            }
+        }
         let hot = self.hot(&batch);
         let scope = if full {
             Scope::Full
@@ -949,6 +958,7 @@ impl Live {
 
     async fn push_now(&mut self, force: bool, out: &mut Output) -> anyhow::Result<()> {
         self.refuse_while_paused("push")?;
+        guard_switch(&mut self.session, force).await?;
         let scope = self.release_for(force, out).await?;
         let report = self.flush(&scope).await?;
         push::print_pushed(out, &report);
@@ -971,6 +981,7 @@ impl Live {
         if !self.session.is_connected() {
             bail!("typstry sync is offline; save the version once it is connected again");
         }
+        guard_switch(&mut self.session, force).await?;
         let scope = self.release_for(force, out).await?;
         let report = self.flush(&scope).await?;
         version::print_pushed(out, &report);
@@ -1003,7 +1014,13 @@ impl Live {
             };
             self.mailbox.answer(&id, &response);
         }
-        if self.pause.is_none() && !self.holding && self.session.can_write() {
+        // After an unnoticed reset the folder may lack pulled edits; the
+        // next run checks it before publishing anything.
+        if self.pause.is_none()
+            && !self.holding
+            && self.session.can_write()
+            && !self.session.git_switched()
+        {
             // Covers edits the watcher has not reported yet.
             match self.session.reconcile_live(&Scope::Full, Mode::Push).await {
                 Ok(report) => print_lines(&report),

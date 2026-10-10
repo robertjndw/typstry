@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
+use super::init::absolute;
 use super::{Ctx, Output, print_report, print_warnings, track_branch};
 use crate::api::{Api, Permission};
 use crate::engine::{Mode, Scope, Session};
 use crate::git::{self, Repo};
 use crate::link::ShareLink;
-use crate::state::STATE_DIR;
+use crate::state::{STATE_DIR, StateDir};
 
 const LINK_VAR: &str = "TYPSTRY_LINK";
 
@@ -61,6 +62,20 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     }
     if let Some(dir) = &explicit {
         check_empty(dir)?;
+    }
+    // Same refusal as init: the outer project's scan would pick up the
+    // clone's files and publish them into the other project.
+    if let Ok(abs) = absolute(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        &parent
+    }) && let Some(outer) = StateDir::find_root(&abs)
+    {
+        bail!(
+            "{} is inside the typstry project in {}; a nested project would be synced twice",
+            abs.display(),
+            outer.display()
+        );
     }
 
     let share = Api::new(&link.origin)?.resolve_share(&link.token).await?;

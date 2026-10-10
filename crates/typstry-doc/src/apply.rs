@@ -267,7 +267,9 @@ fn apply_valid<'a>(
         }
     }
     // A folder goes with its last visible file. Folders that were empty to
-    // begin with never get here.
+    // begin with never get here, and neither do ones that still hold a node
+    // materialize hides, such as an upload still in progress, which
+    // deleting the folder would take with it.
     let emptied: BTreeSet<&str> = removed
         .keys()
         .flat_map(|path| ancestors(path))
@@ -276,7 +278,7 @@ fn apply_valid<'a>(
     for dir in emptied {
         if let Some((id, FileKind::Dir)) = current.node(dir)
             && current
-                .files_under(dir)
+                .non_dirs_under(dir)
                 .all(|path| removed.contains_key(path))
         {
             doomed.push((depth(dir), id));
@@ -443,15 +445,34 @@ impl<'a> Current<'a> {
         }
     }
 
-    /// Paths of the visible files anywhere below `dir`.
-    fn files_under(self, dir: &str) -> impl Iterator<Item = &'a str> {
+    /// Paths of every node anywhere below `dir`.
+    fn nodes_under(self, dir: &str) -> impl Iterator<Item = (&'a str, TreeID)> {
         let prefix = format!("{dir}/");
         self.index
             .by_path
             .range(prefix.clone()..)
             .take_while(move |(path, _)| path.starts_with(&prefix))
-            .map(|(path, _)| path.as_str())
+            .map(|(path, id)| (path.as_str(), *id))
+    }
+
+    /// Paths of the visible files anywhere below `dir`.
+    fn files_under(self, dir: &str) -> impl Iterator<Item = &'a str> {
+        self.nodes_under(dir)
+            .map(|(path, _)| path)
             .filter(move |path| self.shows(path))
+    }
+
+    /// Paths of the files below `dir`, including the ones `materialize`
+    /// hides.
+    fn non_dirs_under(self, dir: &str) -> impl Iterator<Item = &'a str> {
+        self.nodes_under(dir)
+            .filter(move |(_, id)| {
+                self.index
+                    .by_id
+                    .get(id)
+                    .is_some_and(|entry| entry.kind != FileKind::Dir)
+            })
+            .map(|(path, _)| path)
     }
 }
 

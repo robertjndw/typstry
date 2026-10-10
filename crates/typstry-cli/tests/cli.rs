@@ -324,7 +324,8 @@ async fn writers_compact_the_server_log() {
         .await
         .unwrap();
     assert!(records < 20, "{records} records left after compaction");
-    let b = clone(&edit, work.path(), "b").await;
+    let other = tempfile::tempdir().unwrap();
+    let b = clone(&edit, other.path(), "b").await;
     let doc = cached_doc(&b);
     assert_eq!(doc.get_text("scratch").to_string(), text.to_string());
 }

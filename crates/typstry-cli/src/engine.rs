@@ -413,9 +413,13 @@ impl Session {
                 self.config.project_id
             );
         }
-        if share.permission != self.config.permission || share.view_token.is_some() {
+        // Edit links always come back with their view token, so only a
+        // different one counts as news worth rewriting the config for.
+        let new_view_token =
+            share.view_token.is_some() && share.view_token != self.config.view_token;
+        if share.permission != self.config.permission || new_view_token {
             self.config.permission = share.permission;
-            if share.view_token.is_some() {
+            if new_view_token {
                 self.config.view_token = share.view_token;
             }
             self.save_config()?;
@@ -540,8 +544,11 @@ impl Session {
             }
         };
         let Some(event) = event else {
-            self.conn()?.retry_at = None;
+            // Cleared only once the resend went out: the sync loop drops
+            // this future whenever something else wakes it, and a retry
+            // that stays due simply runs again on the next call.
             self.send_missing().await?;
+            self.conn()?.retry_at = None;
             return Ok(RemoteEvent::Progress);
         };
         match event {
@@ -699,9 +706,8 @@ impl Session {
             .collect();
         spans.sort_unstable();
         let mut records = Vec::new();
-        for (peer, start, end) in spans {
+        for &(peer, start, end) in &spans {
             encrypt_span(&self.doc, &self.key, peer, start, end, &mut records)?;
-            raise(&mut conn.server, peer, end);
         }
         let bytes: Vec<&[u8]> = records
             .iter()
@@ -712,6 +718,13 @@ impl Session {
             let spans = records[range].iter().map(|&(span, _)| span).collect();
             let id = conn.client.send_update(&container).await?;
             conn.in_flight.insert(id, InFlight::Deltas(spans));
+        }
+        // Only after everything went out: a send that is cancelled halfway
+        // must leave these ops looking unsent, or nothing would send them
+        // again before the next connect. Resending a container the server
+        // already has costs a duplicate it ignores.
+        for (peer, _, end) in spans {
+            raise(&mut conn.server, peer, end);
         }
         Ok(())
     }
