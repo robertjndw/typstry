@@ -28,18 +28,29 @@ COPY apps/web apps/web
 COPY --from=tinymist /src/apps/web/vendor/tinymist apps/web/vendor/tinymist
 RUN pnpm --filter web build
 
-FROM rust:1.98-slim-trixie AS server
+FROM rust:1.98-slim-trixie AS chef
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src
-# rust-toolchain.toml is left out on purpose: it pins "stable", which would make
-# rustup download a second toolchain instead of using the one in the image.
+
+# rust-toolchain.toml is left out on purpose here and below: it pins "stable",
+# which would make rustup download a second toolchain instead of using the one
+# in the image.
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-# target/ lives in a cache mount, so the binary has to be copied out in the
-# same step to survive into the next stage.
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Dependencies get their own layer so CI's layer cache keeps them across
+# changes to our crates. A target/ cache mount doesn't survive between runners.
+FROM chef AS server
+COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p typstry-server \
-    && cp target/release/typstry-server /usr/local/bin/typstry-server
+    cargo chef cook --release --locked -p typstry-server --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --locked -p typstry-server
 
 FROM debian:trixie-slim
 RUN apt-get update \
@@ -47,7 +58,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data typstry \
     && mkdir /data && chown typstry /data
-COPY --from=server /usr/local/bin/typstry-server /usr/local/bin/typstry-server
+COPY --from=server /src/target/release/typstry-server /usr/local/bin/typstry-server
 COPY --from=web /src/apps/web/dist /app/web
 ENV TYPSTRY_ADDR=0.0.0.0:8787 \
     TYPSTRY_DATA_DIR=/data \
