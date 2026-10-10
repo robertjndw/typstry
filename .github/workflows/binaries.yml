@@ -1,0 +1,109 @@
+name: Binaries
+
+# Same triggers as the image workflow: a green push to main refreshes the
+# `nightly` prerelease, a published release gets the binaries attached.
+# workflow_run runs the file from the default branch but defaults to its HEAD,
+# so the tested commit is checked out explicitly.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  release:
+    types: [published]
+
+# A newer nightly run cancels an older one so `nightly` can't go backwards.
+# Releases are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'release' && github.ref || 'nightly' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'release' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    strategy:
+      matrix:
+        include:
+          # Linux builds run on the oldest image so the binary links against
+          # an older glibc and runs on more distributions.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-26
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+      # rust-toolchain.toml selects the toolchain
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          # Caches saved from a tag are only visible to that tag.
+          save-if: ${{ github.event_name == 'workflow_run' }}
+      - run: cargo build --release --locked -p typstry-cli
+      - name: Package
+        run: |
+          name="typstry-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/typstry README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: typstry-${{ matrix.target }}
+          path: typstry-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: typstry-*
+          merge-multiple: true
+      - name: Attach to release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+      # Updated in place instead of recreated, which would notify watchers on
+      # every push and briefly 404 the downloads. Releases made with
+      # GITHUB_TOKEN don't trigger other workflows, so the image workflow
+      # doesn't pick this one up.
+      - name: Refresh nightly
+        if: github.event_name == 'workflow_run'
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          notes="Built from $SHA on main. Not a stable release."
+          if gh release view nightly > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$SHA" -F force=true
+            gh release upload nightly dist/* --clobber
+            gh release edit nightly --notes "$notes"
+          else
+            gh release create nightly dist/* \
+              --target "$SHA" \
+              --prerelease \
+              --title "Nightly" \
+              --notes "$notes"
+          fi
