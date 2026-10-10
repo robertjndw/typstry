@@ -213,6 +213,15 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     return this.doc.oplogVersion().encode();
   }
 
+  /**
+   * Resolves once every pending op has been handed to the socket. Queued
+   * behind the in-flight encryption steps, so an earlier edit cannot still be
+   * encrypting when this settles.
+   */
+  flush(): Promise<void> {
+    return this.enqueue(() => this.push());
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;

@@ -24,6 +24,8 @@ const fake = vi.hoisted(() => ({
     statusCbs: Set<(s: string) => void>;
     joins: unknown[];
     destroyed: boolean;
+    retryNow: ReturnType<typeof vi.fn>;
+    ping: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -32,6 +34,8 @@ vi.mock("loro-websocket", () => ({
     statusCbs = new Set<StatusCb>();
     joins: FakeJoin[] = [];
     destroyed = false;
+    retryNow = vi.fn(() => Promise.resolve());
+    ping = vi.fn(() => Promise.resolve());
     url: string;
     constructor(opts: { url: string }) {
       this.url = opts.url;
@@ -57,6 +61,9 @@ function lastClient() {
   const client = fake.clients.at(-1)!;
   return {
     ...client,
+    // Spread copies the fields, so keep the original mocks reachable.
+    retryNow: client.retryNow,
+    ping: client.ping,
     joins: client.joins as FakeJoin[],
     setStatus: (s: string) => client.statusCbs.forEach((cb) => cb(s)),
   };
@@ -171,5 +178,67 @@ describe("connectProject", () => {
     expect(destroy).toHaveBeenCalled();
     expect(fake.clients.at(-1)!.destroyed).toBe(true);
     expect(listener).toHaveBeenLastCalledWith("disconnected");
+  });
+});
+
+describe("syncNow", () => {
+  function connect() {
+    const conn = connectProject({
+      projectId: "p",
+      token: "t",
+      key,
+      canWrite: true,
+      doc: new LoroDoc(),
+      url: "ws://x/ws",
+    });
+    const client = lastClient();
+    const goOnline = () => {
+      client.setStatus("connected");
+      client.joins[0]!.onStatusChange?.("joined");
+    };
+    return { conn, client, goOnline };
+  }
+
+  it("pings without reconnecting when already connected", async () => {
+    const { conn, client, goOnline } = connect();
+    goOnline();
+    await expect(conn.syncNow()).resolves.toBe("synced");
+    expect(client.retryNow).not.toHaveBeenCalled();
+    expect(client.ping).toHaveBeenCalledTimes(1);
+    conn.close();
+  });
+
+  it("skips the reconnect backoff and waits for the connection", async () => {
+    const { conn, client, goOnline } = connect();
+    client.setStatus("disconnected");
+    const result = conn.syncNow(1000);
+    expect(client.retryNow).toHaveBeenCalledTimes(1);
+    goOnline();
+    await expect(result).resolves.toBe("synced");
+    expect(client.ping).toHaveBeenCalledTimes(1);
+    conn.close();
+  });
+
+  it("reports offline when the server stays unreachable", async () => {
+    const { conn, client } = connect();
+    client.setStatus("disconnected");
+    await expect(conn.syncNow(10)).resolves.toBe("offline");
+    expect(client.ping).not.toHaveBeenCalled();
+    conn.close();
+  });
+
+  it("reports offline when the ping fails", async () => {
+    const { conn, client, goOnline } = connect();
+    goOnline();
+    client.ping.mockRejectedValueOnce(new Error("Ping timeout"));
+    await expect(conn.syncNow()).resolves.toBe("offline");
+    conn.close();
+  });
+
+  it("does nothing after close()", async () => {
+    const { conn, client } = connect();
+    conn.close();
+    await expect(conn.syncNow()).resolves.toBe("offline");
+    expect(client.retryNow).not.toHaveBeenCalled();
   });
 });
