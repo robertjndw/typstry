@@ -1,0 +1,320 @@
+//! The command line: one module per subcommand, each with its clap `Args`
+//! and an async `run`.
+
+pub mod clone;
+pub mod export;
+pub mod info;
+pub mod init;
+pub mod link;
+pub mod open;
+pub mod pull;
+pub mod push;
+pub mod status;
+pub mod sync;
+pub mod track;
+pub mod version;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use anyhow::bail;
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+
+use typstry_doc::apply::ApplyReport;
+
+use crate::engine::{ChangeKind, Report, Scope, Session};
+use crate::git::{Head, Repo};
+use crate::mailbox::{self, Request};
+use crate::state::SyncRunning;
+use crate::worktree::Skipped;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "typstry",
+    version,
+    about = "Sync a typstry project with a local folder",
+    long_about = "Sync a typstry project with a local folder.\n\n\
+        The folder can be a git repository you fully control: typstry only \
+        moves files, end-to-end encrypted, and never commits, except for \
+        the initial commit of `clone --git`."
+)]
+pub struct Cli {
+    /// Run as if started in this folder.
+    #[arg(short = 'C', global = true, value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
+    /// Author name shown in the project history; defaults to
+    /// `git config user.name`.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub name: Option<String>,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    Clone(clone::Args),
+    Status(status::Args),
+    Pull(pull::Args),
+    Push(push::Args),
+    Sync(sync::Args),
+    Track(track::Args),
+    Init(init::Args),
+    Link(link::Args),
+    Open(open::Args),
+    Info(info::Args),
+    Version(version::Args),
+    Export(export::Args),
+}
+
+/// What every command gets besides its own arguments.
+#[derive(Debug, Clone)]
+pub struct Ctx {
+    pub dir: PathBuf,
+    pub name: Option<String>,
+}
+
+impl Ctx {
+    pub fn open(&self) -> anyhow::Result<Session> {
+        Session::open(&self.dir, self.name.as_deref())
+    }
+
+    /// Opens the folder, or, while `typstry sync` holds it, has the running
+    /// sync handle `request` and prints its answer. None then: the command
+    /// is done.
+    pub async fn open_or_ask(&self, request: Request) -> anyhow::Result<Option<Session>> {
+        match self.open() {
+            Ok(session) => Ok(Some(session)),
+            Err(err) => match err.downcast::<SyncRunning>() {
+                Ok(running) => {
+                    mailbox::ask(&running, &request).await?;
+                    Ok(None)
+                }
+                Err(err) => Err(err),
+            },
+        }
+    }
+}
+
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    let ctx = Ctx {
+        dir: cli.cwd.unwrap_or_else(|| PathBuf::from(".")),
+        name: cli.name,
+    };
+    match cli.command {
+        Command::Clone(args) => clone::run(&ctx, args).await,
+        Command::Status(args) => status::run(&ctx, args).await,
+        Command::Pull(args) => pull::run(&ctx, args).await,
+        Command::Push(args) => push::run(&ctx, args).await,
+        Command::Sync(args) => sync::run(&ctx, args).await,
+        Command::Track(args) => track::run(&ctx, args),
+        Command::Init(args) => init::run(&ctx, args).await,
+        Command::Link(args) => link::run(&ctx, args),
+        Command::Open(args) => open::run(&ctx, args),
+        Command::Info(args) => info::run(&ctx, args).await,
+        Command::Version(args) => version::run(&ctx, args).await,
+        Command::Export(args) => export::run(&ctx, args).await,
+    }
+}
+
+/// The repo the project lives in, after recording its current branch as
+/// the tracked one if none is set yet.
+pub fn track_branch(session: &mut Session) -> anyhow::Result<Option<(Repo, Head)>> {
+    let Some(repo) = Repo::discover(session.root()) else {
+        return Ok(None);
+    };
+    let head = repo.head();
+    if session.config.branch.is_none()
+        && let Head::Branch(branch) = &head
+    {
+        session.config.branch = Some(branch.clone());
+        session.save_config()?;
+        println!("tracking git branch {branch}");
+    }
+    Ok(Some((repo, head)))
+}
+
+/// Refuses to sync files while the checkout is not the tracked branch, or
+/// while git is in the middle of rewriting them. Other branches are
+/// private drafts; syncing there would publish them.
+pub fn guard_branch(session: &mut Session, force: bool) -> anyhow::Result<()> {
+    let Some((repo, head)) = track_branch(session)? else {
+        return Ok(());
+    };
+    if let Some(op) = repo.operation_in_progress() {
+        if !force {
+            bail!("git is in the middle of {op}; finish it first (use --force to sync anyway)");
+        }
+        eprintln!("warning: git is in the middle of {op}, syncing anyway");
+    }
+    let Some(tracked) = session.config.branch.clone() else {
+        // A repo that was only ever seen with a detached HEAD.
+        if !force {
+            bail!(
+                "on {head}, and typstry does not track a branch yet (use `typstry track <branch>` or --force)"
+            );
+        }
+        return Ok(());
+    };
+    if !head.is_on(Some(&tracked)) {
+        if !force {
+            bail!("on {head}, typstry tracks {tracked} (use --force to sync anyway)");
+        }
+        eprintln!("warning: on {head}, typstry tracks {tracked}; syncing anyway");
+    }
+    Ok(())
+}
+
+/// Refuses to publish a folder that differs from the last sync after git
+/// switched branches or reset since then: the differences may be edits
+/// pulled from co-authors that the checkout dropped, and publishing would
+/// revert them for everyone.
+pub async fn guard_switch(session: &mut Session, force: bool) -> anyhow::Result<()> {
+    if force || !session.can_write() || !session.git_switched() {
+        return Ok(());
+    }
+    let status = session.status(&Scope::Full).await?;
+    if status.local.is_empty() {
+        return Ok(());
+    }
+    Err(switch_refusal(&status.local))
+}
+
+/// Why publishing after a branch switch needs --force, with the files.
+fn switch_refusal(local: &BTreeMap<String, ChangeKind>) -> anyhow::Error {
+    let mut list = String::new();
+    for (path, kind) in local {
+        list.push_str(&format!("\n  {} {path}", kind.symbol()));
+    }
+    anyhow::anyhow!(
+        "git switched branches or reset since the last sync, and {} file(s) differ from it:{list}\n\
+         If the switch dropped edits pulled from co-authors, pushing would revert them for everyone. \
+         Check with `typstry status` and `git diff`, then publish with --force.",
+        local.len()
+    )
+}
+
+/// Where a command's lines go: straight to the terminal, or collected so
+/// a running `typstry sync` can send them to the command that asked it.
+#[derive(Debug, Default)]
+pub struct Output {
+    collected: Option<Vec<Line>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "to", content = "text", rename_all = "lowercase")]
+pub enum Line {
+    Stdout(String),
+    Stderr(String),
+}
+
+impl Line {
+    pub fn print(&self) {
+        match self {
+            Self::Stdout(text) => println!("{text}"),
+            Self::Stderr(text) => eprintln!("{text}"),
+        }
+    }
+}
+
+impl Output {
+    pub fn terminal() -> Self {
+        Self::default()
+    }
+
+    pub fn collect() -> Self {
+        Self {
+            collected: Some(Vec::new()),
+        }
+    }
+
+    fn line(&mut self, line: Line) {
+        match &mut self.collected {
+            Some(lines) => lines.push(line),
+            None => line.print(),
+        }
+    }
+
+    pub fn out(&mut self, text: impl Into<String>) {
+        self.line(Line::Stdout(text.into()));
+    }
+
+    pub fn err(&mut self, text: impl Into<String>) {
+        self.line(Line::Stderr(text.into()));
+    }
+
+    pub fn into_lines(self) -> Vec<Line> {
+        self.collected.unwrap_or_default()
+    }
+}
+
+/// Prints `label` and the paths under it, if there are any.
+fn print_list(out: &mut Output, label: &str, items: impl IntoIterator<Item = String>) {
+    let items: Vec<String> = items.into_iter().collect();
+    if items.is_empty() {
+        return;
+    }
+    out.out(label);
+    for item in items {
+        out.out(format!("  {item}"));
+    }
+}
+
+/// Lines shared by pull and push: what was written, deleted, skipped.
+fn print_report(out: &mut Output, report: &Report) {
+    for path in &report.written {
+        out.out(format!("\u{2193} {path}"));
+    }
+    for path in &report.deleted {
+        out.out(format!("\u{2193} {path} (deleted)"));
+    }
+    for skipped in &report.status.skipped {
+        warn_skipped(out, skipped);
+    }
+    for warning in &report.warnings {
+        out.err(format!("warning: {warning}"));
+    }
+}
+
+/// Lines shared by push and sync: what went out. `verb` says what was not
+/// done to a skipped file, e.g. "pushing".
+fn print_applied(out: &mut Output, applied: &ApplyReport, verb: &str) {
+    for path in &applied.created {
+        out.out(format!("\u{2191} {path} (new)"));
+    }
+    for path in &applied.modified {
+        out.out(format!("\u{2191} {path}"));
+    }
+    for renamed in &applied.renamed {
+        out.out(format!("\u{2191} {} -> {}", renamed.from, renamed.to));
+    }
+    for path in &applied.deleted {
+        out.out(format!("\u{2191} {path} (deleted)"));
+    }
+    for skipped in &applied.skipped {
+        out.err(format!(
+            "warning: not {verb} {}: {}",
+            skipped.path, skipped.reason
+        ));
+    }
+}
+
+fn warn_skipped(out: &mut Output, skipped: &Skipped) {
+    if skipped.path.is_empty() {
+        out.err(format!("warning: {}", skipped.reason));
+    } else {
+        out.err(format!("warning: skipped {skipped}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn cli_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+}
