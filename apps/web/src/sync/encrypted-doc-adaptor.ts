@@ -259,7 +259,8 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     this.target = version;
     this.targetReached = false;
     this.serverDeltas = storedDeltas(res.extra);
-    this.snapshotSent = false;
+    // snapshotSent stays as it is: a compaction queued before the
+    // reconnect still runs, and clears it once it is done.
     this.joined = true;
     // Edits made offline (or before a reconnect) go up first.
     await this.enqueuePush();
@@ -485,7 +486,9 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     // exactly what was sent.
     for (let round = 0; ; round++) {
       await this.push();
-      if (this.destroyed || !this.joined) return;
+      // A compaction queued before a reconnect would otherwise go out
+      // before the new backfill is in, and miss ops the server holds.
+      if (this.destroyed || !this.joined || !this.targetReached) return;
       if (missingSpans(this.doc.oplogVersion(), this.server).length === 0)
         break;
       if (round + 1 >= SNAPSHOT_PUSH_ROUNDS) return;
