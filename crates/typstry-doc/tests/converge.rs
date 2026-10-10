@@ -1,9 +1,11 @@
 //! Property test: three replicas apply random file-system and text edits
 //! with random partial syncs in between. Once everything is exchanged they
-//! must agree on every path and every materialized file.
+//! must agree on every path and every materialized file, and applying those
+//! files back must change nothing.
 
 use loro::{LoroDoc, LoroText, TreeID};
 use proptest::prelude::*;
+use typstry_doc::apply::apply_files;
 use typstry_doc::materialize::materialize;
 use typstry_doc::paths::{PathIndex, build_path_index};
 use typstry_doc::testing::{replica, sync};
@@ -199,5 +201,12 @@ proptest! {
             prop_assert_eq!(&build_path_index(doc), &index);
             prop_assert_eq!(&materialize(doc), &files);
         }
+
+        // Pushing an untouched checkout must not write anything, whatever
+        // clashes and empty folders the history left behind.
+        let vv = docs[0].oplog_vv();
+        let report = apply_files(&docs[0], &files, "test apply").unwrap();
+        prop_assert!(!report.changed, "{:?}", report);
+        prop_assert_eq!(docs[0].oplog_vv(), vv);
     }
 }

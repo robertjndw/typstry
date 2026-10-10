@@ -3,16 +3,22 @@
 //! These names must stay in sync with `apps/web/src/doc/schema.ts`; both sides
 //! read and write the same containers.
 
+pub mod apply;
 pub mod init;
 pub mod materialize;
+pub mod names;
 pub mod paths;
+pub mod peers;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
+pub mod versions;
+
+pub use versions::{NamedVersion, named_versions};
 
 use std::fmt;
 use std::str::FromStr;
 
-use loro::{Frontiers, LoroDoc, LoroText, LoroValue, TreeID, ValueOrContainer};
+use loro::{LoroDoc, LoroText, LoroValue, TreeID, ValueOrContainer};
 
 /// Bumped whenever the document layout changes incompatibly.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -31,6 +37,20 @@ pub fn schema_version(doc: &LoroDoc) -> Option<i64> {
         LoroValue::Double(v) if v.is_finite() => Some(v.ceil() as i64),
         _ => None,
     }
+}
+
+/// Loro merges consecutive local commits into one change while they are at
+/// most this many seconds apart. Same value as the browser, see
+/// `CHANGE_MERGE_INTERVAL_S` in schema.ts for the reasoning.
+pub const CHANGE_MERGE_INTERVAL_S: i64 = 30;
+
+/// Applies the per-instance settings the browser's `ProjectDoc` applies.
+/// None of them are synced, so every doc that will be edited locally needs
+/// this before its first commit.
+pub fn configure(doc: &LoroDoc) {
+    doc.get_tree(root::FS).disable_fractional_index();
+    doc.set_record_timestamp(true);
+    doc.set_change_merge_interval(CHANGE_MERGE_INTERVAL_S);
 }
 
 /// The project title from `meta.title`, if it is a non-empty string.
@@ -59,60 +79,21 @@ pub fn text_content(doc: &LoroDoc, id: TreeID) -> Option<LoroText> {
         .ok()
 }
 
+/// The main file from `meta.mainFile`, or None when unset or when it no
+/// longer resolves to a live node (a peer may delete it without clearing
+/// the field).
+pub fn main_file(doc: &LoroDoc) -> Option<TreeID> {
+    let value = string_value(doc.get_map(root::META).get(meta::MAIN_FILE))?;
+    let id = TreeID::try_from(value.as_str()).ok()?;
+    let tree = doc.get_tree(root::FS);
+    (tree.contains(id) && !tree.is_node_deleted(&id).ok()?).then_some(id)
+}
+
 pub(crate) fn string_value(value: Option<ValueOrContainer>) -> Option<String> {
     match value? {
         ValueOrContainer::Value(LoroValue::String(s)) => Some(s.to_string()),
         _ => None,
     }
-}
-
-/// A named version from the `versions` list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamedVersion {
-    pub name: String,
-    pub frontiers: Frontiers,
-    pub created_at: i64,
-    pub author: String,
-}
-
-/// Every well-formed entry of the `versions` list, oldest first. Entries
-/// written by a broken client are skipped.
-pub fn named_versions(doc: &LoroDoc) -> Vec<NamedVersion> {
-    let LoroValue::List(list) = doc.get_list(root::VERSIONS).get_value() else {
-        return Vec::new();
-    };
-    list.iter()
-        .filter_map(|entry| {
-            let LoroValue::Map(map) = entry else {
-                return None;
-            };
-            let (
-                Some(LoroValue::String(name)),
-                Some(LoroValue::Binary(bytes)),
-                Some(created),
-                Some(LoroValue::String(author)),
-            ) = (
-                map.get(version::NAME),
-                map.get(version::FRONTIERS),
-                map.get(version::CREATED_AT),
-                map.get(version::AUTHOR),
-            )
-            else {
-                return None;
-            };
-            let created_at = match created {
-                LoroValue::I64(v) => *v,
-                LoroValue::Double(v) if v.is_finite() => *v as i64,
-                _ => return None,
-            };
-            Some(NamedVersion {
-                name: name.to_string(),
-                frontiers: Frontiers::decode(bytes).ok()?,
-                created_at,
-                author: author.to_string(),
-            })
-        })
-        .collect()
 }
 
 /// Root container names.
@@ -137,6 +118,12 @@ pub mod version {
     pub const CREATED_AT: &str = "createdAt";
     /// Peer id (decimal string) of whoever saved it.
     pub const AUTHOR: &str = "author";
+}
+
+/// Keys of each entry in the `peers` map.
+pub mod peer {
+    pub const NAME: &str = "name";
+    pub const COLOR: &str = "color";
 }
 
 /// Keys inside the `meta` map.
@@ -209,7 +196,7 @@ impl FromStr for FileKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loro::{LoroText, ToJson};
+    use loro::{Frontiers, LoroText, ToJson};
 
     #[test]
     fn file_kind_round_trips() {
@@ -245,44 +232,6 @@ mod tests {
         let json = doc.get_deep_value().to_json_value();
         assert_eq!(json[root::META][meta::SCHEMA], SCHEMA_VERSION);
         assert_eq!(schema_version(&doc), Some(SCHEMA_VERSION));
-    }
-
-    #[test]
-    fn reads_named_versions() {
-        let doc = LoroDoc::new();
-        doc.set_peer_id(7).unwrap();
-        crate::init::init_project(&doc, "T").unwrap();
-        let frontiers = doc.oplog_frontiers();
-        let list = doc.get_list(root::VERSIONS);
-        let entry = loro::LoroMapValue::from(
-            [
-                (version::NAME.to_owned(), LoroValue::from("Draft")),
-                (
-                    version::FRONTIERS.to_owned(),
-                    LoroValue::from(frontiers.encode()),
-                ),
-                (version::CREATED_AT.to_owned(), LoroValue::from(1234.0)),
-                (version::AUTHOR.to_owned(), LoroValue::from("7")),
-            ]
-            .into_iter()
-            .collect::<std::collections::HashMap<_, _>>(),
-        );
-        list.push(LoroValue::Map(entry)).unwrap();
-        list.push("garbage").unwrap();
-        doc.commit();
-
-        let versions = named_versions(&doc);
-        assert_eq!(
-            versions,
-            [NamedVersion {
-                name: "Draft".into(),
-                frontiers: frontiers.clone(),
-                created_at: 1234,
-                author: "7".into(),
-            }]
-        );
-        let files = crate::materialize::materialize_at(&doc, &versions[0].frontiers).unwrap();
-        assert_eq!(files.len(), 1);
     }
 
     #[test]

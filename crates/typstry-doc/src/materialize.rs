@@ -2,12 +2,12 @@
 //! (zip, PDF, git) are meant to go through here, so paths come from
 //! [`build_path_index`] and clash renames apply.
 
-use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, ValueOrContainer};
+use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, TreeID, ValueOrContainer};
 
-use crate::paths::build_path_index;
+use crate::paths::{PathIndex, build_path_index};
 use crate::{FileKind, node, root, string_value, text_content};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FileContent {
     Text(String),
     /// Bytes live in the blob store; only the reference is in the doc.
@@ -35,7 +35,18 @@ pub struct MaterializedFile {
 /// nothing to export for them, and so are files whose path is unsafe to
 /// write to a real file system (see [`is_safe_path`]).
 pub fn materialize(doc: &LoroDoc) -> Vec<MaterializedFile> {
-    let index = build_path_index(doc);
+    materialize_indexed(doc, &build_path_index(doc))
+        .into_iter()
+        .map(|(_, file)| file)
+        .collect()
+}
+
+/// [`materialize`] with the node behind each file, for callers that already
+/// built the index.
+pub(crate) fn materialize_indexed(
+    doc: &LoroDoc,
+    index: &PathIndex,
+) -> Vec<(TreeID, MaterializedFile)> {
     let tree = doc.get_tree(root::FS);
     let mut files = Vec::with_capacity(index.by_path.len());
     // by_path rather than by_id: it is already sorted and its keys are
@@ -71,10 +82,13 @@ pub fn materialize(doc: &LoroDoc) -> Vec<MaterializedFile> {
                 }
             }
         };
-        files.push(MaterializedFile {
-            path: path.clone(),
-            content,
-        });
+        files.push((
+            *id,
+            MaterializedFile {
+                path: path.clone(),
+                content,
+            },
+        ));
     }
     files
 }
@@ -99,7 +113,7 @@ pub fn is_safe_path(path: &str) -> bool {
 }
 
 /// Sizes written by the browser arrive as doubles.
-fn number(value: Option<ValueOrContainer>) -> Option<u64> {
+pub(crate) fn number(value: Option<ValueOrContainer>) -> Option<u64> {
     match value? {
         ValueOrContainer::Value(LoroValue::I64(n)) => u64::try_from(n).ok(),
         ValueOrContainer::Value(LoroValue::Double(n)) if n >= 0.0 && n.is_finite() => {
@@ -115,7 +129,6 @@ mod tests {
     use crate::init::{init_project, starter_content};
     use crate::testing::add;
     use crate::text_content;
-    use loro::TreeID;
 
     fn set_text(doc: &LoroDoc, id: TreeID, text: &str) {
         let content = text_content(doc, id).unwrap();
