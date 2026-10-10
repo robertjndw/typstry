@@ -18,7 +18,7 @@ pub use versions::{NamedVersion, named_versions};
 use std::fmt;
 use std::str::FromStr;
 
-use loro::{LoroDoc, LoroText, LoroValue, TreeID, ValueOrContainer};
+use loro::{LoroDoc, LoroMap, LoroText, LoroValue, TreeID, ValueOrContainer};
 
 /// Bumped whenever the document layout changes incompatibly.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -69,10 +69,12 @@ pub fn title(doc: &LoroDoc) -> Option<String> {
 /// The content of a text node. None for other kinds, and for a text node
 /// whose content container has not been synced yet.
 pub fn text_content(doc: &LoroDoc, id: TreeID) -> Option<LoroText> {
-    doc.get_tree(root::FS)
-        .get_meta(id)
-        .ok()?
-        .get(node::CONTENT)?
+    node_text(&doc.get_tree(root::FS).get_meta(id).ok()?)
+}
+
+/// [`text_content`] for a node whose data map is already at hand.
+pub(crate) fn node_text(data: &LoroMap) -> Option<LoroText> {
+    data.get(node::CONTENT)?
         .into_container()
         .ok()?
         .into_text()
@@ -94,6 +96,11 @@ pub(crate) fn string_value(value: Option<ValueOrContainer>) -> Option<String> {
         ValueOrContainer::Value(LoroValue::String(s)) => Some(s.to_string()),
         _ => None,
     }
+}
+
+/// Whether `value` is the string `want`, without copying it out.
+pub(crate) fn is_string(value: Option<ValueOrContainer>, want: &str) -> bool {
+    matches!(value, Some(ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == want)
 }
 
 /// Root container names.
@@ -169,16 +176,9 @@ impl fmt::Display for FileKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown file kind {0:?}")]
 pub struct UnknownFileKind(pub String);
-
-impl fmt::Display for UnknownFileKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown file kind {:?}", self.0)
-    }
-}
-
-impl std::error::Error for UnknownFileKind {}
 
 impl FromStr for FileKind {
     type Err = UnknownFileKind;

@@ -16,7 +16,7 @@
 //! signed; sealed blobs and presence bind their purpose through the HKDF
 //! info and the associated data.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::alphabet::URL_SAFE;
@@ -118,7 +118,7 @@ fn random<const N: usize>() -> [u8; N] {
 fn hkdf(ikm: &[u8], salt: &[u8], info: &[&[u8]]) -> Zeroizing<[u8; SECRET_BYTES]> {
     let mut out = Zeroizing::new([0; SECRET_BYTES]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
-        .expand(&info.concat(), out.as_mut())
+        .expand_multi_info(info, out.as_mut())
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     out
 }
@@ -130,8 +130,9 @@ fn signed_message(header: &[u8], body: &[u8]) -> Vec<u8> {
 impl ProjectKey {
     /// A fresh edit secret in its shareable form, like
     /// `generateEditSecret` in `apps/web/src/crypto/project-key.ts`.
-    pub fn generate_raw() -> String {
-        BASE64URL.encode(random::<SECRET_BYTES>())
+    pub fn generate_raw() -> Zeroizing<String> {
+        let bytes = Zeroizing::new(random::<SECRET_BYTES>());
+        Zeroizing::new(BASE64URL.encode(bytes.as_ref()))
     }
 
     /// Parses the shareable form, base64url without padding the way it
@@ -190,11 +191,11 @@ impl ProjectKey {
     }
 
     /// The shareable view secret: the read key and the public key.
-    pub fn view_secret(&self) -> String {
+    pub fn view_secret(&self) -> Zeroizing<String> {
         let mut bytes = Zeroizing::new([0; VIEW_SECRET_BYTES]);
         bytes[..SECRET_BYTES].copy_from_slice(self.read.as_ref());
         bytes[SECRET_BYTES..].copy_from_slice(self.verifying.as_bytes());
-        BASE64URL.encode(bytes.as_ref())
+        Zeroizing::new(BASE64URL.encode(bytes.as_ref()))
     }
 
     fn cipher(&self, salt: &Salt, context: &str) -> Aes256Gcm {
@@ -208,17 +209,20 @@ impl ProjectKey {
     pub fn seal(&self, plaintext: &[u8], context: &str) -> Vec<u8> {
         let salt: Salt = random();
         let iv: Iv = random();
-        let ct = self
+        let mut sealed = Vec::with_capacity(plaintext.len() + SEAL_OVERHEAD);
+        sealed.extend_from_slice(&salt);
+        sealed.extend_from_slice(&iv);
+        sealed.extend_from_slice(plaintext);
+        let tag = self
             .cipher(&salt, context)
-            .encrypt(
+            .encrypt_inout_detached(
                 &Nonce::from(iv),
-                Payload {
-                    msg: plaintext,
-                    aad: context.as_bytes(),
-                },
+                context.as_bytes(),
+                (&mut sealed[SALT_LEN + IV_LEN..]).into(),
             )
             .expect("AES-GCM encryption does not fail for in-memory buffers");
-        [&salt[..], &iv, &ct].concat()
+        sealed.extend_from_slice(&tag);
+        sealed
     }
 
     /// Inverse of [`Self::seal`]. Sealed data carries no key id, so a wrong
@@ -255,7 +259,7 @@ impl ProjectKey {
         end: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        self.encrypt_delta_with(peer, start, end, plaintext, &random(), &random())
+        self.seal_delta(peer, start, end, plaintext, &random(), &random())
     }
 
     /// Encrypts a Loro snapshot covering `vv` into a signed snapshot record.
@@ -264,13 +268,39 @@ impl ProjectKey {
         vv: &[(u64, u64)],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        self.encrypt_snapshot_with(vv, plaintext, &random(), &random())
+        self.seal_snapshot(vv, plaintext, &random(), &random())
     }
 
     /// Reusing a salt and IV breaks the encryption of both messages; this
-    /// exists so tests can produce byte-stable records.
+    /// exists so tests can produce byte-stable records, and is compiled out
+    /// of everything else.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn encrypt_delta_with(
+        &self,
+        peer: u64,
+        start: u64,
+        end: u64,
+        plaintext: &[u8],
+        iv: &Iv,
+        salt: &Salt,
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.seal_delta(peer, start, end, plaintext, iv, salt)
+    }
+
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn encrypt_snapshot_with(
+        &self,
+        vv: &[(u64, u64)],
+        plaintext: &[u8],
+        iv: &Iv,
+        salt: &Salt,
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.seal_snapshot(vv, plaintext, iv, salt)
+    }
+
+    fn seal_delta(
         &self,
         peer: u64,
         start: u64,
@@ -283,8 +313,7 @@ impl ProjectKey {
         self.seal_record(&header, iv, salt, plaintext)
     }
 
-    #[doc(hidden)]
-    pub fn encrypt_snapshot_with(
+    fn seal_snapshot(
         &self,
         vv: &[(u64, u64)],
         plaintext: &[u8],
@@ -305,20 +334,24 @@ impl ProjectKey {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         let signing = self.signing.as_ref().ok_or(CryptoError::ReadOnly)?;
-        let ct = self
+        // Laid out as the signed message, `SIGNATURE_CONTEXT || header ||
+        // salt || ciphertext+tag`, with the plaintext encrypted where it
+        // lies, so the record body is the tail of it plus the signature.
+        let body_at = SIGNATURE_CONTEXT.len() + header.len();
+        let ct_at = body_at + SALT_LEN;
+        let mut message = Vec::with_capacity(ct_at + plaintext.len() + TAG_LEN + SIGNATURE_LEN);
+        message.extend_from_slice(SIGNATURE_CONTEXT);
+        message.extend_from_slice(header);
+        message.extend_from_slice(salt);
+        message.extend_from_slice(plaintext);
+        let tag = self
             .cipher(salt, RECORD_CONTEXT)
-            .encrypt(
-                &Nonce::from(*iv),
-                Payload {
-                    msg: plaintext,
-                    aad: header,
-                },
-            )
+            .encrypt_inout_detached(&Nonce::from(*iv), header, (&mut message[ct_at..]).into())
             .expect("AES-GCM encryption does not fail for in-memory buffers");
-        let mut body = [&salt[..], &ct].concat();
-        let signature = signing.sign(&signed_message(header, &body));
-        body.extend_from_slice(&signature.to_bytes());
-        Ok(encode_record(header, &body))
+        message.extend_from_slice(&tag);
+        let signature = signing.sign(&message);
+        message.extend_from_slice(&signature.to_bytes());
+        Ok(encode_record(header, &message[body_at..]))
     }
 
     /// Parses, verifies and decrypts one record of either kind.
@@ -395,7 +428,7 @@ mod tests {
             assert!(ProjectKey::from_base64url(bad).is_err(), "{bad:?}");
         }
         assert!(!format!("{:?}", key()).contains(RAW));
-        assert!(!format!("{:?}", key()).contains(&key().view_secret()));
+        assert!(!format!("{:?}", key()).contains(key().view_secret().as_str()));
     }
 
     #[test]

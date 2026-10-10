@@ -3,7 +3,6 @@
 //! for its keys.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use loro::{Frontiers, LoroDoc, LoroError, LoroMapValue, LoroValue};
 
@@ -30,30 +29,12 @@ pub fn normalize_version_name(raw: &str) -> Option<&str> {
     normalize_bounded(raw, MAX_VERSION_NAME_CHARS)
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SaveVersionError {
+    #[error("version name must be 1 to {MAX_VERSION_NAME_CHARS} characters")]
     InvalidName,
-    Loro(LoroError),
-}
-
-impl fmt::Display for SaveVersionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidName => write!(
-                f,
-                "version name must be 1 to {MAX_VERSION_NAME_CHARS} characters"
-            ),
-            Self::Loro(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SaveVersionError {}
-
-impl From<LoroError> for SaveVersionError {
-    fn from(err: LoroError) -> Self {
-        Self::Loro(err)
-    }
+    #[error(transparent)]
+    Loro(#[from] LoroError),
 }
 
 /// Names the current state of `doc`, writing the same entry `saveVersion`

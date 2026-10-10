@@ -2,11 +2,13 @@
 //! (zip, PDF, git) are meant to go through here, so paths come from
 //! [`build_path_index`] and clash renames apply.
 
+use std::collections::BTreeMap;
+
 use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, TreeID, ValueOrContainer};
 
 use crate::names::is_portable_segment;
-use crate::paths::{PathIndex, build_path_index};
-use crate::{FileKind, node, root, string_value, text_content};
+use crate::paths::{PathEntry, PathIndex, build_path_index};
+use crate::{FileKind, node, node_text, root, string_value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FileContent {
@@ -36,7 +38,8 @@ pub struct MaterializedFile {
 /// nothing to export for them, and so are files whose path is unsafe to
 /// write to a real file system (see [`is_safe_path`]).
 pub fn materialize(doc: &LoroDoc) -> Vec<MaterializedFile> {
-    materialize_indexed(doc, &build_path_index(doc))
+    let PathIndex { by_path, by_id } = build_path_index(doc);
+    collect_files(doc, &by_id, by_path)
         .into_iter()
         .map(|(_, file)| file)
         .collect()
@@ -48,21 +51,36 @@ pub(crate) fn materialize_indexed(
     doc: &LoroDoc,
     index: &PathIndex,
 ) -> Vec<(TreeID, MaterializedFile)> {
-    let mut files = Vec::with_capacity(index.by_path.len());
+    collect_files(
+        doc,
+        &index.by_id,
+        index.by_path.iter().map(|(path, id)| (path, *id)),
+    )
+}
+
+/// Takes the paths by value where the caller can give them up, so that
+/// [`materialize`] moves them out of the index instead of copying them.
+fn collect_files<P: AsRef<str> + Into<String>>(
+    doc: &LoroDoc,
+    by_id: &BTreeMap<TreeID, PathEntry>,
     // by_path rather than by_id: it is already sorted and its keys are
-    // unique even in the pathological case described in resolve_sibling_names.
-    for (path, id) in &index.by_path {
-        let Some(entry) = index.by_id.get(id) else {
+    // unique even in the pathological case described in
+    // resolve_sibling_names.
+    by_path: impl IntoIterator<Item = (P, TreeID)>,
+) -> Vec<(TreeID, MaterializedFile)> {
+    let mut files = Vec::with_capacity(by_id.len());
+    for (path, id) in by_path {
+        let Some(entry) = by_id.get(&id) else {
             continue;
         };
-        if !is_safe_path(path) {
+        if !is_safe_path(path.as_ref()) {
             continue;
         }
-        if let Some(content) = file_content(doc, *id, entry.kind) {
+        if let Some(content) = file_content(doc, id, entry.kind) {
             files.push((
-                *id,
+                id,
                 MaterializedFile {
-                    path: path.clone(),
+                    path: path.into(),
                     content,
                 },
             ));
@@ -78,9 +96,7 @@ pub(crate) fn file_content(doc: &LoroDoc, id: TreeID, kind: FileKind) -> Option<
     match kind {
         FileKind::Dir => None,
         FileKind::Text => {
-            let text = text_content(doc, id)
-                .map(|t| t.to_string())
-                .unwrap_or_default();
+            let text = node_text(&meta).map(|t| t.to_string()).unwrap_or_default();
             Some(FileContent::Text(text))
         }
         FileKind::Asset => {
