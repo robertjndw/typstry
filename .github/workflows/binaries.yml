@@ -12,8 +12,9 @@ on:
   release:
     types: [published]
 
-# A newer nightly run cancels an older one so `nightly` can't go backwards.
-# Releases are never cancelled.
+# A newer nightly run cancels an older one that's still pending. Runs that
+# overlap less than that are caught by the check before publishing. Releases
+# are never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'release' && github.ref || 'nightly' }}
   cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
@@ -86,12 +87,25 @@ jobs:
       - name: Attach to release
         if: github.event_name == 'release'
         run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+      # CI runs on main can finish out of order, so this run may be older
+      # than what `nightly` already points at.
+      - name: Check nightly
+        id: nightly
+        if: github.event_name == 'workflow_run'
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current=$(gh api "repos/$GH_REPO/git/ref/tags/nightly" --jq .object.sha 2> /dev/null) || current=
+          if [ -n "$current" ] && [ "$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$current" --jq .status)" = ahead ]; then
+            echo "::notice::nightly is already at $current, which is newer than $SHA"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
       # Updated in place instead of recreated, which would notify watchers on
       # every push and briefly 404 the downloads. Releases made with
       # GITHUB_TOKEN don't trigger other workflows, so the image workflow
       # doesn't pick this one up.
       - name: Refresh nightly
-        if: github.event_name == 'workflow_run'
+        if: github.event_name == 'workflow_run' && steps.nightly.outputs.skip != 'true'
         env:
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |

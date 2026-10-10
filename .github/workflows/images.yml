@@ -12,8 +12,9 @@ on:
   release:
     types: [published]
 
-# A newer nightly run cancels an older one so `nightly` can't go backwards.
-# Releases are never cancelled.
+# A newer nightly run cancels an older one that's still pending. Runs that
+# overlap less than that are caught by the check before publishing. Releases
+# are never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'release' && github.ref || 'nightly' }}
   cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
@@ -97,6 +98,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # CI runs on main can finish out of order, so this run may be older
+      # than what `nightly` already points at.
+      - name: Check nightly
+        id: nightly
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current=$(docker buildx imagetools inspect "$IMAGE:nightly" --format '{{json .Image}}' 2> /dev/null \
+            | jq -r '.["linux/amd64"].config.Labels["org.opencontainers.image.revision"] // empty') || true
+          if [ -n "$current" ] && [ "$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$current" --jq .status)" = ahead ]; then
+            echo "::notice::nightly is already at $current, which is newer than $SHA"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
       - id: meta
         uses: docker/metadata-action@v6
         with:
@@ -109,10 +125,12 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
       - name: Create manifest
+        if: steps.nightly.outputs.skip != 'true'
         working-directory: ${{ runner.temp }}/digests
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "$IMAGE@sha256:%s " *)
       - name: Inspect
+        if: steps.nightly.outputs.skip != 'true'
         run: docker buildx imagetools inspect "$(jq -cr '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
