@@ -38,7 +38,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 /// The URL for `which`, or a reason why this folder does not know it.
 pub fn url(config: &Config, which: Which) -> anyhow::Result<String> {
     match which {
-        Which::Edit if config.permission == Permission::Read => {
+        Which::Edit if config.permission == Permission::Read || !config.can_sign() => {
             bail!("this folder was cloned with a view-only link, so the edit link is not available")
         }
         Which::Edit => Ok(config.link().to_string()),

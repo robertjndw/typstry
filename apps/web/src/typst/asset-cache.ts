@@ -1,6 +1,17 @@
+import { ownBuffer } from "@/crypto/project-key";
 import { ApiError, blobUrl } from "@/sync/api";
 
 export const BLOB_CACHE = "typstry-blobs-v1";
+
+/** `sha256:<hex>`, the server's name for a blob. */
+export async function contentHash(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", ownBuffer(bytes)),
+  );
+  let hex = "";
+  for (const b of digest) hex += b.toString(16).padStart(2, "0");
+  return `sha256:${hex}`;
+}
 
 export interface AssetCacheOptions {
   /** Origin of the API; empty means same origin. */
@@ -89,6 +100,15 @@ export class AssetCache {
       );
     }
     const bytes = new Uint8Array(await res.arrayBuffer());
+    // The hash comes from the signed doc while blobs are not signed
+    // themselves, so this is what stops a server (or a viewer working with
+    // it) from swapping in other content sealed with the read key.
+    if ((await contentHash(bytes)) !== hash) {
+      throw new ApiError(
+        res.status,
+        `loading blob ${hash} failed: the server sent different content`,
+      );
+    }
     if (store) {
       // Response copies the bytes, and nobody needs to wait for the write.
       const entry = new Response(bytes, {

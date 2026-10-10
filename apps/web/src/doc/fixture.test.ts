@@ -7,7 +7,14 @@ import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { LoroDoc } from "loro-crdt";
 import { describe, expect, it } from "vitest";
-import { createFile, deleteNode, move, rename } from "./fs-ops";
+import {
+  createFile,
+  deleteNode,
+  FsError,
+  move,
+  rename,
+  validateName,
+} from "./fs-ops";
 import { buildPathIndex, type PathIndex } from "./paths";
 import { initProject, ProjectDoc } from "./schema";
 import { fork, newProject, sync } from "./test-utils";
@@ -128,5 +135,20 @@ describe("version fixture", () => {
     const old = new ProjectDoc(doc.forkAt(version!.frontiers));
     expect(old.title).toBe("From Rust");
     expect(old.versions.length).toBe(0);
+  });
+});
+
+// names.json is hand-written; Rust checks the same lists against its rules.
+describe("name fixture", () => {
+  const names = JSON.parse(
+    readFileSync(path.join(FIXTURES, "names.json"), "utf8"),
+  ) as { valid: string[]; invalid: string[] };
+
+  it.each(names.valid)("accepts %j", (name) => {
+    expect(() => validateName(name)).not.toThrow();
+  });
+
+  it.each(names.invalid)("rejects %j", (name) => {
+    expect(() => validateName(name)).toThrow(FsError);
   });
 });

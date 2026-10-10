@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createAsset, createFile, deleteNode } from "@/doc/fs-ops";
 import { versionAt } from "@/doc/restore";
-import { initProject } from "@/doc/schema";
+import { initProject, NODE, type ProjectDoc } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
 
 import { ExportError, exportZip } from "./zip";
@@ -27,7 +27,9 @@ function project() {
 describe("exportZip", () => {
   it("packs text files, assets and empty folders by path", async () => {
     const load = vi.fn(async () => PNG);
-    const files = unzipSync(await exportZip(project(), load));
+    const { zip, skipped } = await exportZip(project(), load);
+    const files = unzipSync(zip);
+    expect(skipped).toEqual([]);
 
     expect(Object.keys(files).sort()).toEqual([
       "empty/",
@@ -48,7 +50,7 @@ describe("exportZip", () => {
     createFile(p, null, "later.typ", "text", "new");
 
     const files = unzipSync(
-      await exportZip(versionAt(p, before), async () => PNG),
+      (await exportZip(versionAt(p, before), async () => PNG)).zip,
     );
     expect(files["main.typ"]).toBeDefined();
     expect(files["later.typ"]).toBeUndefined();
@@ -73,4 +75,41 @@ describe("exportZip", () => {
 
     await expect(exportZip(p, null)).rejects.toBeInstanceOf(ExportError);
   });
+
+  it("leaves out paths that are unsafe to unpack", async () => {
+    const p = project();
+    // What a modified client can write: names the app itself refuses.
+    const plant = (name: string, kind: "text" | "dir", parent = null) => {
+      const id = createFile(p, parent, "x", kind, "");
+      rawRename(p, id, name);
+      return id;
+    };
+    const git = plant(".GIT", "dir");
+    createFile(p, git, "config", "text", "[core]\n");
+    plant("nul.typ", "text");
+    plant("..\\..\\evil.typ", "text");
+
+    const { zip, skipped } = await exportZip(p, async () => PNG);
+    expect(skipped).toEqual([
+      "..\\..\\evil.typ",
+      ".GIT",
+      ".GIT/config",
+      "nul.typ",
+    ]);
+    expect(Object.keys(unzipSync(zip)).sort()).toEqual([
+      "empty/",
+      "figures/logo.png",
+      "main.typ",
+      "refs.bib",
+    ]);
+  });
 });
+
+function rawRename(
+  p: ProjectDoc,
+  id: ReturnType<typeof createFile>,
+  name: string,
+) {
+  p.fs.getNodeByID(id)!.data.set(NODE.name, name);
+  p.doc.commit();
+}

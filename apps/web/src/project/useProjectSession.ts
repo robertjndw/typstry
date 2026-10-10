@@ -2,7 +2,12 @@ import { EphemeralStore, LoroDoc } from "loro-crdt";
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 
 import { projectAssets, type ProjectAssets } from "@/assets/project-assets";
-import { importProjectKey, isRawProjectKey } from "@/crypto/project-key";
+import {
+  importProjectKey,
+  isEditSecret,
+  isProjectSecret,
+  type ProjectKey,
+} from "@/crypto/project-key";
 import { ProjectDoc, SCHEMA_VERSION } from "@/doc/schema";
 import { defaultBackend, LocalDocStore } from "@/persist/local-doc-store";
 import { resolveShare, type ShareInfo } from "@/sync/api";
@@ -35,8 +40,13 @@ export type SessionPhase =
       phase: "ready";
       share: ShareInfo;
       assets: ProjectAssets;
-      /** The raw key, for building share links. */
-      key: string;
+      /** Holds the secrets share links are built from. */
+      key: ProjectKey;
+      /**
+       * An edit token with only the view secret can reach the server but
+       * not sign, so it is read-only too.
+       */
+      canWrite: boolean;
     };
 
 export interface ProjectSession {
@@ -61,6 +71,20 @@ function sameShare(a: ShareInfo | null | undefined, b: ShareInfo | null) {
 }
 
 /**
+ * Imports the link's secret. A creator who opens their own view link (to
+ * check what others see) keeps the edit secret this browser already holds,
+ * instead of being downgraded to read-only for good.
+ */
+async function openKey(projectId: string, raw: string): Promise<ProjectKey> {
+  const key = await importProjectKey(raw);
+  if (key.sign) return key;
+  const stored = loadProjectKey(projectId);
+  if (!stored || !isEditSecret(stored)) return key;
+  const editor = await importProjectKey(stored);
+  return editor.viewSecret === key.viewSecret ? editor : key;
+}
+
+/**
  * Opens a project from a share token and the key from the link fragment,
  * keeps it synced and saved in this browser while mounted. A project this
  * browser has opened before opens from local storage right away, without
@@ -82,6 +106,7 @@ export function useProjectSession(
   );
   const [error, setError] = useState<string | null>(null);
   const [assets, setAssets] = useState<ProjectAssets | null>(null);
+  const [projectKey, setProjectKey] = useState<ProjectKey | null>(null);
   const [loadedLocally, setLoadedLocally] = useState(false);
   const [synced, setSynced] = useState(false);
   const [slow, setSlow] = useState(false);
@@ -92,7 +117,7 @@ export function useProjectSession(
   );
 
   const key =
-    linkKey && isRawProjectKey(linkKey)
+    linkKey && isProjectSecret(linkKey)
       ? linkKey
       : share
         ? loadProjectKey(share.projectId)
@@ -126,7 +151,7 @@ export function useProjectSession(
 
     (async () => {
       const [projectKey, backend] = await Promise.all([
-        importProjectKey(key),
+        openKey(share.projectId, key),
         defaultBackend(),
       ]);
       local = new LocalDocStore(share.projectId, project.doc, backend);
@@ -134,13 +159,14 @@ export function useProjectSession(
       if (!active) return;
       local.start();
       setAssets(projectAssets(token, projectKey));
+      setProjectKey(projectKey);
       if (found) setLoadedLocally(true);
 
       const conn = connectProject({
         projectId: share.projectId,
         token,
         key: projectKey,
-        canWrite: share.permission === "write",
+        canWrite: share.permission === "write" && projectKey.sign !== null,
         doc: project.doc,
         ephemeral,
         // A StrictMode remount closes the first socket mid-join; that is noise.
@@ -184,16 +210,25 @@ export function useProjectSession(
   const opened = synced || loadedLocally;
 
   useEffect(() => {
-    if (!opened || !share || !key || schema === null) return;
-    // Only now is the key known to fit: local data was written with it, or
-    // the server's data decrypted.
-    saveProjectKey(share.projectId, key);
+    if (!opened || !share || !projectKey || schema === null) return;
+    // Only now is the key likely to fit, but local data is stored in plain
+    // text, so loading it proves nothing about the key. A view key that
+    // reaches this point did not match the stored edit secret (see openKey),
+    // and letting it replace that secret would let any crafted link take
+    // edit access away from this browser for good.
+    const stored = loadProjectKey(share.projectId);
+    if (projectKey.editSecret || !stored || !isEditSecret(stored)) {
+      saveProjectKey(
+        share.projectId,
+        projectKey.editSecret ?? projectKey.viewSecret,
+      );
+    }
     rememberProject({
       projectId: share.projectId,
       token,
       title: project.title || "Untitled",
     });
-  }, [opened, share, key, schema, token, project]);
+  }, [opened, share, projectKey, schema, token, project]);
 
   useEffect(() => {
     if (!opened || !share) return;
@@ -209,12 +244,20 @@ export function useProjectSession(
   else if (share === undefined) state = { phase: "resolving" };
   else if (share === null) state = { phase: "not-found" };
   else if (!key) state = { phase: "missing-key" };
-  else if (!opened || !assets) state = { phase: "syncing", share, slow };
+  else if (!opened || !assets || !projectKey)
+    state = { phase: "syncing", share, slow };
   else if (schema === null)
     state = synced
       ? { phase: "empty", share }
       : { phase: "syncing", share, slow };
-  else state = { phase: "ready", share, assets, key };
+  else
+    state = {
+      phase: "ready",
+      share,
+      assets,
+      key: projectKey,
+      canWrite: share.permission === "write" && projectKey.sign !== null,
+    };
 
   return { state, status, project, ephemeral };
 }

@@ -137,7 +137,15 @@ impl Api {
         if !res.status().is_success() {
             bail!("downloading {hash} failed: HTTP {}", res.status());
         }
-        Ok(res.bytes().await.map_err(redact)?.to_vec())
+        let bytes = res.bytes().await.map_err(redact)?.to_vec();
+        // The hash comes from the signed doc and blobs are not signed
+        // themselves, so this check is what stops a server (or a viewer
+        // working with it) from swapping in other content sealed with the
+        // read key.
+        if crate::worktree::digest(&bytes) != hash {
+            bail!("downloading {hash} failed: the server sent different content");
+        }
+        Ok(bytes)
     }
 
     pub async fn upload_blob(&self, token: &str, sealed: Vec<u8>) -> anyhow::Result<StoredBlob> {
@@ -186,5 +194,31 @@ mod tests {
             let shown = format!("{err:#} {err:?}");
             assert!(!shown.contains(token), "{shown}");
         }
+    }
+
+    #[tokio::test]
+    async fn blobs_must_match_their_hash() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            // Serves "abc" for any blob, whatever hash was asked for.
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc",
+                    )
+                    .await;
+            }
+        });
+        let api = Api::new(&origin).unwrap();
+        let abc = crate::worktree::digest(b"abc");
+        assert_eq!(api.get_blob("tok", &abc).await.unwrap(), b"abc");
+        let other = crate::worktree::digest(b"xyz");
+        let err = api.get_blob("tok", &other).await.unwrap_err();
+        assert!(format!("{err:#}").contains("different content"), "{err:#}");
     }
 }

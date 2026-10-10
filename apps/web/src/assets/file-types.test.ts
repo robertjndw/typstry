@@ -1,7 +1,40 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 
-import { fileCategory } from "./file-types";
+import { fileCategory, inertBlobType } from "./file-types";
+
+describe("inertBlobType", () => {
+  it("passes through types that cannot run script", () => {
+    for (const mime of [
+      "image/png",
+      "image/jpeg",
+      "application/pdf",
+      "font/woff2",
+      "font/collection",
+      "audio/mpeg",
+      "video/mp4",
+      "text/plain",
+    ]) {
+      expect(inertBlobType(mime)).toBe(mime);
+    }
+  });
+
+  it("downgrades active or unknown content to a plain download", () => {
+    for (const mime of [
+      "text/html",
+      "image/svg+xml",
+      "application/xhtml+xml",
+      "application/xml",
+      "text/xml",
+      "application/javascript",
+      "text/html;charset=utf-8",
+      "IMAGE/PNG",
+      "",
+    ]) {
+      expect(inertBlobType(mime)).toBe("application/octet-stream");
+    }
+  });
+});
 
 describe("fileCategory", () => {
   it("classifies by extension, ignoring case", () => {

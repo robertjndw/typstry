@@ -14,6 +14,8 @@ use anyhow::{Context, bail};
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sha2::{Digest, Sha256};
+use typstry_doc::materialize::is_safe_path;
+use typstry_doc::names::is_reserved_segment;
 use typstry_wire::crypto::SEAL_OVERHEAD;
 
 use crate::api::MAX_UPLOAD_BYTES;
@@ -381,7 +383,7 @@ impl Worktree {
                 if is_always_skipped(name) {
                     return false;
                 }
-                if GIT_FILES.contains(&name)
+                if is_git_file(name)
                     && let Some(path) = worktree.relative(entry.path())
                 {
                     let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
@@ -495,7 +497,19 @@ impl Worktree {
 
     pub fn abs(&self, path: &str) -> PathBuf {
         let mut out = self.root.clone();
-        out.extend(path.split('/'));
+        for segment in path.split('/') {
+            // `push` replaces the whole path for an absolute segment, or on
+            // Windows for one with a drive like `C:`, and `..` climbs out.
+            // Writes refuse such paths up front (see `check_writable`); this
+            // is the backstop that keeps every other caller inside the root.
+            let mut parts = Path::new(segment).components();
+            if matches!(
+                (parts.next(), parts.next()),
+                (Some(Component::Normal(_)), None)
+            ) {
+                out.push(segment);
+            }
+        }
         out
     }
 
@@ -599,8 +613,13 @@ impl Worktree {
 
     /// Fails when [`Self::write`] would refuse `path`: a symlinked or
     /// non-folder parent, or a symlink or folder at the path itself. Either
-    /// could put the file outside the project or destroy something.
+    /// could put the file outside the project or destroy something. So
+    /// could a path that is not [`is_safe_path`], which `materialize` never
+    /// lists; refusing it here keeps a future caller from slipping one in.
     pub fn check_writable(&self, path: &str) -> anyhow::Result<()> {
+        if !is_safe_path(path) {
+            bail!("{path:?} is not a safe path, not writing it");
+        }
         if let Some(parent) = self.symlinked_parent(path) {
             bail!("{parent} is a symlink or a file, not writing {path} through it");
         }
@@ -637,7 +656,7 @@ impl Worktree {
     /// Deletes a file and then every folder it leaves empty, up to the
     /// root. Anything but a regular file is left alone.
     pub fn remove(&self, path: &str) -> anyhow::Result<()> {
-        if self.symlinked_parent(path).is_some() {
+        if !is_safe_path(path) || self.symlinked_parent(path).is_some() {
             return Ok(());
         }
         let abs = self.abs(path);
@@ -669,7 +688,7 @@ impl Worktree {
             return true;
         }
         for (i, segment) in segments.iter().enumerate() {
-            if GIT_FILES.contains(segment) {
+            if is_git_file(segment) {
                 let last = i == segments.len() - 1;
                 if !self.opted_in(&segments[..=i].join("/"), is_dir || !last) {
                     return true;
@@ -818,8 +837,15 @@ fn folders_to(root: &Path, segments: &[&str]) -> (Vec<PathBuf>, PathBuf) {
     (dirs, abs)
 }
 
+/// `.git` and the state folder in every spelling a file system might fold
+/// into them, so a shared `.GIT/config` is neither written nor uploaded.
 fn is_always_skipped(name: &str) -> bool {
-    name == ".git" || name == STATE_DIR
+    is_reserved_segment(name)
+}
+
+/// Case-insensitive, since `.GITIGNORE` is `.gitignore` on macOS.
+fn is_git_file(name: &str) -> bool {
+    GIT_FILES.iter().any(|file| name.eq_ignore_ascii_case(file))
 }
 
 #[cfg(test)]
@@ -1049,6 +1075,47 @@ mod tests {
         assert!(!wt.is_ignored(".github/workflows/ci.yml", false));
         assert!(wt.is_ignored(IGNORE_FILE, false));
         assert!(wt.is_ignored("sub/.gitignore", false));
+    }
+
+    #[test]
+    fn git_and_state_dirs_are_skipped_in_any_spelling() {
+        let (_dir, wt) = tree();
+        for path in [
+            ".GIT/config",
+            "sub/.Git/config",
+            "GIT~1/HEAD",
+            ".git./config",
+            ".Typstry/config.json",
+        ] {
+            assert!(wt.is_ignored(path, false), "{path}");
+            assert!(wt.check_writable(path).is_err(), "{path}");
+            assert!(wt.write(path, b"[core]").is_err(), "{path}");
+        }
+        assert!(wt.is_ignored(".GITIGNORE", false));
+        assert!(!wt.abs("sub").exists());
+        assert!(!wt.abs(".GIT").exists());
+
+        // On a case-sensitive disk these are separate folders that git
+        // ignores, but uploading them would hand them to everyone else.
+        let root = wt.root().to_path_buf();
+        fs::create_dir_all(root.join("sub/.Git")).unwrap();
+        fs::write(root.join("sub/.Git/config"), "[core]").unwrap();
+        fs::write(root.join("main.typ"), "= Hi").unwrap();
+        let scan = wt.scan().unwrap();
+        let paths: Vec<&str> = scan.files.keys().map(String::as_str).collect();
+        assert_eq!(paths, ["main.typ"]);
+    }
+
+    #[test]
+    fn refuses_paths_that_could_leave_the_root() {
+        let (_dir, wt) = tree();
+        for path in [
+            "C:/x.typ", "a:b.typ", "nul.txt", "notes.", "../x.typ", "/x.typ",
+        ] {
+            assert!(wt.write(path, b"x").is_err(), "{path}");
+            assert!(wt.abs(path).starts_with(wt.root()), "{path}");
+        }
+        assert_eq!(fs::read_dir(wt.root()).unwrap().count(), 0);
     }
 
     #[test]

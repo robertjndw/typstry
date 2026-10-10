@@ -9,9 +9,6 @@ import path from "node:path";
 import { LoroDoc } from "loro-crdt";
 import {
   EloRecordKind,
-  decryptEloRecord,
-  encryptDeltaSpan,
-  encryptSnapshot,
   type EloDeltaHeader,
   type EloSnapshotHeader,
 } from "loro-protocol";
@@ -19,12 +16,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   BLOB_CONTEXT,
+  decryptRecord,
+  encryptDelta,
+  encryptSnapshot,
   fromBase64Url,
   importProjectKey,
   open,
   seal,
   toBase64Url,
-  type ProjectKey,
 } from "./project-key";
 
 const FIXTURES = path.resolve(
@@ -44,6 +43,7 @@ const PEER_B = "9";
 
 interface Fixture {
   key: string;
+  viewKey: string;
   keyId: string;
   delta: {
     peer: string;
@@ -73,13 +73,6 @@ function readFixture(file: string): Fixture {
   return JSON.parse(readFileSync(file, "utf8")) as Fixture;
 }
 
-async function decrypt(key: ProjectKey, record: string) {
-  return decryptEloRecord(bytes(record), async (keyId) => {
-    expect(keyId).toBe(key.keyId);
-    return key.key;
-  });
-}
-
 function buildDoc() {
   const a = new LoroDoc();
   a.setPeerId(PEER_A);
@@ -101,45 +94,35 @@ async function writeJsFixture() {
     mode: "updates-in-range",
     spans: [{ id: { peer: PEER_A, counter: 0 }, len: end }],
   });
-  const delta = await encryptDeltaSpan(
+  const delta = await encryptDelta(
+    key,
+    { peer: PEER_A, start: 0, end },
     deltaPlain,
-    {
-      peerId: encoder.encode(PEER_A),
-      start: 0,
-      end,
-      keyId: key.keyId,
-      iv: new Uint8Array(12).fill(1),
-    },
-    key.key,
+    { iv: new Uint8Array(12).fill(1), salt: new Uint8Array(16).fill(3) },
   );
   const vv = [...b.oplogVersion().toJSON()];
   const snapshotPlain = b.export({ mode: "snapshot" });
   const snapshot = await encryptSnapshot(
+    key,
+    vv.map(([peer, counter]) => ({ peerId: encoder.encode(peer), counter })),
     snapshotPlain,
-    {
-      vv: vv.map(([peer, counter]) => ({
-        peerId: encoder.encode(peer),
-        counter,
-      })),
-      keyId: key.keyId,
-      iv: new Uint8Array(12).fill(2),
-    },
-    key.key,
+    { iv: new Uint8Array(12).fill(2), salt: new Uint8Array(16).fill(4) },
   );
   const blobPlain = encoder.encode("#set page(width: 10cm)\n");
   const fixture: Fixture = {
     key: RAW_KEY,
+    viewKey: key.viewSecret,
     keyId: key.keyId,
     delta: {
       peer: PEER_A,
       start: 0,
       end,
-      record: toBase64Url(delta.record),
+      record: toBase64Url(delta),
       plaintext: toBase64Url(deltaPlain),
     },
     snapshot: {
       vv,
-      record: toBase64Url(snapshot.record),
+      record: toBase64Url(snapshot),
       plaintext: toBase64Url(snapshotPlain),
     },
     blob: {
@@ -153,10 +136,14 @@ async function writeJsFixture() {
 /** Decrypts every part of a fixture and checks it against its own claims. */
 async function checkFixture(fixture: Fixture) {
   expect(fixture.key).toBe(RAW_KEY);
-  const key = await importProjectKey(fixture.key);
+  const editor = await importProjectKey(fixture.key);
+  expect(editor.keyId).toBe(fixture.keyId);
+  expect(editor.viewSecret).toBe(fixture.viewKey);
+  // Everything below must work with the view secret alone.
+  const key = await importProjectKey(fixture.viewKey);
   expect(key.keyId).toBe(fixture.keyId);
 
-  const delta = await decrypt(key, fixture.delta.record);
+  const delta = await decryptRecord(key, bytes(fixture.delta.record));
   expect(delta.kind).toBe(EloRecordKind.DeltaSpan);
   const deltaHeader = delta.header as EloDeltaHeader;
   expect(decoder.decode(deltaHeader.peerId)).toBe(fixture.delta.peer);
@@ -166,7 +153,7 @@ async function checkFixture(fixture: Fixture) {
   ]);
   expect(delta.plaintext).toEqual(bytes(fixture.delta.plaintext));
 
-  const snapshot = await decrypt(key, fixture.snapshot.record);
+  const snapshot = await decryptRecord(key, bytes(fixture.snapshot.record));
   expect(snapshot.kind).toBe(EloRecordKind.Snapshot);
   const vv = (snapshot.header as EloSnapshotHeader).vv.map(
     ({ peerId, counter }) => [decoder.decode(peerId), counter],

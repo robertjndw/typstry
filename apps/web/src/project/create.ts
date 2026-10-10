@@ -1,6 +1,6 @@
 import { LoroDoc } from "loro-crdt";
 
-import { generateRawProjectKey } from "@/crypto/project-key";
+import { generateEditSecret } from "@/crypto/project-key";
 import { initProject } from "@/doc/schema";
 import {
   defaultBackend,
@@ -20,7 +20,7 @@ import {
 export interface NewProject {
   projectId: string;
   editToken: string;
-  /** Raw key for the `#` part of share links. */
+  /** Edit secret for the `#` part of the edit link. */
   key: string;
 }
 
@@ -34,7 +34,7 @@ export async function createLocalProject(
   opts: ApiOptions & { backend?: DocBackend } = {},
 ): Promise<NewProject> {
   const created = await createProject(opts);
-  const key = generateRawProjectKey();
+  const key = generateEditSecret();
   saveShareLinks(created.projectId, created);
   saveProjectKey(created.projectId, key);
   rememberShare(created.editToken, {

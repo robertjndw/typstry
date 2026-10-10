@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   PRESENCE_CONTEXT,
-  generateRawProjectKey,
+  generateEditSecret,
   importProjectKey,
   open,
 } from "@/crypto/project-key";
@@ -15,7 +15,7 @@ function ctx() {
   return { send: vi.fn(), onJoinFailed: vi.fn(), onImportError: vi.fn() };
 }
 
-const key = await importProjectKey(generateRawProjectKey());
+const key = await importProjectKey(generateEditSecret());
 
 async function settle() {
   // Sealing and opening go through WebCrypto, which resolves on a later task.
@@ -71,7 +71,7 @@ describe("EphemeralStoreAdaptor", () => {
   });
 
   it("reports blobs that do not open with the key", async () => {
-    const other = await importProjectKey(generateRawProjectKey());
+    const other = await importProjectKey(generateEditSecret());
     const remote = new EphemeralStore(30_000);
     const remoteAdaptor = new EphemeralStoreAdaptor(remote, other);
     const rc = ctx();

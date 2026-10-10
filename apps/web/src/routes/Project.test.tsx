@@ -3,15 +3,21 @@ import { LoroDoc } from "loro-crdt";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { generateRawProjectKey } from "@/crypto/project-key";
+import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
 import { initProject } from "@/doc/schema";
 import { IDENTITY_KEY, resetIdentityCache } from "@/presence/identity";
-import { rememberShare, saveShareLinks } from "@/project/recent";
+import {
+  loadProjectKey,
+  rememberShare,
+  saveProjectKey,
+  saveShareLinks,
+} from "@/project/recent";
 import { routes } from "@/router";
 import type { ConnectOptions } from "@/sync/connection";
 
 const seed = initProject(new LoroDoc(), { title: "Server seeded" });
-const KEY = generateRawProjectKey();
+const KEY = generateEditSecret();
+const VIEW_KEY = (await importProjectKey(KEY)).viewSecret;
 
 const sync = vi.hoisted(() => ({
   connected: [] as ConnectOptions[],
@@ -92,7 +98,7 @@ describe("project route", () => {
 
     const [opts] = sync.connected;
     expect(opts).toMatchObject({ projectId: "proj1", canWrite: true });
-    expect(opts!.key.raw).toBe(KEY);
+    expect(opts!.key.editSecret).toBe(KEY);
   });
 
   it("asks for the full link when the key is missing", async () => {
@@ -142,7 +148,7 @@ describe("project route", () => {
       IDENTITY_KEY,
       JSON.stringify({ name: "Viewer", color: "#1d4ed8" }),
     );
-    renderProject("read");
+    renderProject("read", { hash: `#${VIEW_KEY}` });
     await screen.findByText("Server seeded");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.getByText("Read only")).toBeInTheDocument();
@@ -157,9 +163,33 @@ describe("project route", () => {
     fireEvent.click(screen.getByRole("button", { name: /share/i }));
     expect(screen.queryByLabelText("Can edit")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Can view")).toHaveValue(
-      `${location.origin}/p/tok-current#${KEY}`,
+      `${location.origin}/p/tok-current#${VIEW_KEY}`,
     );
     expect(sync.connected[0]).toMatchObject({ canWrite: false });
+  });
+
+  it("is read-only with an edit token but only the view secret", async () => {
+    localStorage.setItem(
+      IDENTITY_KEY,
+      JSON.stringify({ name: "Viewer", color: "#1d4ed8" }),
+    );
+    renderProject("write", { hash: `#${VIEW_KEY}` });
+    await screen.findByText("Server seeded");
+    expect(screen.getByText("Read only")).toBeInTheDocument();
+    expect(sync.connected[0]).toMatchObject({ canWrite: false });
+    fireEvent.click(screen.getByRole("button", { name: /share/i }));
+    expect(screen.queryByLabelText("Can edit")).not.toBeInTheDocument();
+  });
+
+  it("keeps the edit secret when the creator opens the view link", async () => {
+    localStorage.setItem(
+      IDENTITY_KEY,
+      JSON.stringify({ name: "Creator", color: "#1d4ed8" }),
+    );
+    saveProjectKey("proj1", KEY);
+    renderProject("read", { hash: `#${VIEW_KEY}` });
+    await screen.findByText("Server seeded");
+    expect(loadProjectKey("proj1")).toBe(KEY);
   });
 
   it("shows both links to the creator", async () => {
@@ -179,8 +209,9 @@ describe("project route", () => {
     expect(screen.getByLabelText("Can edit")).toHaveValue(
       `${location.origin}/p/tok-current#${KEY}`,
     );
+    // Never the edit secret: that would hand viewers the signing key.
     expect(screen.getByLabelText("Can view")).toHaveValue(
-      `${location.origin}/p/tok-view#${KEY}`,
+      `${location.origin}/p/tok-view#${VIEW_KEY}`,
     );
   });
 });

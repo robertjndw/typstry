@@ -2,7 +2,7 @@
 // share links of projects created here, the encryption key of every project
 // opened here, and what each share token resolved to (so a project opens
 // offline).
-import { isRawProjectKey } from "@/crypto/project-key";
+import { isProjectSecret } from "@/crypto/project-key";
 import { getStorage, readJson, writeJson } from "@/lib/storage";
 import { parseShareInfo, type ShareInfo } from "@/sync/api";
 
@@ -103,8 +103,9 @@ export function loadShareLinks(
 }
 
 /**
- * The key rides in the fragment, which browsers never send to the server,
- * so a share link carries everything needed to decrypt the project.
+ * The secret rides in the fragment, which browsers never send to the
+ * server, so a share link carries everything needed to decrypt the project.
+ * Edit links carry the edit secret, view links only the view secret.
  */
 export function projectUrl(
   token: string,
@@ -127,7 +128,7 @@ export function loadProjectKey(
   storage: Storage | null = getStorage(),
 ): string | null {
   const value = readJson(KEY_PREFIX + projectId, storage);
-  return typeof value === "string" && isRawProjectKey(value) ? value : null;
+  return typeof value === "string" && isProjectSecret(value) ? value : null;
 }
 
 export function rememberShare(

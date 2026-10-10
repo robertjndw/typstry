@@ -11,7 +11,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  generateRawProjectKey,
+  generateEditSecret,
   importProjectKey,
   type ProjectKey,
 } from "@/crypto/project-key";
@@ -177,7 +177,7 @@ function write(doc: LoroDoc, text: string) {
   doc.commit();
 }
 
-const key = await importProjectKey(generateRawProjectKey());
+const key = await importProjectKey(generateEditSecret());
 
 describe("EncryptedDocAdaptor", () => {
   it("syncs through a server that only ever sees ciphertext", async () => {
@@ -230,7 +230,7 @@ describe("EncryptedDocAdaptor", () => {
     await a.join();
     await settle();
 
-    const other = await importProjectKey(generateRawProjectKey());
+    const other = await importProjectKey(generateEditSecret());
     const c = makeClient(server, other);
     const synced = vi.fn();
     void c.adaptor.waitForReachingServerVersion().then(synced);
@@ -253,9 +253,12 @@ describe("EncryptedDocAdaptor", () => {
 
     const b = makeClient(server, key, { compactAfterDeltas: 3 });
     await b.join();
-    await settle();
-    expect(server.snapshot).not.toBeNull();
-    expect(server.deltas).toHaveLength(0);
+    // Verifying the backfill and signing the snapshot takes a few crypto
+    // round trips, more than a fixed settle reliably covers.
+    await vi.waitFor(() => {
+      expect(server.snapshot).not.toBeNull();
+      expect(server.deltas).toHaveLength(0);
+    });
 
     const fresh = makeClient(server, key);
     await fresh.join();

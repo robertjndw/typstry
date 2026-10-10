@@ -3,13 +3,15 @@
 //! (regenerate with `pnpm --filter web fixtures`); this side must derive the
 //! same paths and read the same version. `version.rust.loro` goes the other
 //! way and is rewritten by running this test with `TYPSTRY_WRITE_FIXTURES=1`.
+//! `names.json` is written by hand and checked on both sides.
 
 use std::path::Path;
 
 use loro::{ExportMode, LoroDoc};
 use serde::Deserialize;
 use typstry_doc::init::init_project;
-use typstry_doc::materialize::{FileContent, materialize, materialize_at};
+use typstry_doc::materialize::{FileContent, is_safe_path, materialize, materialize_at};
+use typstry_doc::names::validate_name;
 use typstry_doc::paths::build_path_index;
 use typstry_doc::versions::{NamedVersion, named_versions, save_version};
 use typstry_doc::{node, root, title};
@@ -104,6 +106,28 @@ fn rust_saved_version() -> (LoroDoc, NamedVersion) {
     init_project(&doc, "From Rust").unwrap();
     let version = save_version(&doc, "Draft from Rust", 1_700_000_000_456).unwrap();
     (doc, version)
+}
+
+#[derive(Deserialize)]
+struct Names {
+    valid: Vec<String>,
+    invalid: Vec<String>,
+}
+
+/// `names.json` is hand-written and read by both sides, so the browser
+/// never accepts a name the CLI refuses to write, or the other way around.
+/// Backslashes stay out of it: only Rust refuses them, see `validate_name`.
+#[test]
+fn name_rules_match_typescript() {
+    let names: Names = serde_json::from_str(include_str!("fixtures/names.json")).unwrap();
+    for name in &names.valid {
+        assert_eq!(validate_name(name), Ok(()), "{name:?}");
+        assert!(is_safe_path(name), "{name:?}");
+    }
+    for name in &names.invalid {
+        assert!(validate_name(name).is_err(), "{name:?}");
+        assert!(!is_safe_path(&format!("dir/{name}/x.typ")), "{name:?}");
+    }
 }
 
 /// The JS side reads `version.rust.loro`. Snapshots carry change

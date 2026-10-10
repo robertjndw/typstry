@@ -359,8 +359,10 @@ impl Session {
         &self.identity
     }
 
+    /// An edit token alone is not enough: other clients only accept
+    /// records signed with the key an edit secret carries.
     pub fn can_write(&self) -> bool {
-        self.config.permission.can_write()
+        self.config.permission.can_write() && self.key.can_sign()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -775,7 +777,7 @@ impl Session {
             .doc
             .export(ExportMode::Snapshot)
             .context("exporting a snapshot")?;
-        let record = self.key.encrypt_snapshot(&vv, &snapshot);
+        let record = self.key.encrypt_snapshot(&vv, &snapshot)?;
         let container = encode_container(&[&record]);
         let conn = self.conn()?;
         let id = conn.client.send_update(&container).await?;
@@ -1625,7 +1627,7 @@ fn encrypt_span(
     if plaintext.len() <= CONTAINER_BUDGET || ops == 1 {
         out.push((
             (peer, start),
-            key.encrypt_delta(peer, start, end, &plaintext),
+            key.encrypt_delta(peer, start, end, &plaintext)?,
         ));
         return Ok(());
     }
