@@ -52,7 +52,7 @@ pub struct GitMark {
     pub reflog: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Repo {
     /// The directory holding `.git`.
     pub workdir: PathBuf,
@@ -67,27 +67,27 @@ pub struct Repo {
     reflog: ReflogCache,
 }
 
-/// What the reflog says, one flag per entry: whether it moved files.
-#[derive(Debug, Clone, Default)]
+/// What the reflog says: how many entries it has and the last one that
+/// moved files, which is all sync ever asks of it.
+#[derive(Debug, Clone, Copy, Default)]
 struct Reflog {
     /// Entries that end in a newline.
-    entries: Vec<bool>,
-    /// A last line without its newline yet; it still counts, as with
-    /// `lines`.
+    whole: u64,
+    /// Index of the last whole entry that moved files.
+    last_move: Option<u64>,
+    /// A last line without its newline yet, and whether it moves files;
+    /// it still counts, as with `lines`.
     partial: Option<bool>,
 }
 
 impl Reflog {
     fn count(&self) -> u64 {
-        (self.entries.len() + usize::from(self.partial.is_some())) as u64
+        self.whole + u64::from(self.partial.is_some())
     }
 
     fn moves_files_after(&self, seen: u64) -> bool {
-        self.entries
-            .iter()
-            .chain(&self.partial)
-            .skip(seen as usize)
-            .any(|&moves| moves)
+        self.last_move.is_some_and(|i| i >= seen)
+            || (self.partial == Some(true) && self.whole >= seen)
     }
 }
 
@@ -110,15 +110,6 @@ struct ReadReflog {
 
 #[derive(Debug, Clone, Default)]
 struct ReflogCache(Arc<Mutex<Option<ReadReflog>>>);
-
-/// A cache says nothing about which repo it is.
-impl PartialEq for ReflogCache {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for ReflogCache {}
 
 fn entry_moves_files(line: &str) -> bool {
     moves_files(line.split_once('\t').map_or("", |(_, msg)| msg))
@@ -146,8 +137,12 @@ fn parse_reflog(text: &str, log: &mut Reflog) {
         Some(end) => text.split_at(end + 1),
         None => ("", text),
     };
-    log.entries
-        .extend(reflog_entries(whole).map(entry_moves_files));
+    for moves in reflog_entries(whole).map(entry_moves_files) {
+        if moves {
+            log.last_move = Some(log.whole);
+        }
+        log.whole += 1;
+    }
     log.partial = (!partial.is_empty()).then(|| entry_moves_files(partial));
 }
 
@@ -278,7 +273,7 @@ impl Repo {
                 ino,
             });
         }
-        cache.as_ref().map(|read| read.log.clone())
+        cache.as_ref().map(|read| read.log)
     }
 
     pub fn mark(&self) -> GitMark {
@@ -548,12 +543,13 @@ mod tests {
         drop(file);
         let log = repo.clone().reflog().unwrap();
         assert_eq!(log.count(), 3);
-        assert_eq!(log.entries, [false, true, false]);
+        assert_eq!(log.last_move, Some(1));
         assert!(!log.moves_files_after(2));
 
         // Expiring rewrites the file shorter; it is read again in full.
         fs::write(&path, "c\tcommit: two\n").unwrap();
-        assert_eq!(repo.reflog().unwrap().entries, [false]);
+        let log = repo.reflog().unwrap();
+        assert_eq!((log.count(), log.last_move), (1, None));
     }
 
     #[test]
@@ -566,7 +562,8 @@ mod tests {
         let path = dir.path().join(".git/logs/HEAD");
         fs::write(&path, "a\tcommit: one\nb\tcommit: two\n").unwrap();
         let repo = Repo::discover(dir.path()).unwrap();
-        assert_eq!(repo.reflog().unwrap().entries, [false, false]);
+        let log = repo.reflog().unwrap();
+        assert_eq!((log.count(), log.last_move), (2, None));
 
         // Expired down to one entry, then appended back to the old length.
         // Truncating in place keeps the inode, which is what HEAD.lock
@@ -577,7 +574,8 @@ mod tests {
         file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
         drop(file);
         assert_eq!(fs::metadata(&path).unwrap().len(), 28);
-        assert_eq!(repo.reflog().unwrap().entries, [false, true]);
+        let log = repo.reflog().unwrap();
+        assert_eq!((log.count(), log.last_move), (2, Some(1)));
     }
 
     #[test]
