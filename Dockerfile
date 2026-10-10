@@ -43,14 +43,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Dependencies get their own layer so CI's layer cache keeps them across
 # changes to our crates. A target/ cache mount doesn't survive between runners.
+# Same for the registry, otherwise every crate gets downloaded again.
 FROM chef AS server
 COPY --from=planner /src/recipe.json recipe.json
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo chef cook --release --locked -p typstry-server --recipe-path recipe.json
+RUN cargo chef cook --release --locked -p typstry-server --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --locked -p typstry-server
+RUN cargo build --release --locked -p typstry-server
 # Copied into the runtime image, which has no shell to mkdir with.
 RUN mkdir /src/data
 
