@@ -4,7 +4,7 @@ import { getText, normalizeTitle, setTitle } from "./fs-ops";
 import { versionAt } from "./restore";
 import { initProject, PEER_INFO_ORIGIN, ROOT } from "./schema";
 import { fork, newProject, sync } from "./test-utils";
-import { listVersions, saveVersion } from "./versions";
+import { deleteVersion, listVersions, saveVersion } from "./versions";
 
 describe("named versions", () => {
   it("saves the current frontiers and syncs to other peers", () => {
@@ -78,5 +78,49 @@ describe("project title", () => {
     const a = initProject(newProject(1), { title: "Old" });
     expect(() => setTitle(a, "")).toThrow();
     expect(a.title).toBe("Old");
+  });
+
+  it("deletes a version for every peer and keeps the others' indexes", () => {
+    const a = initProject(newProject(1), { title: "T" });
+    const first = saveVersion(a, "First");
+    saveVersion(a, "Second");
+    const b = fork(a, 2);
+
+    deleteVersion(b, first, { now: 99 });
+    sync(a, b);
+
+    for (const project of [a, b]) {
+      expect(listVersions(project).map((v) => [v.index, v.name])).toEqual([
+        [1, "Second"],
+      ]);
+    }
+    expect(a.deletedVersions.get(first.id)).toBe(99);
+  });
+
+  it("deletes the right one when saves were concurrent", () => {
+    const a = initProject(newProject(1), { title: "T" });
+    const b = fork(a, 2);
+    // Both land at index 0 locally; after syncing one of them moves to 1.
+    const fromA = saveVersion(a, "From A");
+    saveVersion(b, "From B");
+    expect(fromA.index).toBe(0);
+    deleteVersion(a, fromA);
+    sync(a, b);
+
+    for (const project of [a, b]) {
+      expect(listVersions(project).map((v) => v.name)).toEqual(["From B"]);
+    }
+  });
+
+  it("is not undone with the user's edits either", () => {
+    const a = initProject(newProject(1), { title: "T" });
+    const undo = new UndoManager(a.doc, {
+      excludeOriginPrefixes: [PEER_INFO_ORIGIN],
+    });
+    getText(a, a.mainFile!).insert(0, "x");
+    a.doc.commit();
+    deleteVersion(a, saveVersion(a, "v"));
+    undo.undo();
+    expect(listVersions(a)).toHaveLength(0);
   });
 });

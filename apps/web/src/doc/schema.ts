@@ -20,6 +20,8 @@ export const ROOT = {
   fs: "fs",
   /** List of named versions, see versions.ts. */
   versions: "versions",
+  /** Map of deleted named versions, see versions.ts. */
+  deletedVersions: "deletedVersions",
 } as const;
 
 export const META = {
@@ -124,6 +126,10 @@ export class ProjectDoc {
     return this.doc.getList(ROOT.versions);
   }
 
+  get deletedVersions(): LoroMap {
+    return this.doc.getMap(ROOT.deletedVersions);
+  }
+
   get schemaVersion(): number | null {
     const value = this.meta.get(META.schema);
     return typeof value === "number" ? value : null;
@@ -165,26 +171,28 @@ export class ProjectDoc {
 }
 
 /**
- * Seeds an empty doc with the schema version, title and a main.typ. Does
- * nothing if the doc already carries a schema version.
+ * Seeds an empty doc with the schema version, title and, unless `starter` is
+ * false, a main.typ. Does nothing if the doc already carries a schema version.
  */
 export function initProject(
   target: LoroDoc | ProjectDoc,
-  opts: { title: string },
+  opts: { title: string; starter?: boolean },
 ): ProjectDoc {
   const project =
     target instanceof ProjectDoc ? target : new ProjectDoc(target);
   if (project.schemaVersion !== null) return project;
 
-  const node = project.fs.createNode();
-  node.data.set(NODE.kind, "text");
-  node.data.set(NODE.name, DEFAULT_MAIN_FILE);
-  const content = node.data.setContainer(NODE.content, new LoroText());
-  content.insert(0, starterContent(opts.title));
+  if (opts.starter !== false) {
+    const node = project.fs.createNode();
+    node.data.set(NODE.kind, "text");
+    node.data.set(NODE.name, DEFAULT_MAIN_FILE);
+    const content = node.data.setContainer(NODE.content, new LoroText());
+    content.insert(0, starterContent(opts.title));
+    project.meta.set(META.mainFile, node.id);
+  }
 
   project.meta.set(META.schema, SCHEMA_VERSION);
   project.meta.set(META.title, opts.title);
-  project.meta.set(META.mainFile, node.id);
   project.doc.commit({ message: "init project" });
   return project;
 }

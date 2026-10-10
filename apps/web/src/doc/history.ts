@@ -10,7 +10,8 @@
 // and memoize by version (see useHistory).
 import type { ContainerID, LoroDoc, OpId, PeerID, TreeID } from "loro-crdt";
 
-import { NODE, type ProjectDoc } from "./schema";
+import { NODE, ROOT, type ProjectDoc } from "./schema";
+import { listVersions, type NamedVersion } from "./versions";
 
 export interface ChangeInfo {
   peer: PeerID;
@@ -21,6 +22,11 @@ export interface ChangeInfo {
   /** Unix seconds, 0 when the author did not record a time. */
   timestamp: number;
   deps: OpId[];
+  /**
+   * Bookkeeping rather than an edit: it only touched the peers map or the
+   * named versions. See groupChanges for how that is treated.
+   */
+  meta?: boolean;
 }
 
 export interface GroupingOptions {
@@ -69,7 +75,14 @@ function comparePeers(a: PeerID, b: PeerID): number {
 export function groupChanges(
   input: readonly ChangeInfo[],
   options: GroupingOptions = DEFAULT_GROUPING,
+  /**
+   * Versions (tags) a group should end at when the history passes through
+   * them exactly, so that a tagged state is a group boundary rather than a
+   * point somewhere inside a group.
+   */
+  cuts: readonly OpId[][] = [],
 ): ChangeGroup[] {
+  const cutKeys = new Set(cuts.map(frontiersKey));
   const byPeer = new Map<PeerID, ChangeInfo[]>();
   for (const change of input) {
     let list = byPeer.get(change.peer);
@@ -129,16 +142,25 @@ export function groupChanges(
   let current: { changes: ChangeInfo[]; first: number; prev: number } | null =
     null;
 
-  const close = () => {
-    if (!current) return;
+  const currentFrontiers = (): OpId[] => {
     const frontiers: OpId[] = [];
     for (const [peer, counter] of last) {
       if ((depended.get(peer) ?? -1) < counter)
         frontiers.push({ peer, counter });
     }
-    frontiers.sort((a, b) => comparePeers(a.peer, b.peer));
+    return frontiers.sort((a, b) => comparePeers(a.peer, b.peer));
+  };
+  // Set once the group reached a cut. The group only closes at the next
+  // edit, so bookkeeping that follows the tag (saving it) stays inside.
+  let cutReached = false;
+
+  const close = () => {
+    cutReached = false;
+    if (!current) return;
+    const frontiers = currentFrontiers();
     const counts = new Map<PeerID, number>();
-    for (const c of current.changes)
+    const edits = current.changes.filter((c) => !c.meta);
+    for (const c of edits.length > 0 ? edits : current.changes)
       counts.set(c.peer, (counts.get(c.peer) ?? 0) + 1);
     const authors = [...counts.keys()].sort(
       (a, b) => counts.get(b)! - counts.get(a)! || comparePeers(a, b),
@@ -155,20 +177,7 @@ export function groupChanges(
     current = null;
   };
 
-  for (const change of ordered) {
-    const time = effective.get(change)!;
-    if (
-      current &&
-      (time - current.prev > options.gapMs / 1000 ||
-        time - current.first > options.maxSpanMs / 1000 ||
-        // Never mix unknown and known times in one group.
-        (current.first === 0) !== (time === 0))
-    ) {
-      close();
-    }
-    current ??= { changes: [], first: time, prev: time };
-    current.changes.push(change);
-    current.prev = time;
+  const include = (change: ChangeInfo) => {
     const end = change.counter + change.length - 1;
     last.set(change.peer, Math.max(last.get(change.peer) ?? -1, end));
     for (const dep of change.deps) {
@@ -178,9 +187,45 @@ export function groupChanges(
         Math.max(depended.get(dep.peer) ?? -1, dep.counter),
       );
     }
+    if (cutKeys.size > 0 && cutKeys.has(frontiersKey(currentFrontiers())))
+      cutReached = true;
+  };
+
+  for (const change of ordered) {
+    const time = effective.get(change)!;
+    // Bookkeeping comes after the edits it belongs to: saving a version, or
+    // a page load recording the name again (every load is a new peer). If it
+    // could extend a session, open one or count as authorship, the same edits
+    // would show up again as a newer session above their version.
+    if (change.meta && current) {
+      current.changes.push(change);
+      include(change);
+      continue;
+    }
+    if (
+      current &&
+      (cutReached ||
+        time - current.prev > options.gapMs / 1000 ||
+        time - current.first > options.maxSpanMs / 1000 ||
+        // Never mix unknown and known times in one group.
+        (current.first === 0) !== (time === 0))
+    ) {
+      close();
+    }
+    current ??= { changes: [], first: time, prev: time };
+    current.changes.push(change);
+    current.prev = time;
+    include(change);
   }
   close();
   return groups;
+}
+
+function frontiersKey(frontiers: readonly OpId[]): string {
+  return frontiers
+    .map((id) => `${id.counter}@${id.peer}`)
+    .sort()
+    .join(",");
 }
 
 export function readChanges(doc: LoroDoc): ChangeInfo[] {
@@ -222,24 +267,87 @@ function containerOwners(project: ProjectDoc): Map<ContainerID, TreeID> {
   return owners;
 }
 
+/** Root containers whose changes are bookkeeping, not edits. */
+const META_CONTAINERS: ReadonlySet<string> = new Set(
+  [
+    { name: ROOT.peers, type: "Map" },
+    { name: ROOT.versions, type: "List" },
+    { name: ROOT.deletedVersions, type: "Map" },
+  ].map(({ name, type }) => `cid:root-${name}:${type}`),
+);
+
+function changedContainers(doc: LoroDoc, change: ChangeInfo): ContainerID[] {
+  return doc.getChangedContainersIn(
+    { peer: change.peer, counter: change.counter },
+    change.length,
+  );
+}
+
+function isMeta(containers: readonly ContainerID[]): boolean {
+  return (
+    containers.length > 0 && containers.every((id) => META_CONTAINERS.has(id))
+  );
+}
+
+/**
+ * The tag on the revision that `frontiers` (by default the current state)
+ * belongs to, if any. Tagging itself, and other bookkeeping, adds changes
+ * of its own, so a tag still names the state as long as nothing but
+ * bookkeeping happened between it and `frontiers`.
+ */
+export function tagAt(
+  project: ProjectDoc,
+  frontiers?: OpId[],
+): NamedVersion | undefined {
+  const { doc } = project;
+  doc.commit();
+  const target = frontiers ?? doc.oplogFrontiers();
+  const targetVV = doc.frontiersToVV(target);
+  let changes: ChangeInfo[] | null = null;
+  // Newest first: the most recent tag is the likeliest match.
+  for (const version of listVersions(project).reverse()) {
+    let cmp: number | undefined;
+    try {
+      cmp = doc.cmpFrontiers(version.frontiers, target);
+    } catch {
+      continue; // frontiers this doc never saw
+    }
+    if (cmp !== 0 && cmp !== -1) continue;
+    const versionVV = doc.frontiersToVV(version.frontiers);
+    changes ??= readChanges(doc);
+    const onlyMetaSince = changes.every((c) => {
+      const inTarget = (targetVV.get(c.peer) ?? 0) > c.counter;
+      const inVersion = (versionVV.get(c.peer) ?? 0) > c.counter;
+      return !inTarget || inVersion || isMeta(changedContainers(doc, c));
+    });
+    if (onlyMetaSince) return version;
+  }
+  return undefined;
+}
+
 /** Groups the whole history of `project`, oldest first. */
 export function computeHistory(
   project: ProjectDoc,
   options: GroupingOptions = DEFAULT_GROUPING,
+  /** Tagged versions, which become group boundaries; see groupChanges. */
+  cuts: readonly OpId[][] = [],
 ): HistoryEntry[] {
   const { doc } = project;
   // getChangedContainersIn commits implicitly; do it once, up front, so a
   // pending local edit is not split at an arbitrary point.
   doc.commit();
-  const groups = groupChanges(readChanges(doc), options);
+  const touched = new Map<string, ContainerID[]>();
+  const changes = readChanges(doc).map((c) => {
+    const containers = changedContainers(doc, c);
+    touched.set(`${c.counter}@${c.peer}`, containers);
+    return isMeta(containers) ? { ...c, meta: true } : c;
+  });
+  const groups = groupChanges(changes, options, cuts);
   const owners = containerOwners(project);
   return groups.map((group) => {
     const files = new Set<TreeID>();
     for (const c of group.changes) {
-      for (const cid of doc.getChangedContainersIn(
-        { peer: c.peer, counter: c.counter },
-        c.length,
-      )) {
+      for (const cid of touched.get(`${c.counter}@${c.peer}`)!) {
         const owner = owners.get(cid);
         if (owner) files.add(owner);
       }
