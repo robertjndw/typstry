@@ -23,6 +23,16 @@ pub struct PathIndex {
     pub by_id: BTreeMap<TreeID, PathEntry>,
 }
 
+/// The entries of `map` keyed by a path anywhere below `dir`, in order.
+pub fn entries_under<'a, V>(
+    map: &'a BTreeMap<String, V>,
+    dir: &str,
+) -> impl Iterator<Item = (&'a String, &'a V)> + use<'a, V> {
+    let prefix = format!("{dir}/");
+    map.range(prefix.clone()..)
+        .take_while(move |(path, _)| path.starts_with(&prefix))
+}
+
 /// Name shown for a node that lost a same-name clash: `main.typ` with id
 /// `3@42` becomes `main~3@42.typ`. A leading dot does not start an
 /// extension, so `.gitignore` becomes `.gitignore~3@42`.

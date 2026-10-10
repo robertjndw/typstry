@@ -7,6 +7,7 @@ use loro::{ExportMode, Frontiers, LoroDoc, VersionVector};
 use typstry_doc::apply::{ApplyReport, apply_changes};
 use typstry_doc::configure;
 use typstry_doc::materialize::{FileContent, MaterializedFile, materialize};
+use typstry_doc::paths::entries_under;
 
 use crate::git::{GitMark, Repo};
 use crate::hash::Digest;
@@ -275,14 +276,9 @@ impl Session {
             Scope::Paths(paths) => {
                 let mut read = BTreeSet::new();
                 for path in paths.iter().chain(extra) {
-                    let under = format!("{path}/");
                     // A listed folder covers the base files inside it.
-                    let inside: Vec<String> = base
-                        .range(under.clone()..)
-                        .map(|(p, _)| p)
-                        .take_while(|p| p.starts_with(&under))
-                        .cloned()
-                        .collect();
+                    let inside: Vec<String> =
+                        entries_under(base, path).map(|(p, _)| p.clone()).collect();
                     for p in inside.iter().chain(std::iter::once(path)) {
                         self.read_one(p, base, &mut local)?;
                         read.insert(p.clone());
@@ -870,10 +866,7 @@ impl Session {
         }
         let assets: Vec<&str> = writes
             .iter()
-            .filter_map(|(_, content)| match content {
-                FileContent::Asset { hash, .. } => Some(hash.as_str()),
-                FileContent::Text(_) => None,
-            })
+            .filter_map(|(_, content)| content.asset_hash())
             .collect();
         self.prefetch_assets(&assets).await?;
         for (path, content) in writes {

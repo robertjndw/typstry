@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use typstry_doc::materialize::{FileContent, materialize, materialize_at};
+use typstry_doc::materialize::{materialize, materialize_at};
 
 use super::clone::check_empty;
 use super::init::absolute;
@@ -83,10 +83,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         if !args.fetch.offline {
             let assets: Vec<&str> = files
                 .iter()
-                .filter_map(|f| match &f.content {
-                    FileContent::Asset { hash, .. } => Some(hash.as_str()),
-                    FileContent::Text(_) => None,
-                })
+                .filter_map(|f| f.content.asset_hash())
                 .collect();
             session.prefetch_assets(&assets).await?;
         }

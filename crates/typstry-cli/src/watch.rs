@@ -6,8 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use typstry_doc::materialize::FileContent;
-
 use crate::engine::{Files, Session};
 use crate::git::{Head, Repo};
 use crate::hash::Digest;
@@ -18,6 +16,7 @@ use anyhow::Context;
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc;
+use typstry_doc::paths::entries_under;
 
 /// Editors save in bursts (write, rename, chmod); one batch per save.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -120,13 +119,6 @@ struct Known {
     size: u64,
 }
 
-fn size_of(content: &FileContent) -> u64 {
-    match content {
-        FileContent::Text(text) => text.len() as u64,
-        FileContent::Asset { size, .. } => *size,
-    }
-}
-
 impl Synced {
     /// Recomputes the map from the session's base.
     pub fn refresh(&mut self, session: &Session) -> anyhow::Result<()> {
@@ -151,7 +143,7 @@ impl Synced {
                 let known = unchanged.or_else(|| {
                     Some(Known {
                         digest: session.known_digest(content)?,
-                        size: size_of(content),
+                        size: content.size(),
                     })
                 });
                 (path.clone(), known)
@@ -161,11 +153,7 @@ impl Synced {
     }
 
     fn contains_under(&self, path: &str) -> bool {
-        let prefix = format!("{path}/");
-        self.digests
-            .range(prefix.clone()..)
-            .next()
-            .is_some_and(|(p, _)| p.starts_with(&prefix))
+        entries_under(&self.digests, path).next().is_some()
     }
 
     pub fn classify(&self, worktree: &Worktree, abs: &Path) -> Seen {

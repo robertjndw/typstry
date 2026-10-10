@@ -24,6 +24,24 @@ pub enum FileContent {
     },
 }
 
+impl FileContent {
+    /// The blob hash, for an asset.
+    pub fn asset_hash(&self) -> Option<&str> {
+        match self {
+            Self::Text(_) => None,
+            Self::Asset { hash, .. } => Some(hash),
+        }
+    }
+
+    /// The size of the file on disk, in bytes.
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::Text(text) => text.len() as u64,
+            Self::Asset { size, .. } => *size,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedFile {
     /// `/`-separated, relative, never empty.

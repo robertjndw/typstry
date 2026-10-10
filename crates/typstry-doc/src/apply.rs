@@ -15,7 +15,9 @@ use crate::materialize::{
     FileContent, MaterializedFile, file_content, is_safe_path, materialize_indexed, number,
 };
 use crate::names::{NameError, validate_path};
-use crate::paths::{LiveNode, PathIndex, build_path_index, read_node, resolve_sibling_names};
+use crate::paths::{
+    LiveNode, PathIndex, build_path_index, entries_under, read_node, resolve_sibling_names,
+};
 use crate::{FileKind, is_string, main_file, meta, node, root, text_content};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -469,12 +471,7 @@ impl<'a> Current<'a> {
 
     /// Paths of every node anywhere below `dir`.
     fn nodes_under(self, dir: &str) -> impl Iterator<Item = (&'a str, TreeID)> {
-        let prefix = format!("{dir}/");
-        self.index
-            .by_path
-            .range(prefix.clone()..)
-            .take_while(move |(path, _)| path.starts_with(&prefix))
-            .map(|(path, id)| (path.as_str(), *id))
+        entries_under(&self.index.by_path, dir).map(|(path, id)| (path.as_str(), *id))
     }
 
     /// Paths of the visible files anywhere below `dir`.
