@@ -2,7 +2,9 @@ use anyhow::{Context, bail};
 use loro::LoroDoc;
 use typstry_doc::peers::peer_name;
 use typstry_doc::versions::MAX_VERSION_NAME_CHARS;
-use typstry_doc::versions::{NamedVersion, named_versions, normalize_version_name, save_version};
+use typstry_doc::versions::{
+    NamedVersion, named_versions, normalize_version_name, save_version, tag_at,
+};
 
 use super::{Ctx, Output, guard_branch, guard_switch, print_report, print_warnings};
 use crate::engine::{Mode, Report, Scope, Session, set_peer_info};
@@ -136,6 +138,16 @@ pub fn print_pushed(out: &mut Output, report: &Report) {
 
 /// Adds the version to the doc; sending it is up to the caller.
 pub fn name_current_state(session: &mut Session, name: &str) -> anyhow::Result<NamedVersion> {
+    // Local changes are pushed before this runs, so edits on disk already
+    // count as a new state. The history panel has the same one-name rule.
+    if let Some(existing) = tag_at(&session.doc, None) {
+        bail!(
+            "the current state is already saved as version #{} {:?}; \
+             make a change first, or remove that version in the browser's history panel",
+            existing.index,
+            existing.name
+        );
+    }
     // The doc's peer is fresh for this run, so the history panel needs its
     // name before the version entry can show an author.
     set_peer_info(&session.doc, session.identity())?;

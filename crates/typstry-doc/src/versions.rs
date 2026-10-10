@@ -2,10 +2,13 @@
 //! plain map appended to the root `versions` list; see [`crate::version`]
 //! for its keys.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
-use loro::{Frontiers, LoroDoc, LoroError, LoroMapValue, LoroValue};
+use loro::{
+    ContainerID, ContainerType, Frontiers, ID, LoroDoc, LoroError, LoroMapValue, LoroValue,
+};
 
 use crate::names::normalize_bounded;
 use crate::{root, version};
@@ -91,15 +94,21 @@ pub fn save_version(
     })
 }
 
-/// Every well-formed entry of the `versions` list, oldest first. Entries
-/// written by a broken client are skipped.
+/// Every well-formed entry of the `versions` list that is not deleted,
+/// oldest first. Entries written by a broken client are skipped.
 pub fn named_versions(doc: &LoroDoc) -> Vec<NamedVersion> {
-    let LoroValue::List(list) = doc.get_list(root::VERSIONS).get_value() else {
+    let handler = doc.get_list(root::VERSIONS);
+    let LoroValue::List(list) = handler.get_value() else {
         return Vec::new();
     };
+    let deleted = doc.get_map(root::DELETED_VERSIONS);
     list.iter()
         .enumerate()
         .filter_map(|(index, entry)| {
+            let id = handler.get_id_at(index)?;
+            if deleted.get(&entry_key(id)).is_some() {
+                return None;
+            }
             let LoroValue::Map(map) = entry else {
                 return None;
             };
@@ -131,6 +140,62 @@ pub fn named_versions(doc: &LoroDoc) -> Vec<NamedVersion> {
             })
         })
         .collect()
+}
+
+/// The named version (a tag in the browser) for the state at `frontiers`,
+/// or the current state if `None`. Saving a version is itself a change, so
+/// a version still matches as long as only bookkeeping happened between it
+/// and `frontiers`. A state only ever gets one name. Mirrors `tagAt` in
+/// apps/web/src/doc/history.ts.
+pub fn tag_at(doc: &LoroDoc, frontiers: Option<&Frontiers>) -> Option<NamedVersion> {
+    // get_changed_containers_in commits implicitly anyway; doing it first
+    // keeps the current frontiers and the ranges below consistent.
+    doc.commit();
+    let target = frontiers.cloned().unwrap_or_else(|| doc.oplog_frontiers());
+    let target_vv = doc.frontiers_to_vv(&target)?;
+    // Newest first: the most recent version is the likeliest match.
+    named_versions(doc).into_iter().rev().find(|version| {
+        let earlier = matches!(
+            doc.cmp_frontiers(&version.frontiers, &target),
+            Ok(Some(Ordering::Less | Ordering::Equal))
+        );
+        let Some(version_vv) = doc.frontiers_to_vv(&version.frontiers) else {
+            return false;
+        };
+        earlier
+            && target_vv.iter().all(|(peer, &end)| {
+                let start = version_vv.get(peer).copied().unwrap_or(0);
+                start >= end
+                    || doc
+                        .get_changed_containers_in(ID::new(*peer, start), (end - start) as usize)
+                        .iter()
+                        .all(is_bookkeeping)
+            })
+    })
+}
+
+/// Root containers whose changes are bookkeeping rather than edits; must
+/// match `META_CONTAINERS` in apps/web/src/doc/history.ts.
+fn is_bookkeeping(id: &ContainerID) -> bool {
+    let ContainerID::Root {
+        name,
+        container_type,
+    } = id
+    else {
+        return false;
+    };
+    matches!(
+        (name.as_str(), container_type),
+        (root::PEERS, ContainerType::Map)
+            | (root::VERSIONS, ContainerType::List)
+            | (root::DELETED_VERSIONS, ContainerType::Map)
+    )
+}
+
+/// How `deletedVersions` refers to a list entry; must match `entryId` in
+/// apps/web/src/doc/versions.ts.
+fn entry_key(id: ID) -> String {
+    format!("{}@{}", id.counter, id.peer)
 }
 
 #[cfg(test)]
@@ -224,5 +289,36 @@ mod tests {
         ));
         assert!(save_version(&doc, &"v".repeat(101), 0).is_err());
         assert_eq!(named_versions(&doc).len(), 1);
+    }
+
+    #[test]
+    fn tag_at_ignores_bookkeeping_but_not_edits() {
+        let doc = LoroDoc::new();
+        doc.set_peer_id(7).unwrap();
+        init_project(&doc, "T").unwrap();
+        assert_eq!(tag_at(&doc, None), None);
+
+        let saved = save_version(&doc, "Tagged", 1).unwrap();
+        assert_eq!(tag_at(&doc, None).as_ref(), Some(&saved));
+        // Peer info is bookkeeping too.
+        crate::peers::set_peer(&doc, "Me", "#000000").unwrap();
+        assert_eq!(tag_at(&doc, None).as_ref(), Some(&saved));
+
+        let tagged = doc.oplog_frontiers();
+        let main = crate::paths::build_path_index(&doc).by_path["main.typ"];
+        crate::text_content(&doc, main)
+            .unwrap()
+            .insert(0, "edit ")
+            .unwrap();
+        doc.commit();
+        assert_eq!(tag_at(&doc, None), None);
+        assert_eq!(tag_at(&doc, Some(&tagged)).as_ref(), Some(&saved));
+
+        let id = doc.get_list(root::VERSIONS).get_id_at(saved.index).unwrap();
+        doc.get_map(root::DELETED_VERSIONS)
+            .insert(&entry_key(id), 2.0)
+            .unwrap();
+        doc.commit();
+        assert_eq!(tag_at(&doc, Some(&tagged)), None);
     }
 }

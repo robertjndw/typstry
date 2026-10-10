@@ -86,6 +86,20 @@ fn materializes_typescript_fixture() {
 }
 
 #[test]
+fn hides_version_deleted_by_typescript() {
+    let doc = LoroDoc::from_snapshot(include_bytes!("fixtures/version-deleted.js.loro")).unwrap();
+    let kept: Vec<_> = named_versions(&doc)
+        .into_iter()
+        .map(|v| (v.index, v.name))
+        .collect();
+    // The deleted entry keeps its slot, so "Also kept" is still #2.
+    assert_eq!(kept, [(0, "Kept".to_owned()), (2, "Also kept".to_owned())]);
+    // Deleting a version is bookkeeping, so the state stays tagged.
+    let current = typstry_doc::versions::tag_at(&doc, None).map(|v| v.name);
+    assert_eq!(current.as_deref(), Some("Also kept"));
+}
+
+#[test]
 fn reads_version_saved_by_typescript() {
     let doc = LoroDoc::from_snapshot(include_bytes!("fixtures/version.js.loro")).unwrap();
     let versions = named_versions(&doc);
