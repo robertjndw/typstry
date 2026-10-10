@@ -1,6 +1,8 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::Context;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 use typstry_server::config::Config;
 use typstry_server::http;
@@ -9,6 +11,10 @@ use typstry_server::store::db;
 
 /// How long open WebSockets get to close before the rooms stop anyway.
 const CONNECTION_GRACE: Duration = Duration::from_secs(5);
+
+/// Below the image's HEALTHCHECK timeout so a hung server gets a proper error
+/// instead of Docker killing the probe.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,8 +43,11 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%dest, "database backed up; copy {} separately", config.data_dir.join("blobs").display());
             Ok(())
         }
+        Some("healthcheck") => healthcheck(config.addr).await,
         Some(other) => {
-            anyhow::bail!("unknown command {other:?}; expected serve or backup <dest.db>")
+            anyhow::bail!(
+                "unknown command {other:?}; expected serve, backup <dest.db> or healthcheck"
+            )
         }
     }
 }
@@ -76,6 +85,41 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The container image has no curl, so its HEALTHCHECK uses this.
+async fn healthcheck(addr: SocketAddr) -> anyhow::Result<()> {
+    let addr = probe_addr(addr);
+    let response = tokio::time::timeout(HEALTHCHECK_TIMEOUT, async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        // HTTP/1.0 so the server closes the connection and read_to_end
+        // returns.
+        stream
+            .write_all(b"GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        anyhow::Ok(response)
+    })
+    .await
+    .with_context(|| format!("no response from {addr} within {HEALTHCHECK_TIMEOUT:?}"))?
+    .with_context(|| format!("requesting /healthz from {addr}"))?;
+
+    let status_line = response.split(|&b| b == b'\r').next().unwrap_or_default();
+    let status_line = String::from_utf8_lossy(status_line);
+    if status_line.split(' ').nth(1) != Some("200") {
+        anyhow::bail!("unhealthy: {status_line:?}");
+    }
+    Ok(())
+}
+
+/// 0.0.0.0 and :: can't be connected to, so probe loopback instead.
+fn probe_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => (Ipv4Addr::LOCALHOST, addr.port()).into(),
+        IpAddr::V6(ip) if ip.is_unspecified() => (Ipv6Addr::LOCALHOST, addr.port()).into(),
+        _ => addr,
+    }
+}
+
 /// Ctrl-C, or SIGTERM from `docker stop` and service managers.
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -103,5 +147,22 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_addr_maps_unspecified_to_loopback() {
+        let cases = [
+            ("0.0.0.0:8787", "127.0.0.1:8787"),
+            ("[::]:8787", "[::1]:8787"),
+            ("10.0.0.5:9000", "10.0.0.5:9000"),
+        ];
+        for (bound, probed) in cases {
+            assert_eq!(probe_addr(bound.parse().unwrap()), probed.parse().unwrap());
+        }
     }
 }
