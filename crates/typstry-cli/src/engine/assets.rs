@@ -84,9 +84,13 @@ impl Session {
     /// the server. Records its digest in the base's asset map.
     pub async fn asset_bytes(&mut self, hash: &str) -> anyhow::Result<Vec<u8>> {
         if let Some(bytes) = self.state.read_blob(hash) {
-            self.base
-                .assets
-                .insert(BlobHash::from(hash), Digest::of(&bytes));
+            // Assets run to megabytes; hash them only when the digest is
+            // not known yet.
+            if !self.base.assets.contains_key(hash) {
+                self.base
+                    .assets
+                    .insert(BlobHash::from(hash), Digest::of(&bytes));
+            }
             return Ok(bytes);
         }
         let sealed = self.api.get_blob(&self.config.token, hash).await?;
@@ -127,8 +131,12 @@ impl Session {
         a: &FileContent,
         b: &FileContent,
     ) -> anyhow::Result<bool> {
-        if a == b {
-            return Ok(true);
+        match (a, b) {
+            _ if a == b => return Ok(true),
+            // Texts are their own content; digests would only say again
+            // that they differ.
+            (FileContent::Text(_), FileContent::Text(_)) => return Ok(false),
+            _ => {}
         }
         Ok(self.content_digest(a).await? == self.content_digest(b).await?)
     }
