@@ -366,24 +366,16 @@ impl Live {
     }
 
     fn next_deadline(&self) -> Instant {
-        let mut at = self.next_git_poll.min(self.next_mailbox_poll);
-        let mut consider = |t: Option<Instant>| {
-            if let Some(t) = t
-                && t < at
-            {
-                at = t;
-            }
-        };
-        consider(self.local.due);
-        consider(self.remote_due);
-        consider(self.retry_at);
-        if !self.session.is_connected() {
-            consider(self.reconnect.at);
-        }
-        if self.dirty {
-            consider(Some(self.last_save + SAVE_EVERY));
-        }
-        at
+        [
+            self.local.due,
+            self.remote_due,
+            self.retry_at,
+            self.reconnect.at.filter(|_| !self.session.is_connected()),
+            self.dirty.then(|| self.last_save + SAVE_EVERY),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(self.next_git_poll.min(self.next_mailbox_poll), Instant::min)
     }
 
     fn on_change(&mut self, change: Change) {

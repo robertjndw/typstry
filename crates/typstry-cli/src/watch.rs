@@ -231,10 +231,7 @@ impl GitState {
                 tracked: tracked.map(str::to_owned),
             };
         }
-        match repo.operation_in_progress() {
-            Some(op) => Self::Busy(op),
-            None => Self::Clear,
-        }
+        repo.operation_in_progress().map_or(Self::Clear, Self::Busy)
     }
 
     /// Why git keeps typstry from syncing, if it does, as the middle of a

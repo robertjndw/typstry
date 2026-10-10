@@ -159,14 +159,15 @@ impl Live {
         if !self.holding() {
             return Ok(Scope::Full);
         }
-        let mut scope = Scope::Full;
-        if !force {
+        let scope = if force {
+            Scope::Full
+        } else {
             let status = self.session.status(&Scope::Full).await?;
             if !status.local.is_empty() {
                 return Err(switch_refusal(&status.local));
             }
-            scope = Scope::Paths(BTreeSet::new());
-        }
+            Scope::Paths(BTreeSet::new())
+        };
         out.out("sync: publishing held changes");
         self.release();
         Ok(scope)
