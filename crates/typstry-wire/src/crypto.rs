@@ -15,6 +15,11 @@
 //! Doc records bind their plaintext header as associated data and are
 //! signed; sealed blobs and presence bind their purpose through the HKDF
 //! info and the associated data.
+//!
+//! Every format starts with a version byte (secrets with a kind byte), which
+//! is authenticated along with the rest. A byte this build does not know
+//! means a newer typstry wrote the data, which [`CryptoError::NewerVersion`]
+//! reports instead of a generic decryption failure.
 
 use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -43,12 +48,22 @@ pub type Salt = [u8; SALT_LEN];
 const TAG_LEN: usize = 16;
 const SIGNATURE_LEN: usize = 64;
 
-/// Bytes [`ProjectKey::seal`] adds: the salt, the IV and the GCM tag.
-pub const SEAL_OVERHEAD: usize = SALT_LEN + IV_LEN + TAG_LEN;
+/// First byte of a sealed blob or presence update.
+pub const SEAL_VERSION: u8 = 1;
+/// First byte of a doc record's ciphertext field.
+pub const RECORD_VERSION: u8 = 1;
+/// First byte of an edit secret, followed by 32 key bytes.
+pub const SECRET_EDIT_V1: u8 = 1;
+/// First byte of a view secret, followed by the read key and the public key.
+pub const SECRET_VIEW_V1: u8 = 2;
+
+/// Bytes [`ProjectKey::seal`] adds: the version, the salt, the IV and the
+/// GCM tag.
+pub const SEAL_OVERHEAD: usize = 1 + SALT_LEN + IV_LEN + TAG_LEN;
 
 const SECRET_BYTES: usize = 32;
-/// A view secret is the read key followed by the public key.
-const VIEW_SECRET_BYTES: usize = 64;
+/// The read key followed by the public key.
+const VIEW_KEY_BYTES: usize = 64;
 const KEY_ID_BYTES: usize = 9;
 
 /// The browser decodes secrets with `atob`, which ignores the unused low
@@ -82,6 +97,9 @@ pub enum CryptoError {
     Decrypt,
     #[error("a view-only key cannot sign records")]
     ReadOnly,
+    /// The version or kind byte is one this build does not know.
+    #[error("made by a newer version of typstry (format {0}); update typstry to read it")]
+    NewerVersion(u8),
 }
 
 /// A record after decryption, with the header it was authenticated under.
@@ -127,39 +145,58 @@ fn signed_message(header: &[u8], body: &[u8]) -> Vec<u8> {
     [SIGNATURE_CONTEXT, header, body].concat()
 }
 
+/// The version goes into the associated data as well, so data cannot be
+/// relabelled as another version without failing authentication.
+fn versioned_aad(version: u8, aad: &[u8]) -> Vec<u8> {
+    [&[version], aad].concat()
+}
+
 impl ProjectKey {
     /// A fresh edit secret in its shareable form, like
     /// `generateEditSecret` in `apps/web/src/crypto/project-key.ts`.
     pub fn generate_raw() -> Zeroizing<String> {
-        let bytes = Zeroizing::new(random::<SECRET_BYTES>());
+        let mut bytes = Zeroizing::new([0; 1 + SECRET_BYTES]);
+        bytes[0] = SECRET_EDIT_V1;
+        getrandom::fill(&mut bytes[1..]).expect("OS random source unavailable");
         Zeroizing::new(BASE64URL.encode(bytes.as_ref()))
     }
 
     /// Parses the shareable form, base64url without padding the way it
-    /// appears in a share link's fragment: 32 bytes for an edit secret, 64
-    /// for a view secret.
+    /// appears in a share link's fragment: a kind byte, then 32 key bytes
+    /// for an edit secret or 64 for a view secret.
     pub fn from_base64url(raw: &str) -> Result<Self, CryptoError> {
         let bytes = Zeroizing::new(
             BASE64URL
                 .decode(raw)
                 .map_err(|_| CryptoError::MalformedKey)?,
         );
-        match bytes.len() {
-            SECRET_BYTES => {
-                let read = hkdf(&bytes, &[], &[READ_INFO]);
-                let signing = SigningKey::from_bytes(&hkdf(&bytes, &[], &[SIGN_INFO]));
+        let Some((&kind, key)) = bytes.split_first() else {
+            return Err(CryptoError::MalformedKey);
+        };
+        match (kind, key.len()) {
+            (SECRET_EDIT_V1, SECRET_BYTES) => {
+                let read = hkdf(key, &[], &[READ_INFO]);
+                let signing = SigningKey::from_bytes(&hkdf(key, &[], &[SIGN_INFO]));
                 let verifying = signing.verifying_key();
                 Ok(Self::assemble(read, verifying, Some(signing)))
             }
-            VIEW_SECRET_BYTES => {
-                let (read, public) = bytes.split_at(SECRET_BYTES);
+            (SECRET_VIEW_V1, VIEW_KEY_BYTES) => {
+                let (read, public) = key.split_at(SECRET_BYTES);
                 let public: &[u8; 32] = public.try_into().expect("split at 32 of 64");
                 let verifying =
                     VerifyingKey::from_bytes(public).map_err(|_| CryptoError::MalformedKey)?;
                 let read = Zeroizing::new(read.try_into().expect("split at 32 of 64"));
                 Ok(Self::assemble(read, verifying, None))
             }
-            _ => Err(CryptoError::MalformedKey),
+            (SECRET_EDIT_V1 | SECRET_VIEW_V1, _) => Err(CryptoError::MalformedKey),
+            // Too short to carry a key, so a truncated link rather than a
+            // newer one. Secrets from before the kind byte were 32 or 64
+            // bytes; their first byte is random and must not read as a
+            // version either.
+            _ if bytes.len() <= SECRET_BYTES || bytes.len() == VIEW_KEY_BYTES => {
+                Err(CryptoError::MalformedKey)
+            }
+            _ => Err(CryptoError::NewerVersion(kind)),
         }
     }
 
@@ -192,9 +229,10 @@ impl ProjectKey {
 
     /// The shareable view secret: the read key and the public key.
     pub fn view_secret(&self) -> Zeroizing<String> {
-        let mut bytes = Zeroizing::new([0; VIEW_SECRET_BYTES]);
-        bytes[..SECRET_BYTES].copy_from_slice(self.read.as_ref());
-        bytes[SECRET_BYTES..].copy_from_slice(self.verifying.as_bytes());
+        let mut bytes = Zeroizing::new([0; 1 + VIEW_KEY_BYTES]);
+        bytes[0] = SECRET_VIEW_V1;
+        bytes[1..=SECRET_BYTES].copy_from_slice(self.read.as_ref());
+        bytes[1 + SECRET_BYTES..].copy_from_slice(self.verifying.as_bytes());
         Zeroizing::new(BASE64URL.encode(bytes.as_ref()))
     }
 
@@ -203,22 +241,34 @@ impl ProjectKey {
         Aes256Gcm::new_from_slice(key.as_ref()).expect("HKDF yields a 32-byte key")
     }
 
-    /// Seals `plaintext` as `salt || iv || ciphertext+tag`, binding
-    /// `context` (one of the `*_CONTEXT` constants) so a blob cannot be
-    /// passed off as presence or the other way around.
+    /// Seals `plaintext` as `version || salt || iv || ciphertext+tag`,
+    /// binding `context` (one of the `*_CONTEXT` constants) so a blob
+    /// cannot be passed off as presence or the other way around.
     pub fn seal(&self, plaintext: &[u8], context: &str) -> Vec<u8> {
-        let salt: Salt = random();
-        let iv: Iv = random();
+        self.seal_raw(plaintext, context, &random(), &random())
+    }
+
+    /// [`Self::seal`] with a caller-chosen salt and IV, for byte-stable
+    /// fixtures. Never reuse a pair outside tests, see
+    /// [`Self::encrypt_delta_with`].
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn seal_with(&self, plaintext: &[u8], context: &str, iv: &Iv, salt: &Salt) -> Vec<u8> {
+        self.seal_raw(plaintext, context, salt, iv)
+    }
+
+    fn seal_raw(&self, plaintext: &[u8], context: &str, salt: &Salt, iv: &Iv) -> Vec<u8> {
         let mut sealed = Vec::with_capacity(plaintext.len() + SEAL_OVERHEAD);
-        sealed.extend_from_slice(&salt);
-        sealed.extend_from_slice(&iv);
+        sealed.push(SEAL_VERSION);
+        sealed.extend_from_slice(salt);
+        sealed.extend_from_slice(iv);
         sealed.extend_from_slice(plaintext);
         let tag = self
-            .cipher(&salt, context)
+            .cipher(salt, context)
             .encrypt_inout_detached(
-                &Nonce::from(iv),
-                context.as_bytes(),
-                (&mut sealed[SALT_LEN + IV_LEN..]).into(),
+                &Nonce::from(*iv),
+                &versioned_aad(SEAL_VERSION, context.as_bytes()),
+                (&mut sealed[1 + SALT_LEN + IV_LEN..]).into(),
             )
             .expect("AES-GCM encryption does not fail for in-memory buffers");
         sealed.extend_from_slice(&tag);
@@ -228,10 +278,16 @@ impl ProjectKey {
     /// Inverse of [`Self::seal`]. Sealed data carries no key id, so a wrong
     /// key shows up as [`CryptoError::Decrypt`].
     pub fn open(&self, sealed: &[u8], context: &str) -> Result<Vec<u8>, CryptoError> {
+        let Some((&version, rest)) = sealed.split_first() else {
+            return Err(CryptoError::Truncated);
+        };
+        if version != SEAL_VERSION {
+            return Err(CryptoError::NewerVersion(version));
+        }
         if sealed.len() < SEAL_OVERHEAD {
             return Err(CryptoError::Truncated);
         }
-        let (salt, rest) = sealed
+        let (salt, rest) = rest
             .split_first_chunk::<SALT_LEN>()
             .expect("length checked");
         let (iv, ct) = rest.split_first_chunk::<IV_LEN>().expect("length checked");
@@ -240,7 +296,7 @@ impl ProjectKey {
                 &Nonce::from(*iv),
                 Payload {
                     msg: ct,
-                    aad: context.as_bytes(),
+                    aad: &versioned_aad(version, context.as_bytes()),
                 },
             )
             .map_err(|_| CryptoError::Decrypt)
@@ -324,8 +380,10 @@ impl ProjectKey {
         self.seal_record(&header, iv, salt, plaintext)
     }
 
-    /// A record's ciphertext field is `salt || ciphertext+tag || signature`,
-    /// the signature covering the header and everything before it.
+    /// A record's ciphertext field is `version || salt || ciphertext+tag ||
+    /// signature`, the signature covering the header and everything before
+    /// it. The header itself is fixed by loro-protocol and read by the
+    /// server, so the version cannot go there.
     fn seal_record(
         &self,
         header: &[u8],
@@ -335,18 +393,24 @@ impl ProjectKey {
     ) -> Result<Vec<u8>, CryptoError> {
         let signing = self.signing.as_ref().ok_or(CryptoError::ReadOnly)?;
         // Laid out as the signed message, `SIGNATURE_CONTEXT || header ||
-        // salt || ciphertext+tag`, with the plaintext encrypted where it
-        // lies, so the record body is the tail of it plus the signature.
+        // version || salt || ciphertext+tag`, with the plaintext encrypted
+        // where it lies, so the record body is the tail of it plus the
+        // signature.
         let body_at = SIGNATURE_CONTEXT.len() + header.len();
-        let ct_at = body_at + SALT_LEN;
+        let ct_at = body_at + 1 + SALT_LEN;
         let mut message = Vec::with_capacity(ct_at + plaintext.len() + TAG_LEN + SIGNATURE_LEN);
         message.extend_from_slice(SIGNATURE_CONTEXT);
         message.extend_from_slice(header);
+        message.push(RECORD_VERSION);
         message.extend_from_slice(salt);
         message.extend_from_slice(plaintext);
         let tag = self
             .cipher(salt, RECORD_CONTEXT)
-            .encrypt_inout_detached(&Nonce::from(*iv), header, (&mut message[ct_at..]).into())
+            .encrypt_inout_detached(
+                &Nonce::from(*iv),
+                &versioned_aad(RECORD_VERSION, header),
+                (&mut message[ct_at..]).into(),
+            )
             .expect("AES-GCM encryption does not fail for in-memory buffers");
         message.extend_from_slice(&tag);
         let signature = signing.sign(&message);
@@ -370,7 +434,14 @@ impl ProjectKey {
         if sealed.key_id != self.key_id {
             return Err(CryptoError::KeyMismatch(sealed.key_id.clone()));
         }
-        if sealed.ct.len() < SALT_LEN + TAG_LEN + SIGNATURE_LEN {
+        let Some(&version) = sealed.ct.first() else {
+            return Err(CryptoError::Truncated);
+        };
+        // Before the signature: a newer version may well sign differently.
+        if version != RECORD_VERSION {
+            return Err(CryptoError::NewerVersion(version));
+        }
+        if sealed.ct.len() < 1 + SALT_LEN + TAG_LEN + SIGNATURE_LEN {
             return Err(CryptoError::Truncated);
         }
         let (body, signature) = sealed.ct.split_at(sealed.ct.len() - SIGNATURE_LEN);
@@ -380,7 +451,7 @@ impl ProjectKey {
         self.verifying
             .verify_strict(&signed_message(sealed.aad, body), &signature)
             .map_err(|_| CryptoError::BadSignature)?;
-        let (salt, ct) = body
+        let (salt, ct) = body[1..]
             .split_first_chunk::<SALT_LEN>()
             .expect("length checked");
         self.cipher(salt, RECORD_CONTEXT)
@@ -388,7 +459,7 @@ impl ProjectKey {
                 &Nonce::from(sealed.iv),
                 Payload {
                     msg: ct,
-                    aad: sealed.aad,
+                    aad: &versioned_aad(version, sealed.aad),
                 },
             )
             .map_err(|_| CryptoError::Decrypt)
@@ -399,14 +470,17 @@ impl ProjectKey {
 mod tests {
     use super::*;
 
-    const RAW: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    /// The edit kind byte, then key bytes 0..32.
+    const RAW: &str = "AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
 
     fn key() -> ProjectKey {
         ProjectKey::from_base64url(RAW).unwrap()
     }
 
     fn other_key() -> ProjectKey {
-        ProjectKey::from_base64url(&BASE64URL.encode([9; 32])).unwrap()
+        let mut raw = [9; 1 + SECRET_BYTES];
+        raw[0] = SECRET_EDIT_V1;
+        ProjectKey::from_base64url(&BASE64URL.encode(raw)).unwrap()
     }
 
     fn viewer() -> ProjectKey {
@@ -414,18 +488,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_32_and_64_byte_base64url_secrets() {
+    fn parses_only_known_kinds_of_base64url_secrets() {
         assert_eq!(key().key_id().len(), 12);
+        assert_eq!(ProjectKey::generate_raw().len(), 44);
+        assert!(
+            ProjectKey::from_base64url(&ProjectKey::generate_raw()).is_ok_and(|k| k.can_sign())
+        );
+        let view = BASE64URL.decode(key().view_secret().as_bytes()).unwrap();
         for bad in [
             "",
-            &RAW[..42],
+            &RAW[..43],
             &format!("{RAW}A"),
             &format!("{RAW}="),
             &RAW.replace('A', "+"),
-            &BASE64URL.encode([0; 16]),
-            &BASE64URL.encode([0; 48]),
+            &BASE64URL.encode([SECRET_EDIT_V1; 16]),
+            &BASE64URL.encode([SECRET_EDIT_V1; 65]),
+            &BASE64URL.encode([SECRET_VIEW_V1; 33]),
+            // Secrets from before the kind byte.
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            &BASE64URL.encode(&view[1..]),
         ] {
-            assert!(ProjectKey::from_base64url(bad).is_err(), "{bad:?}");
+            assert!(
+                matches!(
+                    ProjectKey::from_base64url(bad),
+                    Err(CryptoError::MalformedKey)
+                ),
+                "{bad:?}"
+            );
         }
         assert!(!format!("{:?}", key()).contains(RAW));
         assert!(!format!("{:?}", key()).contains(key().view_secret().as_str()));
@@ -439,7 +528,7 @@ mod tests {
         assert!(!view.can_sign());
         assert_eq!(view.key_id(), edit.key_id());
         assert_eq!(view.view_secret(), edit.view_secret());
-        assert_eq!(view.view_secret().len(), 86);
+        assert_eq!(view.view_secret().len(), 87);
         assert_ne!(other_key().key_id(), edit.key_id());
     }
 
@@ -497,11 +586,11 @@ mod tests {
                 &Nonce::from([1; IV_LEN]),
                 Payload {
                     msg: b"forged",
-                    aad: &header,
+                    aad: &versioned_aad(RECORD_VERSION, &header),
                 },
             )
             .unwrap();
-        let mut body = [&salt[..], &ct].concat();
+        let mut body = [&[RECORD_VERSION], &salt[..], &ct].concat();
         let forger = SigningKey::from_bytes(&[3; 32]);
         body.extend_from_slice(&forger.sign(&signed_message(&header, &body)).to_bytes());
         let forged = encode_record(&header, &body);
@@ -560,7 +649,7 @@ mod tests {
         let key = key();
         let a = key.seal(b"blob", BLOB_CONTEXT);
         let b = key.seal(b"blob", BLOB_CONTEXT);
-        assert_ne!(a[..SALT_LEN], b[..SALT_LEN]);
+        assert_ne!(a[1..=SALT_LEN], b[1..=SALT_LEN]);
         assert_ne!(a, b);
     }
 
@@ -582,6 +671,99 @@ mod tests {
         assert!(matches!(
             key.open(&sealed[..5], BLOB_CONTEXT),
             Err(CryptoError::Truncated)
+        ));
+        assert!(matches!(
+            key.open(&[], BLOB_CONTEXT),
+            Err(CryptoError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn unknown_versions_are_newer() {
+        let key = key();
+        let mut sealed = key.seal(b"blob", BLOB_CONTEXT);
+        sealed[0] = SEAL_VERSION + 1;
+        assert!(matches!(
+            key.open(&sealed, BLOB_CONTEXT),
+            Err(CryptoError::NewerVersion(v)) if v == SEAL_VERSION + 1
+        ));
+        // A newer format may lay out the rest differently, so don't look
+        // at it.
+        assert!(matches!(
+            key.open(&[SEAL_VERSION + 1], BLOB_CONTEXT),
+            Err(CryptoError::NewerVersion(_))
+        ));
+
+        let record = key.encrypt_delta(7, 0, 3, b"ops").unwrap();
+        let sealed = SealedRecord::parse(&record).unwrap();
+        let mut ct = sealed.ct.to_vec();
+        ct[0] = RECORD_VERSION + 1;
+        let newer = encode_record(sealed.aad, &ct);
+        assert!(matches!(
+            viewer().decrypt_record(&newer),
+            Err(CryptoError::NewerVersion(v)) if v == RECORD_VERSION + 1
+        ));
+
+        let mut secret = [7; 1 + SECRET_BYTES];
+        secret[0] = 0x7f;
+        assert!(matches!(
+            ProjectKey::from_base64url(&BASE64URL.encode(secret)),
+            Err(CryptoError::NewerVersion(0x7f))
+        ));
+    }
+
+    /// Data written as another version and relabelled as the current one
+    /// must not authenticate, so the byte cannot be swapped to make a
+    /// newer format parse as this one.
+    #[test]
+    fn version_bytes_are_authenticated() {
+        let key = key();
+        let salt = [2; SALT_LEN];
+        let iv = [1; IV_LEN];
+        let ct = key
+            .cipher(&salt, BLOB_CONTEXT)
+            .encrypt(
+                &Nonce::from(iv),
+                Payload {
+                    msg: b"blob",
+                    aad: &versioned_aad(SEAL_VERSION + 1, BLOB_CONTEXT.as_bytes()),
+                },
+            )
+            .unwrap();
+        let relabelled = [&[SEAL_VERSION], &salt[..], &iv, &ct].concat();
+        assert!(matches!(
+            key.open(&relabelled, BLOB_CONTEXT),
+            Err(CryptoError::Decrypt)
+        ));
+
+        // A record's version is both signed and in the AEAD, so relabelling
+        // fails even when an editor re-signs it.
+        let header = encode_delta_header(7, 0, 3, key.key_id(), &iv);
+        let ct = key
+            .cipher(&salt, RECORD_CONTEXT)
+            .encrypt(
+                &Nonce::from(iv),
+                Payload {
+                    msg: b"ops",
+                    aad: &versioned_aad(RECORD_VERSION + 1, &header),
+                },
+            )
+            .unwrap();
+        let signing = key.signing.as_ref().unwrap();
+        let mut body = [&[RECORD_VERSION + 1], &salt[..], &ct].concat();
+        let signature = signing.sign(&signed_message(&header, &body));
+        body[0] = RECORD_VERSION;
+        let resigned = signing.sign(&signed_message(&header, &body));
+
+        let relabelled = encode_record(&header, &[&body[..], &signature.to_bytes()].concat());
+        assert!(matches!(
+            key.decrypt_record(&relabelled),
+            Err(CryptoError::BadSignature)
+        ));
+        let relabelled = encode_record(&header, &[&body[..], &resigned.to_bytes()].concat());
+        assert!(matches!(
+            key.decrypt_record(&relabelled),
+            Err(CryptoError::Decrypt)
         ));
     }
 }

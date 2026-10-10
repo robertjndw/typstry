@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use typstry_wire::crypto::{BLOB_CONTEXT, ProjectKey, SALT_LEN, Salt};
 use typstry_wire::elo::{Record, SealedRecord, Version};
 
-const RAW_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+const RAW_KEY: &str = "AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,7 +134,8 @@ fn decrypts_typescript_fixture() {
 fn nonces_of(record: &str) -> ([u8; 12], Salt) {
     let record = bytes(record);
     let sealed = SealedRecord::parse(&record).unwrap();
-    (sealed.iv, sealed.ct[..SALT_LEN].try_into().unwrap())
+    // The ciphertext field starts with the version byte.
+    (sealed.iv, sealed.ct[1..=SALT_LEN].try_into().unwrap())
 }
 
 fn rust_fixture() -> Fixture {

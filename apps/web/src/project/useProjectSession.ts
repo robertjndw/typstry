@@ -11,17 +11,24 @@ import { projectAssets, type ProjectAssets } from "@/assets/project-assets";
 import {
   importProjectKey,
   isEditSecret,
-  isProjectSecret,
+  NewerVersionError,
+  secretKind,
   type ProjectKey,
 } from "@/crypto/project-key";
-import { ProjectDoc, SCHEMA_VERSION } from "@/doc/schema";
+import {
+  isSchemaTooNew,
+  migrate,
+  ProjectDoc,
+  SCHEMA_VERSION,
+} from "@/doc/schema";
 import { defaultBackend, LocalDocStore } from "@/persist/local-doc-store";
-import { resolveShare, type ShareInfo } from "@/sync/api";
+import { OutdatedClientError, resolveShare, type ShareInfo } from "@/sync/api";
 import {
   connectProject,
   type SyncNowResult,
   type SyncStatus,
 } from "@/sync/connection";
+import { RELOAD_MESSAGE } from "@/sync/protocol";
 
 import {
   forgetShare,
@@ -130,7 +137,9 @@ export function useProjectSession(
   );
 
   const key =
-    linkKey && isProjectSecret(linkKey)
+    // A newer kind of secret goes through too, so importing it can say why
+    // it does not open.
+    linkKey && secretKind(linkKey)
       ? linkKey
       : share
         ? loadProjectKey(share.projectId)
@@ -147,6 +156,12 @@ export function useProjectSession(
       },
       (err) => {
         if (abort.signal.aborted) return;
+        // Local data would open, but the socket is refused just the same,
+        // so working on would only pile up edits that never sync.
+        if (err instanceof OutdatedClientError) {
+          setError(RELOAD_MESSAGE);
+          return;
+        }
         // Offline with a project seen before: carry on from local data.
         if (cached) return;
         console.error(err);
@@ -159,6 +174,9 @@ export function useProjectSession(
   useEffect(() => {
     if (!share || !key) return;
     let active = true;
+    // Stopping the connection fails the pending join too, which must not
+    // replace the reload message with a vaguer one.
+    let outdated = false;
     let local: LocalDocStore | null = null;
     let close: (() => void) | null = null;
 
@@ -188,7 +206,12 @@ export function useProjectSession(
         },
         onDecryptError: (err) => {
           console.error(err);
-          if (active) setError(WRONG_KEY);
+          if (active)
+            setError(err instanceof NewerVersionError ? TOO_NEW : WRONG_KEY);
+        },
+        onOutdated: () => {
+          outdated = true;
+          if (active) setError(RELOAD_MESSAGE);
         },
       });
       const stopStatus = conn.subscribe((s) => setStatus(s));
@@ -205,7 +228,8 @@ export function useProjectSession(
         },
         (err: unknown) => {
           console.error(err);
-          if (active) setError("The server refused to open this project.");
+          if (active && !outdated)
+            setError("The server refused to open this project.");
         },
       );
       close = () => {
@@ -215,7 +239,12 @@ export function useProjectSession(
       };
     })().catch((err: unknown) => {
       console.error(err);
-      if (active) setError("This project could not be opened.");
+      if (active)
+        setError(
+          err instanceof NewerVersionError
+            ? TOO_NEW
+            : "This project could not be opened.",
+        );
     });
 
     return () => {
@@ -260,8 +289,7 @@ export function useProjectSession(
 
   let state: SessionPhase;
   if (error) state = { phase: "error", message: error };
-  else if (schema !== null && schema > SCHEMA_VERSION)
-    state = { phase: "error", message: TOO_NEW };
+  else if (isSchemaTooNew(schema)) state = { phase: "error", message: TOO_NEW };
   else if (share === undefined) state = { phase: "resolving" };
   else if (share === null) state = { phase: "not-found" };
   else if (!key) state = { phase: "missing-key" };
@@ -279,6 +307,15 @@ export function useProjectSession(
       key: projectKey,
       canWrite: share.permission === "write" && projectKey.sign !== null,
     };
+
+  // Only after the initial sync: a doc loaded from this browser alone may
+  // lack ops the server has, and migrating that would work on a partial
+  // project. A newer doc never gets here, it is the TOO_NEW error above.
+  const canMigrate = synced && state.phase === "ready" && state.canWrite;
+  useEffect(() => {
+    if (canMigrate && schema !== null && schema < SCHEMA_VERSION)
+      migrate(project);
+  }, [canMigrate, schema, project]);
 
   const syncNow = useCallback(
     async (): Promise<SyncNowResult> =>

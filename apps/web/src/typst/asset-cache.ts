@@ -1,7 +1,9 @@
 import { ownBuffer } from "@/crypto/project-key";
-import { ApiError, blobUrl } from "@/sync/api";
+import { apiFetch, ApiError, blobUrl } from "@/sync/api";
 
-export const BLOB_CACHE = "typstry-blobs-v1";
+import { BLOB_CACHE } from "./cache-names";
+
+export { BLOB_CACHE };
 
 /** `sha256:<hex>`, the server's name for a blob. */
 export async function contentHash(bytes: Uint8Array): Promise<string> {
@@ -116,8 +118,10 @@ export class AssetCache {
     const cached = await store?.match(key).catch(() => undefined);
     if (cached) return new Uint8Array(await cached.arrayBuffer());
 
-    const res = await this.fetchFn(
+    const res = await apiFetch(
       blobUrl(token, hash, { baseUrl: this.baseUrl }),
+      {},
+      this.fetchFn,
     );
     if (!res.ok) {
       throw new ApiError(

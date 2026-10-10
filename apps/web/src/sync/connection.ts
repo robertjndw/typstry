@@ -14,6 +14,12 @@ import { toError } from "@/lib/errors";
 
 import { EncryptedDocAdaptor } from "./encrypted-doc-adaptor";
 import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
+import {
+  fetchServerInfo,
+  isOutdated,
+  PROTOCOL_QUERY,
+  PROTOCOL_VERSION,
+} from "./protocol";
 
 export type SyncStatus = "connecting" | "connected" | "disconnected";
 
@@ -21,6 +27,12 @@ export type SyncStatus = "connecting" | "connected" | "disconnected";
 export type SyncNowResult = "synced" | "offline";
 
 const SYNC_NOW_TIMEOUT_MS = 5000;
+
+/**
+ * A failing socket checks /api/info at most this often. Reconnects back off
+ * to 15 s, so that is one request every couple of attempts.
+ */
+const OUTDATED_CHECK_MS = 30_000;
 
 export interface ConnectOptions {
   projectId: string;
@@ -36,6 +48,10 @@ export interface ConnectOptions {
   onError?: (error: Error) => void;
   /** Received data does not decrypt with `key`. */
   onDecryptError?: (error: Error) => void;
+  /** The server no longer serves this build. Syncing has already stopped. */
+  onOutdated?: () => void;
+  /** Whether the server refuses this build; replaceable for tests. */
+  checkOutdated?: () => Promise<boolean>;
 }
 
 export interface ProjectConnection {
@@ -57,7 +73,8 @@ export interface ProjectConnection {
 }
 
 export function projectWsUrl(loc: Pick<Location, "protocol" | "host">): string {
-  return `${loc.protocol === "https:" ? "wss:" : "ws:"}//${loc.host}/ws`;
+  const scheme = loc.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${loc.host}/ws?${PROTOCOL_QUERY}=${PROTOCOL_VERSION}`;
 }
 
 export function connectProject(opts: ConnectOptions): ProjectConnection {
@@ -93,17 +110,38 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
     ? new EphemeralStoreAdaptor(opts.ephemeral, opts.key)
     : undefined;
 
-  const stopSocketStatus = client.onStatusChange((s) => {
-    socket = s;
-    update();
-  });
-
   const fail = () => {
     if (finished) return;
     finished = true;
     update();
     shutdown();
   };
+
+  // The server answers an outdated client's handshake with a 426, but the
+  // browser reports that as a plain failed socket, same as being offline.
+  // So after a failure we ask /api/info and stop retrying if we're too old.
+  const checkOutdated =
+    opts.checkOutdated ?? (async () => isOutdated(await fetchServerInfo()));
+  let lastCheck = -Infinity;
+  const onDisconnect = () => {
+    const now = Date.now();
+    if (now - lastCheck < OUTDATED_CHECK_MS) return;
+    lastCheck = now;
+    void checkOutdated().then(
+      (outdated) => {
+        if (!outdated || finished) return;
+        fail();
+        opts.onOutdated?.();
+      },
+      () => {},
+    );
+  };
+
+  const stopSocketStatus = client.onStatusChange((s) => {
+    socket = s;
+    if (s === "disconnected" && !finished) onDisconnect();
+    update();
+  });
 
   const docJoin: Promise<LoroWebsocketClientRoom> = client.join({
     roomId: opts.projectId,

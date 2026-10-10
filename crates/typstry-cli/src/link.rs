@@ -5,7 +5,8 @@ use std::fmt;
 use std::fmt::Write as _;
 
 use anyhow::{Context, bail};
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::{CryptoError, ProjectKey};
+use typstry_wire::{PROTOCOL_QUERY, PROTOCOL_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareLink {
@@ -35,7 +36,11 @@ impl ShareLink {
         if base.is_empty() || token.is_empty() || token.contains('/') {
             bail!("not a project link: expected .../p/<token>#<key>");
         }
-        ProjectKey::from_base64url(key).context("the key in the link is malformed")?;
+        match ProjectKey::from_base64url(key) {
+            Ok(_) => {}
+            Err(err @ CryptoError::NewerVersion(_)) => bail!("the key in the link was {err}"),
+            Err(err) => return Err(err).context("the key in the link is malformed"),
+        }
         Ok(Self {
             origin: format!("{scheme}://{base}"),
             token,
@@ -64,13 +69,15 @@ impl fmt::Display for ShareLink {
     }
 }
 
-/// The WebSocket endpoint that belongs to an http origin.
+/// The WebSocket endpoint that belongs to an http origin, with our
+/// protocol version, which the server checks before the upgrade.
 pub fn ws_url(origin: &str) -> anyhow::Result<String> {
     let origin = origin.trim_end_matches('/');
+    let query = format!("{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
     if let Some(rest) = origin.strip_prefix("https://") {
-        Ok(format!("wss://{rest}/ws"))
+        Ok(format!("wss://{rest}/ws?{query}"))
     } else if let Some(rest) = origin.strip_prefix("http://") {
-        Ok(format!("ws://{rest}/ws"))
+        Ok(format!("ws://{rest}/ws?{query}"))
     } else {
         bail!("server origin {origin:?} is not an http(s) URL")
     }
@@ -112,7 +119,7 @@ fn percent_decode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    const KEY: &str = "AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
 
     #[test]
     fn parses_share_links() {
@@ -125,10 +132,16 @@ mod tests {
             link.to_string(),
             format!("https://typst.example.org/p/abc_DEF-1#{KEY}")
         );
-        assert_eq!(ws_url(&link.origin).unwrap(), "wss://typst.example.org/ws");
+        assert_eq!(
+            ws_url(&link.origin).unwrap(),
+            format!("wss://typst.example.org/ws?protocol={PROTOCOL_VERSION}")
+        );
 
         let local = ShareLink::parse(&format!("http://127.0.0.1:8787/p/tok#{KEY}")).unwrap();
-        assert_eq!(ws_url(&local.origin).unwrap(), "ws://127.0.0.1:8787/ws");
+        assert_eq!(
+            ws_url(&local.origin).unwrap(),
+            format!("ws://127.0.0.1:8787/ws?protocol={PROTOCOL_VERSION}")
+        );
 
         let prefixed = ShareLink::parse(&format!("https://h/typstry/p/tok/#{KEY}")).unwrap();
         assert_eq!(prefixed.origin, "https://h/typstry");
@@ -146,5 +159,16 @@ mod tests {
         ] {
             assert!(ShareLink::parse(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn says_when_a_key_is_from_a_newer_version() {
+        // Kind byte 0x7f, then 32 key bytes.
+        let newer = format!("f{}", "w".repeat(43));
+        let err = ShareLink::parse(&format!("https://h/p/tok#{newer}")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("newer version of typstry"),
+            "{err:#}"
+        );
     }
 }

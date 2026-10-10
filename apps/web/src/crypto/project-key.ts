@@ -13,6 +13,11 @@
 // random 16-byte salt and uses AES-256-GCM under HKDF(read key, salt,
 // purpose). That lifts the limit of about 2^32 random nonces per GCM key
 // and keeps blobs, presence and doc records under separate keys.
+//
+// Every format starts with a version byte (secrets with a kind byte), which
+// is authenticated with the rest. A byte this build does not know means a
+// newer typstry wrote the data, and throws NewerVersionError instead of a
+// plain decryption failure.
 import {
   BytesWriter,
   EloRecordKind,
@@ -22,9 +27,18 @@ import {
   type EloSnapshotVVEntry,
 } from "loro-protocol";
 
+/** First byte of a sealed blob or presence update. */
+export const SEAL_VERSION = 1;
+/** First byte of a doc record's ciphertext field. */
+export const RECORD_VERSION = 1;
+/** First byte of an edit secret, followed by 32 key bytes. */
+export const SECRET_EDIT_V1 = 1;
+/** First byte of a view secret, followed by the read and public keys. */
+export const SECRET_VIEW_V1 = 2;
+
 const SECRET_BYTES = 32;
 /** The read key followed by the public key. */
-const VIEW_SECRET_BYTES = 64;
+const VIEW_KEY_BYTES = 64;
 const IV_BYTES = 12;
 const SALT_BYTES = 16;
 const TAG_BYTES = 16;
@@ -39,8 +53,8 @@ const READ_INFO = "typstry:v2:read";
 const SIGN_INFO = "typstry:v2:sign";
 const KEY_ID_INFO = "typstry:v2:key-id";
 
-/** Bytes `seal` adds: the salt, the IV and the GCM tag. */
-export const SEAL_OVERHEAD = SALT_BYTES + IV_BYTES + TAG_BYTES;
+/** Bytes `seal` adds: the version, the salt, the IV and the GCM tag. */
+export const SEAL_OVERHEAD = 1 + SALT_BYTES + IV_BYTES + TAG_BYTES;
 
 // PKCS #8 wrapping of a raw Ed25519 seed (RFC 8410), the only way
 // WebCrypto takes one.
@@ -73,6 +87,19 @@ export class KeyMismatchError extends Error {
       `data is encrypted with key ${keyId}, which this link does not carry`,
     );
     this.name = "KeyMismatchError";
+  }
+}
+
+/** The version or kind byte is one this build does not know. */
+export class NewerVersionError extends Error {
+  readonly version: number;
+
+  constructor(version: number) {
+    super(
+      `made by a newer version of typstry (format ${version}); reload to update`,
+    );
+    this.name = "NewerVersionError";
+    this.version = version;
   }
 }
 
@@ -113,18 +140,41 @@ export function fromBase64Url(text: string): Uint8Array<ArrayBuffer> | null {
   }
 }
 
-/** An edit or view secret, as found in a link fragment. */
+/**
+ * What a link fragment holds: an edit or view secret, one of a kind only a
+ * newer typstry knows, or nothing usable.
+ */
+export function secretKind(raw: string): "edit" | "view" | "newer" | null {
+  const bytes = fromBase64Url(raw);
+  if (!bytes?.length) return null;
+  const kind = bytes[0];
+  const keyLength = bytes.length - 1;
+  if (kind === SECRET_EDIT_V1)
+    return keyLength === SECRET_BYTES ? "edit" : null;
+  if (kind === SECRET_VIEW_V1)
+    return keyLength === VIEW_KEY_BYTES ? "view" : null;
+  // Too short to carry a key, so a truncated link rather than a newer one.
+  // Secrets from before the kind byte were 32 or 64 bytes; their first byte
+  // is random and must not read as a version either.
+  if (bytes.length <= SECRET_BYTES || bytes.length === VIEW_KEY_BYTES)
+    return null;
+  return "newer";
+}
+
+/** An edit or view secret this build can use, as found in a link fragment. */
 export function isProjectSecret(raw: string): boolean {
-  const length = fromBase64Url(raw)?.length;
-  return length === SECRET_BYTES || length === VIEW_SECRET_BYTES;
+  const kind = secretKind(raw);
+  return kind === "edit" || kind === "view";
 }
 
 export function isEditSecret(raw: string): boolean {
-  return fromBase64Url(raw)?.length === SECRET_BYTES;
+  return secretKind(raw) === "edit";
 }
 
 export function generateEditSecret(): string {
-  return toBase64Url(crypto.getRandomValues(new Uint8Array(SECRET_BYTES)));
+  const bytes = crypto.getRandomValues(new Uint8Array(1 + SECRET_BYTES));
+  bytes[0] = SECRET_EDIT_V1;
+  return toBase64Url(bytes);
 }
 
 const encoder = new TextEncoder();
@@ -169,14 +219,20 @@ function importHkdf(bytes: Uint8Array): Promise<CryptoKey> {
   ]);
 }
 
-/** Rejects anything that is not exactly an edit or view secret. */
+/**
+ * Rejects anything that is not exactly an edit or view secret, with a
+ * NewerVersionError for a kind only a newer typstry knows.
+ */
 export async function importProjectKey(raw: string): Promise<ProjectKey> {
+  const kind = secretKind(raw);
   const bytes = fromBase64Url(raw);
   let readBytes: Uint8Array<ArrayBuffer>;
   let publicBytes: Uint8Array<ArrayBuffer>;
   let sign: CryptoKey | null = null;
-  if (bytes?.length === SECRET_BYTES) {
-    const edit = await importHkdf(bytes);
+  if (!bytes || kind === null) throw new Error("malformed project key");
+  if (kind === "newer") throw new NewerVersionError(bytes[0]!);
+  if (kind === "edit") {
+    const edit = await importHkdf(bytes.subarray(1));
     readBytes = await hkdfBits(edit, encoder.encode(READ_INFO), SECRET_BYTES);
     const seed = await hkdfBits(edit, encoder.encode(SIGN_INFO), SECRET_BYTES);
     const pkcs8 = concat(ED25519_PKCS8_PREFIX, seed);
@@ -196,11 +252,9 @@ export async function importProjectKey(raw: string): Promise<ProjectKey> {
     sign = await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, [
       "sign",
     ]);
-  } else if (bytes?.length === VIEW_SECRET_BYTES) {
-    readBytes = bytes.slice(0, SECRET_BYTES);
-    publicBytes = bytes.slice(SECRET_BYTES);
   } else {
-    throw new Error("malformed project key");
+    readBytes = bytes.slice(1, 1 + SECRET_BYTES);
+    publicBytes = bytes.slice(1 + SECRET_BYTES);
   }
   // Non-extractable: page code can use these but not read them back out.
   // The secret strings still exist, but only where we put them.
@@ -224,7 +278,9 @@ export async function importProjectKey(raw: string): Promise<ProjectKey> {
   return {
     keyId,
     editSecret: sign ? raw : null,
-    viewSecret: toBase64Url(concat(readBytes, publicBytes)),
+    viewSecret: toBase64Url(
+      concat(Uint8Array.of(SECRET_VIEW_V1), readBytes, publicBytes),
+    ),
     read,
     verify,
     sign,
@@ -288,10 +344,15 @@ async function gcmDecrypt(
   );
 }
 
+/** Bound into the AEAD so data cannot be relabelled as another version. */
+function versionedAad(version: number, aad: Uint8Array): Uint8Array {
+  return concat(Uint8Array.of(version), aad);
+}
+
 /**
- * Seals `plaintext` as `salt || iv || ciphertext+tag`. `context` picks the
- * message key and is bound in as associated data, so a blob can never be
- * passed off as presence or vice versa.
+ * Seals `plaintext` as `version || salt || iv || ciphertext+tag`.
+ * `context` picks the message key and is bound in as associated data, so a
+ * blob can never be passed off as presence or vice versa.
  */
 export async function seal(
   key: ProjectKey,
@@ -300,29 +361,37 @@ export async function seal(
 ): Promise<Uint8Array> {
   const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const aad = encoder.encode(context);
+  const aad = versionedAad(SEAL_VERSION, encoder.encode(context));
   return concat(
+    Uint8Array.of(SEAL_VERSION),
     salt,
     iv,
     await gcmEncrypt(key, salt, iv, context, plaintext, aad),
   );
 }
 
-/** Inverse of `seal`; throws when the key or context does not match. */
+/**
+ * Inverse of `seal`; throws when the key or context does not match, and a
+ * NewerVersionError for data a newer typstry sealed.
+ */
 export async function open(
   key: ProjectKey,
   sealed: Uint8Array,
   context: string,
 ): Promise<Uint8Array> {
+  if (sealed.length === 0) throw new Error("sealed data is truncated");
+  const version = sealed[0]!;
+  if (version !== SEAL_VERSION) throw new NewerVersionError(version);
   if (sealed.length < SEAL_OVERHEAD)
     throw new Error("sealed data is truncated");
+  const ivAt = 1 + SALT_BYTES;
   return gcmDecrypt(
     key,
-    sealed.subarray(0, SALT_BYTES),
-    sealed.subarray(SALT_BYTES, SALT_BYTES + IV_BYTES),
+    sealed.subarray(1, ivAt),
+    sealed.subarray(ivAt, ivAt + IV_BYTES),
     context,
-    sealed.subarray(SALT_BYTES + IV_BYTES),
-    encoder.encode(context),
+    sealed.subarray(ivAt + IV_BYTES),
+    versionedAad(version, encoder.encode(context)),
   );
 }
 
@@ -387,8 +456,10 @@ function freshNonces(): RecordNonces {
 }
 
 /**
- * A record's ciphertext field is `salt || ciphertext+tag || signature`,
- * the signature covering the header and everything before it.
+ * A record's ciphertext field is `version || salt || ciphertext+tag ||
+ * signature`, the signature covering the header and everything before it.
+ * The header itself is fixed by loro-protocol and read by the server, so
+ * the version cannot go there.
  */
 async function sealRecord(
   key: ProjectKey,
@@ -397,8 +468,15 @@ async function sealRecord(
   plaintext: Uint8Array,
 ): Promise<Uint8Array> {
   if (!key.sign) throw new Error("a view-only key cannot sign records");
-  const ct = await gcmEncrypt(key, salt, iv, RECORD_CONTEXT, plaintext, header);
-  const body = concat(salt, ct);
+  const ct = await gcmEncrypt(
+    key,
+    salt,
+    iv,
+    RECORD_CONTEXT,
+    plaintext,
+    versionedAad(RECORD_VERSION, header),
+  );
+  const body = concat(Uint8Array.of(RECORD_VERSION), salt, ct);
   const signature = new Uint8Array(
     await crypto.subtle.sign(
       "Ed25519",
@@ -461,6 +539,7 @@ export type DecryptedRecord =
 /**
  * Parses, verifies and decrypts one record. The signature is checked
  * first, so a record a viewer forged is refused whatever it decrypts to.
+ * Throws a NewerVersionError for a record a newer typstry wrote.
  */
 export async function decryptRecord(
   key: ProjectKey,
@@ -469,7 +548,11 @@ export async function decryptRecord(
   const parsed = parseEloRecordHeader(record);
   if (parsed.keyId !== key.keyId) throw new KeyMismatchError(parsed.keyId);
   const { ct: field, aad } = parsed;
-  if (field.length < SALT_BYTES + TAG_BYTES + SIGNATURE_BYTES)
+  if (field.length === 0) throw new Error("record is truncated");
+  const version = field[0]!;
+  // Before the signature: a newer version may well sign differently.
+  if (version !== RECORD_VERSION) throw new NewerVersionError(version);
+  if (field.length < 1 + SALT_BYTES + TAG_BYTES + SIGNATURE_BYTES)
     throw new Error("record is truncated");
   const body = field.subarray(0, field.length - SIGNATURE_BYTES);
   const signature = field.subarray(field.length - SIGNATURE_BYTES);
@@ -482,11 +565,11 @@ export async function decryptRecord(
   if (!valid) throw new BadSignatureError();
   const plaintext = await gcmDecrypt(
     key,
-    body.subarray(0, SALT_BYTES),
+    body.subarray(1, 1 + SALT_BYTES),
     parsed.iv,
     RECORD_CONTEXT,
-    body.subarray(SALT_BYTES),
-    aad,
+    body.subarray(1 + SALT_BYTES),
+    versionedAad(version, aad),
   );
   return parsed.header.kind === EloRecordKind.DeltaSpan
     ? { kind: EloRecordKind.DeltaSpan, header: parsed.header, plaintext }
