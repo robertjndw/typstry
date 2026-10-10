@@ -311,7 +311,7 @@ async function syncWithFeedback(
   try {
     result = await run();
   } catch (err) {
-    // E.g. the local save failed; the loading toast must not stay up.
+    // The local save can throw, e.g. when storage is full.
     console.error(err);
     toast.error("Syncing failed. See the console for details.", {
       id: SYNC_TOAST,

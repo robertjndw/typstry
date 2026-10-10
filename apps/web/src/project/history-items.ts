@@ -41,7 +41,7 @@ const STEPS: [Intl.RelativeTimeFormatUnit, number][] = [
   ["year", Infinity],
 ];
 
-/** A full date and time, e.g. "Oct 10, 2026, 14:05". */
+/** Date and time in the user's locale. */
 export function formatAbsolute(time: number): string {
   return absolute.format(time);
 }

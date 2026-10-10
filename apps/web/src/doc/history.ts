@@ -83,9 +83,9 @@ export function groupChanges(
   cuts: readonly OpId[][] = [],
 ): ChangeGroup[] {
   const cutKeys = new Set(cuts.map(frontiersKey));
-  // The change just included always ends up in the frontier, so the
-  // frontier can only match a cut right after a change that ends on one of
-  // its ids. Checking that first skips rebuilding the frontier per change.
+  // The last included change is always part of the frontier, so a cut can
+  // only match right after a change ending on one of its ids. Cheap to check,
+  // unlike rebuilding the frontier after every change.
   const cutIds = new Set(cuts.flat().map(opIdKey));
   const byPeer = new Map<PeerID, ChangeInfo[]>();
   for (const change of input) {
