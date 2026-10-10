@@ -117,6 +117,9 @@ describe("project keys", () => {
     await expect(importProjectKey(raw)).rejects.toBeInstanceOf(
       NewerVersionError,
     );
+    // A zero kind byte is corruption, not a newer kind.
+    newer[0] = 0;
+    expect(secretKind(toBase64Url(newer))).toBeNull();
   });
 
   it("refuses records signed by anyone but an editor", async () => {
@@ -190,6 +193,8 @@ describe("project keys", () => {
     await expect(
       open(key, Uint8Array.of(SEAL_VERSION + 1), BLOB_CONTEXT),
     ).rejects.toBeInstanceOf(NewerVersionError);
+    sealed[0] = 0;
+    await expect(open(key, sealed, BLOB_CONTEXT)).rejects.toThrow(/malformed/);
 
     const record = await encryptDelta(
       key,

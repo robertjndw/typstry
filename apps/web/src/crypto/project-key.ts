@@ -159,6 +159,8 @@ function kindOf(bytes: Uint8Array): SecretKind | null {
     return keyLength === SECRET_BYTES ? "edit" : null;
   if (kind === SECRET_VIEW_V1)
     return keyLength === VIEW_KEY_BYTES ? "view" : null;
+  // No kind was ever 0, so this is a corrupt key, not a newer one.
+  if (kind === 0) return null;
   // Too short to carry a key, so a truncated link rather than a newer one.
   // Secrets from before the kind byte were 32 or 64 bytes; their first byte
   // is random and must not read as a version either.
@@ -387,7 +389,9 @@ export async function open(
 ): Promise<Uint8Array> {
   if (sealed.length === 0) throw new Error("sealed data is truncated");
   const version = sealed[0]!;
-  if (version !== SEAL_VERSION) throw new NewerVersionError(version);
+  // Versions start at 1. Only a higher byte means a newer build wrote this.
+  if (version > SEAL_VERSION) throw new NewerVersionError(version);
+  if (version !== SEAL_VERSION) throw new Error("sealed data is malformed");
   if (sealed.length < SEAL_OVERHEAD)
     throw new Error("sealed data is truncated");
   const ivAt = 1 + SALT_BYTES;
@@ -557,7 +561,8 @@ export async function decryptRecord(
   if (field.length === 0) throw new Error("record is truncated");
   const version = field[0]!;
   // Before the signature: a newer version may well sign differently.
-  if (version !== RECORD_VERSION) throw new NewerVersionError(version);
+  if (version > RECORD_VERSION) throw new NewerVersionError(version);
+  if (version !== RECORD_VERSION) throw new Error("record is malformed");
   if (field.length < 1 + SALT_BYTES + TAG_BYTES + SIGNATURE_BYTES)
     throw new Error("record is truncated");
   const body = field.subarray(0, field.length - SIGNATURE_BYTES);

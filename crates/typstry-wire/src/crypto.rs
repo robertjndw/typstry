@@ -188,7 +188,8 @@ impl ProjectKey {
                 let read = Zeroizing::new(read.try_into().expect("split at 32 of 64"));
                 Ok(Self::assemble(read, verifying, None))
             }
-            (SECRET_EDIT_V1 | SECRET_VIEW_V1, _) => Err(CryptoError::MalformedKey),
+            // No kind was ever 0, so this is a corrupt key, not a newer one.
+            (0 | SECRET_EDIT_V1 | SECRET_VIEW_V1, _) => Err(CryptoError::MalformedKey),
             // Too short to carry a key, so a truncated link rather than a
             // newer one. Secrets from before the kind byte were 32 or 64
             // bytes; their first byte is random and must not read as a
@@ -281,8 +282,12 @@ impl ProjectKey {
         let Some((&version, rest)) = sealed.split_first() else {
             return Err(CryptoError::Truncated);
         };
-        if version != SEAL_VERSION {
+        // Versions start at 1. Only a higher byte means a newer build wrote this.
+        if version > SEAL_VERSION {
             return Err(CryptoError::NewerVersion(version));
+        }
+        if version != SEAL_VERSION {
+            return Err(CryptoError::Decrypt);
         }
         if sealed.len() < SEAL_OVERHEAD {
             return Err(CryptoError::Truncated);
@@ -438,8 +443,13 @@ impl ProjectKey {
             return Err(CryptoError::Truncated);
         };
         // Before the signature: a newer version may well sign differently.
-        if version != RECORD_VERSION {
+        if version > RECORD_VERSION {
             return Err(CryptoError::NewerVersion(version));
+        }
+        if version != RECORD_VERSION {
+            return Err(CryptoError::MalformedRecord(format!(
+                "unknown record version {version}"
+            )));
         }
         if sealed.ct.len() < 1 + SALT_LEN + TAG_LEN + SIGNATURE_LEN {
             return Err(CryptoError::Truncated);
@@ -693,6 +703,12 @@ mod tests {
             key.open(&[SEAL_VERSION + 1], BLOB_CONTEXT),
             Err(CryptoError::NewerVersion(_))
         ));
+        // A zero version byte is corruption, not a newer format.
+        sealed[0] = 0;
+        assert!(matches!(
+            key.open(&sealed, BLOB_CONTEXT),
+            Err(CryptoError::Decrypt)
+        ));
 
         let record = key.encrypt_delta(7, 0, 3, b"ops").unwrap();
         let sealed = SealedRecord::parse(&record).unwrap();
@@ -709,6 +725,11 @@ mod tests {
         assert!(matches!(
             ProjectKey::from_base64url(&BASE64URL.encode(secret)),
             Err(CryptoError::NewerVersion(0x7f))
+        ));
+        secret[0] = 0;
+        assert!(matches!(
+            ProjectKey::from_base64url(&BASE64URL.encode(secret)),
+            Err(CryptoError::MalformedKey)
         ));
     }
 
