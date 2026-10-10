@@ -19,11 +19,14 @@ use typstry_wire::crypto::ProjectKey;
 
 use crate::api::Permission;
 use crate::git::GitMark;
+use crate::hash::{BlobHash, Digest};
 use crate::link::ShareLink;
 
 pub const STATE_DIR: &str = ".typstry";
 const CONFIG: &str = "config.json";
 const DOC: &str = "doc.bin";
+/// Updates since `doc.bin` was written, see [`StateDir::append_doc`].
+const DOC_LOG: &str = "doc.log";
 const BASE: &str = "base.json";
 const LOCK: &str = "lock";
 const BLOBS: &str = "blobs";
@@ -78,24 +81,29 @@ impl Config {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Base {
-    /// `Frontiers::encode()` as base64url; empty means the empty doc.
+    /// The doc state the folder matches. On disk, `Frontiers::encode()` as
+    /// base64url, and empty for the empty doc.
+    #[serde(default, with = "encoded_frontiers")]
+    pub frontiers: Frontiers,
+    /// Ciphertext hash (what the doc stores) to the plaintext's digest,
+    /// for every asset we have seen the bytes of. A local binary is
+    /// unchanged when its digest maps back to the base's hash.
     #[serde(default)]
-    pub frontiers: String,
-    /// Ciphertext hash (what the doc stores) to the plaintext's
-    /// `sha256:<hex>`, for every asset we have seen the bytes of. A local
-    /// binary is unchanged when its digest maps back to the base's hash.
-    #[serde(default)]
-    pub assets: BTreeMap<String, String>,
+    pub assets: BTreeMap<BlobHash, Digest>,
     /// Unix milliseconds of the last successful sync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<u64>,
     /// Files whose copy on disk still matches an earlier doc state than
-    /// `frontiers`, in the same encoding: ones a pull left alone because
+    /// `frontiers`, encoded the same way: ones a pull left alone because
     /// they changed on both sides, or that changed on disk while a sync
     /// was writing. Their local edits are diffed against that state, so
     /// the remote changes they lack are not taken for local reverts.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub pins: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "encoded_pins"
+    )]
+    pub pins: BTreeMap<String, Frontiers>,
     /// Where git's HEAD was when the folder was last known to match the
     /// base, to notice a branch switch that happened while nothing ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,16 +111,8 @@ pub struct Base {
 }
 
 impl Base {
-    pub fn frontiers(&self) -> anyhow::Result<Frontiers> {
-        decode_frontiers(&self.frontiers)
-    }
-
-    pub fn set_frontiers(&mut self, frontiers: &Frontiers) {
-        self.frontiers = encode_frontiers(frontiers);
-    }
-
-    /// The doc state `path` on disk corresponds to, encoded.
-    pub fn state_of(&self, path: &str) -> &str {
+    /// The doc state `path` on disk corresponds to.
+    pub fn state_of(&self, path: &str) -> &Frontiers {
         self.pins.get(path).unwrap_or(&self.frontiers)
     }
 
@@ -121,7 +121,7 @@ impl Base {
     }
 }
 
-pub fn encode_frontiers(frontiers: &Frontiers) -> String {
+fn encode_frontiers(frontiers: &Frontiers) -> String {
     if frontiers.is_empty() {
         return String::new();
     }
@@ -129,14 +129,55 @@ pub fn encode_frontiers(frontiers: &Frontiers) -> String {
 }
 
 /// Empty means the empty doc.
-pub fn decode_frontiers(encoded: &str) -> anyhow::Result<Frontiers> {
+fn decode_frontiers(encoded: &str) -> Result<Frontiers, &'static str> {
     if encoded.is_empty() {
         return Ok(Frontiers::default());
     }
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)
-        .context("base.json has malformed frontiers")?;
-    Frontiers::decode(&bytes).context("base.json has malformed frontiers")
+        .map_err(|_| "malformed frontiers")?;
+    Frontiers::decode(&bytes).map_err(|_| "malformed frontiers")
+}
+
+mod encoded_frontiers {
+    use loro::Frontiers;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(frontiers: &Frontiers, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::encode_frontiers(frontiers))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Frontiers, D::Error> {
+        let encoded = String::deserialize(d)?;
+        super::decode_frontiers(&encoded).map_err(serde::de::Error::custom)
+    }
+}
+
+mod encoded_pins {
+    use std::collections::BTreeMap;
+
+    use loro::Frontiers;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        pins: &BTreeMap<String, Frontiers>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_map(
+            pins.iter()
+                .map(|(path, state)| (path, super::encode_frontiers(state))),
+        )
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<String, Frontiers>, D::Error> {
+        BTreeMap::<String, String>::deserialize(d)?
+            .into_iter()
+            .map(|(path, encoded)| Ok((path, super::decode_frontiers(&encoded)?)))
+            .collect::<Result<_, &str>>()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 pub fn now_ms() -> u64 {
@@ -321,26 +362,71 @@ impl StateDir {
         write_json(&self.dir.join(BASE), base)
     }
 
-    /// The cached doc, or an empty one before the first sync.
+    /// The cached doc, or an empty one before the first sync. A log entry
+    /// that a crash cut off is dropped from the file, so the next append
+    /// does not land behind it. A damaged entry with more after it is an
+    /// error instead, see [`log_entries`].
     pub fn load_doc(&self) -> anyhow::Result<LoroDoc> {
-        let doc = LoroDoc::new();
-        let path = self.dir.join(DOC);
-        match fs::read(&path) {
-            Ok(bytes) => {
-                doc.import(&bytes)
-                    .with_context(|| format!("{} is corrupt", path.display()))?;
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        let (doc, log) = read_doc_and_log(&self.dir)?;
+        if log.torn {
+            let path = self.dir.join(DOC_LOG);
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(log.valid))
+                .with_context(|| format!("repairing {}", path.display()))?;
         }
         Ok(doc)
     }
 
-    pub fn save_doc(&self, doc: &LoroDoc) -> anyhow::Result<()> {
+    /// Sizes in bytes of the snapshot and of the log on top of it.
+    pub fn doc_sizes(&self) -> (u64, u64) {
+        let len = |name| fs::metadata(self.dir.join(name)).map_or(0, |m| m.len());
+        (len(DOC), len(DOC_LOG))
+    }
+
+    /// Writes the whole doc as a fresh snapshot and drops the log, which
+    /// it covers. Returns the snapshot's size.
+    pub fn save_doc(&self, doc: &LoroDoc) -> anyhow::Result<u64> {
         let bytes = doc
             .export(loro::ExportMode::Snapshot)
             .context("exporting the doc")?;
-        atomic_write(&self.dir.join(DOC), &bytes, true)
+        // atomic_write syncs the directory, so the new snapshot is durable
+        // before the log goes. Otherwise a crash could keep the removal but
+        // lose the rename, and with it ops that base.json may already
+        // count as synced. A crash before the removal leaves entries the
+        // snapshot already has, which import as no-ops.
+        atomic_write(&self.dir.join(DOC), &bytes, true)?;
+        remove_if_exists(&self.dir.join(DOC_LOG))?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// Appends a Loro update to the log next to the snapshot and syncs it,
+    /// which costs as much as the update rather than the doc. Returns the
+    /// bytes it added. A failed append is cut off again; should that fail
+    /// too, the caller has to write a snapshot before appending more.
+    pub fn append_doc(&self, update: &[u8]) -> anyhow::Result<u64> {
+        let path = self.dir.join(DOC_LOG);
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let before = file.metadata()?.len();
+        let frame = log_frame(update);
+        let result = file.write_all(&frame).and_then(|()| file.sync_data());
+        if let Err(err) = result {
+            let _ = file.set_len(before);
+            return Err(err).with_context(|| format!("writing {}", path.display()));
+        }
+        // A log this append created is only durable once its directory
+        // entry is.
+        if before == 0 {
+            sync_dir(&self.dir).with_context(|| format!("syncing {}", self.dir.display()))?;
+        }
+        Ok(frame.len() as u64)
     }
 
     /// Where the decrypted bytes of the blob with ciphertext `hash` are
@@ -369,6 +455,117 @@ impl StateDir {
     }
 }
 
+/// What reading the log found.
+#[derive(Debug, Default)]
+struct LogRead {
+    /// Bytes of whole, intact entries from the start.
+    valid: u64,
+    /// Something follows them: an entry cut off by a crash.
+    torn: bool,
+}
+
+/// Each log entry: the update's length (u32 LE), its bitwise complement,
+/// the first bytes of the update's SHA-256 and the update. The checksum
+/// tells a torn entry from a whole one where a file system leaves zeros or
+/// garbage after a crash. The complement catches a damaged length, which
+/// would otherwise look like a body cut off by a crash. It also means the
+/// search for intact entries after a damaged one rarely has to hash.
+const LOG_HEADER: usize = 8 + LOG_CHECKSUM;
+const LOG_CHECKSUM: usize = 8;
+
+fn log_checksum(bytes: &[u8]) -> [u8; LOG_CHECKSUM] {
+    use sha2::Digest as _;
+    let hash = sha2::Sha256::digest(bytes);
+    hash[..LOG_CHECKSUM].try_into().expect("long enough")
+}
+
+fn log_frame(update: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(update.len()).expect("updates stay far below 4 GiB");
+    let mut frame = Vec::with_capacity(LOG_HEADER + update.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&(!len).to_le_bytes());
+    frame.extend_from_slice(&log_checksum(update));
+    frame.extend_from_slice(update);
+    frame
+}
+
+/// The intact entries at the start of `log`. Only the last append can be
+/// torn, since each one is synced before the next, so the first damaged
+/// entry is taken for a torn one only when no intact entry follows it.
+/// Otherwise cutting there would lose entries that were synced; that is
+/// `Err` with its offset, for someone to look at.
+fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at < log.len() {
+        let Some(body) = log_entry_at(log, at) else {
+            if (at + 1..log.len()).any(|later| log_entry_at(log, later).is_some()) {
+                return Err(at);
+            }
+            break;
+        };
+        entries.push(body);
+        at += LOG_HEADER + body.len();
+    }
+    let read = LogRead {
+        valid: at as u64,
+        torn: at < log.len(),
+    };
+    Ok((entries, read))
+}
+
+/// The update of the intact entry starting at `at`, if there is one.
+fn log_entry_at(log: &[u8], at: usize) -> Option<&[u8]> {
+    let header = log.get(at..at + LOG_HEADER)?;
+    let len = u32::from_le_bytes(header[..4].try_into().expect("4 bytes"));
+    let check = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
+    if len == 0 || check != !len {
+        return None;
+    }
+    let body = log.get(at + LOG_HEADER..)?.get(..len as usize)?;
+    (log_checksum(body) == header[8..]).then_some(body)
+}
+
+fn read_optional(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// The doc cached in the state folder `dir`: the snapshot plus the log on
+/// top of it. Only reads, so it works without the lock; see
+/// [`StateDir::load_doc`].
+pub fn read_doc(dir: &Path) -> anyhow::Result<LoroDoc> {
+    read_doc_and_log(dir).map(|(doc, _)| doc)
+}
+
+fn read_doc_and_log(dir: &Path) -> anyhow::Result<(LoroDoc, LogRead)> {
+    let doc = LoroDoc::new();
+    let path = dir.join(DOC);
+    if let Some(bytes) = read_optional(&path)? {
+        doc.import(&bytes)
+            .with_context(|| format!("{} is corrupt", path.display()))?;
+    }
+    let path = dir.join(DOC_LOG);
+    let mut read = LogRead::default();
+    if let Some(log) = read_optional(&path)? {
+        let (entries, found) = log_entries(&log).map_err(|at| {
+            anyhow::anyhow!(
+                "{} is corrupt: the entry at byte {at} is damaged and more follow it",
+                path.display()
+            )
+        })?;
+        if !entries.is_empty() {
+            doc.import_batch(&entries.iter().map(|e| e.to_vec()).collect::<Vec<_>>())
+                .with_context(|| format!("{} is corrupt", path.display()))?;
+        }
+        read = found;
+    }
+    Ok((doc, read))
+}
+
 fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("{} is malformed", path.display()))
@@ -394,7 +591,37 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("OS random source unavailable");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    crate::hash::to_hex(&buf)
+}
+
+/// Removes `path`; one that is already gone is just as good.
+pub(crate) fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Makes renames and removals in `dir` durable. Only unix can fsync a
+/// directory; elsewhere this does nothing.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        match fs::File::open(dir).and_then(|d| d.sync_all()) {
+            // Some file systems cannot sync a directory at all; there is
+            // nothing more to do on those.
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Writes through a temp file in the same directory and renames it into
@@ -416,7 +643,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<
         let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        sync_dir(dir)
     })();
     if let Err(err) = result {
         let _ = fs::remove_file(&tmp);
@@ -475,12 +703,164 @@ mod tests {
     }
 
     #[test]
-    fn base_round_trips_frontiers() {
+    fn doc_log_adds_up_and_survives_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let doc = LoroDoc::new();
+        let text = doc.get_text("t");
+        text.insert(0, "snapshot").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let mut saved = doc.oplog_vv();
+        for word in [" one", " two"] {
+            text.insert(text.len_unicode(), word).unwrap();
+            doc.commit();
+            let update = doc.export(loro::ExportMode::updates(&saved)).unwrap();
+            state.append_doc(&update).unwrap();
+            saved = doc.oplog_vv();
+        }
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
+
+        // A crash halfway through the next append.
+        text.insert(text.len_unicode(), " three").unwrap();
+        doc.commit();
+        let update = doc.export(loro::ExportMode::updates(&saved)).unwrap();
+        let frame = log_frame(&update);
+        let log = state.dir().join(DOC_LOG);
+        let whole = fs::metadata(&log).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(&frame[..frame.len() / 2]).unwrap();
+        drop(file);
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
+        // Cut back to the whole entries, so the next one is readable.
+        assert_eq!(fs::metadata(&log).unwrap().len(), whole);
+        state.append_doc(&update).unwrap();
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
+
+        // A snapshot covers the log and replaces it.
+        state.save_doc(&doc).unwrap();
+        assert!(!log.exists());
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
+    }
+
+    /// A log of three entries on an empty snapshot, and the offset where
+    /// each entry starts.
+    fn three_entry_log(state: &StateDir) -> Vec<u64> {
+        let doc = LoroDoc::new();
+        let text = doc.get_text("t");
+        let mut saved = doc.oplog_vv();
+        let mut starts = Vec::new();
+        for word in ["one", " two", " three"] {
+            text.insert(text.len_unicode(), word).unwrap();
+            doc.commit();
+            let update = doc.export(loro::ExportMode::updates(&saved)).unwrap();
+            starts.push(state.doc_sizes().1);
+            state.append_doc(&update).unwrap();
+            saved = doc.oplog_vv();
+        }
+        starts
+    }
+
+    fn flip_byte(path: &Path, at: u64) {
+        let mut bytes = fs::read(path).unwrap();
+        bytes[at as usize] ^= 0xff;
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_last_log_entry_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let starts = three_entry_log(&state);
+        let log = state.dir().join(DOC_LOG);
+        // Garbage in the last entry's body, as a crash can leave.
+        flip_byte(&log, fs::metadata(&log).unwrap().len() - 1);
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "one two");
+        assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
+    }
+
+    #[test]
+    fn a_damaged_middle_log_entry_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let starts = three_entry_log(&state);
+        let log = state.dir().join(DOC_LOG);
+        flip_byte(&log, starts[1] + LOG_HEADER as u64);
+        let before = fs::read(&log).unwrap();
+        let err = state.load_doc().unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
+        assert!(read_doc(state.dir()).is_err());
+        // The entry after it was synced; it stays for someone to recover.
+        assert_eq!(fs::read(&log).unwrap(), before);
+    }
+
+    #[test]
+    fn a_damaged_middle_log_length_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let starts = three_entry_log(&state);
+        let log = state.dir().join(DOC_LOG);
+        // Flipping the high byte makes the length run past EOF, just like a
+        // torn tail.
+        flip_byte(&log, starts[1] + 3);
+        let before = fs::read(&log).unwrap();
+        assert!(state.load_doc().is_err());
+        assert_eq!(fs::read(&log).unwrap(), before);
+    }
+
+    #[test]
+    fn a_damaged_last_log_length_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let starts = three_entry_log(&state);
+        let log = state.dir().join(DOC_LOG);
+        flip_byte(&log, starts[2] + 3);
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "one two");
+        assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
+    }
+
+    #[test]
+    fn zeros_after_the_log_count_as_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        three_entry_log(&state);
+        let whole = state.doc_sizes().1;
+        let log = state.dir().join(DOC_LOG);
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(&[0; 64]).unwrap();
+        drop(file);
+        let loaded = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "one two three");
+        assert_eq!(fs::metadata(&log).unwrap().len(), whole);
+    }
+
+    #[test]
+    fn base_keeps_its_on_disk_format() {
         let mut base = Base::default();
-        assert!(base.frontiers().unwrap().is_empty());
+        let json = serde_json::to_string(&base).unwrap();
+        assert_eq!(json, r#"{"frontiers":"","assets":{}}"#);
+        assert_eq!(serde_json::from_str::<Base>("{}").unwrap(), base);
+
         let f: Frontiers = loro::ID::new(7, 3).into();
-        base.set_frontiers(&f);
-        assert_eq!(base.frontiers().unwrap(), f);
+        base.frontiers = f.clone();
+        base.pins.insert("a.typ".into(), Frontiers::default());
+        base.pins.insert("b.typ".into(), f.clone());
+        let encoded = URL_SAFE_NO_PAD.encode(f.encode());
+        let json = serde_json::to_string(&base).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"frontiers":"{encoded}","assets":{{}},"pins":{{"a.typ":"","b.typ":"{encoded}"}}}}"#
+            )
+        );
+        assert_eq!(serde_json::from_str::<Base>(&json).unwrap(), base);
+        assert!(serde_json::from_str::<Base>(r#"{"frontiers":"!"}"#).is_err());
     }
 
     #[test]

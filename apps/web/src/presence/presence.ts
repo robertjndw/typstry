@@ -22,6 +22,15 @@ export interface RemotePeer extends PresenceState {
   peerId: string;
 }
 
+/**
+ * Who is here and in which file, without the selection that moves with
+ * every keystroke.
+ */
+export type PeerSummary = Pick<
+  RemotePeer,
+  "peerId" | "name" | "color" | "fileId"
+>;
+
 export interface PresenceSource {
   getPeers(): readonly RemotePeer[];
   subscribe(listener: () => void): () => void;
@@ -121,6 +130,23 @@ export interface PresenceOptions {
 }
 
 const EMPTY: readonly RemotePeer[] = [];
+const EMPTY_SUMMARY: readonly PeerSummary[] = [];
+
+function sameSummary(
+  prev: readonly PeerSummary[],
+  next: readonly RemotePeer[],
+): boolean {
+  return (
+    prev.length === next.length &&
+    prev.every(
+      (p, i) =>
+        p.peerId === next[i]!.peerId &&
+        p.name === next[i]!.name &&
+        p.color === next[i]!.color &&
+        p.fileId === next[i]!.fileId,
+    )
+  );
+}
 
 /**
  * This client's entry in the ephemeral store plus a cached, validated view of
@@ -136,6 +162,7 @@ export class Presence implements PresenceSource {
   private fileId: TreeID | null = null;
   private selection: { anchor: Uint8Array; head: Uint8Array } | null = null;
   private peers: readonly RemotePeer[] = EMPTY;
+  private summary: readonly PeerSummary[] = EMPTY_SUMMARY;
   private readonly listeners = new Set<() => void>();
   private running = false;
   /** Time of our last write (set or delete) to the store. */
@@ -188,6 +215,13 @@ export class Presence implements PresenceSource {
   }
 
   getPeers = (): readonly RemotePeer[] => this.peers;
+
+  /**
+   * Keeps its identity until somebody joins, leaves, renames or switches
+   * files, so views that only show who is where skip the updates every
+   * remote caret move triggers. Shares `subscribe` with `getPeers`.
+   */
+  getSummary = (): readonly PeerSummary[] => this.summary;
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -290,6 +324,17 @@ export class Presence implements PresenceSource {
         a.name.localeCompare(b.name) || a.peerId.localeCompare(b.peerId),
     );
     this.peers = next.length === 0 ? EMPTY : next;
+    if (!sameSummary(this.summary, next)) {
+      this.summary =
+        next.length === 0
+          ? EMPTY_SUMMARY
+          : next.map(({ peerId, name, color, fileId }) => ({
+              peerId,
+              name,
+              color,
+              fileId,
+            }));
+    }
     for (const listener of [...this.listeners]) listener();
   }
 

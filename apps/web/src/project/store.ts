@@ -1,7 +1,14 @@
 import { UndoManager, type LoroEventBatch, type TreeID } from "loro-crdt";
 
-import { buildPathIndex, type PathIndex } from "@/doc/paths";
+import type { PathIndex } from "@/doc/paths";
 import { PEER_INFO_ORIGIN, type FileKind, type ProjectDoc } from "@/doc/schema";
+
+import {
+  projectIndex,
+  type ProjectIndex,
+  type ProjectIndexChange,
+  type ProjectIndexState,
+} from "./project-index";
 
 function isOpenable(kind: FileKind | undefined): boolean {
   return kind === "text" || kind === "asset";
@@ -30,9 +37,10 @@ export interface ProjectStoreOptions {
 export class ProjectStore {
   readonly project: ProjectDoc;
   readonly undoManager: UndoManager;
+  private readonly index: ProjectIndex;
   private snapshot: ProjectSnapshot;
   private readonly listeners = new Set<() => void>();
-  private unsubscribeDoc: (() => void) | null = null;
+  private unsubscribeIndex: (() => void) | null = null;
   private readonly options: ProjectStoreOptions;
 
   constructor(project: ProjectDoc, options: ProjectStoreOptions = {}) {
@@ -41,26 +49,27 @@ export class ProjectStore {
     this.undoManager = new UndoManager(project.doc, {
       excludeOriginPrefixes: [PEER_INFO_ORIGIN],
     });
+    this.index = projectIndex(project);
     const main = project.mainFile;
-    this.snapshot = this.compute(main, main ? [main] : []);
+    this.snapshot = this.compute(this.index.state, main, main ? [main] : []);
   }
 
   getSnapshot = (): ProjectSnapshot => this.snapshot;
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
-    if (!this.unsubscribeDoc) {
-      this.unsubscribeDoc = this.project.doc.subscribe((batch) =>
-        this.onDocEvent(batch),
+    if (!this.unsubscribeIndex) {
+      this.unsubscribeIndex = this.index.subscribe((change) =>
+        this.onIndexChange(change),
       );
       // Changes made while nobody was listening were not tracked.
-      this.refresh("local");
+      this.refresh("local", this.index.state);
     }
     return () => {
       this.listeners.delete(listener);
       if (this.listeners.size === 0) {
-        this.unsubscribeDoc?.();
-        this.unsubscribeDoc = null;
+        this.unsubscribeIndex?.();
+        this.unsubscribeIndex = null;
       }
     };
   };
@@ -98,14 +107,22 @@ export class ProjectStore {
     this.emit();
   }
 
-  private onDocEvent(batch: LoroEventBatch): void {
-    if (batch.events.every((e) => e.diff.type === "text")) return;
-    this.refresh(batch.by);
+  private onIndexChange(change: ProjectIndexChange): void {
+    if (change.structural) this.refresh(change.by, change.state);
   }
 
-  private refresh(by: LoroEventBatch["by"]): void {
+  private refresh(by: LoroEventBatch["by"], state: ProjectIndexState): void {
     const prev = this.snapshot;
-    this.snapshot = this.compute(prev.openFileId, prev.tabs);
+    // Peers, versions and most meta writes leave the snapshot as it was. A
+    // new object would still re-render everything under ProjectProvider.
+    // With the same index the tabs and open file cannot have changed either.
+    if (
+      state.paths === prev.index &&
+      state.mainFile === prev.mainFile &&
+      this.project.title === prev.title
+    )
+      return;
+    this.snapshot = this.compute(state, prev.openFileId, prev.tabs);
     const removed = prev.openFileId;
     if (removed === null || this.snapshot.openFileId !== null) {
       this.emit();
@@ -119,14 +136,15 @@ export class ProjectStore {
   }
 
   private compute(
+    state: ProjectIndexState,
     openFileId: TreeID | null,
     tabs: readonly TreeID[],
   ): ProjectSnapshot {
-    const index = buildPathIndex(this.project);
+    const index = state.paths;
     const live = tabs.filter((id) => isOpenable(index.byId.get(id)?.kind));
     return {
       index,
-      mainFile: this.project.mainFile,
+      mainFile: state.mainFile,
       title: this.project.title,
       openFileId:
         openFileId !== null && live.includes(openFileId) ? openFileId : null,

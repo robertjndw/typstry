@@ -2,72 +2,51 @@
 //! classifying files like the browser's upload does, and writing files
 //! back without ever following a symlink out of the folder.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt::Write as _;
+mod classify;
+mod ignore;
+mod stamp;
+
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
+use ::ignore::WalkBuilder;
 use anyhow::{Context, bail};
-use ignore::WalkBuilder;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use sha2::{Digest, Sha256};
 use typstry_doc::materialize::is_safe_path;
-use typstry_doc::names::is_reserved_segment;
-use typstry_wire::crypto::SEAL_OVERHEAD;
 
 use crate::api::MAX_UPLOAD_BYTES;
+use crate::hash::Digest;
 use crate::state::{STATE_DIR, atomic_write};
 
-/// Same cutoff as `MAX_TEXT_BYTES` in `apps/web/src/assets/upload.ts`:
-/// larger files go to the blob store so they do not bloat every peer's
-/// history forever.
-pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
-
-/// Largest asset that still fits the server's limit once sealed, like
-/// `MAX_ASSET_BYTES` in the web app.
-pub const MAX_ASSET_BYTES: usize = MAX_UPLOAD_BYTES - SEAL_OVERHEAD;
-
-pub const IGNORE_FILE: &str = ".typstryignore";
-
-/// Files that configure git or the local checkout rather than belong to
-/// the document. Co-authors in the browser have no use for them, so they
-/// are not synced unless `.typstryignore` asks for them, e.g. with
-/// `!.gitignore`.
-pub const GIT_FILES: &[&str] = &[
-    ".gitignore",
-    ".gitattributes",
-    ".gitmodules",
-    ".github",
-    IGNORE_FILE,
-];
-
-/// Why a file in [`GIT_FILES`] is not synced, for previews.
-pub const GIT_FILE_REASON: &str =
-    "git file, not synced by default (opt in with a !pattern in .typstryignore)";
+pub use self::classify::{MAX_ASSET_BYTES, MAX_TEXT_BYTES, as_text, case_clashes, mime_for};
+pub use self::ignore::{GIT_FILE_REASON, GIT_FILES, IGNORE_FILE};
+use self::ignore::{is_always_skipped, is_git_file};
+use self::stamp::{Caches, Stamp, Stamped};
 
 /// One file as found on disk. Holds the text for files that could be text,
 /// and only a digest for the rest, so scanning a folder of images does not
 /// keep them all in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalFile {
-    /// `sha256:<hex>` of the bytes on disk.
-    pub digest: String,
+    pub digest: Digest,
     pub size: u64,
     /// The content if it may be stored as a text node, see [`as_text`].
-    pub text: Option<String>,
+    /// Shared, so the stat cache and doc entries hand it out without
+    /// copying.
+    pub text: Option<Arc<str>>,
 }
 
 impl LocalFile {
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        let digest = digest(&bytes);
+        let digest = Digest::of(&bytes);
         let size = bytes.len() as u64;
         Self {
             digest,
             size,
-            text: as_text(bytes),
+            text: as_text(bytes).map(Arc::from),
         }
     }
 }
@@ -78,6 +57,16 @@ pub struct Skipped {
     /// ignore file.
     pub path: String,
     pub reason: String,
+}
+
+fn too_large(path: String) -> Skipped {
+    Skipped {
+        path,
+        reason: format!(
+            "larger than the {} MB upload limit",
+            MAX_UPLOAD_BYTES / 1024 / 1024
+        ),
+    }
 }
 
 impl std::fmt::Display for Skipped {
@@ -98,215 +87,6 @@ pub struct Scan {
     /// Paths left out by default as [`GIT_FILES`], which are not worth a
     /// warning on every sync but are in a preview.
     pub git_files: Vec<String>,
-}
-
-/// `sha256:<hex>`, the same spelling the server uses for blob hashes.
-pub fn digest(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(7 + 64);
-    out.push_str("sha256:");
-    for b in hash {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
-/// The text of a file that can be a text node: valid UTF-8, no NUL bytes
-/// (which no text format has, but many binaries that happen to decode do),
-/// and at most [`MAX_TEXT_BYTES`]. Line endings are kept as they are, so a
-/// file round-trips byte for byte and git sees no spurious changes.
-pub fn as_text(bytes: Vec<u8>) -> Option<String> {
-    if bytes.len() > MAX_TEXT_BYTES || bytes.contains(&0) {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
-}
-
-/// Mime type by extension, the table of `apps/web/src/assets/file-types.ts`.
-pub fn mime_for(path: &str) -> &'static str {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    // A leading dot does not start an extension: ".gitignore" has none.
-    let ext = match name.rfind('.') {
-        Some(dot) if dot > 0 => name[dot + 1..].to_ascii_lowercase(),
-        _ => return "application/octet-stream",
-    };
-    match ext.as_str() {
-        "typ" => "text/x-typst",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "avif" => "image/avif",
-        "bmp" => "image/bmp",
-        "pdf" => "application/pdf",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "ttc" | "otc" => "font/collection",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        "m4a" => "audio/mp4",
-        "flac" => "audio/flac",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "bib" => "application/x-bibtex",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "yml" | "yaml" => "application/yaml",
-        "toml" => "application/toml",
-        "xml" => "application/xml",
-        "txt" => "text/plain",
-        "md" => "text/markdown",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Paths that only differ in case, which a case-insensitive file system
-/// stores as one file. One path of each group is kept: the first one
-/// `prefer` accepts, else the first in sorted order. Returns `(kept,
-/// dropped)` pairs.
-pub fn case_clashes<'a>(
-    paths: impl IntoIterator<Item = &'a str>,
-    prefer: impl Fn(&str) -> bool,
-) -> Vec<(String, String)> {
-    let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-    for path in paths {
-        groups.entry(path.to_lowercase()).or_default().insert(path);
-    }
-    let mut clashes = Vec::new();
-    for group in groups.values().filter(|g| g.len() > 1) {
-        let kept = group
-            .iter()
-            .find(|p| prefer(p))
-            .or_else(|| group.first())
-            .expect("groups are not empty");
-        for path in group.iter().filter(|p| *p != kept) {
-            clashes.push(((*kept).to_owned(), (*path).to_owned()));
-        }
-    }
-    clashes
-}
-
-/// How far apart two writes to a file must be for its timestamps to tell
-/// them apart. Nanoseconds on APFS and ext4, but a second on HFS+ and two
-/// on FAT, so this assumes the worst.
-const TIMESTAMP_GRANULARITY: Duration = Duration::from_secs(2);
-
-/// What `stat` says about a file, compared instead of its bytes to tell
-/// whether it changed, the way git's index does. On unix the inode and
-/// ctime also catch a file replaced by a rename or written by a tool that
-/// restores the old mtime afterwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    len: u64,
-    mtime: SystemTime,
-    #[cfg(unix)]
-    ctime: SystemTime,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-}
-
-impl Stamp {
-    /// None where the platform has no mtime, which then is never cached.
-    fn of(meta: &fs::Metadata) -> Option<Self> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-        Some(Self {
-            len: meta.len(),
-            mtime: meta.modified().ok()?,
-            #[cfg(unix)]
-            ctime: u64::try_from(meta.ctime()).map_or(SystemTime::UNIX_EPOCH, |secs| {
-                SystemTime::UNIX_EPOCH + Duration::new(secs, meta.ctime_nsec() as u32)
-            }),
-            #[cfg(unix)]
-            dev: meta.dev(),
-            #[cfg(unix)]
-            ino: meta.ino(),
-        })
-    }
-
-    fn last_change(&self) -> SystemTime {
-        #[cfg(unix)]
-        return self.mtime.max(self.ctime);
-        #[cfg(not(unix))]
-        self.mtime
-    }
-}
-
-/// A value derived from a file's bytes, valid while the file's [`Stamp`]
-/// stays the same.
-#[derive(Debug)]
-struct Stamped<V> {
-    stamp: Stamp,
-    /// When the file was looked at, taken before the `stat`.
-    seen: SystemTime,
-    value: V,
-}
-
-impl<V> Stamped<V> {
-    /// Whether the value still describes a file that now has `stamp`. A
-    /// file changed within the timestamp granularity of when it was read
-    /// is "racily clean" in git's words: a second write in the same tick
-    /// leaves the stamp as it was, so the value is not trusted until the
-    /// file has been quiet for longer than that.
-    fn holds_for(&self, stamp: &Stamp, granularity: Duration) -> bool {
-        self.stamp == *stamp
-            && self
-                .stamp
-                .last_change()
-                .checked_add(granularity)
-                .is_some_and(|settled| settled < self.seen)
-    }
-}
-
-/// What the ignore rules need about the folder's place on disk. Found once
-/// per worktree, so a repo created around a running sync only counts after
-/// a restart.
-#[derive(Debug)]
-struct IgnoreBase {
-    /// The canonical root, since the repo's paths are canonical too.
-    root: PathBuf,
-    /// The folders from the repo's top down to the root's parent, whose
-    /// ignore files also apply. Empty outside a repo.
-    outer: Vec<PathBuf>,
-    /// The repo's `info/exclude` and the folder its patterns are relative
-    /// to.
-    exclude: Option<(PathBuf, PathBuf)>,
-}
-
-/// Shared between clones, so the walker's filter in [`Worktree::scan`]
-/// fills the same cache.
-#[derive(Debug)]
-struct Caches {
-    ignore_base: Mutex<Option<Arc<IgnoreBase>>>,
-    /// Compiled ignore files by path.
-    matchers: Mutex<HashMap<PathBuf, Stamped<Arc<Gitignore>>>>,
-    /// Scanned files by project path. Holds the text of text files, which
-    /// callers need anyway, and only the digest of assets.
-    files: Mutex<HashMap<String, Stamped<LocalFile>>>,
-    granularity: Duration,
-    /// How often a file was actually read, for tests to see cache hits.
-    #[cfg(test)]
-    reads: std::sync::atomic::AtomicUsize,
-}
-
-impl Default for Caches {
-    fn default() -> Self {
-        Self {
-            ignore_base: Mutex::default(),
-            matchers: Mutex::default(),
-            files: Mutex::default(),
-            granularity: TIMESTAMP_GRANULARITY,
-            #[cfg(test)]
-            reads: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -375,7 +155,7 @@ impl Worktree {
         let filter = {
             let worktree = self.clone();
             let git_files = Arc::clone(&git_files);
-            move |entry: &ignore::DirEntry| {
+            move |entry: &::ignore::DirEntry| {
                 if entry.depth() == 0 {
                     return true;
                 }
@@ -438,26 +218,29 @@ impl Worktree {
             if !file_type.is_file() {
                 continue;
             }
-            let too_large = Skipped {
-                reason: format!(
-                    "larger than the {} MB upload limit",
-                    MAX_UPLOAD_BYTES / 1024 / 1024
-                ),
-                path: path.clone(),
+            let seen = SystemTime::now();
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    scan.skipped.push(Skipped {
+                        path,
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
             };
             // Anything past the asset limit is past the text limit too, so
             // it is skipped without reading what may be a huge video.
-            if entry
-                .metadata()
-                .is_ok_and(|meta| meta.len() > MAX_ASSET_BYTES as u64)
-            {
-                scan.skipped.push(too_large);
+            if meta.len() > MAX_ASSET_BYTES as u64 {
+                scan.skipped.push(too_large(path));
                 continue;
             }
-            match self.read(&path) {
+            // The walker follows no links, so the file's folders are real
+            // folders and its own metadata is what `read` would look up.
+            match self.read_known(&path, &meta, seen) {
                 Ok(Some(file)) => {
                     if file.size as usize > MAX_ASSET_BYTES && file.text.is_none() {
-                        scan.skipped.push(too_large);
+                        scan.skipped.push(too_large(path));
                     } else {
                         scan.files.insert(path, file);
                     }
@@ -533,7 +316,18 @@ impl Worktree {
             self.forget(path);
             return Ok(None);
         };
-        let stamp = Stamp::of(&meta);
+        self.read_known(path, &meta, seen)
+    }
+
+    /// [`Self::read`] for a regular file whose metadata the caller has,
+    /// taken no earlier than `seen`.
+    fn read_known(
+        &self,
+        path: &str,
+        meta: &fs::Metadata,
+        seen: SystemTime,
+    ) -> io::Result<Option<LocalFile>> {
+        let stamp = Stamp::of(meta);
         if let Some(stamp) = &stamp
             && let Some(cached) = self.caches.files.lock().expect("never poisoned").get(path)
             && cached.holds_for(stamp, self.caches.granularity)
@@ -565,6 +359,28 @@ impl Worktree {
             _ => self.forget(path),
         }
         Ok(Some(file))
+    }
+
+    /// Whether `path` is still the file `file` was read from, judged by
+    /// its stat alone. False whenever only its bytes could tell, including
+    /// a file changed so recently that a second write may have left its
+    /// stat as it was.
+    pub fn unchanged_since_read(&self, path: &str, file: &LocalFile) -> bool {
+        let Ok(meta) = fs::symlink_metadata(self.abs(path)) else {
+            return false;
+        };
+        let Some(stamp) = Stamp::of(&meta).filter(|_| meta.is_file()) else {
+            return false;
+        };
+        self.caches
+            .files
+            .lock()
+            .expect("never poisoned")
+            .get(path)
+            .is_some_and(|cached| {
+                cached.value.digest == file.digest
+                    && cached.holds_for(&stamp, self.caches.granularity)
+            })
     }
 
     fn forget(&self, path: &str) {
@@ -676,180 +492,12 @@ impl Worktree {
         }
         Ok(())
     }
-
-    /// Whether the ignore rules exclude `path`, for callers that look at
-    /// single paths instead of scanning. Approximates the walker in
-    /// [`Self::scan`]: the `.gitignore` and `.typstryignore` files from the
-    /// repo root down to the file's folder, plus the repo's `info/exclude`.
-    /// The global git excludes are not consulted.
-    pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.iter().any(|s| is_always_skipped(s)) {
-            return true;
-        }
-        for (i, segment) in segments.iter().enumerate() {
-            if is_git_file(segment) {
-                let last = i == segments.len() - 1;
-                if !self.opted_in(&segments[..=i].join("/"), is_dir || !last) {
-                    return true;
-                }
-            }
-        }
-        let base = self.ignore_base();
-        let (chain, abs) = folders_to(&base.root, &segments);
-        let mut matchers = Vec::new();
-        if let Some((file, workdir)) = &base.exclude {
-            matchers.extend(self.matcher(file, workdir));
-        }
-        // Outermost first, so the loop below can let deeper rules win.
-        for dir in base.outer.iter().chain(&chain) {
-            // `.typstryignore` last so it wins over `.gitignore`.
-            for name in [".gitignore", IGNORE_FILE] {
-                matchers.extend(self.matcher(&dir.join(name), dir));
-            }
-        }
-        for matcher in matchers.iter().rev() {
-            let m = matcher.matched_path_or_any_parents(&abs, is_dir);
-            if m.is_ignore() {
-                return true;
-            }
-            if m.is_whitelist() {
-                return false;
-            }
-        }
-        false
-    }
-
-    /// Whether `.typstryignore` re-includes one of the [`GIT_FILES`] with a
-    /// negated pattern. Only `.typstryignore` counts: a `.gitignore` that
-    /// negates itself is about git, not about co-authors.
-    fn opted_in(&self, path: &str, is_dir: bool) -> bool {
-        let segments: Vec<&str> = path.split('/').collect();
-        let base = self.ignore_base();
-        let (dirs, abs) = folders_to(&base.root, &segments);
-        // Deepest first, so a nested file overrides the top-level one.
-        for dir in dirs.iter().rev() {
-            let Some(matcher) = self.matcher(&dir.join(IGNORE_FILE), dir) else {
-                continue;
-            };
-            let m = matcher.matched(&abs, is_dir);
-            if m.is_whitelist() {
-                return true;
-            }
-            if m.is_ignore() {
-                return false;
-            }
-        }
-        false
-    }
-
-    fn ignore_base(&self) -> Arc<IgnoreBase> {
-        let mut cached = self.caches.ignore_base.lock().expect("never poisoned");
-        if let Some(base) = &*cached {
-            return Arc::clone(base);
-        }
-        // A root that does not exist yet cannot be canonicalized; that
-        // answer is not kept, so it is asked again once the folder is there.
-        let Ok(root) = self.root.canonicalize() else {
-            return Arc::new(IgnoreBase {
-                root: self.root.clone(),
-                outer: Vec::new(),
-                exclude: None,
-            });
-        };
-        let mut outer = Vec::new();
-        let mut exclude = None;
-        if let Some(repo) = crate::git::Repo::discover(&root) {
-            outer.extend(
-                root.ancestors()
-                    .skip(1)
-                    .take_while(|dir| dir.starts_with(&repo.workdir))
-                    .map(Path::to_path_buf),
-            );
-            outer.reverse();
-            exclude = Some((repo.common_dir.join("info").join("exclude"), repo.workdir));
-        }
-        let base = Arc::new(IgnoreBase {
-            root,
-            outer,
-            exclude,
-        });
-        *cached = Some(Arc::clone(&base));
-        base
-    }
-
-    /// The compiled rules of the ignore file at `file`, with patterns
-    /// relative to `dir`. None when there is no such file. Recompiled
-    /// whenever the file's stamp changes, so edits apply right away.
-    fn matcher(&self, file: &Path, dir: &Path) -> Option<Arc<Gitignore>> {
-        let seen = SystemTime::now();
-        let meta = fs::metadata(file).ok().filter(fs::Metadata::is_file);
-        let Some(meta) = meta else {
-            self.caches
-                .matchers
-                .lock()
-                .expect("never poisoned")
-                .remove(file);
-            return None;
-        };
-        let stamp = Stamp::of(&meta);
-        if let Some(stamp) = &stamp
-            && let Some(cached) = self
-                .caches
-                .matchers
-                .lock()
-                .expect("never poisoned")
-                .get(file)
-            && cached.holds_for(stamp, self.caches.granularity)
-        {
-            return Some(Arc::clone(&cached.value));
-        }
-        let mut builder = GitignoreBuilder::new(dir);
-        // An unreadable file or a bad line leaves the rules that did parse,
-        // like `Gitignore::new` does.
-        builder.add(file);
-        let matcher = Arc::new(builder.build().unwrap_or_else(|_| Gitignore::empty()));
-        if let Some(stamp) = stamp {
-            self.caches.matchers.lock().expect("never poisoned").insert(
-                file.to_path_buf(),
-                Stamped {
-                    stamp,
-                    seen,
-                    value: Arc::clone(&matcher),
-                },
-            );
-        }
-        Some(matcher)
-    }
-}
-
-/// The folders from `root` down to the one holding `segments`, and the
-/// file's absolute path under `root`.
-fn folders_to(root: &Path, segments: &[&str]) -> (Vec<PathBuf>, PathBuf) {
-    let mut dirs = vec![root.to_path_buf()];
-    let mut dir = root.to_path_buf();
-    for segment in &segments[..segments.len() - 1] {
-        dir.push(segment);
-        dirs.push(dir.clone());
-    }
-    let mut abs = root.to_path_buf();
-    abs.extend(segments);
-    (dirs, abs)
-}
-
-/// `.git` and the state folder in every spelling a file system might fold
-/// into them, so a shared `.GIT/config` is neither written nor uploaded.
-fn is_always_skipped(name: &str) -> bool {
-    is_reserved_segment(name)
-}
-
-/// Case-insensitive, since `.GITIGNORE` is `.gitignore` on macOS.
-fn is_git_file(name: &str) -> bool {
-    GIT_FILES.iter().any(|file| name.eq_ignore_ascii_case(file))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn tree() -> (tempfile::TempDir, Worktree) {
@@ -900,7 +548,7 @@ mod tests {
         let scan = wt.scan().unwrap();
         assert_eq!(reads(&wt), 2);
         assert_eq!(scan.files["main.typ"].text.as_deref(), Some("= One"));
-        assert_eq!(scan.files["logo.png"].digest, digest(b"\0png"));
+        assert_eq!(scan.files["logo.png"].digest, Digest::of(b"\0png"));
 
         // Same size, so only the stamp's times tell the edit apart.
         write_old(&wt, "main.typ", "= Two", 1800);
@@ -935,6 +583,22 @@ mod tests {
             .unwrap();
         let scan = wt.scan().unwrap();
         assert_eq!(scan.files["main.typ"].text.as_deref(), Some("= Two"));
+    }
+
+    #[test]
+    fn tells_an_unchanged_file_by_its_stat() {
+        let (_dir, wt) = trusting_tree();
+        write_old(&wt, "main.typ", "= One", 3600);
+        let file = wt.read("main.typ").unwrap().unwrap();
+        assert!(wt.unchanged_since_read("main.typ", &file));
+        write_old(&wt, "main.typ", "= Two", 1800);
+        assert!(!wt.unchanged_since_read("main.typ", &file));
+
+        // A file still settling is never vouched for.
+        let (_dir, wt) = tree();
+        fs::write(wt.abs("main.typ"), "= One").unwrap();
+        let file = wt.read("main.typ").unwrap().unwrap();
+        assert!(!wt.unchanged_since_read("main.typ", &file));
     }
 
     #[test]
@@ -993,17 +657,6 @@ mod tests {
         write_old(&wt, ".gitignore", "b.typ\n", 1800);
         assert!(!wt.is_ignored("a.typ", false));
         assert!(wt.is_ignored("b.typ", false));
-    }
-
-    #[test]
-    fn classifies_like_the_browser() {
-        assert_eq!(as_text(b"= Hi\r\n".to_vec()).as_deref(), Some("= Hi\r\n"));
-        assert_eq!(as_text(vec![0xff, 0xfe]), None);
-        assert_eq!(as_text(b"a\0b".to_vec()), None);
-        assert_eq!(as_text(vec![b'a'; MAX_TEXT_BYTES + 1]), None);
-        assert_eq!(mime_for("fig/Logo.PNG"), "image/png");
-        assert_eq!(mime_for(".png"), "application/octet-stream");
-        assert_eq!(mime_for("README"), "application/octet-stream");
     }
 
     #[test]
@@ -1138,18 +791,6 @@ mod tests {
         assert!(wt.write("out/evil.typ", b"x").is_err());
         assert!(!outside.path().join("evil.typ").exists());
         assert_eq!(wt.read("out/evil.typ").unwrap(), None);
-    }
-
-    #[test]
-    fn finds_case_clashes() {
-        assert_eq!(
-            case_clashes(["b.typ", "main.typ", "Main.typ"], |_| false),
-            [("Main.typ".to_owned(), "main.typ".to_owned())]
-        );
-        assert_eq!(
-            case_clashes(["b.typ", "main.typ", "Main.typ"], |p| p == "main.typ"),
-            [("main.typ".to_owned(), "Main.typ".to_owned())]
-        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
-use crate::engine::{Conflicts, Mode, Scope};
+use crate::engine::{Conflicts, Flush, Mode, Scope};
 use crate::mailbox::Request;
 
-use super::{Ctx, Output, guard_branch, print_report};
+use super::{Ctx, Output, connected, guard_branch, print_report};
 
 /// Write remote changes to the folder.
 ///
@@ -24,9 +24,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     };
     let mut out = Output::terminal();
     guard_branch(&mut session, args.force, &mut out)?;
-    session.connect().await?;
-    let report = session.reconcile(&Scope::Full, Mode::Pull).await?;
-    session.disconnect().await;
+    let report = connected(&mut session, async |session| {
+        session
+            .reconcile(&Scope::Full, Mode::Pull, Flush::Now)
+            .await
+    })
+    .await?;
     print_report(&mut out, &report);
     if !report.conflicts.is_empty() {
         return Err(Conflicts {

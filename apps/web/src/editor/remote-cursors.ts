@@ -153,6 +153,9 @@ export function remoteCursors(config: RemoteCursorsConfig): Extension {
         this.unsubscribes = [
           source.subscribe(() => this.schedule()),
           doc.subscribe((batch: LoroEventBatch) => {
+            // Local edits came from this editor, and the field already maps
+            // the carets through their changes.
+            if (batch.by === "local") return;
             if (batch.events.some((e) => e.target === text.id)) this.schedule();
           }),
         ];
@@ -200,7 +203,13 @@ export function remoteCursors(config: RemoteCursorsConfig): Extension {
           const to = Math.max(anchor, head);
           if (from < to) {
             ranges.push(
+              // Mapped through local edits until the next recompute, so it
+              // has to grow the way Loro cursors move: both ends follow text
+              // typed right at them, which puts that text outside at the
+              // start and inside at the end. The caret's `side: 1` maps the
+              // same way.
               Decoration.mark({
+                inclusiveEnd: true,
                 class: "cm-remote-selection",
                 attributes: { style: `background-color: ${peer.color}33` },
               }).range(from, to),

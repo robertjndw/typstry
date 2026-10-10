@@ -13,11 +13,21 @@ export async function contentHash(bytes: Uint8Array): Promise<string> {
   return `sha256:${hex}`;
 }
 
+// Assets go up to 25 MB each, so a count bound alone could pin hundreds of
+// megabytes. Most projects fit their working set well under this.
+const DEFAULT_MAX_BYTES = 128 * 1024 * 1024;
+
+interface Entry {
+  bytes: Promise<Uint8Array>;
+  /** Null while loading; pending entries are never evicted. */
+  size: number | null;
+}
+
 export interface AssetCacheOptions {
   /** Origin of the API; empty means same origin. */
   baseUrl?: string;
-  /** How many recent blobs stay in memory. */
-  capacity?: number;
+  /** How many bytes of recent blobs stay in memory. */
+  maxBytes?: number;
   /** Injection points for tests. `null` disables Cache Storage. */
   fetch?: typeof fetch;
   caches?: CacheStorage | null;
@@ -30,17 +40,18 @@ export interface AssetCacheOptions {
  */
 export class AssetCache {
   private readonly baseUrl: string;
-  private readonly capacity: number;
+  private readonly maxBytes: number;
   private readonly fetchFn: typeof fetch;
   private readonly storage: CacheStorage | null;
   private store: Promise<Cache | null> | null = null;
   // Map iteration order is insertion order, so re-inserting on every hit
   // makes the first key the least recently used one.
-  private readonly recent = new Map<string, Promise<Uint8Array>>();
+  private readonly recent = new Map<string, Entry>();
+  private totalBytes = 0;
 
   constructor(opts: AssetCacheOptions = {}) {
     this.baseUrl = opts.baseUrl ?? "";
-    this.capacity = opts.capacity ?? 32;
+    this.maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
     this.fetchFn = opts.fetch ?? ((...args) => fetch(...args));
     this.storage =
       opts.caches !== undefined
@@ -55,19 +66,34 @@ export class AssetCache {
     if (hit) {
       this.recent.delete(hash);
       this.recent.set(hash, hit);
-      return hit;
+      return hit.bytes;
     }
     const pending = this.load(token, hash);
-    this.recent.set(hash, pending);
-    // A failed load must not stick, or the asset could never be retried.
-    pending.catch(() => {
-      if (this.recent.get(hash) === pending) this.recent.delete(hash);
-    });
-    while (this.recent.size > this.capacity) {
-      const oldest = this.recent.keys().next().value!;
-      this.recent.delete(oldest);
-    }
+    const entry: Entry = { bytes: pending, size: null };
+    this.recent.set(hash, entry);
+    pending.then(
+      (bytes) => {
+        if (this.recent.get(hash) !== entry) return;
+        entry.size = bytes.byteLength;
+        this.totalBytes += entry.size;
+        this.evict();
+      },
+      // A failed load must not stick, or the asset could never be retried.
+      () => {
+        if (this.recent.get(hash) === entry) this.recent.delete(hash);
+      },
+    );
     return pending;
+  }
+
+  /** Drops least recently used blobs until the loaded ones fit the budget. */
+  private evict(): void {
+    for (const [hash, entry] of this.recent) {
+      if (this.totalBytes <= this.maxBytes) return;
+      if (entry.size === null) continue;
+      this.recent.delete(hash);
+      this.totalBytes -= entry.size;
+    }
   }
 
   private openStore(): Promise<Cache | null> {

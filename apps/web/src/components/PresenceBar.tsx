@@ -4,7 +4,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { usePresence } from "@/presence/context";
+import { usePresenceSummary } from "@/presence/context";
 import { initials, type Identity } from "@/presence/identity";
 import { useProject } from "@/project/context";
 
@@ -12,7 +12,7 @@ const MAX_SHOWN = 5;
 
 /** Avatars of everybody else here; clicking one opens their file. */
 export function PresenceBar() {
-  const peers = usePresence();
+  const peers = usePresenceSummary();
   const { index, openFile } = useProject();
   if (peers.length === 0) return null;
 

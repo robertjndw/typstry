@@ -1,9 +1,16 @@
-import type { ContainerID, LoroEventBatch, TreeID } from "loro-crdt";
+import type { TreeID } from "loro-crdt";
 
 import { getText } from "@/doc/fs-ops";
 import { extensionOf } from "@/doc/names";
-import { buildPathIndex } from "@/doc/paths";
-import { NODE, type ProjectDoc } from "@/doc/schema";
+import type { ProjectDoc } from "@/doc/schema";
+import {
+  projectIndex,
+  type IndexedText,
+  type ProjectIndex,
+  type ProjectIndexChange,
+  type ProjectIndexState,
+} from "@/project/project-index";
+import { RetryQueue } from "@/project/retry";
 
 import { toProjectDiagnostic, type ProjectDiagnostic } from "./diagnostics";
 import {
@@ -41,7 +48,8 @@ export interface PreviewState {
  * Resolves an asset's bytes by content hash, normally `ProjectAssets.load`
  * from assets/project-assets.ts. Without a loader, asset files are not
  * mirrored and uploaded fonts are not loaded. Each call must return a fresh
- * buffer: asset bytes are transferred to the worker, which detaches them.
+ * buffer: asset and font bytes are transferred to the worker, which detaches
+ * them.
  */
 export type AssetLoader = (hash: string, path: string) => Promise<Uint8Array>;
 
@@ -54,11 +62,12 @@ export interface CompilerClientOptions {
 /** Coalesces bursts of text events per file before sending them. */
 const TEXT_DEBOUNCE_MS = 16;
 
-interface TextFile {
-  id: TreeID;
-  path: string;
-  container: ContainerID;
-}
+/**
+ * Stands in for the hash of an asset whose load failed: it never matches a
+ * real hash, so the next sync loads it again, and the path stays tracked so
+ * that removing the file still clears whatever older version the worker has.
+ */
+const FAILED_LOAD = "";
 
 // Formats Typst can parse. Uploaded WOFF/WOFF2 files stay plain assets;
 // the compiler would silently ignore them as fonts.
@@ -90,10 +99,12 @@ export class CompilerClient {
   private readonly createRenderer: () => Promise<PreviewRenderer>;
   private readonly assetLoader: AssetLoader | undefined;
 
-  private readonly textsById = new Map<TreeID, TextFile>();
-  private readonly idByContainer = new Map<ContainerID, TreeID>();
+  private readonly index: ProjectIndex;
+  /** The index state this client has mirrored into the worker. */
+  private files: ProjectIndexState;
   /** Asset path -> hash currently mirrored (or being loaded). */
   private readonly assets = new Map<string, string>();
+  private readonly retry = new RetryQueue();
   private mainId: TreeID | null = null;
   private baseFonts: FontConfig = DEFAULT_FONTS;
   /**
@@ -101,9 +112,18 @@ export class CompilerClient {
    * failed load so that the next sync retries.
    */
   private fontKey: string | null = "";
-  private projectFonts: Uint8Array[] = [];
+  /**
+   * Hash -> a path using it, for the current font key. The bytes themselves
+   * are not kept here: they are transferred to the worker, and a manual
+   * reinit loads them again.
+   */
+  private fontFiles = new Map<string, string>();
+  /** Bumped per font load, so only the latest one posts a reinit. */
+  private fontLoad = 0;
   private readonly dirty = new Set<TreeID>();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set while the preview is hidden, see pause(). */
+  private paused = false;
 
   private state: PreviewState = {
     status: "starting",
@@ -124,7 +144,7 @@ export class CompilerClient {
   /** The renderer session holds a newer document than `state.document`. */
   private unrendered = false;
   private disposed = false;
-  private readonly unsubscribeDoc: () => void;
+  private readonly unsubscribeIndex: () => void;
   private nextPdfId = 1;
   private readonly pdfRequests = new Map<
     number,
@@ -139,10 +159,13 @@ export class CompilerClient {
     this.assetLoader = options.assetLoader;
 
     this.worker.addEventListener("message", this.onWorkerMessage);
-    this.unsubscribeDoc = project.doc.subscribe((batch) =>
-      this.onDocEvent(batch),
+    this.index = projectIndex(project);
+    this.unsubscribeIndex = this.index.subscribe((change) =>
+      this.onIndexChange(change),
     );
-    this.syncStructure();
+    const state = this.index.state;
+    this.files = state;
+    this.syncStructure(state, [], [...state.texts.values()], true);
     // Fetched alongside the compiler instead of on the first result, which
     // narrows the window where a dropped connection leaves no renderer.
     void this.loadRenderer().catch(() => undefined);
@@ -161,15 +184,67 @@ export class CompilerClient {
    */
   reinit(fonts: FontConfig): void {
     this.baseFonts = fonts;
-    this.postFonts();
+    this.loadFonts();
   }
 
-  private postFonts(): void {
+  /**
+   * Stops compiling while nobody sees the preview (a version is open in its
+   * place). Edits are still tracked and go out on resume().
+   */
+  pause(): void {
+    if (this.paused || this.disposed) return;
+    this.paused = true;
+    if (this.flushTimer !== null) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.post({ type: "cancel" });
+  }
+
+  resume(): void {
+    if (!this.paused || this.disposed) return;
+    this.paused = false;
+    this.flushTexts();
+    this.requestCompile();
+  }
+
+  /** Loads the project's font files and rebuilds the compiler with them. */
+  private loadFonts(): void {
+    const load = ++this.fontLoad;
+    const loader = this.assetLoader;
+    const files = [...this.fontFiles].sort(([a], [b]) => (a < b ? -1 : 1));
+    if (!loader) {
+      this.postFonts([]);
+      return;
+    }
+    // Async even without font files: a delete and an add in back to back
+    // batches then cost one reinit, not two.
+    void Promise.all(files.map(([hash, path]) => loader(hash, path))).then(
+      (data) => {
+        if (load !== this.fontLoad) return;
+        this.retry.succeeded("fonts");
+        this.postFonts(data);
+      },
+      (err: unknown) => {
+        console.error("failed to load project fonts", err);
+        if (load !== this.fontLoad) return;
+        this.fontKey = null;
+        this.retry.schedule("fonts", () => this.syncAssets(this.files));
+      },
+    );
+  }
+
+  private postFonts(projectFonts: Uint8Array[]): void {
     const fonts: FontConfig = {
       ...this.baseFonts,
-      extra: [...(this.baseFonts.extra ?? []), ...this.projectFonts],
+      extra: [...(this.baseFonts.extra ?? []), ...projectFonts],
     };
-    this.post({ type: "reinit", fonts });
+    // Only the freshly loaded project fonts are ours to detach; the base
+    // set belongs to the caller of reinit().
+    const transfer = new Set<ArrayBuffer>();
+    for (const data of projectFonts) {
+      if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength)
+        transfer.add(data.buffer as ArrayBuffer);
+    }
+    this.post({ type: "reinit", fonts }, [...transfer]);
   }
 
   /** Compiles the main file to a PDF, including edits not yet compiled. */
@@ -193,7 +268,8 @@ export class CompilerClient {
     for (const { reject } of this.pdfRequests.values())
       reject(new Error("compiler disposed"));
     this.pdfRequests.clear();
-    this.unsubscribeDoc();
+    this.unsubscribeIndex();
+    this.retry.dispose();
     if (this.flushTimer !== null) clearTimeout(this.flushTimer);
     this.worker.removeEventListener("message", this.onWorkerMessage);
     if (this.ownsWorker) this.worker.terminate();
@@ -243,30 +319,27 @@ export class CompilerClient {
     for (const listener of this.listeners) listener(this.state);
   }
 
-  private onDocEvent(batch: LoroEventBatch): void {
-    let structural = false;
+  private onIndexChange(change: ProjectIndexChange): void {
     let edited = false;
-    for (const event of batch.events) {
-      const id =
-        event.diff.type === "text"
-          ? this.idByContainer.get(event.target)
-          : undefined;
-      if (id !== undefined) {
-        this.dirty.add(id);
-        edited = true;
-      } else {
-        // Tree moves, renames (node metadata maps), new content containers
-        // and main file changes all land here. Rebuilding the path index is
-        // cheap next to a compile, so there is no finer bookkeeping.
-        structural = true;
-      }
+    for (const id of change.edited) {
+      if (!this.files.texts.has(id)) continue;
+      this.dirty.add(id);
+      edited = true;
     }
-    if (structural) this.syncStructure();
+    if (change.structural) {
+      this.files = change.state;
+      this.syncStructure(
+        change.state,
+        change.textsRemoved,
+        change.textsAdded,
+        change.assetsRemoved.length > 0 || change.assetsAdded.length > 0,
+      );
+    }
     if (edited) this.scheduleFlush();
   }
 
   private scheduleFlush(): void {
-    if (this.flushTimer !== null) return;
+    if (this.flushTimer !== null || this.paused) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.flushTexts();
@@ -276,13 +349,13 @@ export class CompilerClient {
 
   private flushTexts(): void {
     for (const id of this.dirty) {
-      const file = this.textsById.get(id);
+      const file = this.files.texts.get(id);
       if (file) this.sendText(file);
     }
     this.dirty.clear();
   }
 
-  private sendText(file: TextFile): void {
+  private sendText(file: IndexedText): void {
     let text: string;
     try {
       text = getText(this.project, file.id).toString();
@@ -292,57 +365,33 @@ export class CompilerClient {
     this.post({ type: "setText", path: typstPath(file.path), text });
   }
 
-  /** Recomputes paths and sends the worker the difference. */
-  private syncStructure(): void {
-    const index = buildPathIndex(this.project);
-    let changed = false;
+  /** Sends the worker what a structural change did to the files. */
+  private syncStructure(
+    state: ProjectIndexState,
+    textsRemoved: readonly IndexedText[],
+    textsAdded: readonly IndexedText[],
+    assetsChanged: boolean,
+  ): void {
+    let changed = textsRemoved.length > 0 || textsAdded.length > 0;
 
     // One batch can hand a path from one file to another (a swap, or a
     // delete plus a rename onto the freed name). Every remove has to reach
     // the worker before any new content, or it would wipe the new owner.
-    const removed: string[] = [];
-    const fresh: TextFile[] = [];
-    const seen = new Set<TreeID>();
-    for (const [id, entry] of index.byId) {
-      if (entry.kind !== "text") continue;
-      let container: ContainerID;
-      try {
-        container = getText(this.project, id).id;
-      } catch {
-        continue; // a text node whose content container has not arrived yet
-      }
-      seen.add(id);
-      const prev = this.textsById.get(id);
-      if (prev && prev.path === entry.path && prev.container === container) {
-        continue;
-      }
-      if (prev && prev.path !== entry.path) removed.push(prev.path);
-      if (prev) this.idByContainer.delete(prev.container);
-      const file = { id, path: entry.path, container };
-      this.textsById.set(id, file);
-      this.idByContainer.set(container, id);
-      this.dirty.delete(id);
-      fresh.push(file);
-      changed = true;
-    }
-    for (const [id, file] of this.textsById) {
-      if (seen.has(id)) continue;
-      this.textsById.delete(id);
-      this.idByContainer.delete(file.container);
-      this.dirty.delete(id);
-      removed.push(file.path);
-      changed = true;
-    }
-
-    for (const path of removed) {
-      this.post({ type: "remove", path: typstPath(path) });
+    for (const old of textsRemoved) {
+      this.dirty.delete(old.id);
+      // A new container under the same path is just new content.
+      if (state.texts.get(old.id)?.path !== old.path)
+        this.post({ type: "remove", path: typstPath(old.path) });
     }
     // Asset removes go out in here too, still ahead of the texts below.
-    if (this.syncAssets(index.byId)) changed = true;
-    for (const file of fresh) this.sendText(file);
+    if (assetsChanged && this.syncAssets(state)) changed = true;
+    for (const file of textsAdded) {
+      this.dirty.delete(file.id);
+      this.sendText(file);
+    }
 
-    const main = this.project.mainFile;
-    const mainId = main !== null && this.textsById.has(main) ? main : null;
+    const main = state.mainFile;
+    const mainId = main !== null && state.texts.has(main) ? main : null;
     if (mainId !== this.mainId) {
       this.mainId = mainId;
       changed = true;
@@ -350,42 +399,42 @@ export class CompilerClient {
     if (changed) this.requestCompile();
   }
 
-  private syncAssets(byId: ReturnType<typeof buildPathIndex>["byId"]): boolean {
-    if (!this.assetLoader) return false;
+  private syncAssets(state: ProjectIndexState): boolean {
+    if (!this.assetLoader || this.disposed) return false;
     const loader = this.assetLoader;
     let changed = false;
-    const live = new Set<string>();
     const fonts = new Map<string, string>(); // hash -> a path using it
-    for (const [id, entry] of byId) {
-      if (entry.kind !== "asset") continue;
-      const hash: unknown = this.project.fs
-        .getNodeByID(id)
-        ?.data.get(NODE.hash);
-      if (typeof hash !== "string") continue;
-      live.add(entry.path);
-      if (isCompilerFont(entry.path)) fonts.set(hash, entry.path);
-      if (this.assets.get(entry.path) === hash) continue;
-      this.assets.set(entry.path, hash);
-      const path = entry.path;
+    for (const { path, hash } of state.assets.values()) {
+      if (isCompilerFont(path)) fonts.set(hash, path);
+      if (this.assets.get(path) === hash) continue;
+      this.assets.set(path, hash);
       void loader(hash, path).then(
         (data) => {
           // The file may have been replaced or removed while loading.
           if (this.assets.get(path) !== hash) return;
+          this.retry.succeeded(`asset:${path}`);
           this.post({ type: "setAsset", path: typstPath(path), data }, [
             data.buffer,
           ]);
           this.requestCompile();
         },
-        (err: unknown) => console.error(`failed to load asset ${path}`, err),
+        (err: unknown) => {
+          console.error(`failed to load asset ${path}`, err);
+          if (this.assets.get(path) !== hash) return;
+          this.assets.set(path, FAILED_LOAD);
+          this.retry.schedule(`asset:${path}`, () => {
+            if (this.syncAssets(this.files)) this.requestCompile();
+          });
+        },
       );
     }
     for (const path of [...this.assets.keys()]) {
-      if (live.has(path)) continue;
+      if (state.assets.has(path)) continue;
       this.assets.delete(path);
       this.post({ type: "remove", path: typstPath(path) });
       changed = true;
     }
-    this.syncFonts(fonts, loader);
+    this.syncFonts(fonts);
     return changed;
   }
 
@@ -394,32 +443,24 @@ export class CompilerClient {
    * of font files (by content, not by path) means a reinit. Renames and
    * moves keep the key and cost nothing.
    */
-  private syncFonts(fonts: Map<string, string>, loader: AssetLoader): void {
-    const sorted = [...fonts.keys()].sort();
-    const key = sorted.join(",");
+  private syncFonts(fonts: Map<string, string>): void {
+    const key = [...fonts.keys()].sort().join(",");
     if (key === this.fontKey) return;
     this.fontKey = key;
-    void Promise.all(sorted.map((hash) => loader(hash, fonts.get(hash)!))).then(
-      (data) => {
-        if (this.fontKey !== key) return; // superseded while loading
-        this.projectFonts = data;
-        this.postFonts();
-      },
-      (err: unknown) => {
-        console.error("failed to load project fonts", err);
-        if (this.fontKey === key) this.fontKey = null;
-      },
-    );
+    this.fontFiles = fonts;
+    this.loadFonts();
   }
 
   /** Project path of the main file, if it is a mirrored text file. */
   private mainPath(): string | undefined {
     return this.mainId !== null
-      ? this.textsById.get(this.mainId)?.path
+      ? this.files.texts.get(this.mainId)?.path
       : undefined;
   }
 
   private requestCompile(): void {
+    // resume() compiles whatever is current by then.
+    if (this.paused) return;
     const mainPath = this.mainPath();
     if (mainPath === undefined) {
       this.post({ type: "cancel" });

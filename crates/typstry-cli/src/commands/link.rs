@@ -9,13 +9,27 @@ use crate::state::{Config, StateDir};
 /// Works offline. The view link of an edit clone is learned from the
 /// server on clone and on every later connection.
 #[derive(Debug, clap::Args)]
+#[group(multiple = false)]
 pub struct Args {
     /// Print only the edit link, for scripts.
-    #[arg(long, conflicts_with = "view")]
+    #[arg(long)]
     pub edit: bool,
     /// Print only the view-only link, for scripts.
     #[arg(long)]
     pub view: bool,
+}
+
+impl Args {
+    /// The one link asked for, if any; the group rules out both.
+    pub fn which(&self) -> Option<Which> {
+        if self.edit {
+            Some(Which::Edit)
+        } else if self.view {
+            Some(Which::View)
+        } else {
+            None
+        }
+    }
 }
 
 /// Which link a caller wants on its own.
@@ -27,12 +41,7 @@ pub enum Which {
 
 pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let config = StateDir::peek_config(&ctx.dir)?;
-    let which = match (args.edit, args.view) {
-        (true, _) => Some(Which::Edit),
-        (_, true) => Some(Which::View),
-        _ => None,
-    };
-    print_links(&config, which)
+    print_links(&config, args.which())
 }
 
 /// The URL for `which`, or a reason why this folder does not know it.

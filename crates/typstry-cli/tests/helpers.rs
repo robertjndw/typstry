@@ -4,14 +4,14 @@
 
 mod common;
 
-use common::{Server, cached_doc, git, has_git, typstry};
+use common::{
+    Server, binary, binary_with, cached_doc, failed, git, has_git, stderr, stdout, temp, typstry,
+};
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
 
-use tempfile::TempDir;
 use typstry_cli::engine::{Identity, set_peer_info};
 use typstry_cli::link::ShareLink;
 use typstry_cli::state::{STATE_DIR, StateDir};
@@ -21,33 +21,6 @@ use typstry_doc::versions::save_version;
 
 /// Nothing listens here, so a command that tries the network fails.
 const DEAD_SERVER: &str = "http://127.0.0.1:9";
-
-/// A temp folder by its canonical path, so paths compare cleanly on macOS
-/// where the temp dir sits behind a symlink.
-fn temp() -> (TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().canonicalize().unwrap();
-    (dir, path)
-}
-
-/// Runs the real binary in `dir`, off the runtime thread so the
-/// in-process server keeps serving it. Stdin is never a terminal.
-async fn binary(dir: &Path, args: &[&str]) -> Output {
-    binary_with(dir, args, "", &[]).await
-}
-
-fn stdout(out: &Output) -> String {
-    assert!(
-        out.status.success(),
-        "failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout.clone()).unwrap()
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8(out.stderr.clone()).unwrap()
-}
 
 fn config(dir: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(dir.join(STATE_DIR).join("config.json")).unwrap())
@@ -344,8 +317,8 @@ async fn versions_are_saved_listed_and_exported() {
     // A browser saves a version under the same name, with its own author.
     let browser = tempfile::tempdir().unwrap();
     let mut session = common::seeder(&ShareLink::parse(&edit).unwrap(), browser.path()).await;
-    set_peer_info(&session.doc, &Identity::new("Browser Ann")).unwrap();
-    save_version(&session.doc, "first draft", 1_700_000_000_000).unwrap();
+    set_peer_info(session.doc(), &Identity::new("Browser Ann")).unwrap();
+    save_version(session.doc(), "first draft", 1_700_000_000_000).unwrap();
     session.push_local().await.unwrap();
     session.disconnect().await;
 
@@ -452,47 +425,6 @@ async fn status_says_when_git_is_busy() {
     assert!(!status.contains("middle of"), "{status}");
 }
 
-/// Runs the real binary with `input` on stdin and extra environment.
-async fn binary_with(dir: &Path, args: &[&str], input: &str, env: &[(&str, &str)]) -> Output {
-    use std::io::Write;
-    assert!(dir.is_absolute());
-    let dir = dir.to_path_buf();
-    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    let input = input.to_owned();
-    let env: Vec<(String, String)> = env
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    tokio::task::spawn_blocking(move || {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_typstry"))
-            .arg("-C")
-            .arg(&dir)
-            .args(["--name", "Tester"])
-            .args(&args)
-            .current_dir(&dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove("TYPSTRY_LINK")
-            .env_remove("TYPSTRY_SERVER")
-            // Fails loudly instead of opening anything, should a test ever
-            // reach the real opener.
-            .env("TYPSTRY_BROWSER", "/nonexistent/typstry-test-browser")
-            .envs(env)
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    })
-    .await
-    .unwrap()
-}
-
 #[tokio::test]
 async fn clone_reads_the_link_from_stdin_or_the_environment() {
     let server = Server::start().await;
@@ -507,7 +439,36 @@ async fn clone_reads_the_link_from_stdin_or_the_environment() {
     stdout(&out);
     assert_eq!(edit_link(&work.join("Hidden-Link")), edit);
 
-    let out = binary_with(&work, &["clone"], "", &[]).await;
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("TYPSTRY_LINK"), "{}", stderr(&out));
+    for unset in [&[][..], &[("TYPSTRY_LINK", " ")]] {
+        let err = failed(&binary_with(&work, &["clone"], "", unset).await);
+        assert!(err.contains("TYPSTRY_LINK"), "{err}");
+    }
+
+    // The link holds the key, so help must not show it.
+    let help =
+        stdout(&binary_with(&work, &["clone", "--help"], "", &[("TYPSTRY_LINK", &edit)]).await);
+    assert!(help.contains("TYPSTRY_LINK"), "{help}");
+    assert!(!help.contains(&edit), "{help}");
+}
+
+#[tokio::test]
+async fn init_takes_the_server_from_the_environment() {
+    let (_work, work) = temp();
+    fs::write(work.join("main.typ"), "= Hi\n").unwrap();
+
+    let env = [("TYPSTRY_SERVER", "https://typst.example.org/")];
+    let preview = stdout(&binary_with(&work, &["init", "--dry-run"], "", &env).await);
+    assert!(
+        preview.contains("server:  https://typst.example.org\n"),
+        "{preview}"
+    );
+
+    // Set but blank counts as unset: fine for a dry run, not for the real
+    // thing.
+    let env = [("TYPSTRY_SERVER", "  ")];
+    let preview = stdout(&binary_with(&work, &["init", "--dry-run"], "", &env).await);
+    assert!(!preview.contains("server:"), "{preview}");
+    let err = failed(&binary_with(&work, &["init", "--yes"], "", &env).await);
+    assert!(err.contains("no server given"), "{err}");
+    assert!(!work.join(STATE_DIR).exists());
 }

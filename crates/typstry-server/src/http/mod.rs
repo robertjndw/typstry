@@ -1,4 +1,5 @@
 pub mod assets;
+mod error;
 pub mod projects;
 
 use std::path::Path;
@@ -10,46 +11,14 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
-use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::room::{RoomConfig, RoomRegistry};
-use crate::store::blobs::BlobStore;
-use crate::ws::{self, ConnLimits};
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: SqlitePool,
-    pub rooms: RoomRegistry,
-    pub blobs: BlobStore,
-    pub limits: ConnLimits,
-}
-
-impl AppState {
-    pub fn new(db: SqlitePool, blobs: BlobStore) -> Self {
-        Self::with_room_config(db, blobs, RoomConfig::default())
-    }
-
-    pub fn with_room_config(db: SqlitePool, blobs: BlobStore, config: RoomConfig) -> Self {
-        let rooms = RoomRegistry::new(db.clone(), config);
-        Self {
-            db,
-            rooms,
-            blobs,
-            limits: ConnLimits::default(),
-        }
-    }
-}
-
-/// Logs an unexpected failure; the client only learns that it was ours.
-/// The trace layer's span already says which request it was.
-fn internal(err: impl std::fmt::Display) -> StatusCode {
-    tracing::error!(%err, "request failed");
-    StatusCode::INTERNAL_SERVER_ERROR
-}
+pub use self::error::AppError;
+pub use crate::state::AppState;
+use crate::ws;
 
 /// Policy for the app pages. The preview inserts compiler-generated SVG
 /// built from collaborators' documents into the page, so inline script must

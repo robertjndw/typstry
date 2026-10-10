@@ -52,6 +52,19 @@ export function ProjectWorkspace({
   const tinymist = useProjectTinymist();
   const [reveal, setReveal] = useState<RevealRequest | null>(null);
 
+  // A version brings its own compiler. The live one would keep compiling
+  // every remote edit for a preview nobody sees.
+  const viewingVersion = viewing !== null;
+  useEffect(() => {
+    if (!viewingVersion) return;
+    compiler?.pause();
+    tinymist?.pause();
+    return () => {
+      compiler?.resume();
+      tinymist?.resume();
+    };
+  }, [viewingVersion, compiler, tinymist]);
+
   const onDiagnosticClick = useCallback(
     (diagnostic: ProjectDiagnostic) => {
       const fileId = diagnostic.path

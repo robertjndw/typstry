@@ -4,8 +4,10 @@ use typstry_doc::peers::peer_name;
 use typstry_doc::versions::MAX_VERSION_NAME_CHARS;
 use typstry_doc::versions::{NamedVersion, named_versions, normalize_version_name, save_version};
 
-use super::{Ctx, Output, guard_branch, guard_switch, print_report, print_warnings};
-use crate::engine::{Mode, Report, Scope, Session, set_peer_info};
+use super::{
+    Ctx, Fetch, Output, connected, guard_branch, guard_switch, print_report, print_warnings,
+};
+use crate::engine::{Flush, Mode, Report, Scope, Session, set_peer_info};
 use crate::mailbox::Request;
 use crate::state::now_ms;
 
@@ -23,9 +25,8 @@ pub struct Args {
 pub enum VersionCommand {
     /// Named versions, newest first.
     List {
-        /// Use the cached copy of the project instead of fetching.
-        #[arg(long)]
-        offline: bool,
+        #[command(flatten)]
+        fetch: Fetch,
     },
     /// Push local changes, then name the project's current state.
     Save {
@@ -42,7 +43,7 @@ pub enum VersionCommand {
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     match args.command {
-        VersionCommand::List { offline } => list(ctx, offline).await,
+        VersionCommand::List { fetch } => list(ctx, &fetch).await,
         VersionCommand::Save {
             version_name,
             force,
@@ -50,16 +51,11 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     }
 }
 
-async fn list(ctx: &Ctx, offline: bool) -> anyhow::Result<()> {
-    let Some(mut session) = ctx.open_or_ask(Request::VersionList).await? else {
+async fn list(ctx: &Ctx, fetch: &Fetch) -> anyhow::Result<()> {
+    let Some((session, mut out)) = ctx.open_current(Request::VersionList, fetch).await? else {
         return Ok(());
     };
-    let mut out = Output::terminal();
-    if !offline {
-        session.refresh().await?;
-        print_warnings(&mut out, &mut session);
-    }
-    print_versions(&session.doc, &mut out);
+    print_versions(session.doc(), &mut out);
     Ok(())
 }
 
@@ -105,15 +101,18 @@ async fn save(ctx: &Ctx, raw_name: &str, force: bool) -> anyhow::Result<()> {
     let mut out = Output::terminal();
     guard_branch(&mut session, force, &mut out)?;
     guard_switch(&mut session, force).await?;
-    session.connect().await?;
-    // The version is meant to be what is on disk now, so local edits go
-    // out first.
-    let report = session.reconcile(&Scope::Full, Mode::Push).await?;
-    print_pushed(&mut out, &report);
-
-    let saved = name_current_state(&mut session, &name)?;
-    session.push_local().await?;
-    session.disconnect().await;
+    let saved = connected(&mut session, async |session| {
+        // The version is meant to be what is on disk now, so local edits
+        // go out first.
+        let report = session
+            .reconcile(&Scope::Full, Mode::Push, Flush::Now)
+            .await?;
+        print_pre_save_push(&mut out, &report);
+        let saved = name_current_state(session, &name)?;
+        session.push_local().await?;
+        Ok(saved)
+    })
+    .await?;
     print_warnings(&mut out, &mut session);
     // The base stays where the reconcile put it: remote edits may have
     // arrived while waiting for the ack, and those are not on disk.
@@ -126,7 +125,7 @@ pub const VIEW_ONLY_SAVE: &str =
     "this folder is linked with a view-only link; saving a version needs the edit link";
 
 /// What the push before saving a version did.
-pub fn print_pushed(out: &mut Output, report: &Report) {
+pub fn print_pre_save_push(out: &mut Output, report: &Report) {
     let pushed = report.applied.len();
     if pushed > 0 {
         out.out(format!("Pushed {pushed} local change(s)."));
@@ -138,8 +137,8 @@ pub fn print_pushed(out: &mut Output, report: &Report) {
 pub fn name_current_state(session: &mut Session, name: &str) -> anyhow::Result<NamedVersion> {
     // The doc's peer is fresh for this run, so the history panel needs its
     // name before the version entry can show an author.
-    set_peer_info(&session.doc, session.identity())?;
-    save_version(&session.doc, name, now_ms() as i64).context("saving the version")
+    set_peer_info(session.doc(), session.identity())?;
+    save_version(session.doc(), name, now_ms() as i64).context("saving the version")
 }
 
 pub fn print_saved(out: &mut Output, saved: &NamedVersion) {

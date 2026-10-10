@@ -10,6 +10,7 @@ pub mod client;
 pub mod commands;
 pub mod engine;
 pub mod git;
+pub mod hash;
 pub mod link;
 pub mod mailbox;
 pub mod state;

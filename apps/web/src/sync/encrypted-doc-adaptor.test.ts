@@ -18,6 +18,22 @@ import {
 
 import { EncryptedDocAdaptor } from "./encrypted-doc-adaptor";
 
+const hooks = vi.hoisted(() => ({
+  /** Runs at the start of every delta encryption, while push() awaits it. */
+  onEncryptDelta: null as (() => void) | null,
+}));
+
+vi.mock("@/crypto/project-key", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/crypto/project-key")>();
+  return {
+    ...actual,
+    encryptDelta: (...args: Parameters<typeof actual.encryptDelta>) => {
+      hooks.onEncryptDelta?.();
+      return actual.encryptDelta(...args);
+    },
+  };
+});
+
 const decoder = new TextDecoder();
 
 interface Delta {
@@ -121,6 +137,7 @@ interface Client {
 const clients: Client[] = [];
 
 afterEach(() => {
+  hooks.onEncryptDelta = null;
   for (const c of clients.splice(0)) c.adaptor.destroy();
 });
 
@@ -131,7 +148,13 @@ async function settle() {
 function makeClient(
   server: FakeServer,
   key: ProjectKey,
-  opts: { canWrite?: boolean; compactAfterDeltas?: number; doc?: LoroDoc } = {},
+  opts: {
+    canWrite?: boolean;
+    compactAfterDeltas?: number;
+    compactIntervalMs?: number;
+    pushDelayMs?: number;
+    doc?: LoroDoc;
+  } = {},
 ): Client {
   const doc = opts.doc ?? new LoroDoc();
   const onDecryptError = vi.fn();
@@ -139,6 +162,8 @@ function makeClient(
     key,
     canWrite: opts.canWrite ?? true,
     compactAfterDeltas: opts.compactAfterDeltas,
+    compactIntervalMs: opts.compactIntervalMs ?? 0,
+    pushDelayMs: opts.pushDelayMs ?? 0,
     retryMs: 10,
     onDecryptError,
   });
@@ -264,6 +289,121 @@ describe("EncryptedDocAdaptor", () => {
     await fresh.join();
     await fresh.adaptor.waitForReachingServerVersion();
     expect(fresh.doc.getText("t").toString()).toBe("01234");
+  });
+
+  it("keeps compacting as its own sends grow the log", async () => {
+    const server = new FakeServer();
+    const a = makeClient(server, key, { compactAfterDeltas: 3 });
+    await a.join();
+    await a.adaptor.waitForReachingServerVersion();
+    for (let i = 0; i < 7; i++) {
+      write(a.doc, `${i}`);
+      await settle();
+    }
+    await vi.waitFor(() => {
+      expect(server.snapshot).not.toBeNull();
+      // Two rounds of compaction: without the second the log would hold
+      // everything after the first snapshot.
+      expect(server.deltas.length).toBeLessThan(3);
+    });
+    const snapshots = server.received.filter((c) =>
+      decodeEloContainer(c).some(
+        (r) => parseEloRecordHeader(r).header.kind === EloRecordKind.Snapshot,
+      ),
+    );
+    expect(snapshots.length).toBeGreaterThanOrEqual(2);
+
+    const fresh = makeClient(server, key);
+    await fresh.join();
+    await fresh.adaptor.waitForReachingServerVersion();
+    expect(fresh.doc.getText("t").toString()).toBe("0123456");
+  });
+
+  it("waits between compactions while connected", async () => {
+    const server = new FakeServer();
+    const a = makeClient(server, key, {
+      compactAfterDeltas: 3,
+      compactIntervalMs: 60_000,
+    });
+    await a.join();
+    await a.adaptor.waitForReachingServerVersion();
+    for (let i = 0; i < 7; i++) {
+      write(a.doc, `${i}`);
+      await settle();
+    }
+    expect(server.snapshot).not.toBeNull();
+    const snapshots = server.received.filter((c) =>
+      decodeEloContainer(c).some(
+        (r) => parseEloRecordHeader(r).header.kind === EloRecordKind.Snapshot,
+      ),
+    );
+    expect(snapshots).toHaveLength(1);
+    expect(server.deltas.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("never snapshots ops that did not go out as deltas", async () => {
+    const server = new FakeServer();
+    const a = makeClient(server, key, {
+      compactAfterDeltas: 1,
+      pushDelayMs: 60_000,
+    });
+    const b = makeClient(server, key);
+    await a.join();
+    await b.join();
+    await b.adaptor.waitForReachingServerVersion();
+
+    // The first two encryptions each see a new commit land while they run:
+    // the second one belongs to the push right before the snapshot.
+    let calls = 0;
+    hooks.onEncryptDelta = () => {
+      calls++;
+      if (calls <= 2) write(a.doc, `${calls + 1}`);
+    };
+    write(a.doc, "1");
+    await a.adaptor.flush();
+    await vi.waitFor(() => expect(server.snapshot).not.toBeNull());
+    await a.adaptor.flush();
+    await settle();
+
+    // A snapshot holding "3" before its delta was sent would have made the
+    // server swallow that delta, and b never sees snapshots.
+    expect(a.doc.getText("t").toString()).toBe("123");
+    expect(b.doc.getText("t").toString()).toBe("123");
+  });
+
+  it("counts a push still encrypting as pending", async () => {
+    const server = new FakeServer();
+    const a = makeClient(server, key, { pushDelayMs: 0 });
+    await a.join();
+    await a.adaptor.waitForReachingServerVersion();
+    write(a.doc, "queued");
+    // The push timer is not involved, but the commit has not been sent yet.
+    expect(a.adaptor.hasPendingPush).toBe(true);
+    await a.adaptor.flush();
+    expect(a.adaptor.hasPendingPush).toBe(false);
+    expect(server.deltas).toHaveLength(1);
+  });
+
+  it("gathers quick commits into one record", async () => {
+    const server = new FakeServer();
+    const a = makeClient(server, key, { pushDelayMs: 30 });
+    await a.join();
+    await a.adaptor.waitForReachingServerVersion();
+    for (const ch of "typing") write(a.doc, ch);
+    expect(a.ctx.send).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(server.deltas).toHaveLength(1));
+    expect(a.ctx.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends pending commits right away on flush", async () => {
+    const server = new FakeServer();
+    const a = makeClient(server, key, { pushDelayMs: 60_000 });
+    await a.join();
+    write(a.doc, "before closing");
+    expect(a.adaptor.hasPendingPush).toBe(true);
+    await a.adaptor.flush();
+    expect(a.adaptor.hasPendingPush).toBe(false);
+    expect(server.deltas).toHaveLength(1);
   });
 
   it("resends spans the server refused for a passing reason", async () => {

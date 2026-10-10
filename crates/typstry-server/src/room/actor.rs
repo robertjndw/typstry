@@ -8,12 +8,11 @@ use loro_protocol::{BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateSta
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 use typstry_wire::elo::{PeerId, Record, Version, encode_container, parse_container};
-use typstry_wire::fragment::encode_update;
 
 use super::elo::{self, DocIndex};
 use super::registry::Inner;
-use super::{ConnId, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
-use crate::store::docs;
+use super::{ConnId, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd, update_frames};
+use crate::store::docs::{self, Write};
 use crate::store::projects::Permission;
 
 /// A connection's latest presence. Each blob is that client's whole state,
@@ -28,6 +27,12 @@ pub(super) struct RoomActor {
     generation: u64,
     registry: Arc<Inner>,
     index: DocIndex,
+    /// The frames a client joining with an empty version gets, which is
+    /// every fresh tab and every first sync. Encoding them means copying
+    /// the whole doc, so they are kept until the doc changes. That doubles
+    /// the room's memory while it is cached, so it is let go once the last
+    /// peer leaves rather than kept for the whole unload delay.
+    full_backfill: Option<Arc<[Bytes]>>,
     presence: HashMap<ConnId, Presence>,
     peers: HashMap<(ConnId, [u8; 4]), Outbox>,
     last_seq: i64,
@@ -41,6 +46,7 @@ impl RoomActor {
             generation,
             registry,
             index: DocIndex::default(),
+            full_backfill: None,
             presence: HashMap::new(),
             peers: HashMap::new(),
             last_seq: 0,
@@ -56,16 +62,12 @@ impl RoomActor {
         }
         tracing::debug!(project = %self.project_id, seq = self.last_seq, "room loaded");
 
+        let stop = self.registry.stop.clone();
         let mut tick = interval(self.registry.config.tick);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
-                    Some(RoomCmd::Shutdown { done }) => {
-                        self.registry.remove(&self.project_id, self.generation);
-                        let _ = done.send(());
-                        break;
-                    }
                     Some(cmd) => self.handle(cmd).await,
                     None => break,
                 },
@@ -73,6 +75,17 @@ impl RoomActor {
                     if self.on_tick(&rx) {
                         break;
                     }
+                }
+                () = stop.cancelled() => {
+                    // Server shutdown. Every record is written before its
+                    // ack, so there is nothing to flush, but what was queued
+                    // before the stop still gets handled.
+                    rx.close();
+                    while let Some(cmd) = rx.recv().await {
+                        self.handle(cmd).await;
+                    }
+                    self.registry.remove(&self.project_id, self.generation);
+                    break;
                 }
             }
         }
@@ -82,7 +95,7 @@ impl RoomActor {
     async fn load(&mut self) -> anyhow::Result<()> {
         let records = docs::load(&self.registry.db, &self.project_id).await?;
         self.last_seq = records.last().map_or(0, |(seq, _)| *seq);
-        self.index = DocIndex::load(records).map_err(anyhow::Error::msg)?;
+        self.index = DocIndex::load(records)?;
         Ok(())
     }
 
@@ -125,7 +138,6 @@ impl RoomActor {
                 _ => self.ack(conn, crdt, batch_id, UpdateStatusCode::Unknown),
             },
             RoomCmd::Leave { conn, crdt } => self.drop_peer(conn, crdt),
-            RoomCmd::Shutdown { .. } => unreachable!("handled in run"),
         }
     }
 
@@ -137,7 +149,12 @@ impl RoomActor {
         version: &[u8],
         outbox: Outbox,
     ) -> bool {
-        let (server_version, extra, backfill): (_, _, Vec<Bytes>) = match crdt {
+        // Checked before the backfill is built, which for most versions
+        // means copying the doc.
+        let Some(backfill) = outbox.start_backfill(&self.project_id, crdt) else {
+            return false;
+        };
+        let (server_version, extra, frames): (_, _, Arc<[Bytes]>) = match crdt {
             CrdtType::Elo => {
                 let client = if version.is_empty() {
                     Version::new()
@@ -165,10 +182,7 @@ impl RoomActor {
                 (
                     self.index.coverage_vv().encode(),
                     Some(extra.into_bytes()),
-                    elo::pack(&self.index.backfill(&client))
-                        .into_iter()
-                        .map(Bytes::from)
-                        .collect(),
+                    self.backfill_frames(&client),
                 )
             }
             CrdtType::LoroEphemeralStore => {
@@ -176,7 +190,9 @@ impl RoomActor {
                     .presence
                     .iter()
                     .filter(|&(&other, _)| other != conn)
-                    .map(|(_, presence)| presence.data.clone())
+                    .flat_map(|(_, presence)| {
+                        update_frames(crdt, &self.project_id, presence.data.to_vec())
+                    })
                     .collect();
                 (Vec::new(), None, others)
             }
@@ -196,11 +212,9 @@ impl RoomActor {
         if !outbox.push_message(&ok) {
             return false;
         }
-        for data in backfill {
-            for frame in encode_update(crdt, &self.project_id, &data) {
-                if !outbox.push(Outbound::Binary(frame.into())) {
-                    return false;
-                }
+        for frame in frames.iter() {
+            if !outbox.push_backfill(&backfill, frame.clone()) {
+                return false;
             }
         }
         self.peers.insert((conn, crdt.magic_bytes()), outbox);
@@ -208,13 +222,35 @@ impl RoomActor {
         true
     }
 
-    async fn doc_update(&mut self, conn: ConnId, batch_id: BatchId, updates: Vec<Vec<u8>>) {
+    fn backfill_frames(&mut self, client: &Version) -> Arc<[Bytes]> {
+        let full = client.is_empty();
+        if full && let Some(frames) = &self.full_backfill {
+            return frames.clone();
+        }
+        let frames: Arc<[Bytes]> = elo::pack(&self.index.backfill(client))
+            .into_iter()
+            .flat_map(|container| update_frames(CrdtType::Elo, &self.project_id, container))
+            .collect();
+        if full {
+            self.full_backfill = Some(frames.clone());
+        }
+        frames
+    }
+
+    /// Stores a whole update message in one transaction. Every record is
+    /// first judged against the index with the batch's earlier records
+    /// staged in it, so duplicates within the batch are dropped too; the
+    /// staging is undone if the write fails.
+    async fn doc_update(&mut self, conn: ConnId, batch_id: BatchId, updates: Vec<Bytes>) {
         let mut status = UpdateStatusCode::Ok;
+        let mut writes = Vec::new();
         let mut relays = Vec::new();
-        for update in &updates {
-            let records = match parse_container(update) {
+        self.index.begin();
+        for update in updates {
+            let records = match parse_container(&update) {
                 Ok(records) => records,
                 Err(err) => {
+                    // Earlier payloads of the message were fine and are kept.
                     tracing::debug!(project = %self.project_id, %err, "rejected update");
                     status = UpdateStatusCode::InvalidUpdate;
                     break;
@@ -223,96 +259,108 @@ impl RoomActor {
             // Only spans this payload added are relayed: duplicates are
             // already known to everyone who could have them, and snapshots
             // only exist to compact the log, peers already hold their ops.
-            let mut fresh: Vec<&[u8]> = Vec::new();
-            let mut failed = false;
+            let count = records.len();
+            let share = shares_buffer(&self.index, &records);
+            let mut fresh = Vec::new();
             for (record, bytes) in records {
-                let stored = match record {
-                    Record::Delta { peer, start, end } => {
-                        self.store_delta(peer, start, end, bytes).await
-                    }
-                    Record::Snapshot { vv } => self.store_snapshot(vv, bytes).await.map(|()| false),
+                let bytes = if share {
+                    update.slice_ref(bytes)
+                } else {
+                    Bytes::copy_from_slice(bytes)
                 };
-                match stored {
-                    Ok(true) => fresh.push(bytes),
-                    Ok(false) => {}
-                    Err(err) => {
-                        tracing::error!(project = %self.project_id, %err, "failed to store record");
-                        status = UpdateStatusCode::Unknown;
-                        failed = true;
-                        break;
+                match record {
+                    Record::Delta { peer, start, end } => {
+                        if self.stage_delta(peer, start, end, &bytes, &mut writes) {
+                            fresh.push(bytes);
+                        }
                     }
+                    Record::Snapshot { vv } => self.stage_snapshot(vv, bytes, &mut writes),
                 }
             }
-            // What was stored before a failure still goes out: it is durable,
-            // and peers would otherwise only see it on their next rejoin.
-            if !fresh.is_empty() {
+            if fresh.len() == count {
+                relays.push(Vec::from(update));
+            } else if !fresh.is_empty() {
+                let fresh: Vec<&[u8]> = fresh.iter().map(|bytes| &bytes[..]).collect();
                 relays.push(encode_container(&fresh));
             }
-            if failed {
-                break;
+        }
+
+        if writes.is_empty() {
+            self.index.commit();
+        } else {
+            match docs::write_batch(&self.registry.db, &self.project_id, &writes).await {
+                Ok(()) => {
+                    self.index.commit();
+                    self.full_backfill = None;
+                }
+                Err(err) => {
+                    tracing::error!(project = %self.project_id, %err, "failed to store records");
+                    self.index.rollback();
+                    status = UpdateStatusCode::Unknown;
+                    relays.clear();
+                }
             }
         }
 
         self.ack(conn, CrdtType::Elo, batch_id, status);
-        for relay in &relays {
+        for relay in relays {
             self.broadcast(conn, CrdtType::Elo, relay);
         }
     }
 
-    /// Returns whether the span was new and got stored.
-    async fn store_delta(
+    /// Returns whether the span was new and is staged for storing.
+    fn stage_delta(
         &mut self,
         peer: PeerId,
         start: u64,
         end: u64,
-        bytes: &[u8],
-    ) -> sqlx::Result<bool> {
+        bytes: &Bytes,
+        writes: &mut Vec<Write>,
+    ) -> bool {
         if self.index.covers(peer, end) {
-            return Ok(false);
+            return false;
         }
-        // Bumped even if the write fails: a failure may still have reached
-        // the disk, and reusing its seq would then collide.
+        // Never handed out twice, even if this batch fails to commit: a
+        // failure may still have reached the disk, and reusing its seq would
+        // then collide.
         self.last_seq += 1;
-        docs::append(&self.registry.db, &self.project_id, self.last_seq, bytes).await?;
+        writes.push(Write::Append {
+            seq: self.last_seq,
+            data: bytes.clone(),
+        });
         self.index
-            .add_delta(self.last_seq, peer, start, end, bytes.to_vec());
-        Ok(true)
+            .add_delta(self.last_seq, peer, start, end, bytes.clone());
+        true
     }
 
     /// A snapshot that would not let anything go is dropped without a word:
     /// the client cannot do anything better with a rejection, and its ops
     /// are already stored as deltas.
-    async fn store_snapshot(&mut self, vv: Version, bytes: &[u8]) -> sqlx::Result<()> {
+    fn stage_snapshot(&mut self, vv: Version, bytes: Bytes, writes: &mut Vec<Write>) {
         let Some(obsolete) = self.index.snapshot_replaces(&vv) else {
-            return Ok(());
+            return;
         };
         self.last_seq += 1;
-        docs::replace_with_snapshot(
-            &self.registry.db,
-            &self.project_id,
-            self.last_seq,
-            bytes,
-            &obsolete,
-        )
-        .await?;
-        self.index
-            .install_snapshot(self.last_seq, vv, bytes.to_vec());
         tracing::debug!(
             project = %self.project_id,
             seq = self.last_seq,
             replaced = obsolete.len(),
             bytes = bytes.len(),
-            "compacted"
+            "compacting"
         );
-        Ok(())
+        writes.push(Write::Snapshot {
+            seq: self.last_seq,
+            data: bytes.clone(),
+            obsolete,
+        });
+        self.index.install_snapshot(self.last_seq, vv, bytes);
     }
 
-    fn presence_update(&mut self, conn: ConnId, batch_id: BatchId, updates: Vec<Vec<u8>>) {
+    fn presence_update(&mut self, conn: ConnId, batch_id: BatchId, updates: Vec<Bytes>) {
         let crdt = CrdtType::LoroEphemeralStore;
         let blobs: Vec<Bytes> = updates
             .into_iter()
             .filter(|blob| !blob.is_empty())
-            .map(Bytes::from)
             .collect();
         if blobs.iter().any(|blob| blob.len() > MAX_PRESENCE_BYTES) {
             self.ack(conn, crdt, batch_id, UpdateStatusCode::InvalidUpdate);
@@ -332,8 +380,8 @@ impl RoomActor {
             );
         }
         self.ack(conn, crdt, batch_id, UpdateStatusCode::Ok);
-        for blob in &blobs {
-            self.broadcast(conn, crdt, blob);
+        for blob in blobs {
+            self.broadcast(conn, crdt, Vec::from(blob));
         }
     }
 
@@ -353,12 +401,9 @@ impl RoomActor {
     }
 
     /// Relays an accepted update to every other peer of the same CRDT.
-    fn broadcast(&mut self, from: ConnId, crdt: CrdtType, update: &[u8]) {
+    fn broadcast(&mut self, from: ConnId, crdt: CrdtType, update: Vec<u8>) {
         let magic = crdt.magic_bytes();
-        let frames: Vec<Bytes> = encode_update(crdt, &self.project_id, update)
-            .into_iter()
-            .map(Bytes::from)
-            .collect();
+        let frames = update_frames(crdt, &self.project_id, update);
         let mut dead = Vec::new();
         for (&(conn, peer_magic), outbox) in &self.peers {
             if conn == from || peer_magic != magic {
@@ -383,6 +428,49 @@ impl RoomActor {
         }
         if self.peers.is_empty() {
             self.empty_since = Some(Instant::now());
+            self.full_backfill = None;
         }
+    }
+}
+
+/// Whether a payload's stored records may be slices of its buffer rather
+/// than copies. Stored records live as long as the room, and a slice keeps
+/// the whole buffer (up to 8 MiB reassembled) alive with it, so that only
+/// pays off when every record is kept. A guess from the index is enough: a
+/// wrong one costs a copy or some memory, not correctness. A snapshot may
+/// be refused, so only one that is the whole payload is worth sharing.
+fn shares_buffer(index: &DocIndex, records: &[(Record, &[u8])]) -> bool {
+    records.iter().all(|(record, _)| match *record {
+        Record::Delta { peer, end, .. } => !index.covers(peer, end),
+        Record::Snapshot { .. } => records.len() == 1,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shares_the_buffer_only_when_every_record_is_kept() {
+        let mut index = DocIndex::default();
+        index.add_delta(1, 1, 0, 5, Bytes::from_static(b"old"));
+        let delta = |peer, start, end| Record::Delta { peer, start, end };
+        let snapshot = || Record::Snapshot { vv: Version::new() };
+
+        assert!(shares_buffer(&index, &[(delta(1, 5, 6), b"")]));
+        assert!(shares_buffer(
+            &index,
+            &[(delta(1, 5, 6), b""), (delta(2, 0, 1), b"")]
+        ));
+        assert!(shares_buffer(&index, &[(snapshot(), b"")]));
+
+        assert!(!shares_buffer(
+            &index,
+            &[(delta(1, 0, 5), b""), (delta(2, 0, 1), b"")]
+        ));
+        assert!(!shares_buffer(
+            &index,
+            &[(snapshot(), b""), (delta(2, 0, 1), b"")]
+        ));
     }
 }
