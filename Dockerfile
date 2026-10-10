@@ -19,6 +19,8 @@ FROM node:26-slim AS web
 WORKDIR /src
 RUN npm install -g pnpm@12.10.1
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# pnpm applies these during install (see patchedDependencies).
+COPY patches patches
 COPY apps/web/package.json apps/web/
 RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile --filter web...

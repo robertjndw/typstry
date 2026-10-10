@@ -1,0 +1,44 @@
+diff --git a/dist/client/index.cjs b/dist/client/index.cjs
+index c2036e771e8ee9981ed5e8a9fd9f8834e98d0191..87ccc471770973c6df6cf6af112e9e2606723ada 100644
+--- a/dist/client/index.cjs
++++ b/dist/client/index.cjs
+@@ -71,7 +71,7 @@ var LoroWebsocketClient = class {
+ 			if (this.shouldReconnect) {
+ 				this.setStatus(ClientStatus.Disconnected);
+ 				try {
+-					this.ws?.close(1001, "Offline");
++					this.ws?.close(1000, "Offline");
+ 				} catch {}
+ 			}
+ 		};
+@@ -899,7 +899,7 @@ var LoroWebsocketClient = class {
+ 				this.awaitingPongSince = now;
+ 				if (this.missedPongs >= 2) {
+ 					try {
+-						this.ws?.close(1001, "ping_timeout");
++						this.ws?.close(1000, "ping_timeout");
+ 					} catch (err) {
+ 						this.logCbError("pingTimer close", err);
+ 					}
+diff --git a/dist/client/index.js b/dist/client/index.js
+index b89e681952b7aebe9460eb6e893c3298d517a883..5ec1d4925430dfda4ffe4af0bd23f4bd1c979321 100644
+--- a/dist/client/index.js
++++ b/dist/client/index.js
+@@ -73,7 +73,7 @@ var LoroWebsocketClient = class {
+ 			if (this.shouldReconnect) {
+ 				this.setStatus(ClientStatus.Disconnected);
+ 				try {
+-					this.ws?.close(1001, "Offline");
++					this.ws?.close(1000, "Offline");
+ 				} catch {}
+ 			}
+ 		};
+@@ -901,7 +901,7 @@ var LoroWebsocketClient = class {
+ 				this.awaitingPongSince = now;
+ 				if (this.missedPongs >= 2) {
+ 					try {
+-						this.ws?.close(1001, "ping_timeout");
++						this.ws?.close(1000, "ping_timeout");
+ 					} catch (err) {
+ 						this.logCbError("pingTimer close", err);
+ 					}

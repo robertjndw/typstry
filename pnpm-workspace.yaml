@@ -1,2 +1,4 @@
 packages:
   - apps/*
+patchedDependencies:
+  loro-websocket@0.6.2: patches/loro-websocket@0.6.2.patch
