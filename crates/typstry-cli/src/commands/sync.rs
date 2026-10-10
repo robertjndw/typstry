@@ -560,10 +560,10 @@ impl Live {
         }
     }
 
-    /// The return-from-branch trap: a folder that differs from the last
-    /// sync after a checkout may lack remote edits that were pulled while
-    /// a draft was checked out. Pushing it would revert them, so outbound
-    /// changes wait for an explicit publish.
+    /// After a checkout, a folder that differs from the last sync may lack
+    /// remote edits that were pulled while a draft was checked out. Pushing
+    /// it would revert them, so outbound changes wait for an explicit
+    /// publish.
     async fn check_tree(&mut self) {
         if !self.session.can_write() {
             return;

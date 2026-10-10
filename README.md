@@ -18,7 +18,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **History** - save named versions, browse the edit history, diff and restore.
 - **Sharing** - separate edit and view-only links, no accounts required.
 - **Export** - download the compiled PDF or the whole project as a ZIP.
-- **Local editing and git** - the `typstry` CLI mirrors a project into a folder, live or on demand, so you can use your own editor and keep the folder in a git repository you fully control.
+- **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
 
 ## Quick start
 
@@ -61,9 +61,9 @@ The `typstry` CLI links a folder to a project. It encrypts and decrypts on your 
 cargo install --path crates/typstry-cli
 ```
 
-**How typstry and git fit together.** typstry moves the current state of the files between people, live. Git records the snapshots you choose to keep. The CLI never commits for you (except the first commit of `clone --git`), so branches, rebase, hooks and remotes all work as usual. The folder is where the two meet.
+typstry moves the current state of the files between people, live. Git keeps the snapshots you decide to commit. The CLI never commits for you (except the first commit of `clone --git`), so branches, rebase, hooks and remotes work as usual.
 
-Exchange content between people through one channel. If your co-authors use typstry, don't also `git pull` the same edits from a shared remote, or they arrive twice. Your git history can be your own, or one person can keep the shared repository for the group.
+Pick one way to get edits from your co-authors. If they use typstry, don't also `git pull` the same edits from a shared remote, or they arrive twice. Your git history can be your own, or one person can keep the shared repository for the group.
 
 ### A normal day
 
