@@ -3,15 +3,15 @@
 
 mod common;
 
-use common::{Server, cached_doc, git, has_git, typstry};
+use common::{Server, cached_doc, clone, git, has_git, read, typstry};
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use typstry_cli::api::Api;
 use typstry_cli::client::{Client, Event};
-use typstry_cli::engine::{Conflicts, Mode, Scope, Session};
+use typstry_cli::engine::{Conflicts, Flush, Mode, Scope, Session};
 use typstry_cli::link::{ShareLink, ws_url};
 use typstry_cli::state::STATE_DIR;
 use typstry_doc::apply::apply_files;
@@ -21,15 +21,6 @@ use typstry_doc::paths::build_path_index;
 use typstry_doc::{FileKind, node, root};
 use typstry_wire::crypto::ProjectKey;
 use typstry_wire::elo::encode_container;
-
-async fn clone(link: &str, parent: &Path, name: &str) -> PathBuf {
-    typstry(parent, &["clone", link, name]).await.unwrap();
-    parent.join(name)
-}
-
-fn read(dir: &Path, path: &str) -> String {
-    fs::read_to_string(dir.join(path)).unwrap()
-}
 
 #[tokio::test]
 async fn clones_an_empty_project() {
@@ -157,6 +148,7 @@ async fn assets_round_trip() {
         .collect();
     fs::create_dir_all(a.join("fig")).unwrap();
     fs::write(a.join("fig/logo.png"), &png).unwrap();
+    fs::write(a.join("data.bin"), [0u8, 1, 2]).unwrap();
     typstry(&a, &["push"]).await.unwrap();
 
     typstry(&b, &["pull"]).await.unwrap();
@@ -169,6 +161,21 @@ async fn assets_round_trip() {
     assert_eq!(*size, png.len() as u64);
     assert_eq!(mime, "image/png");
     assert!(hash.starts_with("sha256:"));
+
+    // Offline, an export only has the cached bytes; otherwise it fetches
+    // what is missing.
+    fs::remove_dir_all(b.join(".typstry/blobs")).unwrap();
+    let export = work.path().join("export");
+    let err = typstry(&b, &["export", "--offline", &export.to_string_lossy()])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("is not cached"), "{err:#}");
+    assert!(!export.exists());
+    typstry(&b, &["export", &export.to_string_lossy()])
+        .await
+        .unwrap();
+    assert_eq!(fs::read(export.join("fig/logo.png")).unwrap(), png);
+    assert_eq!(fs::read(export.join("data.bin")).unwrap(), [0u8, 1, 2]);
 
     // Unchanged assets are not uploaded again; changed ones are.
     typstry(&b, &["push"]).await.unwrap();
@@ -313,10 +320,10 @@ async fn writers_compact_the_server_log() {
     let work = tempfile::tempdir().unwrap();
     let mut session = Session::create(work.path(), &link, &share, None).unwrap();
     session.connect().await.unwrap();
-    let text = session.doc.get_text("scratch");
+    let text = session.doc().get_text("scratch");
     for i in 0..210 {
         text.insert(0, &i.to_string()).unwrap();
-        session.doc.commit();
+        session.doc().commit();
         session.push_local().await.unwrap();
     }
     session.disconnect().await;
@@ -429,7 +436,7 @@ async fn git_files_in_the_project_are_neither_written_nor_deleted() {
             .collect();
         files.extend(extra.iter().map(|(path, text)| MaterializedFile {
             path: (*path).to_owned(),
-            content: FileContent::Text((*text).to_owned()),
+            content: FileContent::Text((*text).into()),
         }));
         apply_files(doc, &files, "test apply").unwrap();
     };
@@ -438,7 +445,7 @@ async fn git_files_in_the_project_are_neither_written_nor_deleted() {
             (".gitignore", "*.pdf\n"),
             (".github/workflows/pdf.yml", "on: push\n"),
         ],
-        &browser.doc,
+        browser.doc(),
     );
     browser.push_local().await.unwrap();
 
@@ -462,7 +469,7 @@ async fn git_files_in_the_project_are_neither_written_nor_deleted() {
     assert_eq!(read(&a, ".gitignore"), "local\n");
 
     // A remote edit does not overwrite it either.
-    set(&[(".gitignore", "*.pdf\nbuild/\n")], &browser.doc);
+    set(&[(".gitignore", "*.pdf\nbuild/\n")], browser.doc());
     browser.push_local().await.unwrap();
     browser.disconnect().await;
     typstry(&a, &["pull"]).await.unwrap();
@@ -522,20 +529,20 @@ async fn a_shared_git_dir_in_another_spelling_is_never_written() {
     // git config, and git runs `core.fsmonitor` on the next `git add`.
     let config = "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = touch pwned\n";
     for top in [".GIT", "GIT~1", ".git."] {
-        let dir = plant(&attacker.doc, None, top, None);
-        plant(&attacker.doc, Some(dir), "config", Some(config));
+        let dir = plant(attacker.doc(), None, top, None);
+        plant(attacker.doc(), Some(dir), "config", Some(config));
         plant(
-            &attacker.doc,
+            attacker.doc(),
             Some(dir),
             "HEAD",
             Some("ref: refs/heads/main\n"),
         );
     }
-    let sub = plant(&attacker.doc, None, "sub", None);
-    let nested = plant(&attacker.doc, Some(sub), ".Git", None);
-    plant(&attacker.doc, Some(nested), "config", Some(config));
-    plant(&attacker.doc, None, "C:", None);
-    plant(&attacker.doc, None, "nul.typ", Some("x"));
+    let sub = plant(attacker.doc(), None, "sub", None);
+    let nested = plant(attacker.doc(), Some(sub), ".Git", None);
+    plant(attacker.doc(), Some(nested), "config", Some(config));
+    plant(attacker.doc(), None, "C:", None);
+    plant(attacker.doc(), None, "nul.typ", Some("x"));
     attacker.push_local().await.unwrap();
     attacker.disconnect().await;
 
@@ -612,19 +619,19 @@ async fn case_variants_from_another_file_system_are_kept() {
             .collect();
         files.extend(extra.iter().map(|(path, text)| MaterializedFile {
             path: (*path).to_owned(),
-            content: FileContent::Text((*text).to_owned()),
+            content: FileContent::Text((*text).into()),
         }));
         apply_files(doc, &files, "test apply").unwrap();
     };
     with(
         &[("Notes.typ", "upper\n"), ("notes.typ", "lower\n")],
-        &other.doc,
+        other.doc(),
     );
     other.push_local().await.unwrap();
 
     let work = tempfile::tempdir().unwrap();
     let a = clone(&edit, work.path(), "a").await;
-    with(&[("notes.typ", "lower, edited\n")], &other.doc);
+    with(&[("notes.typ", "lower, edited\n")], other.doc());
     other.push_local().await.unwrap();
     other.disconnect().await;
 
@@ -632,7 +639,7 @@ async fn case_variants_from_another_file_system_are_kept() {
     let mut session = Session::open(&a, Some("Tester")).unwrap();
     session.connect().await.unwrap();
     session
-        .reconcile(&Scope::Paths(BTreeSet::new()), Mode::Push)
+        .reconcile(&Scope::Paths(BTreeSet::new()), Mode::Push, Flush::Now)
         .await
         .unwrap();
     session.disconnect().await;
@@ -667,7 +674,10 @@ async fn an_edit_saved_while_pushing_is_not_overwritten() {
     // The editor saves again while the push waits for the server.
     session.before_write = Some(Box::new(move |_| fs::write(&main, &saved).unwrap()));
     session.connect().await.unwrap();
-    let report = session.reconcile(&Scope::Full, Mode::Push).await.unwrap();
+    let report = session
+        .reconcile(&Scope::Full, Mode::Push, Flush::Now)
+        .await
+        .unwrap();
     session.disconnect().await;
     drop(session);
     assert_eq!(read(&a, "main.typ"), late);
@@ -749,11 +759,11 @@ async fn inject_foreign_record(link: &str) {
         .await
         .unwrap();
     client
-        .send_update(&encode_container(&[&record]))
+        .send_update(encode_container(&[&record]))
         .await
         .unwrap();
     loop {
-        if let Event::Ack { status, .. } = client.next_event().await.unwrap() {
+        if let Event::Ack { status, .. } = client.next_event().await {
             assert_eq!(status, loro_protocol::UpdateStatusCode::Ok);
             break;
         }
@@ -795,7 +805,7 @@ async fn a_refused_compaction_is_not_fatal() {
     let mut session = Session::create(work.path(), &link, &share, None).unwrap();
     session.connect().await.unwrap();
     // More than the server reassembles, so it refuses the snapshot.
-    let text = session.doc.get_text("scratch");
+    let text = session.doc().get_text("scratch");
     let mut state = 0x2545_f491_u32;
     for _ in 0..10 {
         let chunk: String = (0..900_000)
@@ -807,13 +817,88 @@ async fn a_refused_compaction_is_not_fatal() {
             })
             .collect();
         text.insert(0, &chunk).unwrap();
-        session.doc.commit();
+        session.doc().commit();
         session.push_local().await.unwrap();
     }
     for i in 0..200 {
         text.insert(0, &i.to_string()).unwrap();
-        session.doc.commit();
+        session.doc().commit();
         session.push_local().await.unwrap();
     }
     session.disconnect().await;
+}
+
+/// What sync does when the watcher names paths: only those are read, and
+/// every other file counts as unchanged, edited or not.
+#[tokio::test]
+async fn a_partial_reconcile_only_looks_at_its_paths() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Partial").await;
+    let work = tempfile::tempdir().unwrap();
+    let a = clone(&edit, work.path(), "a").await;
+    fs::create_dir_all(a.join("ch")).unwrap();
+    fs::write(a.join("ch/one.typ"), "one\n").unwrap();
+    fs::write(a.join("ch/two.typ"), "two\n").unwrap();
+    fs::write(a.join("other.typ"), "other\n").unwrap();
+    typstry(&a, &["push"]).await.unwrap();
+
+    fs::remove_file(a.join("ch/one.typ")).unwrap();
+    fs::write(a.join("ch/two.typ"), "two, edited\n").unwrap();
+    fs::write(a.join("other.typ"), "other, edited\n").unwrap();
+    let mut session = Session::open(&a, Some("Tester")).unwrap();
+    session.connect().await.unwrap();
+    let report = session
+        .reconcile(
+            &Scope::Paths(BTreeSet::from(["ch".to_owned()])),
+            Mode::Push,
+            Flush::Now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.applied.deleted, ["ch/one.typ"]);
+    assert_eq!(report.applied.modified, ["ch/two.typ"]);
+    assert!(report.written.is_empty(), "{:?}", report.written);
+    let files = doc_files(&a);
+    assert_eq!(text(files.get("ch/two.typ")), Some("two, edited\n"));
+    assert_eq!(text(files.get("other.typ")), Some("other\n"));
+    assert!(!files.contains_key("ch/one.typ"));
+
+    // The edit outside the scope is still there for the next look.
+    let status = session.status(&Scope::Full).await.unwrap();
+    assert_eq!(
+        status.local.keys().collect::<Vec<_>>(),
+        ["other.typ"],
+        "{status:?}"
+    );
+    fs::remove_file(a.join("main.typ")).unwrap();
+    let report = session
+        .reconcile(
+            &Scope::Paths(BTreeSet::from(["main.typ".to_owned()])),
+            Mode::Push,
+            Flush::Now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.applied.deleted, ["main.typ"]);
+    assert_eq!(read(&a, "other.typ"), "other, edited\n");
+    session.disconnect().await;
+}
+
+/// The CLI only treats the server's own answer for an unknown link as
+/// final, so this pins that answer to what it recognizes.
+#[tokio::test]
+async fn the_server_answers_an_unknown_link_in_a_way_sync_takes_as_final() {
+    let server = Server::start().await;
+    let err = Api::new(&server.origin)
+        .unwrap()
+        .resolve_share("no-such-token")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            typstry_cli::engine::SyncError::fatal(&err),
+            Some(typstry_cli::engine::SyncError::UnknownLink)
+        ),
+        "{err:#}"
+    );
 }

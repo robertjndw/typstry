@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { IDBFactory } from "fake-indexeddb";
 import { LoroDoc } from "loro-crdt";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   IndexedDbBackend,
@@ -71,7 +71,9 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
     const backend = await makeBackend();
     for (const id of ["p1", "p2"]) {
       const doc = new LoroDoc();
-      const store = new LocalDocStore(id, doc, backend, { compactAfter: 1 });
+      const store = new LocalDocStore(id, doc, backend, {
+        compactMinBytes: 1,
+      });
       await store.load();
       write(doc, "a");
       await store.flush();
@@ -83,25 +85,96 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
     expect(text((await reopen(backend, "p2")).doc)).toBe("ab");
   });
 
-  it("compacts into a snapshot without losing anything", async () => {
+  it("compacts once the log outgrows the snapshot", async () => {
     const backend = await makeBackend();
     const doc = new LoroDoc();
-    const store = new LocalDocStore("p1", doc, backend, { compactAfter: 3 });
+    const store = new LocalDocStore("p1", doc, backend, {
+      compactMinBytes: 1,
+      compactRatio: 1,
+    });
     await store.load();
-    for (const part of ["a", "b", "c", "d"]) {
-      write(doc, part);
-      await store.flush();
-    }
-    const stored = await backend.load("p1");
+    // No snapshot yet, so the first row already passes the minimum.
+    write(doc, "a");
+    await store.flush();
+    let stored = await backend.load("p1");
     expect(stored.snapshot).not.toBeNull();
-    expect(stored.updates).toHaveLength(1);
-    expect(text((await reopen(backend)).doc)).toBe("abcd");
+    expect(stored.updates).toHaveLength(0);
+
+    write(doc, "b");
+    await store.flush();
+    write(doc, "c");
+    await store.flush();
+    stored = await backend.load("p1");
+    expect(stored.updates).toHaveLength(2);
+
+    write(doc, "d".repeat(4 * stored.snapshot!.length));
+    await store.flush();
+    stored = await backend.load("p1");
+    expect(stored.updates).toHaveLength(0);
+    expect(text((await reopen(backend)).doc)).toBe(text(doc));
+    expect(text(doc)).toMatch(/^abcd+$/);
+  });
+
+  it("does not re-import its own rows when compacting", async () => {
+    const backend = await makeBackend();
+    const doc = new LoroDoc();
+    const store = new LocalDocStore("p1", doc, backend, {
+      compactMinBytes: 1,
+      compactRatio: 1,
+    });
+    await store.load();
+    write(doc, "a");
+    await store.flush();
+    const importBatch = vi.spyOn(doc, "importBatch");
+    write(doc, "b".repeat(5000));
+    await store.flush();
+    expect((await backend.load("p1")).updates).toHaveLength(0);
+    expect(importBatch).not.toHaveBeenCalled();
+    expect(text((await reopen(backend)).doc)).toBe(text(doc));
+  });
+
+  it("waits for a pause in typing before writing", async () => {
+    const backend = await makeBackend();
+    const append = vi.spyOn(backend, "append");
+    const doc = new LoroDoc();
+    const store = new LocalDocStore("p1", doc, backend, {
+      flushDelayMs: 30,
+      maxFlushDelayMs: 10_000,
+    });
+    await store.load();
+    store.start();
+    for (const ch of "typing") {
+      write(doc, ch);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(append).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+    await store.stop();
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(text((await reopen(backend)).doc)).toBe("typing");
+  });
+
+  it("writes during steady typing at least every maxFlushDelayMs", async () => {
+    const backend = await makeBackend();
+    const append = vi.spyOn(backend, "append");
+    const doc = new LoroDoc();
+    const store = new LocalDocStore("p1", doc, backend, {
+      flushDelayMs: 1000,
+      maxFlushDelayMs: 20,
+    });
+    await store.load();
+    store.start();
+    write(doc, "a");
+    await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+    await store.stop();
   });
 
   it("folds in what another tab stored when compacting", async () => {
     const backend = await makeBackend();
     const tabA = new LoroDoc();
-    const storeA = new LocalDocStore("p1", tabA, backend, { compactAfter: 2 });
+    const storeA = new LocalDocStore("p1", tabA, backend, {
+      compactMinBytes: 1,
+    });
     await storeA.load();
     const tabB = new LoroDoc();
     const storeB = new LocalDocStore("p1", tabB, backend);
@@ -110,9 +183,9 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
     write(tabB, "B was offline. ");
     await storeB.flush();
     write(tabA, "A ");
-    await storeA.flush();
     write(tabA, "compacts");
     await storeA.flush();
+    expect((await backend.load("p1")).updates).toHaveLength(0);
 
     const restored = text((await reopen(backend)).doc);
     expect(restored).toContain("B was offline.");

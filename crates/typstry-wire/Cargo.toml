@@ -29,9 +29,12 @@ crypto = [
     "dep:thiserror",
     "dep:zeroize",
 ]
+# Exposes the encryption entry points that take a caller-chosen salt and IV,
+# which the fixture tests need for byte-stable records.
+test-util = ["crypto"]
 
 [dev-dependencies]
-typstry-wire = { path = ".", features = ["crypto"] }
+typstry-wire = { path = ".", features = ["crypto", "test-util"] }
 serde.workspace = true
 serde_json.workspace = true
 

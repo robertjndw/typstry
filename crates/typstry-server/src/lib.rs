@@ -1,6 +1,7 @@
 pub mod config;
 pub mod http;
 pub mod room;
+pub mod state;
 pub mod store;
 pub mod token;
 pub mod ws;

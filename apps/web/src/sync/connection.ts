@@ -189,7 +189,12 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
       finished = true;
       update();
       listeners.clear();
-      shutdown();
+      // Commits not yet handed to the socket (waiting for the push timer,
+      // queued, or still encrypting) would otherwise only go up on the next
+      // visit, since destroy() makes a running push give up. Encrypting them
+      // takes a moment, so the socket stays open until then.
+      if (docAdaptor.hasPendingPush) void docAdaptor.flush().finally(shutdown);
+      else shutdown();
     },
   };
 }

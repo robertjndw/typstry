@@ -5,6 +5,7 @@
 //! is a list of paths rather than another doc, so nodes are matched by path
 //! instead of by TreeID.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -14,8 +15,10 @@ use crate::materialize::{
     FileContent, MaterializedFile, file_content, is_safe_path, materialize_indexed, number,
 };
 use crate::names::{NameError, validate_path};
-use crate::paths::{LiveNode, PathIndex, build_path_index, read_node, resolve_sibling_names};
-use crate::{FileKind, main_file, meta, node, root, string_value, text_content};
+use crate::paths::{
+    LiveNode, PathIndex, build_path_index, entries_under, read_node, resolve_sibling_names,
+};
+use crate::{FileKind, is_string, main_file, meta, node, root, text_content};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyReport {
@@ -125,9 +128,9 @@ pub fn apply_files(
     let desired = validate(files, &mut report.skipped);
     let index = build_path_index(doc);
     let visible = materialize_indexed(doc, &index);
-    let visible: HashMap<&str, &FileContent> = visible
+    let visible: Visible = visible
         .iter()
-        .map(|(_, file)| (file.path.as_str(), &file.content))
+        .map(|(id, file)| (file.path.as_str(), (*id, &file.content)))
         .collect();
     let deletes = visible
         .keys()
@@ -136,9 +139,14 @@ pub fn apply_files(
         .collect();
     let puts = desired
         .into_iter()
-        .filter(|(path, content)| visible.get(path) != Some(content))
+        .filter(|(path, content)| visible.get(path).map(|&(_, c)| c) != Some(content))
         .collect();
-    apply_valid(doc, &index, puts, deletes, report, message)
+    let current = Current {
+        doc,
+        index: &index,
+        visible: Some(&visible),
+    };
+    apply_valid(current, puts, deletes, report, message)
 }
 
 /// Writes `changes` on top of the doc's files: `Some` creates or replaces
@@ -166,7 +174,11 @@ pub fn apply_changes(
     doc.commit();
     let mut report = ApplyReport::default();
     let index = build_path_index(doc);
-    let current = Current { doc, index: &index };
+    let current = Current {
+        doc,
+        index: &index,
+        visible: None,
+    };
     let mut puts = BTreeMap::new();
     let mut deletes = BTreeSet::new();
     for (path, content) in changes {
@@ -201,26 +213,25 @@ pub fn apply_changes(
             },
         });
     }
-    apply_valid(doc, &index, puts, deletes, report, message)
+    apply_valid(current, puts, deletes, report, message)
 }
 
 /// The part both entry points share. `puts` holds valid paths with no other
-/// put above them, `deletes` may name anything. `index` must be fresh.
+/// put above them, `deletes` may name anything. `current` must be fresh.
 fn apply_valid<'a>(
-    doc: &LoroDoc,
-    index: &'a PathIndex,
+    current: Current<'a>,
     puts: BTreeMap<&'a str, &'a FileContent>,
     deletes: BTreeSet<&'a str>,
     mut report: ApplyReport,
     message: &str,
 ) -> LoroResult<ApplyReport> {
+    let Current { doc, index, .. } = current;
     let tree = doc.get_tree(root::FS);
-    let current = Current { doc, index };
     let main_before = main_file(doc);
     let desired_dirs: BTreeSet<&str> = puts.keys().flat_map(|p| ancestors(p)).collect();
 
     // Visible files that go away, unless a rename keeps them.
-    let mut removed: BTreeMap<&str, (TreeID, FileContent)> = BTreeMap::new();
+    let mut removed: BTreeMap<&str, (TreeID, Cow<FileContent>)> = BTreeMap::new();
     for &path in &deletes {
         if let Some(file) = current.file(path) {
             removed.insert(path, file);
@@ -228,7 +239,7 @@ fn apply_valid<'a>(
     }
     let mut doomed: Vec<(usize, TreeID)> = Vec::new();
     let mut reused: Vec<(&str, TreeID)> = Vec::new();
-    let mut before: HashMap<&str, FileContent> = HashMap::new();
+    let mut before: HashMap<&str, Cow<FileContent>> = HashMap::new();
     for (&path, &content) in &puts {
         let Some((id, kind)) = current.node(path) else {
             continue;
@@ -299,7 +310,7 @@ fn apply_valid<'a>(
         .collect();
     let gone: Vec<(&str, TreeID, &FileContent)> = removed
         .iter()
-        .map(|(&path, (id, content))| (path, *id, content))
+        .map(|(&path, (id, content))| (path, *id, &**content))
         .collect();
     let renames = pair_renames(&gone, &fresh, &puts);
 
@@ -345,7 +356,7 @@ fn apply_valid<'a>(
 
     for &(path, id) in &reused {
         let content = puts[path];
-        let before = before.get(path);
+        let before = before.get(path).map(|c| &**c);
         if before != Some(content) {
             write_content(doc, id, content)?;
             if before.is_some() {
@@ -413,11 +424,17 @@ fn apply_valid<'a>(
     Ok(report)
 }
 
+/// What `materialize` lists, by path, with the node behind each file.
+type Visible<'a> = HashMap<&'a str, (TreeID, &'a FileContent)>;
+
 /// Read access to the doc's files by path, through an index built once.
 #[derive(Clone, Copy)]
 struct Current<'a> {
     doc: &'a LoroDoc,
     index: &'a PathIndex,
+    /// Every visible file, when the caller already read them all, so that
+    /// none is read twice.
+    visible: Option<&'a Visible<'a>>,
 }
 
 impl<'a> Current<'a> {
@@ -431,13 +448,20 @@ impl<'a> Current<'a> {
     }
 
     /// The file `materialize` lists at `path`.
-    fn file(self, path: &str) -> Option<(TreeID, FileContent)> {
+    fn file(self, path: &str) -> Option<(TreeID, Cow<'a, FileContent>)> {
+        if let Some(visible) = self.visible {
+            let &(id, content) = visible.get(path)?;
+            return Some((id, Cow::Borrowed(content)));
+        }
         let (id, kind) = self.node(path)?;
-        Some((id, file_content(self.doc, id, kind)?))
+        Some((id, Cow::Owned(file_content(self.doc, id, kind)?)))
     }
 
     /// Whether `materialize` lists a file at `path`, without reading text.
     fn shows(self, path: &str) -> bool {
+        if let Some(visible) = self.visible {
+            return visible.contains_key(path);
+        }
         match self.node(path) {
             Some((_, FileKind::Text)) => true,
             Some((id, kind @ FileKind::Asset)) => file_content(self.doc, id, kind).is_some(),
@@ -447,12 +471,7 @@ impl<'a> Current<'a> {
 
     /// Paths of every node anywhere below `dir`.
     fn nodes_under(self, dir: &str) -> impl Iterator<Item = (&'a str, TreeID)> {
-        let prefix = format!("{dir}/");
-        self.index
-            .by_path
-            .range(prefix.clone()..)
-            .take_while(move |(path, _)| path.starts_with(&prefix))
-            .map(|(path, id)| (path.as_str(), *id))
+        entries_under(&self.index.by_path, dir).map(|(path, id)| (path.as_str(), *id))
     }
 
     /// Paths of the visible files anywhere below `dir`.
@@ -520,14 +539,14 @@ impl<'a> Names<'a> {
                 .filter_map(|id| read_node(&tree, id))
                 .filter(|node| names.contains(&node.name))
                 .collect();
-            for (node, shown, _) in resolve_sibling_names(group) {
+            for node in resolve_sibling_names(group) {
                 let wanted = self
                     .wanted
                     .get(&node.id)
                     .copied()
                     .or_else(|| before.by_id.get(&node.id).map(|e| basename(&e.path)));
                 if let Some(wanted) = wanted
-                    && shown != wanted
+                    && node.name != wanted
                 {
                     pins.push((node.id, wanted));
                 }
@@ -626,6 +645,9 @@ fn pair_renames<'a>(
     renames
 }
 
+/// Only called for a node whose content differs from `content`, or a fresh
+/// empty one, so the text is not compared first. `update` diffs anyway and
+/// writes nothing for equal text.
 fn write_content(doc: &LoroDoc, id: TreeID, content: &FileContent) -> LoroResult<()> {
     let data = doc.get_tree(root::FS).get_meta(id)?;
     match content {
@@ -634,20 +656,18 @@ fn write_content(doc: &LoroDoc, id: TreeID, content: &FileContent) -> LoroResult
                 Some(text) => text,
                 None => data.insert_container(node::CONTENT, LoroText::new())?,
             };
-            if text.to_string() != *want {
-                text.update(want, Default::default())
-                    .expect("no timeout was set");
-            }
+            text.update(want, Default::default())
+                .expect("no timeout was set");
         }
         FileContent::Asset { hash, size, mime } => {
-            if string_value(data.get(node::HASH)).as_ref() != Some(hash) {
+            if !is_string(data.get(node::HASH), hash) {
                 data.insert(node::HASH, hash.as_str())?;
             }
             if number(data.get(node::SIZE)) != Some(*size) {
                 // The browser writes JS numbers, so match its value type.
                 data.insert(node::SIZE, *size as f64)?;
             }
-            if string_value(data.get(node::MIME)).as_ref() != Some(mime) {
+            if !is_string(data.get(node::MIME), mime) {
                 data.insert(node::MIME, mime.as_str())?;
             }
         }
@@ -657,7 +677,7 @@ fn write_content(doc: &LoroDoc, id: TreeID, content: &FileContent) -> LoroResult
 
 fn set_name(doc: &LoroDoc, id: TreeID, name: &str) -> LoroResult<()> {
     let data = doc.get_tree(root::FS).get_meta(id)?;
-    if string_value(data.get(node::NAME)).as_deref() != Some(name) {
+    if !is_string(data.get(node::NAME), name) {
         data.insert(node::NAME, name)?;
     }
     Ok(())

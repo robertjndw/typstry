@@ -4,8 +4,9 @@
 // Layout mirrors the server's old update log: per project one snapshot plus
 // the updates appended since. Data here is plaintext; it never leaves the
 // browser (sync encrypts on its own).
-import { VersionVector, type LoroDoc } from "loro-crdt";
+import { VersionVector, decodeImportBlobMeta, type LoroDoc } from "loro-crdt";
 
+import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
 export interface StoredDoc {
@@ -215,10 +216,17 @@ export function defaultBackend(): Promise<DocBackend> {
 }
 
 export interface LocalDocStoreOptions {
-  /** Batches a burst of edits into one write. */
+  /** Writes once edits pause for this long, batching a burst into one row. */
   flushDelayMs?: number;
-  /** Fold the update log into a snapshot after this many appends. */
-  compactAfter?: number;
+  /** Writes at least this often while edits keep coming. */
+  maxFlushDelayMs?: number;
+  /**
+   * Fold the update log into a snapshot once it outgrows both this share of
+   * the snapshot's size and `compactMinBytes`.
+   */
+  compactRatio?: number;
+  /** Keeps a small project from compacting every few edits. */
+  compactMinBytes?: number;
 }
 
 /**
@@ -231,11 +239,21 @@ export class LocalDocStore {
   private readonly doc: LoroDoc;
   private readonly backend: DocBackend;
   private readonly flushDelayMs: number;
-  private readonly compactAfter: number;
+  private readonly maxFlushDelayMs: number;
+  private readonly compactRatio: number;
+  private readonly compactMinBytes: number;
   /** The doc version everything up to which is stored. */
   private persisted: VersionVector = new VersionVector(null);
-  private appended = 0;
+  /** Stored snapshot size, as of the last load or compaction. */
+  private snapshotBytes = 0;
+  /**
+   * Bytes in the update log. Rows other tabs append are not counted, so
+   * with several tabs open this runs behind and compaction comes late.
+   */
+  private logBytes = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** When the oldest change not written yet happened. */
+  private dirtySince: number | null = null;
   private readonly enqueue = createSerialQueue(
     "saving the project locally failed",
   );
@@ -251,7 +269,9 @@ export class LocalDocStore {
     this.doc = doc;
     this.backend = backend;
     this.flushDelayMs = options.flushDelayMs ?? 300;
-    this.compactAfter = options.compactAfter ?? 100;
+    this.maxFlushDelayMs = options.maxFlushDelayMs ?? 2000;
+    this.compactRatio = options.compactRatio ?? 0.5;
+    this.compactMinBytes = options.compactMinBytes ?? 64 * 1024;
   }
 
   /** Imports what is stored. Returns false when nothing was. */
@@ -260,7 +280,8 @@ export class LocalDocStore {
     const blobs = blobsOf(stored);
     if (blobs.length > 0) this.doc.importBatch(blobs);
     this.persisted = this.doc.oplogVersion();
-    this.appended = stored.updates.length;
+    this.snapshotBytes = stored.snapshot?.length ?? 0;
+    this.logBytes = totalBytes(stored.updates);
     return blobs.length > 0;
   }
 
@@ -269,23 +290,11 @@ export class LocalDocStore {
     const schedule = () => this.schedule();
     const unsubscribeDoc = this.doc.subscribe(schedule);
     const unsubscribeLocal = this.doc.subscribeLocalUpdates(schedule);
-    // A closing tab gets no second chance; hidden is the last reliable
-    // moment, especially on mobile where pagehide may never fire.
-    const onHide = () => {
-      if (document.visibilityState === "hidden") void this.flush();
-    };
-    const onPageHide = () => void this.flush();
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", onHide);
-      window.addEventListener("pagehide", onPageHide);
-    }
+    const stopPageExit = onPageExit(() => void this.flush());
     this.stopListening = () => {
       unsubscribeDoc();
       unsubscribeLocal();
-      if (typeof document !== "undefined") {
-        document.removeEventListener("visibilitychange", onHide);
-        window.removeEventListener("pagehide", onPageHide);
-      }
+      stopPageExit();
     };
   }
 
@@ -299,15 +308,28 @@ export class LocalDocStore {
   flush(): Promise<void> {
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
+    this.dirtySince = null;
     return this.enqueue(() => this.write());
   }
 
+  // Waits for a pause, so steady typing does not append a row every few
+  // keystrokes, but never longer than maxFlushDelayMs: that bounds what a
+  // crash can take with it.
   private schedule(): void {
-    if (this.timer !== null) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.flush();
-    }, this.flushDelayMs);
+    const now = Date.now();
+    this.dirtySince ??= now;
+    if (this.timer !== null) clearTimeout(this.timer);
+    const wait = Math.min(
+      this.flushDelayMs,
+      this.dirtySince + this.maxFlushDelayMs - now,
+    );
+    this.timer = setTimeout(
+      () => {
+        this.timer = null;
+        void this.flush();
+      },
+      Math.max(0, wait),
+    );
   }
 
   private async write(): Promise<void> {
@@ -318,21 +340,50 @@ export class LocalDocStore {
     const update = this.doc.export({ mode: "update", from: this.persisted });
     await this.backend.append(this.projectId, update);
     this.persisted = version;
-    this.appended += 1;
-    if (this.appended >= this.compactAfter) await this.compact();
+    this.logBytes += update.length;
+    const limit = Math.max(
+      this.compactMinBytes,
+      this.snapshotBytes * this.compactRatio,
+    );
+    if (this.logBytes > limit) await this.compact();
   }
 
   private async compact(): Promise<void> {
     let version = this.persisted;
+    let size = 0;
     await this.backend.compact(this.projectId, (stored) => {
-      const blobs = blobsOf(stored);
       // Another tab may have stored ops this doc has never seen; importing
-      // them is what keeps the new snapshot from dropping them.
-      if (blobs.length > 0) this.doc.importBatch(blobs);
+      // them is what keeps the new snapshot from dropping them. Most rows
+      // are this tab's own or arrived here through sync too, and importing
+      // those again would only cost time.
+      const have = this.doc.oplogVersion();
+      const missing = blobsOf(stored).filter((blob) => !covers(have, blob));
+      if (missing.length > 0) this.doc.importBatch(missing);
       version = this.doc.oplogVersion();
-      return this.doc.export({ mode: "snapshot" });
+      const snapshot = this.doc.export({ mode: "snapshot" });
+      size = snapshot.length;
+      return snapshot;
     });
     this.persisted = version;
-    this.appended = 0;
+    this.snapshotBytes = size;
+    this.logBytes = 0;
   }
+}
+
+function totalBytes(blobs: Uint8Array[]): number {
+  return blobs.reduce((sum, blob) => sum + blob.length, 0);
+}
+
+/** Whether `have` already includes every op in `blob`. */
+function covers(have: VersionVector, blob: Uint8Array): boolean {
+  let end: VersionVector;
+  try {
+    end = decodeImportBlobMeta(blob, false).partialEndVersionVector;
+  } catch {
+    // Let importBatch judge it: it throws for a broken row, which aborts
+    // the compaction instead of writing a snapshot without that row.
+    return false;
+  }
+  const cmp = have.compare(end);
+  return cmp !== undefined && cmp >= 0;
 }

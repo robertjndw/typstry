@@ -367,6 +367,101 @@ describe("CompilerClient PDF export", () => {
   });
 });
 
+describe("CompilerClient asset retries", () => {
+  function retrySetup() {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const project = initProject(newProject(1), { title: "T" });
+    const worker = new FakeWorker();
+    let fail = true;
+    const loader = vi.fn(async () => {
+      if (fail) throw new TypeError("Failed to fetch");
+      return new Uint8Array([1, 2, 3]);
+    });
+    new CompilerClient(project, {
+      worker,
+      assetLoader: loader,
+      createRenderer: async () => fakeRenderer().renderer,
+    });
+    worker.take();
+    const logo = createAsset(project, null, "logo.png", {
+      hash: "abc",
+      size: 3,
+      mime: "image/png",
+    });
+    const setAssets = () => worker.take().filter((m) => m.type === "setAsset");
+    return {
+      project,
+      worker,
+      loader,
+      logo,
+      setAssets,
+      heal: () => (fail = false),
+    };
+  }
+
+  it("retries a failed asset load after a backoff", async () => {
+    const { loader, setAssets, heal } = retrySetup();
+    await settle();
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(setAssets()).toEqual([]);
+
+    heal();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(setAssets()).toEqual([
+      { type: "setAsset", path: "/logo.png", data: new Uint8Array([1, 2, 3]) },
+    ]);
+  });
+
+  it("retries right away once the browser is back online", async () => {
+    const { loader, setAssets, heal } = retrySetup();
+    await settle();
+    heal();
+    window.dispatchEvent(new Event("online"));
+    await settle();
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(setAssets()).toHaveLength(1);
+  });
+
+  it("does not retry an asset that was deleted meanwhile", async () => {
+    const { project, worker, loader, logo, heal } = retrySetup();
+    await settle();
+    deleteNode(project, logo);
+    await settle();
+    expect(worker.take()).toContainEqual({ type: "remove", path: "/logo.png" });
+
+    heal();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(worker.take()).toEqual([]);
+  });
+});
+
+describe("CompilerClient pause", () => {
+  it("holds edits and compiles while paused, then catches up", async () => {
+    const { project, worker, client } = setup();
+    worker.take();
+
+    client.pause();
+    expect(worker.take()).toEqual([{ type: "cancel" }]);
+    const text = getText(project, mainId(project));
+    text.insert(0, "x");
+    project.doc.commit();
+    createFile(project, null, "ch.typ", "text");
+    await settle();
+    expect(worker.take().filter((m) => m.type === "compile")).toEqual([]);
+
+    client.resume();
+    const sent = worker.take();
+    expect(sent).toContainEqual({
+      type: "setText",
+      path: "/main.typ",
+      text: text.toString(),
+    });
+    expect(sent.at(-1)).toEqual({ type: "compile", mainPath: "/main.typ" });
+  });
+});
+
 describe("CompilerClient fonts", () => {
   function fontSetup() {
     const project = initProject(newProject(1), { title: "T" });
@@ -454,6 +549,8 @@ describe("CompilerClient fonts", () => {
     worker.take();
 
     client.reinit({ assets: ["text", "cjk"], extra: ["https://x/y.ttf"] });
+    // The font bytes are not kept around, so a reinit loads them again.
+    await settle();
     const [msg] = worker.take();
     expect(msg?.type).toBe("reinit");
     if (msg?.type !== "reinit") return;

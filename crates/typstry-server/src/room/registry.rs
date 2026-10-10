@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::actor::RoomActor;
 use super::{ConnId, RoomCmd, RoomConfig};
@@ -15,7 +17,7 @@ pub enum JoinOutcome {
     Joined(mpsc::Sender<RoomCmd>),
     /// The room refused and already sent the client a JoinError.
     Refused,
-    /// The room kept unloading under us.
+    /// The room kept unloading under us, or the server is shutting down.
     Unavailable,
 }
 
@@ -27,8 +29,19 @@ pub struct RoomRegistry {
 pub(super) struct Inner {
     pub(super) db: SqlitePool,
     pub(super) config: RoomConfig,
-    rooms: Mutex<HashMap<String, RoomEntry>>,
+    /// Tells every actor to stop, for server shutdown.
+    pub(super) stop: CancellationToken,
+    rooms: Mutex<Rooms>,
+    actors: TaskTracker,
     next_id: AtomicU64,
+}
+
+#[derive(Default)]
+struct Rooms {
+    map: HashMap<String, RoomEntry>,
+    /// Set once shutdown starts. Checked under the same lock that spawns
+    /// actors, so none can start after shutdown collected the running ones.
+    closed: bool,
 }
 
 struct RoomEntry {
@@ -42,7 +55,9 @@ impl RoomRegistry {
             inner: Arc::new(Inner {
                 db,
                 config,
-                rooms: Mutex::new(HashMap::new()),
+                stop: CancellationToken::new(),
+                rooms: Mutex::new(Rooms::default()),
+                actors: TaskTracker::new(),
                 next_id: AtomicU64::new(1),
             }),
         }
@@ -53,17 +68,21 @@ impl RoomRegistry {
     }
 
     /// The room's command queue, spawning (and loading) the actor if needed.
-    /// The caller must already have checked that the project exists.
-    pub fn get(&self, project_id: &str) -> mpsc::Sender<RoomCmd> {
+    /// The caller must already have checked that the project exists. None
+    /// once shutdown has started.
+    pub fn get(&self, project_id: &str) -> Option<mpsc::Sender<RoomCmd>> {
         let mut rooms = self.inner.rooms.lock().expect("room registry poisoned");
-        if let Some(entry) = rooms.get(project_id)
+        if rooms.closed {
+            return None;
+        }
+        if let Some(entry) = rooms.map.get(project_id)
             && !entry.tx.is_closed()
         {
-            return entry.tx.clone();
+            return Some(entry.tx.clone());
         }
         let generation = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(ROOM_QUEUE);
-        rooms.insert(
+        rooms.map.insert(
             project_id.to_owned(),
             RoomEntry {
                 tx: tx.clone(),
@@ -71,8 +90,8 @@ impl RoomRegistry {
             },
         );
         let actor = RoomActor::new(project_id.to_owned(), generation, self.inner.clone());
-        tokio::spawn(actor.run(rx));
-        tx
+        self.inner.actors.spawn(actor.run(rx));
+        Some(tx)
     }
 
     /// Sends a join to the project's room and waits for its answer. A room
@@ -85,7 +104,9 @@ impl RoomRegistry {
         mut cmd: impl FnMut(oneshot::Sender<bool>) -> RoomCmd,
     ) -> JoinOutcome {
         for _ in 0..2 {
-            let room = self.get(project_id);
+            let Some(room) = self.get(project_id) else {
+                return JoinOutcome::Unavailable;
+            };
             let (reply, joined) = oneshot::channel();
             if room.send(cmd(reply)).await.is_err() {
                 continue;
@@ -103,6 +124,7 @@ impl RoomRegistry {
     pub fn loaded(&self, project_id: &str) -> Option<mpsc::Sender<RoomCmd>> {
         let rooms = self.inner.rooms.lock().expect("room registry poisoned");
         rooms
+            .map
             .get(project_id)
             .filter(|entry| !entry.tx.is_closed())
             .map(|entry| entry.tx.clone())
@@ -113,25 +135,21 @@ impl RoomRegistry {
             .rooms
             .lock()
             .expect("room registry poisoned")
+            .map
             .len()
     }
 
-    /// Stops every loaded room.
+    /// Stops every loaded room, all at once, and refuses to load new ones.
+    /// Each room finishes the commands already queued for it first.
     pub async fn shutdown(&self) {
-        let senders: Vec<_> = self
-            .inner
+        self.inner
             .rooms
             .lock()
             .expect("room registry poisoned")
-            .values()
-            .map(|entry| entry.tx.clone())
-            .collect();
-        for tx in senders {
-            let (done, wait) = oneshot::channel();
-            if tx.send(RoomCmd::Shutdown { done }).await.is_ok() {
-                let _ = wait.await;
-            }
-        }
+            .closed = true;
+        self.inner.stop.cancel();
+        self.inner.actors.close();
+        self.inner.actors.wait().await;
     }
 }
 
@@ -151,13 +169,13 @@ impl Inner {
         if !rx.is_empty() {
             return false;
         }
-        remove_generation(&mut rooms, project_id, generation);
+        remove_generation(&mut rooms.map, project_id, generation);
         true
     }
 
     pub(super) fn remove(&self, project_id: &str, generation: u64) {
         let mut rooms = self.rooms.lock().expect("room registry poisoned");
-        remove_generation(&mut rooms, project_id, generation);
+        remove_generation(&mut rooms.map, project_id, generation);
     }
 }
 

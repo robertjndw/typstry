@@ -1,48 +1,37 @@
 //! Name rules, mirroring `validateName` in `apps/web/src/doc/fs-ops.ts` and
 //! `normalizeBounded` in `apps/web/src/doc/names.ts`.
 
-use std::fmt;
-
 /// Longest file or folder name the UI accepts, in UTF-8 bytes.
 pub const MAX_NAME_BYTES: usize = 255;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NameError {
+    #[error("name must not be empty")]
     Empty,
     /// `.` or `..`.
+    #[error("\".\" and \"..\" are reserved")]
     Reserved,
+    #[error("name must not contain \"/\"")]
     Slash,
+    #[error("name must not contain \"\\\"")]
     Backslash,
+    #[error("name must not contain control characters")]
     ControlChar,
+    #[error("name must be at most {MAX_NAME_BYTES} bytes")]
     TooLong,
     /// `.git` or `.typstry` in some spelling, see [`is_reserved_segment`].
+    #[error("\".git\" and \".typstry\" are reserved")]
     ReservedName,
     /// The rest are fine on Unix but not on Windows. A project is shared
     /// across systems, so they are refused everywhere.
+    #[error("name must not contain \":\"")]
     Colon,
+    #[error("name must not end with a dot or a space")]
     TrailingDotOrSpace,
     /// `CON`, `NUL`, `COM1` and the like, see [`is_device_name`].
+    #[error("name is reserved for a device on Windows")]
     DeviceName,
 }
-
-impl fmt::Display for NameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Empty => "name must not be empty",
-            Self::Reserved => "\".\" and \"..\" are reserved",
-            Self::Slash => "name must not contain \"/\"",
-            Self::Backslash => "name must not contain \"\\\"",
-            Self::ControlChar => "name must not contain control characters",
-            Self::TooLong => "name must be at most 255 bytes",
-            Self::ReservedName => "\".git\" and \".typstry\" are reserved",
-            Self::Colon => "name must not contain \":\"",
-            Self::TrailingDotOrSpace => "name must not end with a dot or a space",
-            Self::DeviceName => "name is reserved for a device on Windows",
-        })
-    }
-}
-
-impl std::error::Error for NameError {}
 
 /// The browser's rules for a single path segment, plus a ban on backslashes.
 /// The browser allows those, but [`crate::materialize::is_safe_path`] treats
@@ -96,7 +85,17 @@ fn is_hfs_ignorable(c: char) -> bool {
 /// shared file at `.GIT/config` would otherwise land in a real `.git` and
 /// plant a git config, whose `core.fsmonitor` is a command git runs.
 pub fn is_reserved_segment(segment: &str) -> bool {
-    let visible: String = segment.chars().filter(|&c| !is_hfs_ignorable(c)).collect();
+    // Nearly every name is free of ignorable code points, and this runs for
+    // every segment of every path, so only those that have one get copied.
+    if segment.contains(is_hfs_ignorable) {
+        let visible: String = segment.chars().filter(|&c| !is_hfs_ignorable(c)).collect();
+        is_reserved_visible(&visible)
+    } else {
+        is_reserved_visible(segment)
+    }
+}
+
+fn is_reserved_visible(visible: &str) -> bool {
     let name = visible.trim_end_matches(['.', ' ']);
     name.eq_ignore_ascii_case("git~1")
         || RESERVED_DIRS
@@ -112,21 +111,23 @@ pub fn is_device_name(segment: &str) -> bool {
         .split('.')
         .next()
         .unwrap_or_default()
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    match stem.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
-        _ => ["COM", "LPT"].iter().any(|prefix| {
-            stem.strip_prefix(prefix).is_some_and(|n| {
-                let mut digits = n.chars();
-                // Windows counts the superscript digits as well.
-                matches!(
-                    (digits.next(), digits.next()),
-                    (Some('1'..='9' | '¹' | '²' | '³'), None)
-                )
-            })
-        }),
-    }
+        .trim_end_matches(' ');
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+        || ["COM", "LPT"].iter().any(|prefix| {
+            // A prefix that does not end on a char boundary cannot be ASCII.
+            stem.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                && {
+                    let mut digits = stem[prefix.len()..].chars();
+                    // Windows counts the superscript digits as well.
+                    matches!(
+                        (digits.next(), digits.next()),
+                        (Some('1'..='9' | '¹' | '²' | '³'), None)
+                    )
+                }
+        })
 }
 
 /// The rules only Windows needs. The colon matters most: `C:x` is a drive
@@ -151,19 +152,12 @@ pub(crate) fn is_portable_segment(segment: &str) -> bool {
 }
 
 /// The first segment of a path that breaks the name rules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{segment:?}: {error}")]
 pub struct InvalidSegment<'a> {
     pub segment: &'a str,
     pub error: NameError,
 }
-
-impl fmt::Display for InvalidSegment<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.segment, self.error)
-    }
-}
-
-impl std::error::Error for InvalidSegment<'_> {}
 
 /// A `/`-separated relative path is valid when every segment is, so empty
 /// segments (leading, trailing or doubled slashes) are rejected too.
@@ -271,6 +265,47 @@ mod tests {
             "connect.typ",
         ] {
             assert!(!is_device_name(name), "{name:?}");
+        }
+    }
+
+    fn reserved_reference(segment: &str) -> bool {
+        let visible: String = segment.chars().filter(|&c| !is_hfs_ignorable(c)).collect();
+        let name = visible.trim_end_matches(['.', ' ']);
+        name.eq_ignore_ascii_case("git~1")
+            || RESERVED_DIRS
+                .iter()
+                .any(|dir| name.eq_ignore_ascii_case(dir))
+    }
+
+    fn device_reference(segment: &str) -> bool {
+        let stem = segment
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        match stem.as_str() {
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+            _ => ["COM", "LPT"].iter().any(|prefix| {
+                stem.strip_prefix(prefix).is_some_and(|n| {
+                    let mut digits = n.chars();
+                    matches!(
+                        (digits.next(), digits.next()),
+                        (Some('1'..='9' | '¹' | '²' | '³'), None)
+                    )
+                })
+            }),
+        }
+    }
+
+    proptest::proptest! {
+        /// The allocation-free checks against the plain spelling of the rules.
+        #[test]
+        fn fast_paths_match_the_plain_rules(
+            segment in "[.gGiItT~1yYsSrRpPcCoOnNuUlLmMaAxX$ \u{200c}\u{feff}\u{b9}\u{e9}0-9]{0,10}"
+        ) {
+            proptest::prop_assert_eq!(is_reserved_segment(&segment), reserved_reference(&segment));
+            proptest::prop_assert_eq!(is_device_name(&segment), device_reference(&segment));
         }
     }
 

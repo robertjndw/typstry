@@ -23,6 +23,16 @@ pub struct PathIndex {
     pub by_id: BTreeMap<TreeID, PathEntry>,
 }
 
+/// The entries of `map` keyed by a path anywhere below `dir`, in order.
+pub fn entries_under<'a, V>(
+    map: &'a BTreeMap<String, V>,
+    dir: &str,
+) -> impl Iterator<Item = (&'a String, &'a V)> + use<'a, V> {
+    let prefix = format!("{dir}/");
+    map.range(prefix.clone()..)
+        .take_while(move |(path, _)| path.starts_with(&prefix))
+}
+
 /// Name shown for a node that lost a same-name clash: `main.typ` with id
 /// `3@42` becomes `main~3@42.typ`. A leading dot does not start an
 /// extension, so `.gitignore` becomes `.gitignore~3@42`.
@@ -73,18 +83,18 @@ pub fn build_path_index(doc: &LoroDoc) -> PathIndex {
         let Some(siblings) = children.remove(&parent) else {
             continue;
         };
-        for (live, name, renamed) in resolve_sibling_names(siblings) {
-            let path = format!("{prefix}{name}");
-            index.by_path.insert(path.clone(), live.id);
-            if live.kind == FileKind::Dir {
-                stack.push((Some(live.id), format!("{path}/")));
+        for sibling in resolve_sibling_names(siblings) {
+            let path = format!("{prefix}{}", sibling.name);
+            index.by_path.insert(path.clone(), sibling.id);
+            if sibling.kind == FileKind::Dir {
+                stack.push((Some(sibling.id), format!("{path}/")));
             }
             index.by_id.insert(
-                live.id,
+                sibling.id,
                 PathEntry {
                     path,
-                    kind: live.kind,
-                    renamed,
+                    kind: sibling.kind,
+                    renamed: sibling.renamed,
                 },
             );
         }
@@ -92,27 +102,44 @@ pub fn build_path_index(doc: &LoroDoc) -> PathIndex {
     index
 }
 
-pub(crate) fn resolve_sibling_names(siblings: Vec<LiveNode>) -> Vec<(LiveNode, String, bool)> {
-    let mut groups: BTreeMap<String, Vec<LiveNode>> = BTreeMap::new();
+/// A sibling with the name it is shown under.
+pub(crate) struct ShownNode {
+    pub(crate) id: TreeID,
+    pub(crate) kind: FileKind,
+    pub(crate) name: String,
+    /// True when it lost a same-name clash and `name` is derived.
+    pub(crate) renamed: bool,
+}
+
+/// The shown names of one folder's children, in name (byte) order and, among
+/// equal names, in TreeID order, the winner of each clash first.
+pub(crate) fn resolve_sibling_names(mut siblings: Vec<LiveNode>) -> Vec<ShownNode> {
+    // TreeID's derived Ord compares peer (u64) first, then counter.
+    siblings.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    let mut out: Vec<ShownNode> = Vec::with_capacity(siblings.len());
+    // Index in `out` of the current group's winner. It keeps its own name,
+    // and every later member of the group has that same name.
+    let mut winner = 0;
     for live in siblings {
-        groups.entry(live.name.clone()).or_default().push(live);
-    }
-    let mut out = Vec::new();
-    for mut group in groups.into_values() {
-        // TreeID's derived Ord compares peer (u64) first, then counter.
-        group.sort_by_key(|live| live.id);
-        for (i, live) in group.into_iter().enumerate() {
-            // A derived name could in theory equal a real sibling's name
-            // (someone literally named a file "main~3@42.typ"). That is
-            // vanishingly rare and left unresolved; only one of the two ends
-            // up in by_path.
-            if i == 0 {
-                let name = live.name.clone();
-                out.push((live, name, false));
-            } else {
-                let name = disambiguated_name(&live.name, live.id);
-                out.push((live, name, true));
-            }
+        // A derived name could in theory equal a real sibling's name
+        // (someone literally named a file "main~3@42.typ"). That is
+        // vanishingly rare and left unresolved; only one of the two ends up
+        // in by_path.
+        if out.get(winner).is_some_and(|w| w.name == live.name) {
+            out.push(ShownNode {
+                id: live.id,
+                kind: live.kind,
+                name: disambiguated_name(&live.name, live.id),
+                renamed: true,
+            });
+        } else {
+            winner = out.len();
+            out.push(ShownNode {
+                id: live.id,
+                kind: live.kind,
+                name: live.name,
+                renamed: false,
+            });
         }
     }
     out

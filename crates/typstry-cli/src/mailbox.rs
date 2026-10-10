@@ -23,8 +23,9 @@ pub const MAILBOX: &str = "requests";
 const REQUEST: &str = ".req";
 const RESPONSE: &str = ".res";
 
-/// Sync looks at the mailbox every few hundred milliseconds, unless it is
-/// in the middle of a long reconcile or upload.
+/// Sync looks at the mailbox when its file watcher sees a request, and
+/// every few seconds in case it missed one, unless it is in the middle of
+/// a long reconcile or upload.
 const PICKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Covers a reconcile plus waiting for the server's acks, which time out

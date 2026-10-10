@@ -57,8 +57,8 @@ import {
 import { stemLength } from "@/doc/names";
 import { fileCategory, type FileCategory } from "@/assets/file-types";
 import { cn } from "@/lib/utils";
-import { usePresence } from "@/presence/context";
-import type { RemotePeer } from "@/presence/presence";
+import { usePresenceSummary } from "@/presence/context";
+import type { PeerSummary } from "@/presence/presence";
 import { useProject } from "@/project/context";
 import {
   attempt,
@@ -76,9 +76,9 @@ type Editing =
 export function FileTree({ className }: { className?: string }) {
   const { project, index, mainFile, openFileId, openFile, readOnly, assets } =
     useProject();
-  const peers = usePresence();
+  const peers = usePresenceSummary();
   const peersByFile = useMemo(() => {
-    const map = new Map<TreeID, RemotePeer[]>();
+    const map = new Map<TreeID, PeerSummary[]>();
     for (const peer of peers) {
       if (!peer.fileId) continue;
       const list = map.get(peer.fileId);
@@ -624,7 +624,7 @@ function EntryEditItems({
   );
 }
 
-function PeerDots({ peers }: { peers: RemotePeer[] | undefined }) {
+function PeerDots({ peers }: { peers: PeerSummary[] | undefined }) {
   if (!peers?.length) return null;
   const names = peers.map((p) => p.name).join(", ");
   return (

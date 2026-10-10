@@ -63,13 +63,13 @@ fn counter(value: u64) -> Result<u64, String> {
 /// Reads the leading uleb128 count and checks it against the bytes left.
 /// The library pre-allocates from that count, so a hostile one like 2^60
 /// would abort the process before any bounds check runs.
-fn plausible_count(reader: &mut BytesReader<'_>, min_entry_bytes: usize) -> Result<(), String> {
+fn plausible_count(reader: &mut BytesReader<'_>, min_entry_bytes: usize) -> Result<u64, String> {
     let count = reader.read_uleb128()?;
     let room = (reader.remaining() / min_entry_bytes) as u64;
     if count > room {
         return Err(format!("count {count} exceeds the remaining bytes"));
     }
-    Ok(())
+    Ok(count)
 }
 
 impl<'a> SealedRecord<'a> {
@@ -118,6 +118,12 @@ pub fn decode_container(payload: &[u8]) -> Result<Vec<&[u8]>, String> {
     // Every record is at least its one-byte length prefix.
     plausible_count(&mut BytesReader::new(payload), 1)?;
     decode_elo_container(payload)
+}
+
+/// How many records a container says it holds, from its header alone, for
+/// callers that only need the count.
+pub fn container_len(payload: &[u8]) -> Result<u64, String> {
+    plausible_count(&mut BytesReader::new(payload), 1)
 }
 
 /// Parses every record of one update payload. All or nothing: a single bad

@@ -1,10 +1,8 @@
 //! Project seeding, mirroring `initProject` in `apps/web/src/doc/schema.ts`.
 
-use std::fmt;
-
 use loro::{LoroDoc, LoroError, LoroResult, LoroText, LoroValue, TreeID, TreeParentId};
 
-use crate::{FileKind, SCHEMA_VERSION, configure, meta, node, root, schema_version, string_value};
+use crate::{FileKind, SCHEMA_VERSION, configure, is_string, meta, node, root, schema_version};
 
 pub const DEFAULT_MAIN_FILE: &str = "main.typ";
 
@@ -60,28 +58,13 @@ fn seed(doc: &LoroDoc, title: &str, starter: bool) -> LoroResult<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SetMainFileError {
     /// The id is not a live text node.
+    #[error("not a text file: {0}")]
     NotATextFile(TreeID),
-    Loro(LoroError),
-}
-
-impl fmt::Display for SetMainFileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotATextFile(id) => write!(f, "not a text file: {id}"),
-            Self::Loro(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SetMainFileError {}
-
-impl From<LoroError> for SetMainFileError {
-    fn from(err: LoroError) -> Self {
-        Self::Loro(err)
-    }
+    #[error(transparent)]
+    Loro(#[from] LoroError),
 }
 
 /// Points `meta.mainFile` at a text node, or clears it with None. Commits
@@ -94,8 +77,7 @@ pub fn set_main_file(doc: &LoroDoc, id: Option<TreeID>) -> Result<(), SetMainFil
             let tree = doc.get_tree(root::FS);
             let is_text = tree.contains(id)
                 && !tree.is_node_deleted(&id)?
-                && string_value(tree.get_meta(id)?.get(node::KIND)).as_deref()
-                    == Some(FileKind::Text.as_str());
+                && is_string(tree.get_meta(id)?.get(node::KIND), FileKind::Text.as_str());
             if !is_text {
                 return Err(SetMainFileError::NotATextFile(id));
             }

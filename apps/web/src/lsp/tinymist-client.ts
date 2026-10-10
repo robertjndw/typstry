@@ -6,13 +6,19 @@ import {
   type Transport,
 } from "@codemirror/lsp-client";
 import { EditorState, type Extension } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
-import type { ContainerID, LoroEventBatch, TreeID } from "loro-crdt";
+import { EditorView, ViewPlugin } from "@codemirror/view";
+import type { ContainerID, TreeID } from "loro-crdt";
 
 import type { ProjectAssets } from "@/assets/project-assets";
 import { getText } from "@/doc/fs-ops";
-import { buildPathIndex } from "@/doc/paths";
-import { NODE, type ProjectDoc } from "@/doc/schema";
+import type { ProjectDoc } from "@/doc/schema";
+import {
+  projectIndex,
+  type ProjectIndex,
+  type ProjectIndexChange,
+  type ProjectIndexState,
+} from "@/project/project-index";
+import { RetryQueue } from "@/project/retry";
 
 import { pathCompletion } from "./path-completion";
 import type { TinymistRequest, TinymistResponse } from "./protocol";
@@ -42,7 +48,17 @@ const SYNC_DEBOUNCE_MS = 150;
 
 const encoder = new TextEncoder();
 
-function workerTransport(worker: Worker): Transport {
+/** The Worker surface used here, so tests can substitute a fake. */
+export type TinymistWorker = Pick<
+  Worker,
+  "postMessage" | "addEventListener" | "removeEventListener" | "terminate"
+>;
+
+export interface TinymistClientOptions {
+  worker?: TinymistWorker;
+}
+
+function workerTransport(worker: TinymistWorker): Transport {
   const handlers = new Map<
     (value: string) => void,
     (event: MessageEvent<TinymistResponse>) => void
@@ -87,29 +103,43 @@ interface AssetFile {
  */
 export class TinymistClient {
   readonly lsp: LSPClient;
-  private readonly worker: Worker;
+  private readonly worker: TinymistWorker;
   private readonly project: ProjectDoc;
   private readonly assets: ProjectAssets | null;
+  private readonly index: ProjectIndex;
 
   private readonly textsById = new Map<TreeID, TextFile>();
-  private readonly idByContainer = new Map<ContainerID, TreeID>();
   private readonly assetsByUri = new Map<string, AssetFile>();
+  private readonly retry = new RetryQueue();
+  /**
+   * URIs open in an editor, with how many editors show each. The LSP client
+   * keeps tinymist up to date on those itself.
+   */
+  private readonly openUris = new Map<string, number>();
   /** Project paths of every file, for path completion. */
   private paths: string[] = [];
   private readonly dirty = new Set<TreeID>();
   private structural = false;
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set while the editor is hidden, see pause(). */
+  private paused = false;
   private pinnedMain: string | null = null;
-  private readonly unsubscribeDoc: () => void;
+  private readonly unsubscribeIndex: () => void;
   private disposed = false;
 
-  constructor(project: ProjectDoc, assets: ProjectAssets | null) {
+  constructor(
+    project: ProjectDoc,
+    assets: ProjectAssets | null,
+    options: TinymistClientOptions = {},
+  ) {
     this.project = project;
     this.assets = assets;
-    this.worker = new Worker(new URL("./tinymist.worker.ts", import.meta.url), {
-      type: "module",
-      name: "tinymist",
-    });
+    this.worker =
+      options.worker ??
+      new Worker(new URL("./tinymist.worker.ts", import.meta.url), {
+        type: "module",
+        name: "tinymist",
+      });
     this.worker.addEventListener("message", this.onWorkerMessage);
     this.lsp = new LSPClient({
       rootUri: PROJECT_ROOT_URI,
@@ -125,10 +155,11 @@ export class TinymistClient {
       extensions: [serverCompletion(), hoverTooltips(), signatureHelp()],
     }).connect(workerTransport(this.worker));
 
-    this.unsubscribeDoc = project.doc.subscribe((batch) =>
-      this.onDocEvent(batch),
+    this.index = projectIndex(project);
+    this.unsubscribeIndex = this.index.subscribe((change) =>
+      this.onIndexChange(change),
     );
-    this.syncStructure();
+    this.syncStructure(this.index.state);
   }
 
   /** The editor extension for the file at project path `path`. */
@@ -136,17 +167,41 @@ export class TinymistClient {
     // Created once: CodeMirror tracks completion sources by identity, and a
     // fresh function per lookup would leave the completion pending forever.
     const data = [{ autocomplete: pathCompletion(path, () => this.paths) }];
+    const uri = projectUri(path);
     return [
-      this.lsp.plugin(projectUri(path), "typst"),
+      this.lsp.plugin(uri, "typst"),
+      ViewPlugin.define(() => {
+        this.opened(uri);
+        return { destroy: () => this.closed(uri) };
+      }),
       EditorState.languageData.of(() => data),
       lspTooltipTheme,
     ];
   }
 
+  /**
+   * Stops mirroring edits while no editor of the live project is shown (a
+   * version is open in its place). Changes are still tracked and go out on
+   * resume().
+   */
+  pause(): void {
+    if (this.paused || this.disposed) return;
+    this.paused = true;
+    if (this.syncTimer !== null) clearTimeout(this.syncTimer);
+    this.syncTimer = null;
+  }
+
+  resume(): void {
+    if (!this.paused || this.disposed) return;
+    this.paused = false;
+    if (this.structural || this.dirty.size > 0) this.scheduleSync();
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.unsubscribeDoc();
+    this.unsubscribeIndex();
+    this.retry.dispose();
     if (this.syncTimer !== null) clearTimeout(this.syncTimer);
     this.worker.removeEventListener("message", this.onWorkerMessage);
     this.lsp.disconnect();
@@ -165,24 +220,41 @@ export class TinymistClient {
     this.sendAsset(data.uri, asset);
   };
 
-  // Same split as CompilerClient.onDocEvent: an edit only resends its file,
-  // anything else (tree moves, renames, new containers) rescans the project.
-  private onDocEvent(batch: LoroEventBatch): void {
-    for (const event of batch.events) {
-      const id =
-        event.diff.type === "text"
-          ? this.idByContainer.get(event.target)
-          : undefined;
-      if (id !== undefined) this.dirty.add(id);
-      else this.structural = true;
+  private opened(uri: string): void {
+    this.openUris.set(uri, (this.openUris.get(uri) ?? 0) + 1);
+  }
+
+  private closed(uri: string): void {
+    const count = (this.openUris.get(uri) ?? 1) - 1;
+    if (count > 0) {
+      this.openUris.set(uri, count);
+      return;
     }
-    if (this.syncTimer !== null) return;
+    this.openUris.delete(uri);
+    // While the file was open, its edits reached tinymist through the LSP
+    // client only, so the mirror is out of date now that tinymist reads it.
+    for (const [id, file] of this.textsById) {
+      if (file.uri === uri) this.dirty.add(id);
+    }
+    this.scheduleSync();
+  }
+
+  // Edits only resend their file. Anything structural (tree moves, renames,
+  // new containers) is reconciled against the shared index on the next sync.
+  private onIndexChange(change: ProjectIndexChange): void {
+    for (const id of change.edited) this.dirty.add(id);
+    if (change.structural) this.structural = true;
+    this.scheduleSync();
+  }
+
+  private scheduleSync(): void {
+    if (this.syncTimer !== null || this.paused || this.disposed) return;
     this.syncTimer = setTimeout(() => {
       this.syncTimer = null;
-      if (this.structural) this.syncStructure();
+      if (this.structural) this.syncStructure(this.index.state);
       for (const id of this.dirty) {
         const file = this.textsById.get(id);
-        if (file) this.sendText(id, file.uri);
+        if (file && !this.openUris.has(file.uri)) this.sendText(id, file.uri);
       }
       this.dirty.clear();
     }, SYNC_DEBOUNCE_MS);
@@ -195,7 +267,8 @@ export class TinymistClient {
     } catch {
       return; // deleted meanwhile; the structure sync sends the removal
     }
-    this.post({ type: "setFile", uri, data: encoder.encode(text) });
+    const data = encoder.encode(text);
+    this.post({ type: "setFile", uri, data }, [data.buffer]);
   }
 
   private sendAsset(uri: string, asset: AssetFile): void {
@@ -203,72 +276,73 @@ export class TinymistClient {
     void this.assets?.load(hash).then(
       (data) => {
         // Replaced or removed while loading.
-        if (this.assetsByUri.get(uri)?.hash !== hash) return;
+        if (this.assetsByUri.get(uri) !== asset) return;
+        this.retry.succeeded(uri);
         this.post({ type: "setFile", uri, data }, [data.buffer]);
       },
-      (err: unknown) => console.error(`failed to load asset ${path}`, err),
+      (err: unknown) => {
+        console.error(`failed to load asset ${path}`, err);
+        // tinymist asks for a file once, so nobody else would retry it.
+        if (this.assetsByUri.get(uri) !== asset) return;
+        // Looks up the entry again instead of closing over `asset`: only one
+        // retry per URI is pending, so if the asset was replaced and the new
+        // version failed too, this retry is the only one left for it.
+        this.retry.schedule(uri, () => {
+          const current = this.assetsByUri.get(uri);
+          if (current?.requested) this.sendAsset(uri, current);
+        });
+      },
     );
   }
 
-  /** Recomputes paths and sends the worker the difference. */
-  private syncStructure(): void {
+  /** Brings the worker's mirror in line with the index. */
+  private syncStructure(state: ProjectIndexState): void {
     this.structural = false;
-    const index = buildPathIndex(this.project);
     const paths: string[] = [];
-    const seenTexts = new Set<TreeID>();
-    const seenAssets = new Set<string>();
-    for (const [id, entry] of index.byId) {
-      if (entry.kind === "dir") continue;
-      paths.push(entry.path);
-      const uri = projectUri(entry.path);
-      if (entry.kind === "text") {
-        let container: ContainerID;
-        try {
-          container = getText(this.project, id).id;
-        } catch {
-          continue; // content container not arrived yet
-        }
-        seenTexts.add(id);
-        const prev = this.textsById.get(id);
-        if (prev?.uri === uri && prev.container === container) continue;
-        if (prev) {
-          this.idByContainer.delete(prev.container);
-          if (prev.uri !== uri)
-            this.post({ type: "removeFile", uri: prev.uri });
-        }
-        this.textsById.set(id, { uri, container });
-        this.idByContainer.set(container, id);
-        this.dirty.delete(id);
-        this.sendText(id, uri);
-      } else {
-        const hash: unknown = this.project.fs
-          .getNodeByID(id)
-          ?.data.get(NODE.hash);
-        if (typeof hash !== "string") continue;
-        seenAssets.add(uri);
-        const prev = this.assetsByUri.get(uri);
-        if (prev?.hash === hash) continue;
-        const asset = { path: entry.path, hash, requested: !!prev?.requested };
-        this.assetsByUri.set(uri, asset);
-        if (asset.requested) this.sendAsset(uri, asset);
-      }
-    }
+    for (const entry of state.paths.byId.values())
+      if (entry.kind !== "dir") paths.push(entry.path);
     this.paths = paths;
+
+    // Every removal goes out before any write: a file deleted while another
+    // moves onto its path, two files swapping paths, or an asset replaced by
+    // a text file at the same path would otherwise have the worker drop the
+    // file that just arrived.
+    const nextAssets = new Map<string, { path: string; hash: string }>();
+    for (const { path, hash } of state.assets.values())
+      nextAssets.set(projectUri(path), { path, hash });
     for (const [id, file] of this.textsById) {
-      if (seenTexts.has(id)) continue;
-      this.textsById.delete(id);
-      this.idByContainer.delete(file.container);
-      this.dirty.delete(id);
+      const next = state.texts.get(id);
+      if (next && projectUri(next.path) === file.uri) continue;
+      if (!next) {
+        this.textsById.delete(id);
+        this.dirty.delete(id);
+      }
       this.post({ type: "removeFile", uri: file.uri });
     }
     for (const uri of this.assetsByUri.keys()) {
-      if (seenAssets.has(uri)) continue;
+      if (nextAssets.has(uri)) continue;
       this.assetsByUri.delete(uri);
       this.post({ type: "removeFile", uri });
     }
 
-    const mainId = this.project.mainFile;
-    const mainPath = mainId ? index.byId.get(mainId)?.path : undefined;
+    for (const [id, file] of state.texts) {
+      const uri = projectUri(file.path);
+      const prev = this.textsById.get(id);
+      if (prev?.uri === uri && prev.container === file.container) continue;
+      this.textsById.set(id, { uri, container: file.container });
+      this.dirty.delete(id);
+      this.sendText(id, uri);
+    }
+    for (const [uri, { path, hash }] of nextAssets) {
+      const prev = this.assetsByUri.get(uri);
+      if (prev?.hash === hash) continue;
+      const asset = { path, hash, requested: !!prev?.requested };
+      this.assetsByUri.set(uri, asset);
+      if (asset.requested) this.sendAsset(uri, asset);
+    }
+
+    const mainId = state.mainFile;
+    const mainPath = mainId ? state.paths.byId.get(mainId)?.path : undefined;
     this.pinMain(mainPath ?? null);
   }
 

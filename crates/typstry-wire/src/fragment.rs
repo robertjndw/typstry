@@ -26,8 +26,14 @@ pub fn random_batch_id() -> BatchId {
 }
 
 /// Encodes one update as a single `DocUpdate`, or as a header plus fragments
-/// when it would not fit in one message.
-pub fn encode_update(crdt: CrdtType, room_id: &str, update: &[u8]) -> Vec<Vec<u8>> {
+/// when it would not fit in one message. An owned update that fits a single
+/// message is moved into it rather than copied, which matters for a server
+/// relaying every update to every peer.
+pub fn encode_update(
+    crdt: CrdtType,
+    room_id: &str,
+    update: impl AsRef<[u8]> + Into<Vec<u8>>,
+) -> Vec<Vec<u8>> {
     encode_batch(crdt, room_id, random_batch_id(), update)
 }
 
@@ -37,18 +43,27 @@ pub fn encode_batch(
     crdt: CrdtType,
     room_id: &str,
     batch_id: BatchId,
-    update: &[u8],
+    update: impl AsRef<[u8]> + Into<Vec<u8>>,
 ) -> Vec<Vec<u8>> {
-    if update.len() <= FRAGMENT_LIMIT {
-        let msg = ProtocolMessage::DocUpdate {
-            crdt,
-            room_id: room_id.to_owned(),
-            updates: vec![update.to_vec()],
-            batch_id,
-        };
-        return vec![encode(&msg).expect("update below the fragment limit fits")];
+    if update.as_ref().len() <= FRAGMENT_LIMIT {
+        return vec![single(crdt, room_id, batch_id, update.into())];
     }
+    fragments(crdt, room_id, batch_id, update.as_ref())
+}
 
+/// An update of at most [`FRAGMENT_LIMIT`] bytes as one `DocUpdate`.
+fn single(crdt: CrdtType, room_id: &str, batch_id: BatchId, update: Vec<u8>) -> Vec<u8> {
+    let msg = ProtocolMessage::DocUpdate {
+        crdt,
+        room_id: room_id.to_owned(),
+        updates: vec![update],
+        batch_id,
+    };
+    encode(&msg).expect("update below the fragment limit fits")
+}
+
+/// A larger update as a header plus fragments.
+fn fragments(crdt: CrdtType, room_id: &str, batch_id: BatchId, update: &[u8]) -> Vec<Vec<u8>> {
     let chunks = update.chunks(FRAGMENT_LIMIT);
     let mut out = Vec::with_capacity(chunks.len() + 1);
     out.push(
@@ -77,7 +92,7 @@ pub fn encode_batch(
 }
 
 /// Key of an in-flight batch: CRDT magic, room id and batch id.
-pub type BatchKey = ([u8; 4], String, BatchId);
+type BatchKey = ([u8; 4], String, BatchId);
 
 struct Pending {
     crdt: CrdtType,
@@ -219,7 +234,7 @@ mod tests {
 
     #[test]
     fn small_update_is_a_single_message() {
-        let msgs = encode_update(CrdtType::Elo, "room", b"abc");
+        let msgs = encode_update(CrdtType::Elo, "room", &b"abc"[..]);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(
             decode(&msgs[0]).unwrap(),
@@ -230,7 +245,21 @@ mod tests {
     #[test]
     fn large_update_round_trips_through_fragments() {
         let data: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
-        let msgs = encode_update(CrdtType::Elo, "room", &data);
+        let msgs = encode_update(CrdtType::Elo, "room", data.as_slice());
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(reassemble(&msgs), data);
+    }
+
+    #[test]
+    fn owned_updates_encode_the_same() {
+        let small = encode_update(CrdtType::Elo, "room", b"abc".to_vec());
+        assert_eq!(small.len(), 1);
+        assert!(matches!(
+            decode(&small[0]).unwrap(),
+            ProtocolMessage::DocUpdate { updates, .. } if updates == vec![b"abc".to_vec()]
+        ));
+        let data: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        let msgs = encode_update(CrdtType::Elo, "room", data.clone());
         assert_eq!(msgs.len(), 4);
         assert_eq!(reassemble(&msgs), data);
     }

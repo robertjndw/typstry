@@ -15,6 +15,7 @@ pub mod track;
 pub mod version;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::bail;
@@ -95,6 +96,54 @@ impl Ctx {
             },
         }
     }
+
+    /// [`Self::open_or_ask`] for commands that only read the project, with
+    /// the cached doc brought up to date unless `fetch` says not to.
+    pub async fn open_current(
+        &self,
+        request: Request,
+        fetch: &Fetch,
+    ) -> anyhow::Result<Option<(Session, Output)>> {
+        let Some(mut session) = self.open_or_ask(request).await? else {
+            return Ok(None);
+        };
+        let mut out = Output::terminal();
+        fetch.refresh(&mut session, &mut out).await?;
+        Ok(Some((session, out)))
+    }
+}
+
+/// `--offline`, for commands that read the project but can make do with
+/// the cached copy.
+#[derive(Debug, clap::Args)]
+pub struct Fetch {
+    /// Use the cached copy of the project instead of fetching.
+    #[arg(long)]
+    pub offline: bool,
+}
+
+impl Fetch {
+    pub async fn refresh(&self, session: &mut Session, out: &mut Output) -> anyhow::Result<()> {
+        if !self.offline {
+            session.refresh().await?;
+            print_warnings(out, session);
+        }
+        Ok(())
+    }
+}
+
+/// Runs `body` connected, and disconnects afterwards whatever happened, so
+/// the server sees a close frame rather than a dropped socket.
+pub async fn connected<T>(
+    session: &mut Session,
+    body: impl AsyncFnOnce(&mut Session) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let result = match session.connect().await {
+        Ok(()) => body(session).await,
+        Err(err) => Err(err),
+    };
+    session.disconnect().await;
+    result
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -144,37 +193,22 @@ pub fn track_branch(
 pub fn guard_branch(session: &mut Session, force: bool, out: &mut Output) -> anyhow::Result<()> {
     let (repo, head) = track_branch(session, out)?.unzip();
     let state = GitState::of(repo.as_ref().zip(head), session.config.branch.as_deref());
-    let warning = match state {
-        GitState::Clear => return Ok(()),
-        GitState::Busy(op) => {
-            if !force {
-                bail!("git is in the middle of {op}; finish it first (use --force to sync anyway)");
-            }
-            format!("git is in the middle of {op}, syncing anyway")
-        }
-        GitState::Elsewhere {
-            head,
-            tracked: Some(tracked),
-        } => {
-            if !force {
-                bail!("on {head}, typstry tracks {tracked} (use --force to sync anyway)");
-            }
-            format!("on {head}, typstry tracks {tracked}; syncing anyway")
-        }
-        // A repo that was only ever seen with a detached HEAD.
-        GitState::Elsewhere {
-            head,
-            tracked: None,
-        } => {
-            if !force {
-                bail!(
-                    "on {head}, and typstry does not track a branch yet (use `typstry track <branch>` or --force)"
-                );
-            }
-            return Ok(());
-        }
+    let Some(reason) = state.reason() else {
+        return Ok(());
     };
-    out.err(format!("warning: {warning}"));
+    // A repo that was only ever seen with a detached HEAD has no branch
+    // to suggest going back to.
+    let untracked = matches!(state, GitState::Elsewhere { tracked: None, .. });
+    if !force {
+        match state {
+            GitState::Busy(_) => bail!("{reason}; finish it first (use --force to sync anyway)"),
+            _ if untracked => bail!("{reason} (use `typstry track <branch>` or --force)"),
+            _ => bail!("{reason} (use --force to sync anyway)"),
+        }
+    }
+    if !untracked {
+        out.err(format!("warning: {reason}; syncing anyway"));
+    }
     Ok(())
 }
 
@@ -197,7 +231,7 @@ pub async fn guard_switch(session: &mut Session, force: bool) -> anyhow::Result<
 fn switch_refusal(local: &BTreeMap<String, ChangeKind>) -> anyhow::Error {
     let mut list = String::new();
     for (path, kind) in local {
-        list.push_str(&format!("\n  {} {path}", kind.symbol()));
+        let _ = write!(list, "\n  {} {path}", kind.symbol());
     }
     anyhow::anyhow!(
         "git switched branches or reset since the last sync, and {} file(s) differ from it:{list}\n\
@@ -284,6 +318,10 @@ fn print_report(out: &mut Output, report: &Report) {
     for skipped in &report.status.skipped {
         warn_skipped(out, skipped);
     }
+    print_report_warnings(out, report);
+}
+
+fn print_report_warnings(out: &mut Output, report: &Report) {
     for warning in &report.warnings {
         out.err(format!("warning: {warning}"));
     }
@@ -304,6 +342,10 @@ fn print_applied(out: &mut Output, applied: &ApplyReport, verb: &str) {
     for path in &applied.deleted {
         out.out(format!("\u{2191} {path} (deleted)"));
     }
+    print_not_applied(out, applied, verb);
+}
+
+fn print_not_applied(out: &mut Output, applied: &ApplyReport, verb: &str) {
     for skipped in &applied.skipped {
         out.err(format!(
             "warning: not {verb} {}: {}",

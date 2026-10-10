@@ -56,6 +56,22 @@ describe("ProjectProvider", () => {
     expect(hook.result.current.index.byId.get(other)?.path).toBe("renamed.typ");
   });
 
+  it("keeps the same value when a change leaves the files alone", () => {
+    const { project, hook } = setup();
+    const before = hook.result.current;
+
+    act(() => project.setPeer("7", { name: "Ada", color: "#000" }));
+    expect(hook.result.current).toBe(before);
+
+    act(() => {
+      project.meta.set("title", "Renamed");
+      project.doc.commit();
+    });
+    expect(hook.result.current).not.toBe(before);
+    expect(hook.result.current.title).toBe("Renamed");
+    expect(hook.result.current.index).toBe(before.index);
+  });
+
   it("opens new tabs next to the active one", () => {
     const { project, other, hook } = setup();
     const main = project.mainFile!;

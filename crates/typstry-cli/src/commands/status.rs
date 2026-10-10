@@ -4,28 +4,25 @@ use crate::engine::{ChangeKind, Scope, Session};
 use crate::mailbox::Request;
 use crate::watch::GitState;
 
-use super::{Ctx, Output, print_list, print_warnings, track_branch, warn_skipped};
+use super::{Ctx, Fetch, Output, print_list, track_branch, warn_skipped};
 
 /// Show files changed locally and remotely since the last sync.
 ///
 /// While `typstry sync` runs in the folder, the running sync answers.
 #[derive(Debug, clap::Args)]
+#[command(mut_arg("offline", |arg| {
+    arg.help("Compare against the cached copy of the project instead of fetching")
+}))]
 pub struct Args {
-    /// Compare against the cached copy of the project instead of fetching.
-    #[arg(long)]
-    pub offline: bool,
+    #[command(flatten)]
+    pub fetch: Fetch,
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
-    let Some(mut session) = ctx.open_or_ask(Request::Status).await? else {
+    let Some((mut session, mut out)) = ctx.open_current(Request::Status, &args.fetch).await? else {
         return Ok(());
     };
-    let mut out = Output::terminal();
     track_branch(&mut session, &mut out)?;
-    if !args.offline {
-        session.refresh().await?;
-        print_warnings(&mut out, &mut session);
-    }
     print_status(&mut session, &mut out).await
 }
 
@@ -33,23 +30,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 pub async fn print_status(session: &mut Session, out: &mut Output) -> anyhow::Result<()> {
     let repo = session.repo().cloned();
     let found = repo.as_ref().map(|repo| (repo, repo.head()));
-    match GitState::of(found, session.config.branch.as_deref()) {
-        GitState::Clear => {}
-        GitState::Busy(op) => out.out(format!(
-            "git is in the middle of {op}: pull and push are paused until it is done"
-        )),
-        GitState::Elsewhere {
-            head,
-            tracked: Some(tracked),
-        } => out.out(format!(
-            "on {head}, typstry tracks {tracked}: pull and push are paused"
-        )),
-        GitState::Elsewhere {
-            head,
-            tracked: None,
-        } => out.out(format!(
-            "on {head}, and typstry does not track a branch yet: pull and push are paused"
-        )),
+    if let Some(reason) = GitState::of(found, session.config.branch.as_deref()).reason() {
+        out.out(format!("{reason}: pull and push are paused"));
     }
     let status = session.status(&Scope::Full).await?;
     let lines = |changes: &BTreeMap<String, ChangeKind>| {

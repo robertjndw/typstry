@@ -3,7 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Serialize;
 
-use super::{AppState, internal};
+use super::{AppError, AppState};
 use crate::store::projects;
 
 #[derive(Debug, Serialize)]
@@ -28,8 +28,8 @@ pub struct ShareInfo {
 /// does send (`{}`, say) is never read, so it cannot make creation fail.
 pub async fn create(
     State(state): State<AppState>,
-) -> Result<(StatusCode, Json<CreatedProject>), StatusCode> {
-    let project = projects::create(&state.db).await.map_err(internal)?;
+) -> Result<(StatusCode, Json<CreatedProject>), AppError> {
+    let project = projects::create(&state.db).await?;
     Ok((
         StatusCode::CREATED,
         Json(CreatedProject {
@@ -43,14 +43,13 @@ pub async fn create(
 pub async fn share(
     State(state): State<AppState>,
     Path(token): Path<String>,
-) -> Result<Json<ShareInfo>, StatusCode> {
-    match projects::resolve_share(&state.db, &token).await {
-        Ok(Some(found)) => Ok(Json(ShareInfo {
-            project_id: found.project_id,
-            permission: found.permission.as_str(),
-            view_token: found.view_token,
-        })),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(err) => Err(internal(err)),
-    }
+) -> Result<Json<ShareInfo>, AppError> {
+    let found = projects::resolve_share(&state.db, &token)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ShareInfo {
+        project_id: found.project_id,
+        permission: found.permission.as_str(),
+        view_token: found.view_token,
+    }))
 }

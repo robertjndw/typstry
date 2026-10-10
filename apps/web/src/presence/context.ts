@@ -1,7 +1,7 @@
 import { createContext, useContext, useSyncExternalStore } from "react";
 
 import type { Identity } from "./identity";
-import type { Presence, RemotePeer } from "./presence";
+import type { PeerSummary, Presence } from "./presence";
 
 export interface PresenceContextValue {
   presence: Presence;
@@ -15,15 +15,19 @@ export function usePresenceContext(): PresenceContextValue | null {
   return useContext(PresenceContext);
 }
 
-const EMPTY: readonly RemotePeer[] = [];
+const EMPTY: readonly PeerSummary[] = [];
 const noopSubscribe = () => () => {};
 const getEmpty = () => EMPTY;
 
-/** Everybody else in the project, sorted by name. */
-export function usePresence(): readonly RemotePeer[] {
+/**
+ * Everybody else in the project and their open file, sorted by name. Does
+ * not re-render on selection changes; the editor reads those from the
+ * Presence itself.
+ */
+export function usePresenceSummary(): readonly PeerSummary[] {
   const presence = useContext(PresenceContext)?.presence;
   return useSyncExternalStore(
     presence ? presence.subscribe : noopSubscribe,
-    presence ? presence.getPeers : getEmpty,
+    presence ? presence.getSummary : getEmpty,
   );
 }

@@ -6,12 +6,10 @@ use anyhow::{Context, bail};
 use super::init::absolute;
 use super::{Ctx, Output, print_report, print_warnings, track_branch};
 use crate::api::Api;
-use crate::engine::{Mode, Scope, Session};
+use crate::engine::{Flush, Mode, Scope, Session};
 use crate::git::{self, Repo};
 use crate::link::ShareLink;
 use crate::state::{STATE_DIR, StateDir};
-
-const LINK_VAR: &str = "TYPSTRY_LINK";
 
 /// Copy a project into a new folder and link the folder to it.
 #[derive(Debug, clap::Args)]
@@ -25,7 +23,9 @@ runs, so on shared machines pass it on standard input instead:
 or in the environment, as TYPSTRY_LINK, with the link argument left out.")]
 pub struct Args {
     /// The edit or view link from the share dialog, including the `#key`;
-    /// `-` reads it from standard input. Defaults to $TYPSTRY_LINK.
+    /// `-` reads it from standard input.
+    // The link holds the key, so --help must not echo it.
+    #[arg(env = "TYPSTRY_LINK", hide_env_values = true)]
     pub link: Option<String>,
     /// Where to put the files; must be new or empty. Defaults to a folder
     /// named after the project title.
@@ -78,7 +78,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         );
     }
 
-    let share = Api::new(&link.origin)?.resolve_share(&link.token).await?;
+    let api = Api::new(&link.origin)?;
+    let share = api.resolve_share(&link.token).await?;
     let staging = match &explicit {
         Some(dir) => dir.clone(),
         None => parent.join(format!(".typstry-clone-{}", share.project_id)),
@@ -87,7 +88,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let created = !staging.exists();
     fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
 
-    let title = match fetch(&staging, &link, &share, ctx).await {
+    let title = match fetch(&staging, &link, &share, api.clone(), ctx).await {
         Ok(title) => title,
         Err(err) => {
             // Leaves the folder as it was: empty, or gone if we made it.
@@ -115,8 +116,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         }
     };
 
-    let mut session = Session::open(&root, ctx.name.as_deref())?;
-    let report = session.reconcile(&Scope::Full, Mode::Pull).await?;
+    let mut session = Session::open_with_api(&root, ctx.name.as_deref(), api)?;
+    let report = session
+        .reconcile(&Scope::Full, Mode::Pull, Flush::Now)
+        .await?;
     let mut out = Output::terminal();
     print_report(&mut out, &report);
 
@@ -147,18 +150,20 @@ async fn fetch(
     dir: &Path,
     link: &ShareLink,
     share: &crate::api::ShareInfo,
+    api: Api,
     ctx: &Ctx,
 ) -> anyhow::Result<Option<String>> {
-    let mut session = Session::create(dir, link, share, ctx.name.as_deref())?;
+    let mut session = Session::create_with_api(dir, link, share, api, ctx.name.as_deref())?;
     session.connect().await?;
     session.disconnect().await;
     print_warnings(&mut Output::terminal(), &mut session);
     session.save()?;
-    Ok(typstry_doc::title(&session.doc))
+    Ok(typstry_doc::title(session.doc()))
 }
 
 fn read_link(arg: Option<&str>) -> anyhow::Result<String> {
-    match arg {
+    // clap hands over a set but empty TYPSTRY_LINK as a value.
+    match arg.filter(|link| !link.trim().is_empty()) {
         Some("-") => {
             let mut line = String::new();
             std::io::stdin()
@@ -170,9 +175,7 @@ fn read_link(arg: Option<&str>) -> anyhow::Result<String> {
             Ok(line)
         }
         Some(link) => Ok(link.to_owned()),
-        None => std::env::var(LINK_VAR).map_err(|_| {
-            anyhow::anyhow!("pass the link, `-` to read it from standard input, or set {LINK_VAR}")
-        }),
+        None => bail!("pass the link, `-` to read it from standard input, or set TYPSTRY_LINK"),
     }
 }
 

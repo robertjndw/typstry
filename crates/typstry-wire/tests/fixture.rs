@@ -67,7 +67,7 @@ fn check(fixture: &Fixture) -> ProjectKey {
     assert_eq!(fixture.key, RAW_KEY);
     let editor = ProjectKey::from_base64url(&fixture.key).unwrap();
     assert_eq!(editor.key_id(), fixture.key_id);
-    assert_eq!(editor.view_secret(), fixture.view_key);
+    assert_eq!(*editor.view_secret(), fixture.view_key);
     // Everything below must work with the view secret alone.
     let key = ProjectKey::from_base64url(&fixture.view_key).unwrap();
     assert_eq!(key.key_id(), fixture.key_id);
@@ -145,7 +145,7 @@ fn rust_fixture() -> Fixture {
     let blob = b"#set text(lang: \"de\")\n";
     Fixture {
         key: RAW_KEY.into(),
-        view_key: key.view_secret(),
+        view_key: key.view_secret().to_string(),
         key_id: key.key_id().into(),
         delta: Delta {
             peer: u64::MAX.to_string(),
