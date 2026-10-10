@@ -217,6 +217,10 @@ struct Live {
     pause: Option<Pause>,
     holding: bool,
     held_count: usize,
+    /// The user published the folder as it is. Until a push records where
+    /// HEAD is now, the base still remembers HEAD from before the switch,
+    /// so `git_switched` would put the hold straight back.
+    published: bool,
     retry_at: Option<Instant>,
     last_error: Option<String>,
     reconnect_at: Option<Instant>,
@@ -249,6 +253,7 @@ impl Live {
             pause: None,
             holding: false,
             held_count: 0,
+            published: false,
             retry_at: None,
             last_error: None,
             reconnect_at: None,
@@ -274,6 +279,7 @@ impl Live {
         let marker = self.hold_marker();
         if publish {
             remove_marker(&marker)?;
+            self.published = true;
         }
         match &mut self.pause {
             // Whatever happened while sync was not running, the folder
@@ -550,6 +556,8 @@ impl Live {
         }
         self.notify(Notice::Resumed);
         if pause.left_branch {
+            // Another switch after publishing needs its own check.
+            self.published = false;
             self.clear_local_queue();
             self.check_tree().await;
             if !self.holding {
@@ -623,6 +631,7 @@ impl Live {
         }
         println!("sync: publishing held changes");
         self.release();
+        self.published = true;
         self.queue_rescan();
     }
 
@@ -645,7 +654,7 @@ impl Live {
         // A `git reset --hard` or a quick checkout round trip can come and
         // go between two git polls without ever showing up as a pause. The
         // reconcile below records where HEAD is, so this only fires once.
-        if self.session.git_switched() {
+        if !self.published && self.session.git_switched() {
             self.check_tree().await;
             if self.holding {
                 return;
@@ -662,7 +671,10 @@ impl Live {
             .reconcile_live_holding(&scope, Mode::Push, &hot)
             .await
         {
-            Ok(Reconciled::Done(mut report)) => self.after(&mut report).await,
+            Ok(Reconciled::Done(mut report)) => {
+                self.published = false;
+                self.after(&mut report).await
+            }
             Ok(Reconciled::Held(paths)) => {
                 self.pending.extend(batch);
                 self.rescan |= full;
@@ -1019,7 +1031,7 @@ impl Live {
         if self.pause.is_none()
             && !self.holding
             && self.session.can_write()
-            && !self.session.git_switched()
+            && (self.published || !self.session.git_switched())
         {
             // Covers edits the watcher has not reported yet.
             match self.session.reconcile_live(&Scope::Full, Mode::Push).await {
