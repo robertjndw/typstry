@@ -149,6 +149,11 @@ impl RoomActor {
         version: &[u8],
         outbox: Outbox,
     ) -> bool {
+        // Checked before the backfill is built, which for most versions
+        // means copying the doc.
+        if !outbox.start_backfill(crdt) {
+            return false;
+        }
         let (server_version, extra, frames): (_, _, Arc<[Bytes]>) = match crdt {
             CrdtType::Elo => {
                 let client = if version.is_empty() {
@@ -208,7 +213,7 @@ impl RoomActor {
             return false;
         }
         for frame in frames.iter() {
-            if !outbox.push_backfill(frame.clone()) {
+            if !outbox.push_backfill(crdt, frame.clone()) {
                 return false;
             }
         }

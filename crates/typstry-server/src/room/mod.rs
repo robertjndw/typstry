@@ -59,11 +59,13 @@ pub struct Outbox {
     max_bytes: usize,
 }
 
-/// What budgeted frames currently sit in the queue.
+/// What budgeted frames currently sit in the queue, and the backfill
+/// bytes queued per CRDT outside that budget.
 #[derive(Debug, Default)]
 struct Budget {
     frames: AtomicUsize,
     bytes: AtomicUsize,
+    backfill: [AtomicUsize; 2],
 }
 
 impl Budget {
@@ -73,10 +75,25 @@ impl Budget {
     }
 }
 
+/// Which backfill counter a CRDT's joins use. Only `%ELO` and `%EPH` are
+/// ever joined.
+fn backfill_slot(crdt: CrdtType) -> usize {
+    match crdt {
+        CrdtType::Elo => 0,
+        _ => 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Charge {
+    Budget,
+    Backfill(usize),
+}
+
 #[derive(Debug)]
 struct Queued {
     frame: Outbound,
-    budgeted: bool,
+    charge: Charge,
 }
 
 /// The writer task's end of an [`Outbox`].
@@ -122,7 +139,7 @@ impl Outbox {
             .tx
             .send(Queued {
                 frame,
-                budgeted: true,
+                charge: Charge::Budget,
             })
             .is_err()
         {
@@ -139,15 +156,36 @@ impl Outbox {
     /// past it could never be loaded again: every fresh client would
     /// overflow, reconnect and overflow again. The backfill is bounded by
     /// the doc itself, and live relays queued behind it still get the full
-    /// budget on their own, so a stalled client holds at most one backfill
-    /// plus the budget.
-    pub fn push_backfill(&self, frame: Bytes) -> bool {
-        self.tx
+    /// budget on their own. A join only starts once the last backfill of
+    /// the same CRDT is out (see [`Self::start_backfill`]), so a stalled
+    /// client holds at most one backfill per CRDT plus the budget.
+    pub fn push_backfill(&self, crdt: CrdtType, frame: Bytes) -> bool {
+        let slot = backfill_slot(crdt);
+        let cost = frame.len();
+        self.budget.backfill[slot].fetch_add(cost, Ordering::AcqRel);
+        let sent = self
+            .tx
             .send(Queued {
                 frame: Outbound::Binary(frame),
-                budgeted: false,
+                charge: Charge::Backfill(slot),
             })
-            .is_ok()
+            .is_ok();
+        if !sent {
+            self.budget.backfill[slot].fetch_sub(cost, Ordering::AcqRel);
+        }
+        sent
+    }
+
+    /// Whether a join of `crdt` may queue its backfill. A client that never
+    /// reads could otherwise rejoin over and over and have the server queue
+    /// a copy of the doc for every join, since backfill skips the budget.
+    /// False, with overflow signalled, while an earlier one is still queued.
+    pub fn start_backfill(&self, crdt: CrdtType) -> bool {
+        if self.budget.backfill[backfill_slot(crdt)].load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        self.overflow.notify_one();
+        false
     }
 
     /// Encodes and queues a message; false if it could not be sent.
@@ -164,9 +202,12 @@ impl Outbox {
 
 impl OutboxReceiver {
     pub async fn recv(&mut self) -> Option<Outbound> {
-        let Queued { frame, budgeted } = self.rx.recv().await?;
-        if budgeted {
-            self.budget.release(frame.cost());
+        let Queued { frame, charge } = self.rx.recv().await?;
+        match charge {
+            Charge::Budget => self.budget.release(frame.cost()),
+            Charge::Backfill(slot) => {
+                self.budget.backfill[slot].fetch_sub(frame.cost(), Ordering::AcqRel);
+            }
         }
         Some(frame)
     }
@@ -277,7 +318,7 @@ mod tests {
         let (outbox, mut rx) = Outbox::channel(2, 100);
         let overflow = outbox.overflow_signal();
         for _ in 0..10 {
-            assert!(outbox.push_backfill(Bytes::from(vec![0; 60])));
+            assert!(outbox.push_backfill(CrdtType::Elo, Bytes::from(vec![0; 60])));
         }
         assert!(overflow.notified().now_or_never().is_none());
 
@@ -293,5 +334,21 @@ mod tests {
         assert!(!outbox.push(frame(60)));
         assert!(rx.recv().await.is_some());
         assert!(outbox.push(frame(60)));
+    }
+
+    #[tokio::test]
+    async fn a_join_waits_for_the_last_backfill_of_its_crdt() {
+        let (outbox, mut rx) = Outbox::channel(16, 100);
+        let overflow = outbox.overflow_signal();
+        assert!(outbox.start_backfill(CrdtType::Elo));
+        assert!(outbox.push_backfill(CrdtType::Elo, Bytes::from(vec![0; 60])));
+        // Presence has its own backfill and is not held up by the doc's.
+        assert!(outbox.start_backfill(CrdtType::LoroEphemeralStore));
+        assert!(overflow.notified().now_or_never().is_none());
+
+        assert!(!outbox.start_backfill(CrdtType::Elo));
+        assert!(overflow.notified().now_or_never().is_some());
+        assert!(rx.recv().await.is_some());
+        assert!(outbox.start_backfill(CrdtType::Elo));
     }
 }
