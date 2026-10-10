@@ -14,16 +14,24 @@ interface ParsedCombo {
   alt: boolean;
 }
 
+// The keydown handler runs on every keystroke typed in the editor, and the
+// combos are a handful of string literals, so parse each one only once.
+const parsed = new Map<string, ParsedCombo>();
+
 function parse(combo: string): ParsedCombo {
+  const cached = parsed.get(combo);
+  if (cached) return cached;
   const parts = combo.split("+");
   // "Mod++" would split into empty strings; nothing here uses it.
   const key = parts.pop()!.toLowerCase();
-  return {
+  const result = {
     key,
     mod: parts.includes("Mod"),
     shift: parts.includes("Shift"),
     alt: parts.includes("Alt"),
   };
+  parsed.set(combo, result);
+  return result;
 }
 
 const CODES: Record<string, string> = { "\\": "Backslash", "/": "Slash" };

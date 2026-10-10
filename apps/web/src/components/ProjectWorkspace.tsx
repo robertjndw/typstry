@@ -73,8 +73,10 @@ export function ProjectWorkspace({
   const [tagging, setTagging] = useState<TagTarget | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  const [viewing, setViewing] = useState<VersionTarget | null>(null);
-  const [viewingChanges, setViewingChanges] = useState(false);
+  const [viewing, setViewing] = useState<{
+    target: VersionTarget;
+    changes: boolean;
+  } | null>(null);
   const [grouping] = useState(groupingFromLocation);
   const layout = useWorkspaceLayout("workspace");
   const root = useRef<HTMLDivElement>(null);
@@ -233,15 +235,13 @@ export function ProjectWorkspace({
         open={historyOpen}
         onOpenChange={setHistoryOpen}
         grouping={grouping}
-        selected={viewing?.key ?? null}
+        selected={viewing?.target.key ?? null}
         onSelect={(target) => {
-          setViewing(target);
-          setViewingChanges(false);
+          setViewing({ target, changes: false });
           setHistoryOpen(false);
         }}
         onShowChanges={(target) => {
-          setViewing(target);
-          setViewingChanges(true);
+          setViewing({ target, changes: true });
           setHistoryOpen(false);
         }}
         assets={assets}
@@ -264,13 +264,13 @@ export function ProjectWorkspace({
           <VersionView
             // Remounted when "Show changes" is picked for the version
             // already open, so it switches to the diff.
-            key={`${viewing.key}:${viewingChanges}`}
+            key={`${viewing.target.key}:${viewing.changes}`}
             project={project}
-            target={viewing}
+            target={viewing.target}
             assets={assets}
             canRestore={!readOnly}
             onClose={() => setViewing(null)}
-            showChangesOnOpen={viewingChanges}
+            showChangesOnOpen={viewing.changes}
           />
         </div>
       ) : (

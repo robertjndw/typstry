@@ -41,6 +41,11 @@ const STEPS: [Intl.RelativeTimeFormatUnit, number][] = [
   ["year", Infinity],
 ];
 
+/** A full date and time, e.g. "Oct 10, 2026, 14:05". */
+export function formatAbsolute(time: number): string {
+  return absolute.format(time);
+}
+
 export function formatRelative(time: number, now = Date.now()): string {
   let value = (time - now) / 1000;
   for (const [unit, size] of STEPS) {

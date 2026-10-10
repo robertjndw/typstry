@@ -23,12 +23,12 @@ import {
 } from "react";
 
 import {
-  pageIndexAt,
   pointAt,
   positionOf,
   type DocPoint,
   type Layout,
 } from "@/components/preview/geometry";
+import { ToolbarButton } from "@/components/ToolbarButton";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -44,6 +44,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatShortcut } from "@/lib/platform";
 import type { CompilerClient, PreviewState } from "@/typst/compiler-client";
 import { formatLocation, type ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewState } from "@/typst/hooks";
@@ -91,11 +92,6 @@ interface Anchor {
 
 const clampZoom = (scale: number) =>
   Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, scale));
-
-const isMac =
-  typeof navigator !== "undefined" &&
-  /Mac|iP(hone|ad)/.test(navigator.platform);
-const MOD = isMac ? "⌘" : "Ctrl+";
 
 export function PreviewPane({
   client,
@@ -265,11 +261,8 @@ export function PreviewPane({
   const onScroll = () => {
     const el = viewportRef.current;
     if (!el || pages.length === 0 || renderedScale.current === null) return;
-    const layout = layoutFor(el, renderedScale.current);
     centerPoint.current = readCenter(el, renderedScale.current);
-    setCurrentPage(
-      pageIndexAt(pages, layout, el.scrollTop + el.clientHeight / 2),
-    );
+    setCurrentPage(centerPoint.current.page);
     setScrolling(true);
     clearTimeout(idleTimer.current);
     idleTimer.current = setTimeout(
@@ -309,30 +302,24 @@ export function PreviewPane({
     />
   );
   const zoomOut = (
-    <WithTooltip label={`Zoom out (${MOD}-)`}>
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        aria-label="Zoom out"
-        disabled={scale <= MIN_ZOOM}
-        onClick={() => stepZoom(1 / ZOOM_STEP)}
-      >
-        <ZoomOut />
-      </Button>
-    </WithTooltip>
+    <ToolbarButton
+      label="Zoom out"
+      shortcut="Mod+-"
+      disabled={scale <= MIN_ZOOM}
+      onClick={() => stepZoom(1 / ZOOM_STEP)}
+    >
+      <ZoomOut />
+    </ToolbarButton>
   );
   const zoomIn = (
-    <WithTooltip label={`Zoom in (${MOD}+)`}>
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        aria-label="Zoom in"
-        disabled={scale >= MAX_ZOOM}
-        onClick={() => stepZoom(ZOOM_STEP)}
-      >
-        <ZoomIn />
-      </Button>
-    </WithTooltip>
+    <ToolbarButton
+      label="Zoom in"
+      shortcut="Mod+="
+      disabled={scale >= MAX_ZOOM}
+      onClick={() => stepZoom(ZOOM_STEP)}
+    >
+      <ZoomIn />
+    </ToolbarButton>
   );
 
   return (
@@ -356,17 +343,16 @@ export function PreviewPane({
             {zoomOut}
             {zoomMenu}
             {zoomIn}
-            <WithTooltip label={`Fit pages to the pane width (${MOD}0)`}>
-              <Button
-                variant={zoom.mode === "fit" ? "secondary" : "ghost"}
-                size="icon-sm"
-                aria-label="Fit width"
-                aria-pressed={zoom.mode === "fit"}
-                onClick={() => applyZoom({ mode: "fit" })}
-              >
-                <MoveHorizontal />
-              </Button>
-            </WithTooltip>
+            <ToolbarButton
+              label="Fit width"
+              tooltip="Fit pages to the pane width"
+              shortcut="Mod+0"
+              variant={zoom.mode === "fit" ? "secondary" : "ghost"}
+              aria-pressed={zoom.mode === "fit"}
+              onClick={() => applyZoom({ mode: "fit" })}
+            >
+              <MoveHorizontal />
+            </ToolbarButton>
           </div>
         </div>
       )}
@@ -479,7 +465,9 @@ function ZoomMenu({
             <DropdownMenuRadioItem key={fit.value} value={fit.value}>
               {fit.label}
               {fit.value === defaultMode && (
-                <DropdownMenuShortcut>{MOD}0</DropdownMenuShortcut>
+                <DropdownMenuShortcut>
+                  {formatShortcut("Mod+0")}
+                </DropdownMenuShortcut>
               )}
             </DropdownMenuRadioItem>
           ))}

@@ -155,7 +155,8 @@ export function assertImportable(source: ImportSource): void {
   }
   const tooLarge = [...source.files]
     .filter(
-      ([path, bytes]) => !isText(path, bytes) && bytes.length > MAX_ASSET_BYTES,
+      // Size first: decoding a large text file just to skip it is wasted.
+      ([path, bytes]) => bytes.length > MAX_ASSET_BYTES && !isText(path, bytes),
     )
     .map(([path]) => path)
     .sort();

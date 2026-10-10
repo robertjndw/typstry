@@ -8,6 +8,7 @@ import { fileCategory } from "@/assets/file-types";
 import { AssetView } from "@/components/AssetView";
 import { FileTabs } from "@/components/FileTabs";
 import { EntryIcon } from "@/components/FileTree";
+import { ShortcutKeys } from "@/components/ShortcutKeys";
 import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
 import { Editor } from "@/editor/Editor";
@@ -15,7 +16,7 @@ import { imageDrop } from "@/editor/image-drop";
 import { typstLanguage } from "@/editor/language";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
 import type { TinymistClient } from "@/lsp/tinymist-client";
-import { shortcutKeys } from "@/lib/platform";
+import { SHORTCUTS } from "@/lib/shortcuts";
 import { cn } from "@/lib/utils";
 import { usePresenceContext } from "@/presence/context";
 import { useProject } from "@/project/context";
@@ -182,26 +183,11 @@ export function EditorPane({
   );
 }
 
-function Kbd({ combo }: { combo: string }) {
-  return (
-    <kbd className="flex items-center gap-0.5">
-      {shortcutKeys(combo).map((key) => (
-        <span
-          key={key}
-          className="inline-flex h-5 min-w-5 items-center justify-center rounded border bg-muted/60 px-1 font-sans text-[11px] font-medium text-muted-foreground"
-        >
-          {key}
-        </span>
-      ))}
-    </kbd>
-  );
-}
-
 function Hint({ combo, children }: { combo: string; children: ReactNode }) {
   return (
     <li className="flex items-center justify-between gap-6">
       <span>{children}</span>
-      <Kbd combo={combo} />
+      <ShortcutKeys combo={combo} />
     </li>
   );
 }
@@ -275,10 +261,10 @@ function EmptyEditor({ recent }: { recent: readonly TreeID[] }) {
         )}
 
         <ul className="mt-5 flex w-full flex-col gap-2 border-t pt-4 text-xs text-muted-foreground">
-          <Hint combo="Mod+P">Open a file</Hint>
-          <Hint combo="Mod+S">Sync now</Hint>
-          <Hint combo="Mod+B">Toggle files</Hint>
-          <Hint combo={"Mod+\\"}>Toggle preview</Hint>
+          <Hint combo={SHORTCUTS.quickOpen}>Open a file</Hint>
+          <Hint combo={SHORTCUTS.syncNow}>Sync now</Hint>
+          <Hint combo={SHORTCUTS.toggleFiles}>Toggle files</Hint>
+          <Hint combo={SHORTCUTS.togglePreview}>Toggle preview</Hint>
         </ul>
       </div>
     </div>

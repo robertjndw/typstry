@@ -31,6 +31,7 @@ import {
 import { toast } from "sonner";
 
 import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
+import { ToolbarButton } from "@/components/ToolbarButton";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -700,35 +701,6 @@ function Badge({ tip, children }: { tip: string; children: ReactNode }) {
         <span className="flex shrink-0 items-center">{children}</span>
       </TooltipTrigger>
       <TooltipContent side="right">{tip}</TooltipContent>
-    </Tooltip>
-  );
-}
-
-function ToolbarButton({
-  label,
-  disabled,
-  onClick,
-  children,
-}: {
-  label: string;
-  disabled?: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={label}
-          disabled={disabled}
-          onClick={onClick}
-        >
-          {children}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
     </Tooltip>
   );
 }

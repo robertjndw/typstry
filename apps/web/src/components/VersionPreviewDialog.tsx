@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/tooltip";
 import { ProjectDoc } from "@/doc/schema";
 import {
+  formatAbsolute,
   formatRelative,
   type HistoryItem,
   type VersionTarget,
@@ -126,7 +127,7 @@ function PreviewBody({
   const when = target.time !== null ? formatRelative(target.time) : null;
   const authors = authorsOf(item);
   const details = [
-    target.time !== null ? absolute.format(target.time) : null,
+    target.time !== null ? formatAbsolute(target.time) : null,
     item.detail,
     authors.length > 0 ? `by ${authors.join(", ")}` : null,
   ].filter(Boolean);
@@ -317,8 +318,3 @@ function NavButton({
     </Tooltip>
   );
 }
-
-const absolute = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-});

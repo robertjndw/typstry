@@ -83,6 +83,10 @@ export function groupChanges(
   cuts: readonly OpId[][] = [],
 ): ChangeGroup[] {
   const cutKeys = new Set(cuts.map(frontiersKey));
+  // The change just included always ends up in the frontier, so the
+  // frontier can only match a cut right after a change that ends on one of
+  // its ids. Checking that first skips rebuilding the frontier per change.
+  const cutIds = new Set(cuts.flat().map(opIdKey));
   const byPeer = new Map<PeerID, ChangeInfo[]>();
   for (const change of input) {
     let list = byPeer.get(change.peer);
@@ -167,7 +171,7 @@ export function groupChanges(
     );
     const first = current.changes[0]!;
     groups.push({
-      id: `${first.counter}@${first.peer}`,
+      id: opIdKey(first),
       start: current.first > 0 ? current.first * 1000 : null,
       end: current.prev > 0 ? current.prev * 1000 : null,
       authors,
@@ -187,7 +191,10 @@ export function groupChanges(
         Math.max(depended.get(dep.peer) ?? -1, dep.counter),
       );
     }
-    if (cutKeys.size > 0 && cutKeys.has(frontiersKey(currentFrontiers())))
+    if (
+      cutIds.has(opIdKey({ peer: change.peer, counter: end })) &&
+      cutKeys.has(frontiersKey(currentFrontiers()))
+    )
       cutReached = true;
   };
 
@@ -221,11 +228,12 @@ export function groupChanges(
   return groups;
 }
 
+function opIdKey(id: OpId): string {
+  return `${id.counter}@${id.peer}`;
+}
+
 function frontiersKey(frontiers: readonly OpId[]): string {
-  return frontiers
-    .map((id) => `${id.counter}@${id.peer}`)
-    .sort()
-    .join(",");
+  return frontiers.map(opIdKey).sort().join(",");
 }
 
 export function readChanges(doc: LoroDoc): ChangeInfo[] {
@@ -339,7 +347,7 @@ export function computeHistory(
   const touched = new Map<string, ContainerID[]>();
   const changes = readChanges(doc).map((c) => {
     const containers = changedContainers(doc, c);
-    touched.set(`${c.counter}@${c.peer}`, containers);
+    touched.set(opIdKey(c), containers);
     return isMeta(containers) ? { ...c, meta: true } : c;
   });
   const groups = groupChanges(changes, options, cuts);
@@ -347,7 +355,7 @@ export function computeHistory(
   return groups.map((group) => {
     const files = new Set<TreeID>();
     for (const c of group.changes) {
-      for (const cid of touched.get(`${c.counter}@${c.peer}`)!) {
+      for (const cid of touched.get(opIdKey(c))!) {
         const owner = owners.get(cid);
         if (owner) files.add(owner);
       }

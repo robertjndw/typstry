@@ -91,11 +91,7 @@ function TagForm({
       onDone();
       return;
     }
-    const tagged = saveVersion(
-      project,
-      name,
-      current ? {} : { frontiers: target.frontiers },
-    );
+    const tagged = saveVersion(project, name, { frontiers });
     toast.success(`Tagged "${tagged.name}"`);
     onDone();
   }

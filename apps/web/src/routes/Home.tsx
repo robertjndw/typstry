@@ -27,16 +27,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { readDrop, readPicked, type PendingImport } from "@/import/sources";
 import { assertImportable, ImportError, writeImport } from "@/import/import";
-import { formatRelative } from "@/project/history-items";
+import { formatAbsolute, formatRelative } from "@/project/history-items";
 import { createLocalProject, deleteLocalProject } from "@/project/create";
-import { loadRecent, type RecentProject } from "@/project/recent";
+import { loadRecent, projectUrl, type RecentProject } from "@/project/recent";
 
 const TITLE_MAX_LENGTH = 120;
-
-const dateFormat = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
 
 const FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
   {
@@ -93,7 +88,7 @@ export function Home() {
     setError(null);
     try {
       const created = await createLocalProject(title.trim() || "Untitled");
-      navigate(`/p/${encodeURIComponent(created.editToken)}#${created.key}`);
+      navigate(projectUrl(created.editToken, created.key, ""));
     } catch (err) {
       console.error(err);
       setError("Could not create a project. Is the server running?");
@@ -128,7 +123,7 @@ export function Home() {
           { description: source.skipped.slice(0, 5).join(", ") },
         );
       }
-      navigate(`/p/${encodeURIComponent(created.editToken)}#${created.key}`);
+      navigate(projectUrl(created.editToken, created.key, ""));
     } catch (err) {
       console.error(err);
       setError(
@@ -337,7 +332,7 @@ export function Home() {
                     </span>
                     <time
                       dateTime={new Date(p.visitedAt).toISOString()}
-                      title={dateFormat.format(p.visitedAt)}
+                      title={formatAbsolute(p.visitedAt)}
                       className="shrink-0 text-xs text-muted-foreground tabular-nums"
                     >
                       {capitalize(formatRelative(p.visitedAt, now))}

@@ -38,32 +38,20 @@ export function WorkspaceLayout({
   const { ids } = layout;
 
   if (layout.isMobile) {
+    const slots = { files, editor, preview };
     return (
       <div className="flex min-h-0 flex-1 flex-col">
-        <section
-          id={ids.files}
-          aria-label="Files"
-          hidden={layout.view !== "files"}
-          className="min-h-0 flex-1"
-        >
-          {files}
-        </section>
-        <section
-          id={ids.editor}
-          aria-label="Editor"
-          hidden={layout.view !== "editor"}
-          className="min-h-0 flex-1"
-        >
-          {editor}
-        </section>
-        <section
-          id={ids.preview}
-          aria-label="Preview"
-          hidden={layout.view !== "preview"}
-          className="min-h-0 flex-1"
-        >
-          {preview}
-        </section>
+        {VIEWS.map(({ view, label }) => (
+          <section
+            key={view}
+            id={ids[view]}
+            aria-label={label}
+            hidden={layout.view !== view}
+            className="min-h-0 flex-1"
+          >
+            {slots[view]}
+          </section>
+        ))}
         <nav
           aria-label="Workspace views"
           className="grid shrink-0 grid-cols-3 gap-1 border-t bg-background px-2 pt-1 pb-[max(0.25rem,env(safe-area-inset-bottom))]"

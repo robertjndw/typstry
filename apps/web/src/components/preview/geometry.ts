@@ -39,8 +39,8 @@ export function contentWidth(pages: PageSize[], layout: Layout): number {
 
 function pageTop(pages: PageSize[], layout: Layout, index: number): number {
   let top = layout.padding;
-  for (const page of pages.slice(0, index)) {
-    top += page.height * layout.scale + layout.gap;
+  for (let i = 0; i < index; i++) {
+    top += pages[i]!.height * layout.scale + layout.gap;
   }
   return top;
 }

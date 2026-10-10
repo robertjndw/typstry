@@ -40,6 +40,7 @@ import { readJson, writeJson } from "@/lib/storage";
 import { cn } from "@/lib/utils";
 import {
   buildHistoryItems,
+  formatAbsolute,
   formatRelative,
   type HistoryItem,
   type VersionTarget,
@@ -295,7 +296,7 @@ function HistoryRow({
 }) {
   const { target, tags } = item;
   const when = target.time !== null ? formatRelative(target.time) : null;
-  const exact = target.time !== null ? absolute.format(target.time) : undefined;
+  const exact = target.time !== null ? formatAbsolute(target.time) : undefined;
   const titleId = useId();
 
   return (
@@ -395,7 +396,7 @@ function TagBadge({
 }) {
   return (
     <span
-      title={`Tagged ${absolute.format(tag.createdAt)}`}
+      title={`Tagged ${formatAbsolute(tag.createdAt)}`}
       className={cn(
         "inline-flex h-5 max-w-full items-center gap-1 rounded-full border bg-secondary pl-1.5 text-[11px] font-medium text-secondary-foreground",
         onRemove ? "pr-0.5" : "pr-2",
@@ -456,11 +457,6 @@ function RowAction({
     </Tooltip>
   );
 }
-
-const absolute = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
 
 function LoadingRows() {
   return (
