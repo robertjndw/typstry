@@ -22,11 +22,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let Some(mut session) = ctx.open_or_ask(Request::Pull).await? else {
         return Ok(());
     };
-    guard_branch(&mut session, args.force)?;
+    let mut out = Output::terminal();
+    guard_branch(&mut session, args.force, &mut out)?;
     session.connect().await?;
     let report = session.reconcile(&Scope::Full, Mode::Pull).await?;
     session.disconnect().await;
-    print_report(&mut Output::terminal(), &report);
+    print_report(&mut out, &report);
     if !report.conflicts.is_empty() {
         return Err(Conflicts {
             paths: report.conflicts,
@@ -34,13 +35,13 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         .into());
     }
     if report.written.is_empty() && report.deleted.is_empty() {
-        println!("Already up to date.");
+        out.out("Already up to date.");
     }
     if !report.status.local.is_empty() {
-        println!(
+        out.out(format!(
             "{} local change(s) not pushed yet; see typstry status",
             report.status.local.len()
-        );
+        ));
     }
     Ok(())
 }

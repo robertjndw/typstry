@@ -1,18 +1,19 @@
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use loro::Frontiers;
 use tokio::sync::mpsc;
 
-use crate::engine::{Mode, RemoteEvent, Report, Scope, Session};
+use crate::engine::{Mode, Reconciled, RemoteEvent, Report, Scope, Session};
 use crate::git::{GitMark, Head, Repo};
 use crate::mailbox::{Mailbox, Request, Response};
 use crate::watch::{Change, GitState, Seen, Synced, Watcher};
 
 use super::{
-    Ctx, Output, info, print_applied, print_report, push, status, switch_refusal, track_branch,
-    version,
+    Ctx, Output, info, print_applied, print_report, print_warnings, push, status, switch_refusal,
+    track_branch, version,
 };
 
 /// Remote changes are written this long after the first one arrives, so a
@@ -180,10 +181,22 @@ struct Pause {
     /// Where HEAD was on the last poll that found git done, if the one
     /// before found it busy or elsewhere.
     settled: Option<GitMark>,
-    announced: bool,
     since: Instant,
-    /// The last pause line printed, to print again only on news.
+    /// The last pause line printed, to print again only on news. Also
+    /// says whether the pause was announced at all.
     shown: Option<String>,
+}
+
+impl Pause {
+    fn new(left_branch: bool, start: Option<GitMark>, since: Instant) -> Self {
+        Pause {
+            left_branch,
+            start,
+            settled: None,
+            since,
+            shown: None,
+        }
+    }
 }
 
 struct Live {
@@ -258,7 +271,7 @@ impl Live {
         self.synced.refresh(&self.session)?;
         self.reconnect().await;
         self.poll_git().await;
-        let marker = self.session.state().dir().join(HOLD_MARKER);
+        let marker = self.hold_marker();
         if publish {
             remove_marker(&marker)?;
         }
@@ -275,8 +288,7 @@ impl Live {
                     }
                 }
                 if !self.holding {
-                    self.rescan = true;
-                    self.local_at = Some(Instant::now());
+                    self.queue_rescan();
                 }
             }
         }
@@ -423,6 +435,7 @@ impl Live {
         if self.dirty && Instant::now() >= self.last_save + SAVE_EVERY {
             self.save();
         }
+        print_warnings(&mut Output::terminal(), &mut self.session);
     }
 
     /// Whether the doc holds remote changes the folder does not have yet.
@@ -452,14 +465,17 @@ impl Live {
     }
 
     async fn poll_git(&mut self) {
-        let repo = match track_branch(&mut self.session) {
-            Ok(found) => found.map(|(repo, _)| repo),
+        let (repo, head) = match track_branch(&mut self.session, &mut Output::terminal()) {
+            Ok(found) => found.unzip(),
             Err(err) => {
                 self.error(&err);
                 return;
             }
         };
-        let state = GitState::of(repo.as_ref(), self.session.config.branch.as_deref());
+        let state = GitState::of(
+            repo.as_ref().zip(head),
+            self.session.config.branch.as_deref(),
+        );
         let now = Instant::now();
         match state {
             GitState::Clear => {
@@ -488,20 +504,14 @@ impl Live {
             }
             GitState::Busy(op) => {
                 let fresh = self.pause.is_none();
-                let pause = self.pause.get_or_insert(Pause {
-                    left_branch: false,
-                    start: repo.as_ref().map(|r| r.mark()),
-                    settled: None,
-                    announced: false,
-                    since: now,
-                    shown: None,
-                });
+                let pause = self
+                    .pause
+                    .get_or_insert_with(|| Pause::new(false, repo.as_ref().map(|r| r.mark()), now));
                 pause.settled = None;
-                let line = format!("sync: paused, git is in the middle of {op}");
-                if !pause.announced && now >= pause.since + ANNOUNCE_BUSY_AFTER {
-                    pause.announced = true;
-                    pause.shown = Some(line.clone());
+                if pause.shown.is_none() && now >= pause.since + ANNOUNCE_BUSY_AFTER {
+                    let line = format!("sync: paused, git is in the middle of {op}");
                     println!("{line}");
+                    pause.shown = Some(line);
                 }
                 if fresh {
                     self.notify(Notice::Paused);
@@ -509,17 +519,11 @@ impl Live {
             }
             GitState::Elsewhere { head, tracked } => {
                 let fresh = self.pause.is_none();
-                let pause = self.pause.get_or_insert(Pause {
-                    left_branch: true,
-                    start: repo.as_ref().map(|r| r.mark()),
-                    settled: None,
-                    announced: false,
-                    since: now,
-                    shown: None,
-                });
+                let pause = self
+                    .pause
+                    .get_or_insert_with(|| Pause::new(true, repo.as_ref().map(|r| r.mark()), now));
                 pause.left_branch = true;
                 pause.settled = None;
-                pause.announced = true;
                 let line = match (&head, tracked) {
                     (_, Some(tracked)) => format!("sync: paused, on {head} (tracks {tracked})"),
                     (Head::Detached, None) => "sync: paused, on a detached HEAD and no branch is tracked yet; check out a branch or use typstry track".to_owned(),
@@ -532,9 +536,7 @@ impl Live {
                 // Edits made before the switch that were still waiting
                 // belong to the tracked branch; they are part of what the
                 // check on return looks at.
-                self.pending.clear();
-                self.rescan = false;
-                self.local_at = None;
+                self.clear_local_queue();
                 if fresh {
                     self.notify(Notice::Paused);
                 }
@@ -543,20 +545,17 @@ impl Live {
     }
 
     async fn resume(&mut self, pause: Pause) {
-        if pause.announced {
+        if pause.shown.is_some() {
             println!("sync: resumed");
         }
         self.notify(Notice::Resumed);
         if pause.left_branch {
-            self.pending.clear();
-            self.rescan = false;
-            self.local_at = None;
+            self.clear_local_queue();
             self.check_tree().await;
             if !self.holding {
                 // The tree matches the base, but a rescan is cheap and
                 // catches anything the watcher could not attribute.
-                self.rescan = true;
-                self.local_at = Some(Instant::now());
+                self.queue_rescan();
             }
         }
     }
@@ -596,7 +595,7 @@ impl Live {
 
     fn hold(&mut self) {
         self.holding = true;
-        let marker = self.session.state().dir().join(HOLD_MARKER);
+        let marker = self.hold_marker();
         if let Err(err) = std::fs::write(&marker, b"") {
             eprintln!("warning: cannot write {}: {err}", marker.display());
         }
@@ -607,7 +606,7 @@ impl Live {
         self.holding = false;
         self.held_count = 0;
         self.blocked = None;
-        if let Err(err) = remove_marker(&self.session.state().dir().join(HOLD_MARKER)) {
+        if let Err(err) = remove_marker(&self.hold_marker()) {
             eprintln!("warning: {err:#}");
         }
         self.notify(Notice::Released);
@@ -624,8 +623,7 @@ impl Live {
         }
         println!("sync: publishing held changes");
         self.release();
-        self.rescan = true;
-        self.local_at = Some(Instant::now());
+        self.queue_rescan();
     }
 
     async fn sync_local(&mut self) {
@@ -644,19 +642,23 @@ impl Live {
             self.recheck_hold().await;
             return;
         }
-        if let Some(until) = self.hot_until(&batch).await {
-            self.pending.extend(batch);
-            self.rescan |= full;
-            self.local_at = Some(until);
-            return;
-        }
+        let hot = self.hot(&batch);
         let scope = if full {
             Scope::Full
         } else {
             Scope::Paths(batch.clone())
         };
-        match self.reconcile(&scope, Mode::Push).await {
-            Ok(report) => self.after(&report).await,
+        match self
+            .session
+            .reconcile_live_holding(&scope, Mode::Push, &hot)
+            .await
+        {
+            Ok(Reconciled::Done(mut report)) => self.after(&mut report).await,
+            Ok(Reconciled::Held(paths)) => {
+                self.pending.extend(batch);
+                self.rescan |= full;
+                self.local_at = Some(self.hot_until(&paths));
+            }
             Err(err) => {
                 self.pending.extend(batch);
                 self.rescan |= full;
@@ -689,32 +691,46 @@ impl Live {
     }
 
     async fn sync_remote(&mut self) {
-        if let Some(until) = self.hot_until(&BTreeSet::new()).await {
-            self.remote_due = Some(until);
-            return;
-        }
+        let hot = self.hot(&BTreeSet::new());
         let empty = Scope::Paths(BTreeSet::new());
         let outbound = self.session.can_write() && !self.holding;
         let mode = if outbound { Mode::Push } else { Mode::Pull };
-        match self.reconcile(&empty, mode).await {
-            Ok(report) => {
+        match self
+            .session
+            .reconcile_live_holding(&empty, mode, &hot)
+            .await
+        {
+            Ok(Reconciled::Held(paths)) => self.remote_due = Some(self.hot_until(&paths)),
+            Ok(Reconciled::Done(mut report)) => {
                 if !report.conflicts.is_empty() {
                     println!(
                         "sync: remote changes to {} wait until the local changes to them are published or undone",
                         report.conflicts.join(", ")
                     );
                 }
-                self.after(&report).await;
+                self.after(&mut report).await;
             }
             Err(err) => self.error(&err),
         }
     }
 
-    async fn reconcile(&mut self, scope: &Scope, mode: Mode) -> anyhow::Result<Report> {
-        self.session.reconcile_live(scope, mode).await
+    fn queue_rescan(&mut self) {
+        self.rescan = true;
+        self.local_at = Some(Instant::now());
     }
 
-    async fn after(&mut self, report: &Report) {
+    fn clear_local_queue(&mut self) {
+        self.pending.clear();
+        self.rescan = false;
+        self.local_at = None;
+    }
+
+    fn hold_marker(&self) -> PathBuf {
+        self.session.state().dir().join(HOLD_MARKER)
+    }
+
+    /// Takes the reconcile's base files for the watcher filter.
+    async fn after(&mut self, report: &mut Report) {
         self.dirty = true;
         // Files the reconcile left alone only fit once the folder or the
         // doc changes again.
@@ -722,9 +738,8 @@ impl Live {
             (!self.session.base.pins.is_empty()).then(|| self.session.doc.oplog_frontiers());
         self.last_error = None;
         print_lines(report);
-        if let Err(err) = self.synced.refresh(&self.session) {
-            self.error(&err);
-        }
+        self.synced
+            .update(&self.session, std::mem::take(&mut report.base));
         if report.applied.changed
             && self.session.is_connected()
             && let Err(err) = self.session.push_local().await
@@ -733,33 +748,41 @@ impl Live {
         }
     }
 
-    /// When the [`HOT`] hold ends for files with remote changes, if any of
-    /// them were saved locally a moment ago. `except` are the paths about
-    /// to be reconciled anyway: their local version goes in first.
-    async fn hot_until(&mut self, except: &BTreeSet<String>) -> Option<Instant> {
+    /// Paths saved locally a moment ago: a reconcile waits for [`HOT`] if
+    /// any of them changed remotely. `except` are the paths about to be
+    /// reconciled anyway: their local version goes in first.
+    fn hot(&mut self, except: &BTreeSet<String>) -> BTreeSet<String> {
         let now = Instant::now();
         self.saved.retain(|_, at| *at + HOT > now);
-        if self.saved.keys().all(|path| except.contains(path))
-            || self.session.doc.oplog_frontiers() == self.session.base.frontiers().ok()?
-        {
-            return None;
+        match self.session.base.frontiers() {
+            // Without remote ops past the base, nothing can have changed
+            // remotely under a fresh save.
+            Ok(base) if base != self.session.doc.oplog_frontiers() => {}
+            _ => return BTreeSet::new(),
         }
-        let status = self
-            .session
-            .status(&Scope::Paths(BTreeSet::new()))
-            .await
-            .ok()?;
         self.saved
-            .iter()
-            .filter(|(path, _)| !except.contains(*path) && status.remote.contains_key(*path))
-            .map(|(_, at)| *at + HOT)
+            .keys()
+            .filter(|path| !except.contains(*path))
+            .cloned()
+            .collect()
+    }
+
+    /// When the [`HOT`] hold ends for `held`.
+    fn hot_until(&self, held: &BTreeSet<String>) -> Instant {
+        held.iter()
+            .filter_map(|path| self.saved.get(path))
+            .map(|at| *at + HOT)
             .max()
+            .unwrap_or_else(Instant::now)
     }
 
     /// Answers what other typstry commands in the folder asked for; see
     /// [`crate::mailbox`]. Runs between steps, so requests see the same
     /// state as the loop.
     async fn answer_requests(&mut self) {
+        // Whatever the loop ran into so far is its own news, not part of
+        // the answer to whoever asks next.
+        print_warnings(&mut Output::terminal(), &mut self.session);
         let waiting = match self.mailbox.take() {
             Ok(waiting) => waiting,
             Err(err) => {
@@ -776,6 +799,7 @@ impl Live {
                 Ok(request) => self.handle(request, &mut out).await,
                 Err(err) => Err(err),
             };
+            print_warnings(&mut out, &mut self.session);
             let response = Response {
                 lines: out.into_lines(),
                 error: result.err().map(|err| format!("{err:#}")),
@@ -794,7 +818,7 @@ impl Live {
             }
             // The live doc is as fresh as a fetch would make it; "offline"
             // means the same as for the standalone command.
-            Request::Info { .. } => {
+            Request::Info => {
                 let sync = self.describe();
                 let offline = !self.session.is_connected();
                 info::print_info(&mut self.session, offline, &sync, out).await
@@ -816,8 +840,9 @@ impl Live {
     fn pause_reason(&self) -> Option<String> {
         self.pause.as_ref()?;
         let repo = Repo::discover(self.session.root());
+        let found = repo.as_ref().map(|repo| (repo, repo.head()));
         Some(
-            match GitState::of(repo.as_ref(), self.session.config.branch.as_deref()) {
+            match GitState::of(found, self.session.config.branch.as_deref()) {
                 GitState::Busy(op) => format!("git is in the middle of {op}"),
                 GitState::Elsewhere {
                     head,
@@ -892,38 +917,40 @@ impl Live {
 
     /// Ends a hold for a command that publishes. Like the one-shot
     /// commands, that takes --force while the folder still differs from
-    /// the last sync.
-    async fn release_for(&mut self, force: bool) -> anyhow::Result<()> {
+    /// the last sync. Returns what the flush after it has to scan: nothing
+    /// once the check found that the folder matches the last sync.
+    async fn release_for(&mut self, force: bool, out: &mut Output) -> anyhow::Result<Scope> {
         if !self.holding {
-            return Ok(());
+            return Ok(Scope::Full);
         }
+        let mut scope = Scope::Full;
         if !force {
             let status = self.session.status(&Scope::Full).await?;
             if !status.local.is_empty() {
                 return Err(switch_refusal(&status.local));
             }
+            scope = Scope::Paths(BTreeSet::new());
         }
-        println!("sync: publishing held changes");
+        out.out("sync: publishing held changes");
         self.release();
-        Ok(())
+        Ok(scope)
     }
 
     /// Publishes what is on disk now rather than when the watcher reports
     /// it, so a command right after a save already includes the save.
-    async fn flush(&mut self) -> anyhow::Result<Report> {
-        let report = self.reconcile(&Scope::Full, Mode::Push).await?;
-        // The full scan covered whatever the watcher had queued.
-        self.pending.clear();
-        self.rescan = false;
-        self.local_at = None;
-        self.after(&report).await;
+    async fn flush(&mut self, scope: &Scope) -> anyhow::Result<Report> {
+        let mut report = self.session.reconcile_live(scope, Mode::Push).await?;
+        // The scan covered whatever the watcher had queued, be it this one
+        // or the one in release_for.
+        self.clear_local_queue();
+        self.after(&mut report).await;
         Ok(report)
     }
 
     async fn push_now(&mut self, force: bool, out: &mut Output) -> anyhow::Result<()> {
         self.refuse_while_paused("push")?;
-        self.release_for(force).await?;
-        let report = self.flush().await?;
+        let scope = self.release_for(force, out).await?;
+        let report = self.flush(&scope).await?;
         push::print_pushed(out, &report);
         if !self.session.is_connected() {
             out.out("typstry sync is offline; the changes go out once it is connected again.");
@@ -944,8 +971,8 @@ impl Live {
         if !self.session.is_connected() {
             bail!("typstry sync is offline; save the version once it is connected again");
         }
-        self.release_for(force).await?;
-        let report = self.flush().await?;
+        let scope = self.release_for(force, out).await?;
+        let report = self.flush(&scope).await?;
         version::print_pushed(out, &report);
         let saved = version::name_current_state(&mut self.session, name)?;
         self.dirty = true;
@@ -978,7 +1005,7 @@ impl Live {
         }
         if self.pause.is_none() && !self.holding && self.session.can_write() {
             // Covers edits the watcher has not reported yet.
-            match self.reconcile(&Scope::Full, Mode::Push).await {
+            match self.session.reconcile_live(&Scope::Full, Mode::Push).await {
                 Ok(report) => print_lines(&report),
                 Err(err) => eprintln!("sync: final sync failed: {err:#}"),
             }
@@ -992,6 +1019,7 @@ impl Live {
                 );
             }
         }
+        print_warnings(&mut Output::terminal(), &mut self.session);
         self.session.save()?;
         self.session.disconnect().await;
         Ok(())

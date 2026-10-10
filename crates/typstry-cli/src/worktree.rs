@@ -2,12 +2,13 @@
 //! classifying files like the browser's upload does, and writing files
 //! back without ever following a symlink out of the folder.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 use ignore::WalkBuilder;
@@ -188,10 +189,129 @@ pub fn case_clashes<'a>(
     clashes
 }
 
+/// How far apart two writes to a file must be for its timestamps to tell
+/// them apart. Nanoseconds on APFS and ext4, but a second on HFS+ and two
+/// on FAT, so this assumes the worst.
+const TIMESTAMP_GRANULARITY: Duration = Duration::from_secs(2);
+
+/// What `stat` says about a file, compared instead of its bytes to tell
+/// whether it changed, the way git's index does. On unix the inode and
+/// ctime also catch a file replaced by a rename or written by a tool that
+/// restores the old mtime afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    mtime: SystemTime,
+    #[cfg(unix)]
+    ctime: SystemTime,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl Stamp {
+    /// None where the platform has no mtime, which then is never cached.
+    fn of(meta: &fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Some(Self {
+            len: meta.len(),
+            mtime: meta.modified().ok()?,
+            #[cfg(unix)]
+            ctime: u64::try_from(meta.ctime()).map_or(SystemTime::UNIX_EPOCH, |secs| {
+                SystemTime::UNIX_EPOCH + Duration::new(secs, meta.ctime_nsec() as u32)
+            }),
+            #[cfg(unix)]
+            dev: meta.dev(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+        })
+    }
+
+    fn last_change(&self) -> SystemTime {
+        #[cfg(unix)]
+        return self.mtime.max(self.ctime);
+        #[cfg(not(unix))]
+        self.mtime
+    }
+}
+
+/// A value derived from a file's bytes, valid while the file's [`Stamp`]
+/// stays the same.
+#[derive(Debug)]
+struct Stamped<V> {
+    stamp: Stamp,
+    /// When the file was looked at, taken before the `stat`.
+    seen: SystemTime,
+    value: V,
+}
+
+impl<V> Stamped<V> {
+    /// Whether the value still describes a file that now has `stamp`. A
+    /// file changed within the timestamp granularity of when it was read
+    /// is "racily clean" in git's words: a second write in the same tick
+    /// leaves the stamp as it was, so the value is not trusted until the
+    /// file has been quiet for longer than that.
+    fn holds_for(&self, stamp: &Stamp, granularity: Duration) -> bool {
+        self.stamp == *stamp
+            && self
+                .stamp
+                .last_change()
+                .checked_add(granularity)
+                .is_some_and(|settled| settled < self.seen)
+    }
+}
+
+/// What the ignore rules need about the folder's place on disk. Found once
+/// per worktree, so a repo created around a running sync only counts after
+/// a restart.
+#[derive(Debug)]
+struct IgnoreBase {
+    /// The canonical root, since the repo's paths are canonical too.
+    root: PathBuf,
+    /// The folders from the repo's top down to the root's parent, whose
+    /// ignore files also apply. Empty outside a repo.
+    outer: Vec<PathBuf>,
+    /// The repo's `info/exclude` and the folder its patterns are relative
+    /// to.
+    exclude: Option<(PathBuf, PathBuf)>,
+}
+
+/// Shared between clones, so the walker's filter in [`Worktree::scan`]
+/// fills the same cache.
+#[derive(Debug)]
+struct Caches {
+    ignore_base: Mutex<Option<Arc<IgnoreBase>>>,
+    /// Compiled ignore files by path.
+    matchers: Mutex<HashMap<PathBuf, Stamped<Arc<Gitignore>>>>,
+    /// Scanned files by project path. Holds the text of text files, which
+    /// callers need anyway, and only the digest of assets.
+    files: Mutex<HashMap<String, Stamped<LocalFile>>>,
+    granularity: Duration,
+    /// How often a file was actually read, for tests to see cache hits.
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for Caches {
+    fn default() -> Self {
+        Self {
+            ignore_base: Mutex::default(),
+            matchers: Mutex::default(),
+            files: Mutex::default(),
+            granularity: TIMESTAMP_GRANULARITY,
+            #[cfg(test)]
+            reads: Default::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Worktree {
     root: PathBuf,
     case_insensitive: OnceLock<bool>,
+    caches: Arc<Caches>,
 }
 
 impl Worktree {
@@ -199,6 +319,7 @@ impl Worktree {
         Self {
             root: root.into(),
             case_insensitive: OnceLock::new(),
+            caches: Arc::default(),
         }
     }
 
@@ -215,9 +336,7 @@ impl Worktree {
             } else {
                 self.root.clone()
             };
-            let mut suffix = [0u8; 4];
-            getrandom::fill(&mut suffix).expect("OS random source unavailable");
-            let tag: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+            let tag = crate::state::random_hex(4);
             let lower = dir.join(format!(".case-probe-{tag}"));
             let upper = dir.join(format!(".CASE-PROBE-{tag}"));
             if fs::write(&lower, b"").is_err() {
@@ -317,16 +436,26 @@ impl Worktree {
             if !file_type.is_file() {
                 continue;
             }
+            let too_large = Skipped {
+                reason: format!(
+                    "larger than the {} MB upload limit",
+                    MAX_UPLOAD_BYTES / 1024 / 1024
+                ),
+                path: path.clone(),
+            };
+            // Anything past the asset limit is past the text limit too, so
+            // it is skipped without reading what may be a huge video.
+            if entry
+                .metadata()
+                .is_ok_and(|meta| meta.len() > MAX_ASSET_BYTES as u64)
+            {
+                scan.skipped.push(too_large);
+                continue;
+            }
             match self.read(&path) {
                 Ok(Some(file)) => {
                     if file.size as usize > MAX_ASSET_BYTES && file.text.is_none() {
-                        scan.skipped.push(Skipped {
-                            reason: format!(
-                                "larger than the {} MB upload limit",
-                                MAX_UPLOAD_BYTES / 1024 / 1024
-                            ),
-                            path,
-                        });
+                        scan.skipped.push(too_large);
                     } else {
                         scan.files.insert(path, file);
                     }
@@ -338,6 +467,13 @@ impl Worktree {
                 }),
             }
         }
+        // Files that went away or became ignored would otherwise stay
+        // cached for as long as the sync runs.
+        self.caches
+            .files
+            .lock()
+            .expect("never poisoned")
+            .retain(|path, _| scan.files.contains_key(path));
         scan.git_files = std::mem::take(&mut *git_files.lock().expect("never poisoned"));
         scan.git_files.sort();
         Ok(scan)
@@ -365,8 +501,64 @@ impl Worktree {
 
     /// Reads one file. None when it does not exist or is not a regular
     /// file, e.g. a symlink or a folder.
+    ///
+    /// Unchanged files come from a cache keyed by what `stat` says, so a
+    /// full scan only reads and hashes what was edited since the last one.
     pub fn read(&self, path: &str) -> io::Result<Option<LocalFile>> {
-        Ok(self.read_bytes(path)?.map(LocalFile::from_bytes))
+        let seen = SystemTime::now();
+        let meta = if self.symlinked_parent(path).is_some() {
+            None
+        } else {
+            match fs::symlink_metadata(self.abs(path)) {
+                Ok(meta) => Some(meta).filter(fs::Metadata::is_file),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err),
+            }
+        };
+        let Some(meta) = meta else {
+            self.forget(path);
+            return Ok(None);
+        };
+        let stamp = Stamp::of(&meta);
+        if let Some(stamp) = &stamp
+            && let Some(cached) = self.caches.files.lock().expect("never poisoned").get(path)
+            && cached.holds_for(stamp, self.caches.granularity)
+        {
+            return Ok(Some(cached.value.clone()));
+        }
+        let Some(bytes) = self.read_bytes(path)? else {
+            self.forget(path);
+            return Ok(None);
+        };
+        #[cfg(test)]
+        self.caches
+            .reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = LocalFile::from_bytes(bytes);
+        // A length that differs from the stat means the file was written
+        // while being read; the next read gets to look again.
+        match stamp {
+            Some(stamp) if stamp.len == file.size => {
+                self.caches.files.lock().expect("never poisoned").insert(
+                    path.to_owned(),
+                    Stamped {
+                        stamp,
+                        seen,
+                        value: file.clone(),
+                    },
+                );
+            }
+            _ => self.forget(path),
+        }
+        Ok(Some(file))
+    }
+
+    fn forget(&self, path: &str) {
+        self.caches
+            .files
+            .lock()
+            .expect("never poisoned")
+            .remove(path);
     }
 
     pub fn read_bytes(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
@@ -434,6 +626,7 @@ impl Worktree {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         atomic_write(&abs, bytes, false)?;
+        self.forget(path);
         // Keeps an executable bit or a read-only flag the user set.
         if let Some(permissions) = previous {
             let _ = fs::set_permissions(&abs, permissions);
@@ -451,6 +644,7 @@ impl Worktree {
         match fs::symlink_metadata(&abs) {
             Ok(meta) if meta.is_file() => {
                 fs::remove_file(&abs).with_context(|| format!("deleting {path}"))?;
+                self.forget(path);
             }
             _ => return Ok(()),
         }
@@ -482,38 +676,19 @@ impl Worktree {
                 }
             }
         }
-        let root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
+        let base = self.ignore_base();
+        let (chain, abs) = folders_to(&base.root, &segments);
         let mut matchers = Vec::new();
+        if let Some((file, workdir)) = &base.exclude {
+            matchers.extend(self.matcher(file, workdir));
+        }
         // Outermost first, so the loop below can let deeper rules win.
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        if let Some(repo) = crate::git::Repo::discover(&root) {
-            let mut builder = GitignoreBuilder::new(&repo.workdir);
-            builder.add(repo.common_dir.join("info").join("exclude"));
-            if let Ok(exclude) = builder.build() {
-                matchers.push(exclude);
+        for dir in base.outer.iter().chain(&chain) {
+            // `.typstryignore` last so it wins over `.gitignore`.
+            for name in [".gitignore", IGNORE_FILE] {
+                matchers.extend(self.matcher(&dir.join(name), dir));
             }
-            dirs.extend(
-                root.ancestors()
-                    .skip(1)
-                    .take_while(|dir| dir.starts_with(&repo.workdir))
-                    .map(Path::to_path_buf),
-            );
-            dirs.reverse();
         }
-        let mut dir = root.clone();
-        dirs.push(dir.clone());
-        for segment in &segments[..segments.len() - 1] {
-            dir.push(segment);
-            dirs.push(dir.clone());
-        }
-        for dir in &dirs {
-            matchers.extend(dir_matchers(dir));
-        }
-        let mut abs = root;
-        abs.extend(&segments);
         for matcher in matchers.iter().rev() {
             let m = matcher.matched_path_or_any_parents(&abs, is_dir);
             if m.is_ignore() {
@@ -525,33 +700,19 @@ impl Worktree {
         }
         false
     }
-}
 
-impl Worktree {
     /// Whether `.typstryignore` re-includes one of the [`GIT_FILES`] with a
     /// negated pattern. Only `.typstryignore` counts: a `.gitignore` that
     /// negates itself is about git, not about co-authors.
     fn opted_in(&self, path: &str, is_dir: bool) -> bool {
-        let root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
         let segments: Vec<&str> = path.split('/').collect();
-        let mut dirs = vec![root.clone()];
-        let mut dir = root.clone();
-        for segment in &segments[..segments.len() - 1] {
-            dir.push(segment);
-            dirs.push(dir.clone());
-        }
-        let mut abs = root;
-        abs.extend(&segments);
+        let base = self.ignore_base();
+        let (dirs, abs) = folders_to(&base.root, &segments);
         // Deepest first, so a nested file overrides the top-level one.
         for dir in dirs.iter().rev() {
-            let file = dir.join(IGNORE_FILE);
-            if !file.is_file() {
+            let Some(matcher) = self.matcher(&dir.join(IGNORE_FILE), dir) else {
                 continue;
-            }
-            let (matcher, _) = Gitignore::new(file);
+            };
             let m = matcher.matched(&abs, is_dir);
             if m.is_whitelist() {
                 return true;
@@ -562,20 +723,103 @@ impl Worktree {
         }
         false
     }
+
+    fn ignore_base(&self) -> Arc<IgnoreBase> {
+        let mut cached = self.caches.ignore_base.lock().expect("never poisoned");
+        if let Some(base) = &*cached {
+            return Arc::clone(base);
+        }
+        // A root that does not exist yet cannot be canonicalized; that
+        // answer is not kept, so it is asked again once the folder is there.
+        let Ok(root) = self.root.canonicalize() else {
+            return Arc::new(IgnoreBase {
+                root: self.root.clone(),
+                outer: Vec::new(),
+                exclude: None,
+            });
+        };
+        let mut outer = Vec::new();
+        let mut exclude = None;
+        if let Some(repo) = crate::git::Repo::discover(&root) {
+            outer.extend(
+                root.ancestors()
+                    .skip(1)
+                    .take_while(|dir| dir.starts_with(&repo.workdir))
+                    .map(Path::to_path_buf),
+            );
+            outer.reverse();
+            exclude = Some((repo.common_dir.join("info").join("exclude"), repo.workdir));
+        }
+        let base = Arc::new(IgnoreBase {
+            root,
+            outer,
+            exclude,
+        });
+        *cached = Some(Arc::clone(&base));
+        base
+    }
+
+    /// The compiled rules of the ignore file at `file`, with patterns
+    /// relative to `dir`. None when there is no such file. Recompiled
+    /// whenever the file's stamp changes, so edits apply right away.
+    fn matcher(&self, file: &Path, dir: &Path) -> Option<Arc<Gitignore>> {
+        let seen = SystemTime::now();
+        let meta = fs::metadata(file).ok().filter(fs::Metadata::is_file);
+        let Some(meta) = meta else {
+            self.caches
+                .matchers
+                .lock()
+                .expect("never poisoned")
+                .remove(file);
+            return None;
+        };
+        let stamp = Stamp::of(&meta);
+        if let Some(stamp) = &stamp
+            && let Some(cached) = self
+                .caches
+                .matchers
+                .lock()
+                .expect("never poisoned")
+                .get(file)
+            && cached.holds_for(stamp, self.caches.granularity)
+        {
+            return Some(Arc::clone(&cached.value));
+        }
+        let mut builder = GitignoreBuilder::new(dir);
+        // An unreadable file or a bad line leaves the rules that did parse,
+        // like `Gitignore::new` does.
+        builder.add(file);
+        let matcher = Arc::new(builder.build().unwrap_or_else(|_| Gitignore::empty()));
+        if let Some(stamp) = stamp {
+            self.caches.matchers.lock().expect("never poisoned").insert(
+                file.to_path_buf(),
+                Stamped {
+                    stamp,
+                    seen,
+                    value: Arc::clone(&matcher),
+                },
+            );
+        }
+        Some(matcher)
+    }
+}
+
+/// The folders from `root` down to the one holding `segments`, and the
+/// file's absolute path under `root`.
+fn folders_to(root: &Path, segments: &[&str]) -> (Vec<PathBuf>, PathBuf) {
+    let mut dirs = vec![root.to_path_buf()];
+    let mut dir = root.to_path_buf();
+    for segment in &segments[..segments.len() - 1] {
+        dir.push(segment);
+        dirs.push(dir.clone());
+    }
+    let mut abs = root.to_path_buf();
+    abs.extend(segments);
+    (dirs, abs)
 }
 
 fn is_always_skipped(name: &str) -> bool {
     name == ".git" || name == STATE_DIR
-}
-
-/// The ignore files of one folder, `.typstryignore` last so it wins.
-fn dir_matchers(dir: &Path) -> Vec<Gitignore> {
-    [".gitignore", IGNORE_FILE]
-        .into_iter()
-        .map(|name| dir.join(name))
-        .filter(|path| path.is_file())
-        .map(|path| Gitignore::new(path).0)
-        .collect()
 }
 
 #[cfg(test)]
@@ -586,6 +830,143 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         (dir, Worktree::new(root))
+    }
+
+    fn tree_with(granularity: Duration) -> (tempfile::TempDir, Worktree) {
+        let (dir, mut wt) = tree();
+        wt.caches = Arc::new(Caches {
+            granularity,
+            ..Caches::default()
+        });
+        (dir, wt)
+    }
+
+    /// A worktree that trusts timestamps at once, so tests can tell cache
+    /// hits from the racy-timestamp rereads without sleeping.
+    fn trusting_tree() -> (tempfile::TempDir, Worktree) {
+        tree_with(Duration::ZERO)
+    }
+
+    fn reads(wt: &Worktree) -> usize {
+        wt.caches.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Writes `content` and dates the file back, as if it had been
+    /// written long before the scan.
+    fn write_old(wt: &Worktree, path: &str, content: &str, age_secs: u64) {
+        fs::write(wt.abs(path), content).unwrap();
+        let mtime = SystemTime::now() - Duration::from_secs(age_secs);
+        fs::File::options()
+            .write(true)
+            .open(wt.abs(path))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn rescans_only_changed_files() {
+        let (_dir, wt) = trusting_tree();
+        write_old(&wt, "main.typ", "= One", 3600);
+        write_old(&wt, "logo.png", "\0png", 3600);
+        assert_eq!(wt.scan().unwrap().files.len(), 2);
+        assert_eq!(reads(&wt), 2);
+        let scan = wt.scan().unwrap();
+        assert_eq!(reads(&wt), 2);
+        assert_eq!(scan.files["main.typ"].text.as_deref(), Some("= One"));
+        assert_eq!(scan.files["logo.png"].digest, digest(b"\0png"));
+
+        // Same size, so only the stamp's times tell the edit apart.
+        write_old(&wt, "main.typ", "= Two", 1800);
+        let scan = wt.scan().unwrap();
+        assert_eq!(reads(&wt), 3);
+        assert_eq!(scan.files["main.typ"].text.as_deref(), Some("= Two"));
+
+        fs::remove_file(wt.abs("logo.png")).unwrap();
+        assert!(!wt.scan().unwrap().files.contains_key("logo.png"));
+        assert!(!wt.caches.files.lock().unwrap().contains_key("logo.png"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rereads_a_file_whose_mtime_was_restored() {
+        let (_dir, wt) = trusting_tree();
+        write_old(&wt, "main.typ", "= One", 3600);
+        let mtime = fs::metadata(wt.abs("main.typ"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        wt.scan().unwrap();
+        // Like `cp -p` or an unpacked archive: new bytes, old mtime. Only
+        // the ctime moves.
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(wt.abs("main.typ"), "= Two").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(wt.abs("main.typ"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let scan = wt.scan().unwrap();
+        assert_eq!(scan.files["main.typ"].text.as_deref(), Some("= Two"));
+    }
+
+    #[test]
+    fn rereads_racily_clean_files() {
+        let granularity = Duration::from_millis(200);
+        let (_dir, wt) = tree_with(granularity);
+        fs::write(wt.abs("main.typ"), "= One").unwrap();
+        // Written within the granularity of the read, so a second write
+        // in the same tick could hide behind an unchanged stamp.
+        wt.scan().unwrap();
+        wt.scan().unwrap();
+        assert_eq!(reads(&wt), 2);
+
+        // Read again once the file has been quiet for longer than that,
+        // and only from then on trusted.
+        std::thread::sleep(granularity + Duration::from_millis(50));
+        wt.scan().unwrap();
+        let scan = wt.scan().unwrap();
+        assert_eq!(reads(&wt), 3);
+        assert_eq!(scan.files["main.typ"].text.as_deref(), Some("= One"));
+    }
+
+    #[test]
+    fn notices_edited_ignore_files() {
+        let (_dir, wt) = tree();
+        fs::write(wt.abs("a.typ"), "").unwrap();
+        fs::write(wt.abs("b.typ"), "").unwrap();
+        fs::write(wt.abs(".gitignore"), "a.typ\n").unwrap();
+        assert!(wt.is_ignored("a.typ", false));
+        assert!(!wt.is_ignored("b.typ", false));
+
+        fs::write(wt.abs(".gitignore"), "b.typ\n").unwrap();
+        assert!(!wt.is_ignored("a.typ", false));
+        assert!(wt.is_ignored("b.typ", false));
+
+        fs::write(wt.abs(IGNORE_FILE), "!b.typ\n").unwrap();
+        assert!(!wt.is_ignored("b.typ", false));
+        fs::remove_file(wt.abs(IGNORE_FILE)).unwrap();
+        fs::remove_file(wt.abs(".gitignore")).unwrap();
+        assert!(!wt.is_ignored("b.typ", false));
+    }
+
+    #[test]
+    fn reuses_compiled_ignore_files_until_they_change() {
+        let (_dir, wt) = trusting_tree();
+        write_old(&wt, ".gitignore", "a.typ\n", 3600);
+        assert!(wt.is_ignored("a.typ", false));
+        let first = wt
+            .matcher(&wt.root().join(".gitignore"), wt.root())
+            .unwrap();
+        let again = wt
+            .matcher(&wt.root().join(".gitignore"), wt.root())
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        write_old(&wt, ".gitignore", "b.typ\n", 1800);
+        assert!(!wt.is_ignored("a.typ", false));
+        assert!(wt.is_ignored("b.typ", false));
     }
 
     #[test]

@@ -31,11 +31,6 @@ pub fn init_bare_project(doc: &LoroDoc, title: &str) -> LoroResult<()> {
     seed(doc, title, false)
 }
 
-/// The old entry point, kept until the CLI moves to [`init_bare_project`].
-pub fn init_project_with(doc: &LoroDoc, title: &str, starter: bool) -> LoroResult<()> {
-    seed(doc, title, starter)
-}
-
 fn seed(doc: &LoroDoc, title: &str, starter: bool) -> LoroResult<()> {
     if schema_version(doc).is_some() {
         return Ok(());

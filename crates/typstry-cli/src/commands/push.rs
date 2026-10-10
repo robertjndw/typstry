@@ -30,12 +30,13 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let Some(mut session) = ctx.open_or_ask(request).await? else {
         return Ok(());
     };
-    guard_branch(&mut session, args.force)?;
+    let mut out = Output::terminal();
+    guard_branch(&mut session, args.force, &mut out)?;
     guard_switch(&mut session, args.force).await?;
     session.connect().await?;
     let report = session.reconcile(&Scope::Full, Mode::Push).await?;
     session.disconnect().await;
-    print_pushed(&mut Output::terminal(), &report);
+    print_pushed(&mut out, &report);
     Ok(())
 }
 

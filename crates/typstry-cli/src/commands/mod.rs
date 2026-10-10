@@ -27,6 +27,7 @@ use crate::engine::{ChangeKind, Report, Scope, Session};
 use crate::git::{Head, Repo};
 use crate::mailbox::{self, Request};
 use crate::state::SyncRunning;
+use crate::watch::GitState;
 use crate::worktree::Skipped;
 
 #[derive(Debug, Parser)]
@@ -119,8 +120,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
 /// The repo the project lives in, after recording its current branch as
 /// the tracked one if none is set yet.
-pub fn track_branch(session: &mut Session) -> anyhow::Result<Option<(Repo, Head)>> {
-    let Some(repo) = Repo::discover(session.root()) else {
+pub fn track_branch(
+    session: &mut Session,
+    out: &mut Output,
+) -> anyhow::Result<Option<(Repo, Head)>> {
+    let Some(repo) = session.repo().cloned() else {
         return Ok(None);
     };
     let head = repo.head();
@@ -129,7 +133,7 @@ pub fn track_branch(session: &mut Session) -> anyhow::Result<Option<(Repo, Head)
     {
         session.config.branch = Some(branch.clone());
         session.save_config()?;
-        println!("tracking git branch {branch}");
+        out.out(format!("tracking git branch {branch}"));
     }
     Ok(Some((repo, head)))
 }
@@ -137,31 +141,40 @@ pub fn track_branch(session: &mut Session) -> anyhow::Result<Option<(Repo, Head)
 /// Refuses to sync files while the checkout is not the tracked branch, or
 /// while git is in the middle of rewriting them. Other branches are
 /// private drafts; syncing there would publish them.
-pub fn guard_branch(session: &mut Session, force: bool) -> anyhow::Result<()> {
-    let Some((repo, head)) = track_branch(session)? else {
-        return Ok(());
-    };
-    if let Some(op) = repo.operation_in_progress() {
-        if !force {
-            bail!("git is in the middle of {op}; finish it first (use --force to sync anyway)");
+pub fn guard_branch(session: &mut Session, force: bool, out: &mut Output) -> anyhow::Result<()> {
+    let (repo, head) = track_branch(session, out)?.unzip();
+    let state = GitState::of(repo.as_ref().zip(head), session.config.branch.as_deref());
+    let warning = match state {
+        GitState::Clear => return Ok(()),
+        GitState::Busy(op) => {
+            if !force {
+                bail!("git is in the middle of {op}; finish it first (use --force to sync anyway)");
+            }
+            format!("git is in the middle of {op}, syncing anyway")
         }
-        eprintln!("warning: git is in the middle of {op}, syncing anyway");
-    }
-    let Some(tracked) = session.config.branch.clone() else {
+        GitState::Elsewhere {
+            head,
+            tracked: Some(tracked),
+        } => {
+            if !force {
+                bail!("on {head}, typstry tracks {tracked} (use --force to sync anyway)");
+            }
+            format!("on {head}, typstry tracks {tracked}; syncing anyway")
+        }
         // A repo that was only ever seen with a detached HEAD.
-        if !force {
-            bail!(
-                "on {head}, and typstry does not track a branch yet (use `typstry track <branch>` or --force)"
-            );
+        GitState::Elsewhere {
+            head,
+            tracked: None,
+        } => {
+            if !force {
+                bail!(
+                    "on {head}, and typstry does not track a branch yet (use `typstry track <branch>` or --force)"
+                );
+            }
+            return Ok(());
         }
-        return Ok(());
     };
-    if !head.is_on(Some(&tracked)) {
-        if !force {
-            bail!("on {head}, typstry tracks {tracked} (use --force to sync anyway)");
-        }
-        eprintln!("warning: on {head}, typstry tracks {tracked}; syncing anyway");
-    }
+    out.err(format!("warning: {warning}"));
     Ok(())
 }
 
@@ -296,6 +309,14 @@ fn print_applied(out: &mut Output, applied: &ApplyReport, verb: &str) {
             "warning: not {verb} {}: {}",
             skipped.path, skipped.reason
         ));
+    }
+}
+
+/// Warnings the session ran into outside a reconcile, whose report
+/// carries its own.
+fn print_warnings(out: &mut Output, session: &mut Session) {
+    for warning in session.take_warnings() {
+        out.err(format!("warning: {warning}"));
     }
 }
 

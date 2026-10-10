@@ -7,10 +7,10 @@ use loro::VersionVector;
 use loro_protocol::{BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateStatusCode};
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
-use typstry_wire::elo::encode_container;
+use typstry_wire::elo::{PeerId, Record, Version, encode_container, parse_container};
 use typstry_wire::fragment::encode_update;
 
-use super::elo::{self, DocIndex, PeerId, Record, Version};
+use super::elo::{self, DocIndex};
 use super::registry::Inner;
 use super::{ConnId, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
 use crate::store::docs;
@@ -212,7 +212,7 @@ impl RoomActor {
         let mut status = UpdateStatusCode::Ok;
         let mut relays = Vec::new();
         for update in &updates {
-            let records = match elo::parse_container(update) {
+            let records = match parse_container(update) {
                 Ok(records) => records,
                 Err(err) => {
                     tracing::debug!(project = %self.project_id, %err, "rejected update");

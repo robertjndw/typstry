@@ -7,9 +7,9 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use loro_protocol::{EloDeltaHeader, EloHeader, EloSnapshotHeader, parse_elo_record_header};
 use serde::{Deserialize, Serialize};
 use typstry_wire::crypto::{BLOB_CONTEXT, ProjectKey};
+use typstry_wire::elo::{Record, SealedRecord, Version};
 
 const RAW_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
@@ -68,32 +68,21 @@ fn check(fixture: &Fixture) -> ProjectKey {
     assert_eq!(key.key_id(), fixture.key_id);
 
     let delta = key.decrypt_record(&bytes(&fixture.delta.record)).unwrap();
-    let EloHeader::Delta(EloDeltaHeader {
-        peer_id,
-        start,
-        end,
-        ..
-    }) = &delta.header
-    else {
-        panic!("not a delta: {:?}", delta.header);
+    let Record::Delta { peer, start, end } = delta.record else {
+        panic!("not a delta: {:?}", delta.record);
     };
-    assert_eq!(peer_id, fixture.delta.peer.as_bytes());
-    assert_eq!((*start, *end), (fixture.delta.start, fixture.delta.end));
+    // The parser only takes the canonical spelling, so this also pins it.
+    assert_eq!(peer.to_string(), fixture.delta.peer);
+    assert_eq!((start, end), (fixture.delta.start, fixture.delta.end));
     assert_eq!(delta.plaintext, bytes(&fixture.delta.plaintext));
 
     let snapshot = key
         .decrypt_record(&bytes(&fixture.snapshot.record))
         .unwrap();
-    let EloHeader::Snapshot(EloSnapshotHeader { vv, .. }) = &snapshot.header else {
-        panic!("not a snapshot: {:?}", snapshot.header);
+    let Record::Snapshot { vv } = &snapshot.record else {
+        panic!("not a snapshot: {:?}", snapshot.record);
     };
-    let mut expected: Vec<(Vec<u8>, u64)> = fixture
-        .snapshot
-        .vv
-        .iter()
-        .map(|(peer, counter)| (peer.clone().into_bytes(), *counter))
-        .collect();
-    expected.sort();
+    let expected: Version = vv_of(&fixture.snapshot).into_iter().collect();
     assert_eq!(vv, &expected);
     assert_eq!(snapshot.plaintext, bytes(&fixture.snapshot.plaintext));
 
@@ -129,10 +118,7 @@ fn decrypts_typescript_fixture() {
 }
 
 fn iv_of(record: &str) -> [u8; 12] {
-    match parse_elo_record_header(&bytes(record)).unwrap().header {
-        EloHeader::Delta(delta) => delta.iv,
-        EloHeader::Snapshot(snapshot) => snapshot.iv,
-    }
+    SealedRecord::parse(&bytes(record)).unwrap().iv
 }
 
 fn rust_fixture() -> Fixture {

@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use typstry_doc::materialize::{materialize, materialize_at};
 
-use super::Ctx;
 use super::clone::check_empty;
 use super::init::absolute;
 use super::version::{find_version, format_ms};
+use super::{Ctx, Output, print_warnings};
 use crate::worktree::{Worktree, case_clashes};
 
 /// Write the project's files, now or at a named version, to a new folder.
@@ -43,6 +43,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 
     if !args.offline {
         session.refresh().await?;
+        print_warnings(&mut Output::terminal(), &mut session);
     }
     let (files, label) = match &args.at {
         Some(at) => {

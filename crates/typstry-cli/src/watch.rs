@@ -2,27 +2,26 @@
 //! that tells real edits from the echo of our own writes, and the git
 //! checks that pause syncing while git rewrites the folder.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::engine::{Files, Session};
+use crate::git::{Head, Repo};
+use crate::worktree::{Worktree, digest};
 use anyhow::Context;
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc;
-use typstry_doc::materialize::FileContent;
-
-use crate::engine::Session;
-use crate::git::{Head, Repo};
-use crate::worktree::{Worktree, digest};
 
 /// Editors save in bursts (write, rename, chmod); one batch per save.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// What the watcher saw.
+/// What the watcher saw. One save reports the same path several times,
+/// so paths are a set.
 #[derive(Debug)]
 pub enum Change {
-    Paths(Vec<PathBuf>),
+    Paths(BTreeSet<PathBuf>),
     /// Events were lost or the OS gave up tracking details; only a full
     /// scan can tell what changed.
     Rescan,
@@ -87,26 +86,37 @@ pub enum Seen {
 /// that was undone, and needs no reconcile.
 #[derive(Debug, Default)]
 pub struct Synced {
+    /// The base files the digests were taken of.
+    files: Files,
     digests: HashMap<String, Option<String>>,
 }
 
 impl Synced {
-    /// Recomputes the map from the session's base. Assets whose bytes we
-    /// never saw have no digest; events for them always count as changes,
-    /// which costs a reconcile but never loses an edit.
+    /// Recomputes the map from the session's base.
     pub fn refresh(&mut self, session: &Session) -> anyhow::Result<()> {
-        let files = session.base_files()?;
+        self.update(session, session.base_files()?);
+        Ok(())
+    }
+
+    /// Takes `files` as the base, as a reconcile reports it. Hashing every
+    /// file after every reconcile would cost more than the reconcile, so
+    /// only files whose content differs from last time are hashed. Assets
+    /// whose bytes we never saw have no digest; events for them always
+    /// count as changes, which costs a reconcile but never loses an edit.
+    pub fn update(&mut self, session: &Session, files: Files) {
+        let mut before = std::mem::take(&mut self.digests);
         self.digests = files
-            .into_iter()
+            .iter()
             .map(|(path, content)| {
-                let digest = match &content {
-                    FileContent::Text(text) => Some(digest(text.as_bytes())),
-                    FileContent::Asset { hash, .. } => session.base.assets.get(hash).cloned(),
+                let unchanged = match (self.files.get(path), before.remove(path)) {
+                    (Some(then), Some(known)) if then == content => known,
+                    _ => None,
                 };
-                (path, digest)
+                let digest = unchanged.or_else(|| session.known_digest(content));
+                (path.clone(), digest)
             })
             .collect();
-        Ok(())
+        self.files = files;
     }
 
     fn contains_under(&self, path: &str) -> bool {
@@ -165,11 +175,12 @@ pub enum GitState {
 }
 
 impl GitState {
-    pub fn of(repo: Option<&Repo>, tracked: Option<&str>) -> Self {
-        let Some(repo) = repo else {
+    /// `repo` comes with the HEAD the caller read from it, so HEAD is read
+    /// once per look.
+    pub fn of(repo: Option<(&Repo, Head)>, tracked: Option<&str>) -> Self {
+        let Some((repo, head)) = repo else {
             return Self::Clear;
         };
-        let head = repo.head();
         if !head.is_on(tracked) {
             return Self::Elsewhere {
                 head,
@@ -194,18 +205,21 @@ mod tests {
         std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let repo = Repo::discover(dir.path()).unwrap();
         assert_eq!(GitState::of(None, Some("main")), GitState::Clear);
-        assert_eq!(GitState::of(Some(&repo), Some("main")), GitState::Clear);
+        assert_eq!(
+            GitState::of(Some((&repo, repo.head())), Some("main")),
+            GitState::Clear
+        );
         assert!(matches!(
-            GitState::of(Some(&repo), Some("draft")),
+            GitState::of(Some((&repo, repo.head())), Some("draft")),
             GitState::Elsewhere { .. }
         ));
         assert!(matches!(
-            GitState::of(Some(&repo), None),
+            GitState::of(Some((&repo, repo.head())), None),
             GitState::Elsewhere { .. }
         ));
         std::fs::write(dir.path().join(".git/index.lock"), "").unwrap();
         assert!(matches!(
-            GitState::of(Some(&repo), Some("main")),
+            GitState::of(Some((&repo, repo.head())), Some("main")),
             GitState::Busy(_)
         ));
     }

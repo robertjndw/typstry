@@ -66,7 +66,7 @@ impl Config {
 }
 
 /// What the working tree looked like after the last successful sync.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Base {
     /// `Frontiers::encode()` as base64url; empty means the empty doc.
@@ -180,22 +180,25 @@ impl StateDir {
         let start = start
             .canonicalize()
             .with_context(|| format!("cannot open {}", start.display()))?;
-        let mut current = Some(start.as_path());
-        while let Some(dir) = current {
-            if dir.join(STATE_DIR).join(CONFIG).is_file() {
-                let state = Self::lock(dir.to_path_buf(), dir.join(STATE_DIR))?;
-                // Folders linked before the file existed get it too.
-                if !state.dir.join(GITIGNORE).exists() {
-                    state.ignore_in_git()?;
-                }
-                return Ok(state);
+        if let Some(dir) = Self::find_root(&start) {
+            let state = Self::lock(dir.to_path_buf(), dir.join(STATE_DIR))?;
+            // Folders linked before the file existed get it too.
+            if !state.dir.join(GITIGNORE).exists() {
+                state.ignore_in_git()?;
             }
-            current = dir.parent();
+            return Ok(state);
         }
         bail!(
             "{} is not inside a typstry project (no {STATE_DIR}/ found); use `typstry clone` first",
             start.display()
         )
+    }
+
+    /// The nearest folder at or above `start` that holds a project.
+    pub fn find_root(start: &Path) -> Option<&Path> {
+        start
+            .ancestors()
+            .find(|dir| dir.join(STATE_DIR).join(CONFIG).is_file())
     }
 
     /// The config of the project `start` is in, without taking the lock,
@@ -205,12 +208,8 @@ impl StateDir {
         let start = start
             .canonicalize()
             .with_context(|| format!("cannot open {}", start.display()))?;
-        match start
-            .ancestors()
-            .map(|dir| dir.join(STATE_DIR).join(CONFIG))
-            .find(|path| path.is_file())
-        {
-            Some(path) => read_json(&path),
+        match Self::find_root(&start) {
+            Some(dir) => read_json(&dir.join(STATE_DIR).join(CONFIG)),
             None => bail!(
                 "{} is not inside a typstry project (no {STATE_DIR}/ found)",
                 start.display()
@@ -366,7 +365,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("{} is malformed", path.display()))
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     atomic_write(path, &bytes, true)
@@ -383,22 +382,19 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("cannot create {}", dir.display()))
 }
 
+pub(crate) fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf).expect("OS random source unavailable");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Writes through a temp file in the same directory and renames it into
 /// place, so a crash or a concurrent reader never sees half a file. The
 /// rename replaces a symlink at `path` instead of writing through it.
 pub fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     let dir = path.parent().context("path has no parent")?;
     let name = path.file_name().context("path has no file name")?;
-    let mut suffix = [0u8; 6];
-    getrandom::fill(&mut suffix).expect("OS random source unavailable");
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        suffix
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    ));
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), random_hex(6)));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

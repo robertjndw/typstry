@@ -86,18 +86,19 @@ impl Repo {
     }
 
     pub fn head(&self) -> Head {
-        let Ok(head) = fs::read_to_string(self.git_dir.join("HEAD")) else {
-            return Head::Detached;
-        };
-        match head.trim().strip_prefix("ref: refs/heads/") {
-            Some(branch) if !branch.is_empty() => Head::Branch(branch.to_owned()),
-            _ => Head::Detached,
-        }
+        parse_head(self.read_head().as_deref())
     }
 
     /// The commit HEAD points at, from the loose ref or `packed-refs`.
     pub fn head_commit(&self) -> Option<String> {
-        let head = fs::read_to_string(self.git_dir.join("HEAD")).ok()?;
+        self.commit_of(self.read_head().as_deref()?)
+    }
+
+    fn read_head(&self) -> Option<String> {
+        fs::read_to_string(self.git_dir.join("HEAD")).ok()
+    }
+
+    fn commit_of(&self, head: &str) -> Option<String> {
         let head = head.trim();
         let Some(name) = head.strip_prefix("ref: ") else {
             return is_object_id(head).then(|| head.to_owned());
@@ -115,24 +116,26 @@ impl Repo {
         })
     }
 
-    /// The messages of HEAD's reflog, oldest first. None without a reflog.
-    fn reflog(&self) -> Option<Vec<String>> {
-        let log = fs::read_to_string(self.git_dir.join("logs").join("HEAD")).ok()?;
-        Some(
-            log.lines()
-                .map(|line| line.split_once('\t').map_or("", |(_, msg)| msg).to_owned())
-                .collect(),
-        )
+    /// HEAD's reflog as it is on disk. None without a reflog.
+    fn reflog(&self) -> Option<String> {
+        fs::read_to_string(self.git_dir.join("logs").join("HEAD")).ok()
     }
 
     pub fn mark(&self) -> GitMark {
+        self.mark_with(self.reflog().as_deref())
+    }
+
+    /// [`Self::mark`] with the reflog already read, so callers that also
+    /// look at its entries read it only once.
+    fn mark_with(&self, reflog: Option<&str>) -> GitMark {
+        let head = self.read_head();
         GitMark {
-            branch: match self.head() {
+            branch: match parse_head(head.as_deref()) {
                 Head::Branch(name) => Some(name),
                 Head::Detached => None,
             },
-            commit: self.head_commit(),
-            reflog: self.reflog().map(|log| log.len() as u64),
+            commit: head.as_deref().and_then(|head| self.commit_of(head)),
+            reflog: reflog.map(|log| reflog_entries(log).count() as u64),
         }
     }
 
@@ -141,13 +144,17 @@ impl Repo {
     /// Commits and merges on the same branch do not count. Without a
     /// reflog to tell, any move of HEAD counts.
     pub fn switched_since(&self, then: &GitMark) -> bool {
-        let now = self.mark();
+        let log = self.reflog();
+        let now = self.mark_with(log.as_deref());
         if now == *then {
             return false;
         }
-        match (then.reflog, self.reflog()) {
-            (Some(seen), Some(log)) if log.len() as u64 >= seen => {
-                now.branch != then.branch || log[seen as usize..].iter().any(|msg| moves_files(msg))
+        match (then.reflog, now.reflog, log) {
+            (Some(seen), Some(count), Some(log)) if count >= seen => {
+                now.branch != then.branch
+                    || reflog_entries(&log)
+                        .skip(seen as usize)
+                        .any(|line| moves_files(line.split_once('\t').map_or("", |(_, msg)| msg)))
             }
             _ => true,
         }
@@ -189,6 +196,22 @@ impl Repo {
         next.push('\n');
         fs::write(&path, next).with_context(|| format!("writing {}", path.display()))
     }
+}
+
+fn parse_head(head: Option<&str>) -> Head {
+    match head
+        .map(str::trim)
+        .and_then(|h| h.strip_prefix("ref: refs/heads/"))
+    {
+        Some(branch) if !branch.is_empty() => Head::Branch(branch.to_owned()),
+        _ => Head::Detached,
+    }
+}
+
+/// The lines of a reflog, one per entry. Git always ends an entry with a
+/// newline, but a final line without one still counts, as with `lines`.
+fn reflog_entries(log: &str) -> impl Iterator<Item = &str> {
+    log.split_terminator('\n')
 }
 
 /// Reflog entries of commands that replace the checked-out files rather
@@ -326,6 +349,14 @@ mod tests {
         fs::remove_file(git.join("logs/HEAD")).unwrap();
         assert_eq!(repo.head_commit().as_deref(), Some(two.as_str()));
         assert!(repo.switched_since(&mark));
+    }
+
+    #[test]
+    fn counts_reflog_entries_like_lines() {
+        assert_eq!(reflog_entries("").count(), 0);
+        assert_eq!(reflog_entries("a\tx\nb\ty\n").count(), 2);
+        // Cut off mid-write, the last entry still counts.
+        assert_eq!(reflog_entries("a\tx\nb\ty").count(), 2);
     }
 
     #[test]

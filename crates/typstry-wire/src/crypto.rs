@@ -11,10 +11,11 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use loro_protocol::{EloHeader, parse_elo_record_header};
 use sha2::{Digest, Sha256};
 
-use crate::elo::{IV_LEN, Iv, encode_delta_header, encode_record, encode_snapshot_header};
+use crate::elo::{
+    IV_LEN, Iv, Record, SealedRecord, encode_delta_header, encode_record, encode_snapshot_header,
+};
 
 pub const BLOB_CONTEXT: &str = "typstry:blob:v1";
 pub const PRESENCE_CONTEXT: &str = "typstry:presence:v1";
@@ -55,7 +56,7 @@ pub enum CryptoError {
 /// A record after decryption, with the header it was authenticated under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecryptedRecord {
-    pub header: EloHeader,
+    pub record: Record,
     pub plaintext: Vec<u8>,
 }
 
@@ -189,28 +190,29 @@ impl ProjectKey {
         encode_record(&header, &self.encrypt(iv, plaintext, &header))
     }
 
-    /// Decrypts one record of either kind, authenticating its header.
+    /// Parses and decrypts one record of either kind, authenticating its
+    /// header.
     pub fn decrypt_record(&self, record: &[u8]) -> Result<DecryptedRecord, CryptoError> {
-        let parsed = parse_elo_record_header(record).map_err(CryptoError::MalformedRecord)?;
-        let (key_id, iv) = match &parsed.header {
-            EloHeader::Delta(delta) => (&delta.key_id, &delta.iv),
-            EloHeader::Snapshot(snapshot) => (&snapshot.key_id, &snapshot.iv),
-        };
-        if *key_id != self.key_id {
-            return Err(CryptoError::KeyMismatch(key_id.clone()));
-        }
-        let plaintext = self.decrypt(iv, parsed.ct, parsed.aad)?;
+        let sealed = SealedRecord::parse(record).map_err(CryptoError::MalformedRecord)?;
+        let plaintext = self.open_record(&sealed)?;
         Ok(DecryptedRecord {
-            header: parsed.header,
+            record: sealed.record,
             plaintext,
         })
+    }
+
+    /// Decrypts a record that is already parsed, for callers that need its
+    /// header even when decryption fails.
+    pub fn open_record(&self, sealed: &SealedRecord<'_>) -> Result<Vec<u8>, CryptoError> {
+        if sealed.key_id != self.key_id {
+            return Err(CryptoError::KeyMismatch(sealed.key_id.clone()));
+        }
+        self.decrypt(&sealed.iv, sealed.ct, sealed.aad)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use loro_protocol::EloDeltaHeader;
-
     use super::*;
 
     const RAW: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
@@ -245,19 +247,24 @@ mod tests {
         let record = key.encrypt_delta(7, 0, 3, b"ops");
         let out = key.decrypt_record(&record).unwrap();
         assert_eq!(out.plaintext, b"ops");
-        assert!(matches!(
-            out.header,
-            EloHeader::Delta(EloDeltaHeader {
+        assert_eq!(
+            out.record,
+            Record::Delta {
+                peer: 7,
                 start: 0,
-                end: 3,
-                ..
-            })
-        ));
+                end: 3
+            }
+        );
 
         let record = key.encrypt_snapshot(&[(9, 1), (10, 2)], b"snapshot");
         let out = key.decrypt_record(&record).unwrap();
         assert_eq!(out.plaintext, b"snapshot");
-        assert!(matches!(out.header, EloHeader::Snapshot(_)));
+        assert_eq!(
+            out.record,
+            Record::Snapshot {
+                vv: [(9, 1), (10, 2)].into()
+            }
+        );
     }
 
     #[test]

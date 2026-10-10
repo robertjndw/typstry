@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use typstry_doc::paths::build_path_index;
 
 use super::version::format_ms;
-use super::{Ctx, Output, track_branch};
+use super::{Ctx, Output, print_warnings, track_branch};
 use crate::engine::{ChangeKind, Scope, Session};
 use crate::git::Repo;
 use crate::mailbox::Request;
@@ -19,23 +19,16 @@ pub struct Args {
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
-    let request = Request::Info {
-        offline: args.offline,
-    };
-    let Some(mut session) = ctx.open_or_ask(request).await? else {
+    let Some(mut session) = ctx.open_or_ask(Request::Info).await? else {
         return Ok(());
     };
-    track_branch(&mut session)?;
+    let mut out = Output::terminal();
+    track_branch(&mut session, &mut out)?;
     if !args.offline {
         session.refresh().await?;
+        print_warnings(&mut out, &mut session);
     }
-    print_info(
-        &mut session,
-        args.offline,
-        "not running",
-        &mut Output::terminal(),
-    )
-    .await
+    print_info(&mut session, args.offline, "not running", &mut out).await
 }
 
 /// What the folder is linked to and how it stands. `sync` describes

@@ -19,17 +19,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use loro::{ExportMode, IdSpan, LoroDoc, VersionVector};
-use loro_protocol::{BatchId, EloHeader, EloRecordKind, UpdateStatusCode, decode_elo_container};
-use typstry_doc::apply::{ApplyReport, apply_files};
+use loro_protocol::{BatchId, UpdateStatusCode};
+use typstry_doc::apply::{ApplyReport, apply_changes};
 use typstry_doc::configure;
 use typstry_doc::materialize::{FileContent, MaterializedFile, materialize};
-use typstry_doc::peers::set_peer;
+use typstry_doc::peers::{PALETTE, normalize_peer_name, set_peer};
 use typstry_wire::crypto::{BLOB_CONTEXT, CryptoError, ProjectKey};
-use typstry_wire::elo::{encode_container, pack, parse_peer_id};
+use typstry_wire::elo::{Record, SealedRecord, decode_container, encode_container, pack_ranges};
 
 use crate::api::{Api, Permission, ShareInfo};
 use crate::client::{Client, Event};
-use crate::git::Repo;
+use crate::git::{GitMark, Repo};
 use crate::link::{ShareLink, ws_url};
 use crate::state::{Base, Config, StateDir, decode_frontiers, encode_frontiers};
 use crate::worktree::{LocalFile, MAX_ASSET_BYTES, Skipped, Worktree, case_clashes, mime_for};
@@ -51,15 +51,6 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// How long a one-shot command waits for the server without any progress.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The browser's avatar palette (`PALETTE` in presence/identity.ts).
-const PALETTE: [&str; 10] = [
-    "#c2410c", "#b91c1c", "#be185d", "#7e22ce", "#4338ca", "#1d4ed8", "#0e7490", "#047857",
-    "#4d7c0f", "#a16207",
-];
-
-/// The longest display name the browser accepts.
-const MAX_NAME_CHARS: usize = 40;
-
 /// How this run shows up in the history panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
@@ -71,13 +62,7 @@ impl Identity {
     /// The color is derived from the name, so one person keeps one color
     /// across runs even though every run is a new Loro peer.
     pub fn new(name: &str) -> Self {
-        let name: String = name
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(MAX_NAME_CHARS)
-            .collect();
+        let name = normalize_peer_name(name);
         let name = if name.is_empty() {
             "CLI".to_owned()
         } else {
@@ -105,6 +90,14 @@ impl Identity {
 }
 
 pub type Files = BTreeMap<String, FileContent>;
+
+struct Sides {
+    base: Files,
+    remote: Files,
+    local: BTreeMap<String, Local>,
+    skipped: Vec<Skipped>,
+    remote_changes: BTreeMap<String, ChangeKind>,
+}
 
 #[doc(hidden)]
 pub type WriteHook = Box<dyn FnMut(&str) + Send>;
@@ -182,6 +175,18 @@ pub struct Report {
     pub deleted: Vec<String>,
     /// Problems that did not stop the run.
     pub warnings: Vec<String>,
+    /// The files at the new base, as [`Session::base_files`] would return
+    /// them, for callers that track what the folder holds.
+    pub base: Files,
+}
+
+/// What [`Session::reconcile_live`] did.
+#[derive(Debug)]
+pub enum Reconciled {
+    Done(Box<Report>),
+    /// Nothing was touched, because these of the paths to hold changed
+    /// remotely.
+    Held(BTreeSet<String>),
 }
 
 /// What a local path holds as far as a reconcile is concerned.
@@ -206,9 +211,21 @@ pub struct Session {
     conn: Option<Conn>,
     /// One warning about undecryptable records is enough per run.
     warned_unreadable: bool,
+    /// Problems the connection ran into that did not stop it. The session
+    /// never prints: a running sync may be working for another command,
+    /// whose terminal they belong in. See [`Self::take_warnings`].
+    warnings: Vec<String>,
     /// The server refused a compaction snapshot; it would refuse the next
     /// one for the same reason.
     compaction_refused: bool,
+    /// The repo the folder is in, once found. A miss is looked up again
+    /// next time, so a `git init` while sync runs is noticed.
+    repo: Option<Repo>,
+    /// What is on disk in `.typstry/`, as far as this run knows. Exporting
+    /// a snapshot costs as much as the doc is big, so an unchanged doc is
+    /// not written again.
+    saved_vv: Option<VersionVector>,
+    saved_base: Option<Base>,
     /// Runs right before a file is written, for tests that need to change
     /// it at exactly that moment.
     #[doc(hidden)]
@@ -224,8 +241,8 @@ struct Conn {
     target: VersionVector,
     deltas: u64,
     snapshot_sent: bool,
-    /// Sent containers awaiting their ack, for rewinding on refusal.
-    in_flight: HashMap<BatchId, Vec<u8>>,
+    /// Sent containers awaiting their ack.
+    in_flight: HashMap<BatchId, InFlight>,
     retry_at: Option<Instant>,
     /// Per peer, the end of every op range the server sent us, including
     /// records we could not decrypt.
@@ -234,7 +251,16 @@ struct Conn {
     /// was under another key.
     unreadable: u64,
     mismatched_key: Option<String>,
-    decrypted: u64,
+    decrypted_any: bool,
+}
+
+/// What an unacked container carried. A refused one is never resent as is:
+/// rewinding `Conn::server` makes the next [`Session::send_missing`]
+/// export its ops again, so the bytes are not kept.
+enum InFlight {
+    /// Delta records, as the `(peer, start)` of each span.
+    Deltas(Vec<(u64, u64)>),
+    Snapshot,
 }
 
 /// What [`Session::next_remote`] saw.
@@ -253,7 +279,10 @@ impl Session {
         let config = state.load_config()?;
         let base = state.load_base()?;
         let doc = state.load_doc()?;
-        Self::assemble(state, config, base, doc, name)
+        let mut session = Self::assemble(state, config, base, doc, name)?;
+        session.saved_vv = Some(session.doc.oplog_vv());
+        session.saved_base = Some(session.base.clone());
+        Ok(session)
     }
 
     /// Links `root` to a project: writes `.typstry/` with an empty doc and
@@ -305,7 +334,11 @@ impl Session {
             identity,
             conn: None,
             warned_unreadable: false,
+            warnings: Vec::new(),
             compaction_refused: false,
+            repo: None,
+            saved_vv: None,
+            saved_base: None,
             before_write: None,
         })
     }
@@ -334,12 +367,32 @@ impl Session {
         self.conn.is_some()
     }
 
-    /// Persists the doc and the base. The doc goes first: a base pointing
-    /// at ops the cached doc lacks would be unusable.
-    pub fn save(&self) -> anyhow::Result<()> {
-        self.state.save_doc(&self.doc)?;
-        self.state.save_base(&self.base)?;
+    /// Persists the doc and the base, each only if it changed since this
+    /// run last saved it. The doc goes first: a base pointing at ops the
+    /// cached doc lacks would be unusable.
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        self.save_doc()?;
+        if self.saved_base.as_ref() != Some(&self.base) {
+            self.state.save_base(&self.base)?;
+            self.saved_base = Some(self.base.clone());
+        }
         Ok(())
+    }
+
+    fn save_doc(&mut self) -> anyhow::Result<()> {
+        // Only imports and commits move the oplog version, and nothing
+        // else ends up in the snapshot.
+        let vv = self.doc.oplog_vv();
+        if self.saved_vv.as_ref() != Some(&vv) {
+            self.state.save_doc(&self.doc)?;
+            self.saved_vv = Some(vv);
+        }
+        Ok(())
+    }
+
+    /// The git repo the folder is in, if any.
+    pub fn repo(&mut self) -> Option<&Repo> {
+        cached_repo(&mut self.repo, self.state.root())
     }
 
     pub fn save_config(&self) -> anyhow::Result<()> {
@@ -396,7 +449,7 @@ impl Session {
             seen: HashMap::new(),
             unreadable: 0,
             mismatched_key: None,
-            decrypted: 0,
+            decrypted_any: false,
         });
 
         while !self.caught_up() {
@@ -411,7 +464,7 @@ impl Session {
         // key in the link is not the project's.
         let conn = self.conn.as_ref().context("not connected")?;
         if let Some(id) = conn.mismatched_key.clone()
-            && conn.decrypted == 0
+            && !conn.decrypted_any
             && self.doc.oplog_vv().iter().next().is_none()
         {
             self.disconnect().await;
@@ -432,7 +485,14 @@ impl Session {
     pub async fn refresh(&mut self) -> anyhow::Result<()> {
         self.connect().await?;
         self.disconnect().await;
-        self.state.save_doc(&self.doc)
+        self.save_doc()
+    }
+
+    /// Warnings collected since the last call or reconcile, which hands
+    /// them out in [`Report::warnings`] instead. Each is meant to be
+    /// printed as `warning: ...`.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     pub async fn disconnect(&mut self) {
@@ -508,22 +568,29 @@ impl Session {
     }
 
     /// Decrypts and imports one container. Returns whether the doc gained
-    /// ops. A record that does not decrypt (under another key, or
-    /// tampered with) is skipped like the browser does, so one bad record
-    /// cannot block the project.
+    /// ops. A record that does not decrypt (under another key, tampered
+    /// with, or with a header the server would have refused) is skipped
+    /// like the browser does, so one bad record cannot block the project.
+    /// Only a container whose framing is broken fails the import.
     pub fn import_container(&mut self, container: &[u8]) -> anyhow::Result<bool> {
-        let records = decode_elo_container(container).map_err(anyhow::Error::msg)?;
+        let records = decode_container(container).map_err(anyhow::Error::msg)?;
         let mut plaintexts = Vec::with_capacity(records.len());
         let mut received: HashMap<u64, u64> = HashMap::new();
         let mut seen: HashMap<u64, u64> = HashMap::new();
         let mut unreadable = 0;
         let mut mismatched_key = None;
-        for record in records {
-            if let Ok(parsed) = loro_protocol::parse_elo_record_header(record) {
-                cover(&parsed.header, &mut seen);
-            }
-            let out = match self.key.decrypt_record(record) {
-                Ok(out) => out,
+        for bytes in records {
+            // A header that does not parse gives nothing to track, so it
+            // only counts as unreadable.
+            let opened = SealedRecord::parse(bytes)
+                .map_err(CryptoError::MalformedRecord)
+                .and_then(|sealed| {
+                    cover(&sealed.record, &mut seen);
+                    let plaintext = self.key.open_record(&sealed)?;
+                    Ok((sealed.record, plaintext))
+                });
+            let (record, plaintext) = match opened {
+                Ok(opened) => opened,
                 Err(err) => {
                     unreadable += 1;
                     if let CryptoError::KeyMismatch(id) = &err {
@@ -531,22 +598,22 @@ impl Session {
                     }
                     if !self.warned_unreadable {
                         self.warned_unreadable = true;
-                        eprintln!(
-                            "warning: skipping changes that do not decrypt with this folder's key ({err}); the browser skips them too"
-                        );
+                        self.warnings.push(format!(
+                            "skipping changes that do not decrypt with this folder's key ({err}); the browser skips them too"
+                        ));
                     }
                     continue;
                 }
             };
-            cover(&out.header, &mut received);
-            plaintexts.push(out.plaintext);
+            cover(&record, &mut received);
+            plaintexts.push(plaintext);
         }
         if let Some(conn) = self.conn.as_mut() {
             for (peer, end) in seen {
                 raise(&mut conn.seen, peer, end);
             }
             conn.unreadable += unreadable;
-            conn.decrypted += plaintexts.len() as u64;
+            conn.decrypted_any |= !plaintexts.is_empty();
             if mismatched_key.is_some() {
                 conn.mismatched_key = mismatched_key;
             }
@@ -568,48 +635,49 @@ impl Session {
 
     fn on_ack(&mut self, batch: BatchId, status: UpdateStatusCode) -> anyhow::Result<()> {
         let conn = self.conn()?;
-        let Some(container) = conn.in_flight.remove(&batch) else {
+        let Some(sent) = conn.in_flight.remove(&batch) else {
             return Ok(());
         };
-        match status {
-            UpdateStatusCode::Ok => {
-                conn.deltas += delta_count(&container) as u64;
+        match (status, sent) {
+            (UpdateStatusCode::Ok, InFlight::Deltas(spans)) => {
+                conn.deltas += spans.len() as u64;
                 Ok(())
             }
-            UpdateStatusCode::RateLimited
-            | UpdateStatusCode::FragmentTimeout
-            | UpdateStatusCode::Unknown => {
+            (UpdateStatusCode::Ok, InFlight::Snapshot) => Ok(()),
+            (
+                UpdateStatusCode::RateLimited
+                | UpdateStatusCode::FragmentTimeout
+                | UpdateStatusCode::Unknown,
+                sent,
+            ) => {
                 // The ops are still in the doc; forget that the server has
-                // them so the retry sends them again.
-                for record in decode_elo_container(&container).unwrap_or_default() {
-                    if let Ok(parsed) = loro_protocol::parse_elo_record_header(record)
-                        && let EloHeader::Delta(delta) = parsed.header
-                        && let Some(peer) = parse_peer_id(&delta.peer_id)
-                    {
+                // them so the retry sends them again. A snapshot needs no
+                // rewind: maybe_compact only sends one after the deltas it
+                // covers were acked.
+                if let InFlight::Deltas(spans) = sent {
+                    for (peer, start) in spans {
                         let known = conn.server.entry(peer).or_default();
-                        if delta.start < *known {
-                            *known = delta.start;
-                        }
+                        *known = (*known).min(start);
                     }
                 }
                 conn.retry_at
                     .get_or_insert_with(|| Instant::now() + RETRY_DELAY);
                 Ok(())
             }
-            UpdateStatusCode::PermissionDenied => {
+            (UpdateStatusCode::PermissionDenied, _) => {
                 bail!("the server refused the changes: this link is view-only")
             }
-            other if is_snapshot(&container) => {
+            (other, InFlight::Snapshot) => {
                 // Every delta the snapshot would replace is stored, so
                 // only the compaction is lost; trying again would hit the
                 // same limit.
                 self.compaction_refused = true;
-                eprintln!(
-                    "warning: the server refused to compact the project's log ({other:?}); it keeps the uncompacted log"
-                );
+                self.warnings.push(format!(
+                    "the server refused to compact the project's log ({other:?}); it keeps the uncompacted log"
+                ));
                 Ok(())
             }
-            other => bail!("the server refused the changes ({other:?})"),
+            (other, InFlight::Deltas(_)) => bail!("the server refused the changes ({other:?})"),
         }
     }
 
@@ -635,10 +703,15 @@ impl Session {
             encrypt_span(&self.doc, &self.key, peer, start, end, &mut records)?;
             raise(&mut conn.server, peer, end);
         }
-        let records: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
-        for container in pack(&records, CONTAINER_BUDGET) {
+        let bytes: Vec<&[u8]> = records
+            .iter()
+            .map(|(_, record)| record.as_slice())
+            .collect();
+        for range in pack_ranges(&bytes, CONTAINER_BUDGET) {
+            let container = encode_container(&bytes[range.clone()]);
+            let spans = records[range].iter().map(|&(span, _)| span).collect();
             let id = conn.client.send_update(&container).await?;
-            conn.in_flight.insert(id, container);
+            conn.in_flight.insert(id, InFlight::Deltas(spans));
         }
         Ok(())
     }
@@ -693,7 +766,7 @@ impl Session {
         let container = encode_container(&[&record]);
         let conn = self.conn()?;
         let id = conn.client.send_update(&container).await?;
-        conn.in_flight.insert(id, container);
+        conn.in_flight.insert(id, InFlight::Snapshot);
         conn.deltas = 0;
         self.wait_for_acks().await
     }
@@ -726,18 +799,25 @@ impl Session {
         }
     }
 
-    /// `sha256:<hex>` of the plaintext a doc entry stands for.
-    async fn content_digest(&mut self, content: &FileContent) -> anyhow::Result<String> {
+    /// `sha256:<hex>` of the plaintext a doc entry stands for, unless it
+    /// is an asset whose bytes this folder never had.
+    pub fn known_digest(&self, content: &FileContent) -> Option<String> {
         match content {
-            FileContent::Text(text) => Ok(crate::worktree::digest(text.as_bytes())),
-            FileContent::Asset { hash, .. } => {
-                if let Some(digest) = self.base.assets.get(hash) {
-                    return Ok(digest.clone());
-                }
-                self.asset_bytes(hash).await?;
-                Ok(self.base.assets[hash].clone())
-            }
+            FileContent::Text(text) => Some(crate::worktree::digest(text.as_bytes())),
+            FileContent::Asset { hash, .. } => self.base.assets.get(hash).cloned(),
         }
+    }
+
+    /// [`Self::known_digest`], fetching the asset when needed.
+    async fn content_digest(&mut self, content: &FileContent) -> anyhow::Result<String> {
+        if let Some(digest) = self.known_digest(content) {
+            return Ok(digest);
+        }
+        if let FileContent::Asset { hash, .. } = content {
+            self.asset_bytes(hash).await?;
+        }
+        self.known_digest(content)
+            .context("an asset has no digest after fetching it")
     }
 
     async fn same_content(&mut self, a: &FileContent, b: &FileContent) -> anyhow::Result<bool> {
@@ -748,14 +828,15 @@ impl Session {
     }
 
     /// Encrypts and uploads a local file, or reuses a blob we already know
-    /// with the same plaintext.
-    async fn upload_asset(&mut self, path: &str, file: &LocalFile) -> anyhow::Result<FileContent> {
-        let known = self
-            .base
-            .assets
-            .iter()
-            .find(|(_, digest)| **digest == file.digest)
-            .map(|(hash, _)| hash.clone());
+    /// with the same plaintext. `by_digest` maps plaintext digests back to
+    /// the hashes in the base's asset map and gains the uploaded blob.
+    async fn upload_asset(
+        &mut self,
+        path: &str,
+        file: &LocalFile,
+        by_digest: &mut HashMap<String, String>,
+    ) -> anyhow::Result<FileContent> {
+        let known = by_digest.get(&file.digest).cloned();
         let hash = match known {
             Some(hash) => hash,
             None => {
@@ -775,6 +856,7 @@ impl Session {
                 self.base
                     .assets
                     .insert(stored.hash.clone(), file.digest.clone());
+                by_digest.insert(file.digest.clone(), stored.hash.clone());
                 stored.hash
             }
         };
@@ -788,11 +870,23 @@ impl Session {
     /// The files at the base: what the folder held after the last sync,
     /// each file as of the doc state its copy on disk matches.
     pub fn base_files(&self) -> anyhow::Result<Files> {
-        let mut files = if self.base.frontiers()? == self.doc.oplog_frontiers() {
-            self.remote_files()
+        self.base_files_over(None)
+    }
+
+    /// [`Self::base_files`] reusing `remote` when the caller already
+    /// materialized the doc, since the base usually is the doc.
+    fn base_files_over(&self, remote: Option<&Files>) -> anyhow::Result<Files> {
+        let files = if self.base.frontiers()? == self.doc.oplog_frontiers() {
+            remote.cloned().unwrap_or_else(|| self.remote_files())
         } else {
             to_map(materialize(&self.fork_base()?))
         };
+        self.pin_files(files)
+    }
+
+    /// Turns the files at the base's frontiers into the base files by
+    /// putting in the pinned files as of their states.
+    fn pin_files(&self, mut files: Files) -> anyhow::Result<Files> {
         let mut pinned: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (path, state) in &self.base.pins {
             pinned.entry(state).or_default().push(path);
@@ -830,11 +924,11 @@ impl Session {
     /// Whether git moved HEAD to another branch, or reset it, since the
     /// folder last matched the base. Files may then differ from it without
     /// anyone having edited them.
-    pub fn git_switched(&self) -> bool {
+    pub fn git_switched(&mut self) -> bool {
         let Some(then) = &self.base.git else {
             return false;
         };
-        Repo::discover(self.root()).is_some_and(|repo| repo.switched_since(then))
+        cached_repo(&mut self.repo, self.state.root()).is_some_and(|repo| repo.switched_since(then))
     }
 
     /// The files in the doc as it is now.
@@ -981,13 +1075,32 @@ impl Session {
         Ok(changes)
     }
 
-    /// Local and remote changes since the base, without touching anything.
-    pub async fn status(&mut self, scope: &Scope) -> anyhow::Result<Status> {
-        let base = self.base_files()?;
+    /// The base, the doc and the folder, plus what changed remotely since
+    /// the base. Remotely changed paths are read even outside `scope`.
+    async fn sides(&mut self, scope: &Scope) -> anyhow::Result<Sides> {
         let remote = self.remote_files();
+        let base = self.base_files_over(Some(&remote))?;
         let remote_changes = self.remote_changes(&base, &remote).await?;
         let extra = remote_changes.keys().cloned().collect();
         let (local, skipped) = self.read_local(scope, &base, &extra)?;
+        Ok(Sides {
+            base,
+            remote,
+            local,
+            skipped,
+            remote_changes,
+        })
+    }
+
+    /// Local and remote changes since the base, without touching anything.
+    pub async fn status(&mut self, scope: &Scope) -> anyhow::Result<Status> {
+        let Sides {
+            base,
+            local,
+            skipped,
+            remote_changes,
+            ..
+        } = self.sides(scope).await?;
         let local_changes = self.local_changes(&base, &local).await?;
         Ok(Status {
             local: local_changes,
@@ -1001,7 +1114,8 @@ impl Session {
     /// it needs a connection when there is anything to send. The base and
     /// the cached doc are saved at the end.
     pub async fn reconcile(&mut self, scope: &Scope, mode: Mode) -> anyhow::Result<Report> {
-        self.reconcile_with(scope, mode, true).await
+        let (git, sides) = self.marked_sides(scope).await?;
+        self.reconcile_sides(git, sides, mode, true).await
     }
 
     /// [`Self::reconcile`] for callers that send and save on their own
@@ -1009,25 +1123,56 @@ impl Session {
     /// throttles writes of the cached doc. New ops only land in the doc and
     /// go out with the next push or connect.
     pub async fn reconcile_live(&mut self, scope: &Scope, mode: Mode) -> anyhow::Result<Report> {
-        self.reconcile_with(scope, mode, false).await
+        let (git, sides) = self.marked_sides(scope).await?;
+        self.reconcile_sides(git, sides, mode, false).await
+    }
+
+    /// [`Self::reconcile_live`], unless any of `hold` changed remotely.
+    /// Then nothing is touched and those paths are returned, so a caller
+    /// can wait for the editor that just saved them without diffing twice.
+    pub async fn reconcile_live_holding(
+        &mut self,
+        scope: &Scope,
+        mode: Mode,
+        hold: &BTreeSet<String>,
+    ) -> anyhow::Result<Reconciled> {
+        let (git, sides) = self.marked_sides(scope).await?;
+        let held: BTreeSet<String> = hold
+            .iter()
+            .filter(|path| sides.remote_changes.contains_key(*path))
+            .cloned()
+            .collect();
+        if !held.is_empty() {
+            return Ok(Reconciled::Held(held));
+        }
+        let report = self.reconcile_sides(git, sides, mode, false).await?;
+        Ok(Reconciled::Done(Box::new(report)))
+    }
+
+    /// [`Self::sides`], plus where HEAD was before the folder was read: a
+    /// checkout during the reconcile must not be vouched for.
+    async fn marked_sides(&mut self, scope: &Scope) -> anyhow::Result<(Option<GitMark>, Sides)> {
+        let git = self.repo().map(Repo::mark);
+        let sides = self.sides(scope).await?;
+        Ok((git, sides))
     }
 
     /// `flush`: in push mode, send new ops and wait for the acks, then
     /// persist the doc and the base.
-    async fn reconcile_with(
+    async fn reconcile_sides(
         &mut self,
-        scope: &Scope,
+        git: Option<GitMark>,
+        sides: Sides,
         mode: Mode,
         flush: bool,
     ) -> anyhow::Result<Report> {
-        // Taken before the folder is read: a checkout during the reconcile
-        // must not be vouched for.
-        let git = Repo::discover(self.root()).map(|repo| repo.mark());
-        let base = self.base_files()?;
-        let remote = self.remote_files();
-        let remote_changes = self.remote_changes(&base, &remote).await?;
-        let extra = remote_changes.keys().cloned().collect();
-        let (mut local, skipped) = self.read_local(scope, &base, &extra)?;
+        let Sides {
+            base,
+            remote,
+            mut local,
+            skipped,
+            remote_changes,
+        } = sides;
         let dropped = self.case_dropped(&base, &remote, &local);
         for path in &dropped {
             // Reading it would read its case variant's bytes. Taken as
@@ -1069,7 +1214,7 @@ impl Session {
         // The folder ends up matching this state, except for the files in
         // `kept`. Ops that arrive while we wait for acks are left for the
         // next run, which sees them as remote changes on top of this base.
-        let (synced, kept) = match mode {
+        let (synced, kept, fin) = match mode {
             Mode::Pull => {
                 let targets: BTreeSet<String> = remote_changes
                     .keys()
@@ -1090,7 +1235,7 @@ impl Session {
                     .await?;
                 kept.extend(both.iter().cloned());
                 report.conflicts = both;
-                (frontiers, kept)
+                (frontiers, kept, remote)
             }
             Mode::Push => {
                 if !local_changes.is_empty() {
@@ -1122,7 +1267,11 @@ impl Session {
                         self.save()?;
                     }
                 }
-                let merged = self.remote_files();
+                let merged = if report.applied.changed {
+                    self.remote_files()
+                } else {
+                    remote
+                };
                 let frontiers = self.doc.oplog_frontiers();
                 if report.applied.changed && flush {
                     self.push_local().await?;
@@ -1139,7 +1288,7 @@ impl Session {
                         &mut report,
                     )
                     .await?;
-                (frontiers, kept)
+                (frontiers, kept, merged)
             }
         };
 
@@ -1156,9 +1305,11 @@ impl Session {
         if mode == Mode::Push || report.status.local.is_empty() {
             self.base.git = git;
         }
+        report.base = self.pin_files(fin)?;
         if flush {
             self.save()?;
         }
+        report.warnings.append(&mut self.warnings);
         Ok(report)
     }
 
@@ -1195,6 +1346,7 @@ impl Session {
         changes: &BTreeMap<String, ChangeKind>,
     ) -> anyhow::Result<BTreeMap<String, Option<FileContent>>> {
         let mut out = BTreeMap::new();
+        let mut by_digest = None;
         for path in changes.keys() {
             let Some(Local::File(file)) = local.get(path) else {
                 out.insert(path.clone(), None);
@@ -1208,7 +1360,18 @@ impl Session {
             };
             let content = match as_text {
                 Some(text) => FileContent::Text(text),
-                None => self.upload_asset(path, file).await?,
+                None => {
+                    let by_digest = by_digest.get_or_insert_with(|| {
+                        // Reversed so that, like a scan, the first hash wins.
+                        self.base
+                            .assets
+                            .iter()
+                            .rev()
+                            .map(|(hash, digest)| (digest.clone(), hash.clone()))
+                            .collect()
+                    });
+                    self.upload_asset(path, file, by_digest).await?
+                }
             };
             out.insert(path.clone(), Some(content));
         }
@@ -1250,18 +1413,7 @@ impl Session {
                 fork.set_peer_id(self.doc.peer_id())?;
             }
             configure(&fork);
-            let mut files = to_map(materialize(&fork));
-            for (path, content) in &changes {
-                match content {
-                    Some(content) => files.insert(path.clone(), content.clone()),
-                    None => files.remove(path),
-                };
-            }
-            let desired: Vec<MaterializedFile> = files
-                .into_iter()
-                .map(|(path, content)| MaterializedFile { path, content })
-                .collect();
-            let applied = apply_files(&fork, &desired, PUSH_MESSAGE)?;
+            let applied = apply_changes(&fork, &changes, PUSH_MESSAGE)?;
             if applied.changed {
                 set_peer_info(&fork, &self.identity)?;
                 let updates = fork
@@ -1415,71 +1567,83 @@ impl Session {
     }
 }
 
+/// Looks up the repo `root` is in unless `slot` already holds it. Checking
+/// the cached one takes a stat or two where a lookup canonicalizes and
+/// walks up the tree, which adds up when sync polls git several times a
+/// second.
+fn cached_repo<'a>(slot: &'a mut Option<Repo>, root: &Path) -> Option<&'a Repo> {
+    let current = slot.as_ref().is_some_and(|repo| {
+        // The nearest `.git` has to still be this repo's: one created
+        // closer to the folder, as `clone --git` does inside another repo,
+        // takes over, and a removed one gives way to whatever is left.
+        repo.git_dir.exists()
+            && root.ancestors().find(|dir| dir.join(".git").exists())
+                == Some(repo.workdir.as_path())
+    });
+    if !current {
+        *slot = Repo::discover(root);
+    }
+    slot.as_ref()
+}
+
 /// Writes our name and color into `peers` under the doc's peer id, so the
 /// history panel can say who made an edit.
 pub fn set_peer_info(doc: &LoroDoc, identity: &Identity) -> anyhow::Result<()> {
     Ok(set_peer(doc, &identity.name, &identity.color)?)
 }
 
-/// Encrypts ops `[start, end)` of `peer` into delta records. A span whose
-/// updates exceed the container budget is split in halves until each part
-/// fits or is a single op, so a big initial import never produces one
-/// update larger than the server accepts.
+/// Encrypts ops `[start, end)` of `peer` into delta records, each paired
+/// with the `(peer, start)` of its span. A span whose updates exceed the
+/// container budget is cut into pieces, so a big initial import never
+/// produces one update larger than the server accepts.
 fn encrypt_span(
     doc: &LoroDoc,
     key: &ProjectKey,
     peer: u64,
     start: u64,
     end: u64,
-    out: &mut Vec<Vec<u8>>,
+    out: &mut Vec<((u64, u64), Vec<u8>)>,
 ) -> anyhow::Result<()> {
     let span = IdSpan::new(peer, start as i32, end as i32);
     let plaintext = doc
         .export(ExportMode::updates_in_range(vec![span]))
         .context("exporting local ops")?;
-    if plaintext.len() > CONTAINER_BUDGET && end - start > 1 {
-        let mid = start + (end - start) / 2;
-        encrypt_span(doc, key, peer, start, mid, out)?;
-        return encrypt_span(doc, key, peer, mid, end, out);
+    let ops = end - start;
+    if plaintext.len() <= CONTAINER_BUDGET || ops == 1 {
+        out.push((
+            (peer, start),
+            key.encrypt_delta(peer, start, end, &plaintext),
+        ));
+        return Ok(());
     }
-    out.push(key.encrypt_delta(peer, start, end, &plaintext));
+    // Exporting dominates the cost, and halving would export every op once
+    // per level. Sizing pieces from the average op instead exports most ops
+    // just once more. Aiming at half the budget leaves room for ops that
+    // are bigger than average; a piece that still comes out too big is cut
+    // again.
+    let pieces = (plaintext.len() as u64)
+        .div_ceil(CONTAINER_BUDGET as u64 / 2)
+        .min(ops);
+    let step = ops.div_ceil(pieces);
+    let mut at = start;
+    while at < end {
+        let next = (at + step).min(end);
+        encrypt_span(doc, key, peer, at, next, out)?;
+        at = next;
+    }
     Ok(())
 }
 
-/// Raises `map` to the op ranges a record header says it covers.
-fn cover(header: &EloHeader, map: &mut HashMap<u64, u64>) {
-    match header {
-        EloHeader::Delta(delta) => {
-            if let Some(peer) = parse_peer_id(&delta.peer_id) {
-                raise(map, peer, delta.end);
-            }
-        }
-        EloHeader::Snapshot(snapshot) => {
-            for (peer, counter) in &snapshot.vv {
-                if let Some(peer) = parse_peer_id(peer) {
-                    raise(map, peer, *counter);
-                }
+/// Raises `map` to the op ranges a record says it covers.
+fn cover(record: &Record, map: &mut HashMap<u64, u64>) {
+    match record {
+        Record::Delta { peer, end, .. } => raise(map, *peer, *end),
+        Record::Snapshot { vv } => {
+            for (&peer, &counter) in vv {
+                raise(map, peer, counter);
             }
         }
     }
-}
-
-fn is_snapshot(container: &[u8]) -> bool {
-    decode_elo_container(container)
-        .unwrap_or_default()
-        .into_iter()
-        .any(|record| {
-            loro_protocol::parse_elo_record_header(record)
-                .is_ok_and(|parsed| matches!(parsed.header, EloHeader::Snapshot(_)))
-        })
-}
-
-fn delta_count(container: &[u8]) -> usize {
-    decode_elo_container(container)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|record| record.first() == Some(&(EloRecordKind::DeltaSpan as u8)))
-        .count()
 }
 
 fn raise(map: &mut HashMap<u64, u64>, peer: u64, end: u64) {
@@ -1515,7 +1679,31 @@ mod tests {
         assert_eq!(a, Identity::new("Ada Lovelace"));
         assert!(PALETTE.contains(&a.color.as_str()));
         assert_eq!(Identity::new("").name, "CLI");
-        assert_eq!(Identity::new(&"x".repeat(100)).name.len(), MAX_NAME_CHARS);
+        assert_eq!(
+            Identity::new(&"x".repeat(100)).name.len(),
+            typstry_doc::peers::MAX_PEER_NAME_UTF16
+        );
+    }
+
+    #[test]
+    fn cached_repo_follows_repos_created_or_removed_later() {
+        let fake_repo = |dir: &Path| {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        };
+        let outer = tempfile::tempdir().unwrap();
+        let outer = outer.path().canonicalize().unwrap();
+        let root = outer.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut slot = None;
+        assert!(cached_repo(&mut slot, &root).is_none());
+
+        fake_repo(&outer);
+        assert_eq!(cached_repo(&mut slot, &root).unwrap().workdir, outer);
+        fake_repo(&root);
+        assert_eq!(cached_repo(&mut slot, &root).unwrap().workdir, root);
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        assert_eq!(cached_repo(&mut slot, &root).unwrap().workdir, outer);
     }
 
     #[test]
@@ -1537,10 +1725,25 @@ mod tests {
         assert!(records.len() > 1);
 
         let copy = LoroDoc::new();
-        let plaintexts: Vec<Vec<u8>> = records
-            .iter()
-            .map(|r| key.decrypt_record(r).unwrap().plaintext)
-            .collect();
+        let mut next = 0;
+        let mut plaintexts = Vec::new();
+        for ((peer, start), record) in &records {
+            let out = key.decrypt_record(record).unwrap();
+            let Record::Delta {
+                peer: p,
+                start: s,
+                end: e,
+            } = out.record
+            else {
+                panic!("not a delta");
+            };
+            assert_eq!((p, s), (*peer, *start));
+            assert_eq!(s, next, "spans must be contiguous");
+            next = e;
+            assert!(out.plaintext.len() <= CONTAINER_BUDGET);
+            plaintexts.push(out.plaintext);
+        }
+        assert_eq!(next, end);
         copy.import_batch(&plaintexts).unwrap();
         assert_eq!(copy.get_text("t").to_string(), body);
     }

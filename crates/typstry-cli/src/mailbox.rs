@@ -17,7 +17,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::Line;
-use crate::state::{SyncRunning, atomic_write, create_private_dir};
+use crate::state::{SyncRunning, create_private_dir, random_hex, write_json};
 
 pub const MAILBOX: &str = "requests";
 const REQUEST: &str = ".req";
@@ -38,7 +38,7 @@ const POLL: Duration = Duration::from_millis(50);
 #[serde(tag = "command", rename_all = "camelCase")]
 pub enum Request {
     Status,
-    Info { offline: bool },
+    Info,
     VersionList,
     VersionSave { name: String, force: bool },
     Push { force: bool },
@@ -63,10 +63,10 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
         // existed.
         bail!("{running}");
     }
-    let id = random_id();
+    let id = random_hex(8);
     let request_path = dir.join(format!("{id}{REQUEST}"));
     let response_path = dir.join(format!("{id}{RESPONSE}"));
-    atomic_write(&request_path, &serde_json::to_vec(request)?, true)?;
+    write_json(&request_path, request)?;
 
     let started = Instant::now();
     let mut taken = false;
@@ -186,17 +186,8 @@ impl Mailbox {
 
     pub fn answer(&self, id: &str, response: &Response) {
         let path = self.dir.join(format!("{id}{RESPONSE}"));
-        let result = serde_json::to_vec(response)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| atomic_write(&path, &bytes, true));
-        if let Err(err) = result {
+        if let Err(err) = write_json(&path, response) {
             eprintln!("sync: cannot answer a request: {err:#}");
         }
     }
-}
-
-fn random_id() -> String {
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("OS random source unavailable");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

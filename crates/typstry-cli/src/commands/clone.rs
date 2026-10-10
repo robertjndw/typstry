@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-use super::{Ctx, Output, print_report, track_branch};
+use super::{Ctx, Output, print_report, print_warnings, track_branch};
 use crate::api::{Api, Permission};
 use crate::engine::{Mode, Scope, Session};
 use crate::git::{self, Repo};
@@ -102,16 +102,16 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 
     let mut session = Session::open(&root, ctx.name.as_deref())?;
     let report = session.reconcile(&Scope::Full, Mode::Pull).await?;
-    print_report(&mut Output::terminal(), &report);
+    let mut out = Output::terminal();
+    print_report(&mut out, &report);
 
     let title = title.unwrap_or_else(|| "untitled".to_owned());
     if args.git {
         init_repo(&root, &title)?;
-    }
-    if let Some(repo) = Repo::discover(&root) {
+    } else if let Some(repo) = Repo::discover(&root) {
         repo.exclude_state_dir()?;
     }
-    track_branch(&mut session)?;
+    track_branch(&mut session, &mut out)?;
 
     println!(
         "Cloned {title:?} into {} ({} file(s){})",
@@ -137,6 +137,7 @@ async fn fetch(
     let mut session = Session::create(dir, link, share, ctx.name.as_deref())?;
     session.connect().await?;
     session.disconnect().await;
+    print_warnings(&mut Output::terminal(), &mut session);
     session.save()?;
     Ok(typstry_doc::title(&session.doc))
 }
@@ -207,27 +208,20 @@ fn init_repo(root: &Path, title: &str) -> anyhow::Result<()> {
     repo.exclude_state_dir()?;
     git::run(root, &["add", "-A"])?;
     let message = format!("import from typstry: {title}");
-    let mut commit = std::process::Command::new("git");
-    commit
-        .args(["commit", "--quiet", "--allow-empty", "-m", &message])
-        .current_dir(root);
+    let mut args = vec![];
     // Without a configured identity git refuses to commit at all; the
     // import commit is ours rather than the user's anyway.
     let configured = |key: &str| git::run(root, &["config", key]).is_ok();
     if !configured("user.name") || !configured("user.email") {
-        commit
-            .env("GIT_AUTHOR_NAME", "typstry")
-            .env("GIT_AUTHOR_EMAIL", "typstry@localhost")
-            .env("GIT_COMMITTER_NAME", "typstry")
-            .env("GIT_COMMITTER_EMAIL", "typstry@localhost");
+        args.extend([
+            "-c",
+            "user.name=typstry",
+            "-c",
+            "user.email=typstry@localhost",
+        ]);
     }
-    let out = commit.output().context("cannot run git commit")?;
-    if !out.status.success() {
-        bail!(
-            "git commit failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    args.extend(["commit", "--quiet", "--allow-empty", "-m", &message]);
+    git::run(root, &args)?;
     Ok(())
 }
 

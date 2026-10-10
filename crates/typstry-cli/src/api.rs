@@ -48,8 +48,6 @@ pub struct CreatedProject {
 pub struct StoredBlob {
     /// `sha256:<hex>` of the ciphertext.
     pub hash: String,
-    /// Ciphertext size; the doc stores the plaintext size instead.
-    pub size: u64,
 }
 
 /// rustls refuses to pick a crypto provider on its own. Only ring is
@@ -85,10 +83,6 @@ impl Api {
             http,
             origin: origin.trim_end_matches('/').to_owned(),
         })
-    }
-
-    pub fn origin(&self) -> &str {
-        &self.origin
     }
 
     /// Registers an empty project; its content arrives later, encrypted.

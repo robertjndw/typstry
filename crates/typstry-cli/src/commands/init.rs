@@ -4,17 +4,17 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use typstry_doc::init::{DEFAULT_MAIN_FILE, init_project_with, set_main_file, starter_content};
-use typstry_doc::names::validate_name;
+use typstry_doc::init::{DEFAULT_MAIN_FILE, init_bare_project, set_main_file, starter_content};
+use typstry_doc::names::validate_path;
 use typstry_doc::paths::build_path_index;
 use typstry_wire::crypto::ProjectKey;
 
-use super::{Ctx, link::print_links, track_branch};
+use super::{Ctx, Output, link::print_links, print_warnings, track_branch};
 use crate::api::{Api, Permission, ShareInfo};
 use crate::engine::{Mode, Scope, Session, set_peer_info};
-use crate::git::{Head, Repo};
+use crate::git::{self, Head, Repo};
 use crate::link::{ShareLink, ws_url};
-use crate::state::STATE_DIR;
+use crate::state::{STATE_DIR, StateDir};
 use crate::worktree::{GIT_FILE_REASON, LocalFile, Skipped, Worktree, case_clashes};
 
 /// Files and folders that are common in repositories but rarely matter to
@@ -157,11 +157,7 @@ fn plan(root: &Path, args: &Args) -> anyhow::Result<Plan> {
             root.display()
         );
     }
-    if let Some(outer) = root
-        .ancestors()
-        .skip(1)
-        .find(|dir| dir.join(STATE_DIR).join("config.json").is_file())
-    {
+    if let Some(outer) = root.parent().and_then(StateDir::find_root) {
         bail!(
             "{} is inside the typstry project in {}; a nested project would be synced twice",
             root.display(),
@@ -194,11 +190,9 @@ fn plan(root: &Path, args: &Args) -> anyhow::Result<Plan> {
     }));
     let mut files = Vec::new();
     for (path, file) in scan.files {
-        if let Some(error) = path.split('/').find_map(|s| validate_name(s).err()) {
-            skipped.push(Skipped {
-                path,
-                reason: format!("not a valid name: {error}"),
-            });
+        if let Err(invalid) = validate_path(&path) {
+            let reason = format!("not a valid name: {}", invalid.error);
+            skipped.push(Skipped { path, reason });
         } else {
             files.push((path, file));
         }
@@ -353,14 +347,12 @@ fn dirty_count(dir: &Path) -> Option<usize> {
     }
     // --no-optional-locks keeps status from refreshing the index, so this
     // never writes to .git, even while an editor's git plugin is busy.
-    let out = std::process::Command::new("git")
-        .args(["--no-optional-locks", "status", "--porcelain", "--", "."])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).lines().count())
+    git::run(
+        dir,
+        &["--no-optional-locks", "status", "--porcelain", "--", "."],
+    )
+    .ok()
+    .map(|out| out.lines().count())
 }
 
 fn confirm(question: &str) -> anyhow::Result<bool> {
@@ -393,7 +385,9 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     // The seed and the files go out together after the assets, so nobody
     // ever sees a project whose assets are still missing.
     set_peer_info(&session.doc, session.identity())?;
-    init_project_with(&session.doc, &plan.title, plan.starter)?;
+    init_bare_project(&session.doc, &plan.title)?;
+    // The starter goes up like any other file, so there is only one way a
+    // file gets into a new project.
     let paths: BTreeSet<String> = if plan.starter {
         session
             .worktree()
@@ -411,9 +405,10 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
             skipped.path, skipped.reason
         );
     }
-    if let Some(main) = &plan.main
-        && !plan.starter
-    {
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(main) = &plan.main {
         match build_path_index(&session.doc).by_path.get(main) {
             Some(&id) => set_main_file(&session.doc, Some(id))?,
             None => eprintln!("warning: {main} was not uploaded, so there is no main file"),
@@ -424,8 +419,10 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     session.base.set_frontiers(&session.doc.oplog_frontiers());
     session.push_local().await?;
     session.disconnect().await;
+    let mut out = Output::terminal();
+    print_warnings(&mut out, &mut session);
     session.save()?;
-    track_branch(&mut session)?;
+    track_branch(&mut session, &mut out)?;
     Ok(session)
 }
 

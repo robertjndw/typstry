@@ -4,7 +4,7 @@ use typstry_doc::peers::peer_name;
 use typstry_doc::versions::MAX_VERSION_NAME_CHARS;
 use typstry_doc::versions::{NamedVersion, named_versions, normalize_version_name, save_version};
 
-use super::{Ctx, Output, guard_branch, guard_switch, print_report};
+use super::{Ctx, Output, guard_branch, guard_switch, print_report, print_warnings};
 use crate::engine::{Mode, Report, Scope, Session, set_peer_info};
 use crate::mailbox::Request;
 use crate::state::now_ms;
@@ -54,10 +54,12 @@ async fn list(ctx: &Ctx, offline: bool) -> anyhow::Result<()> {
     let Some(mut session) = ctx.open_or_ask(Request::VersionList).await? else {
         return Ok(());
     };
+    let mut out = Output::terminal();
     if !offline {
         session.refresh().await?;
+        print_warnings(&mut out, &mut session);
     }
-    print_versions(&session.doc, &mut Output::terminal());
+    print_versions(&session.doc, &mut out);
     Ok(())
 }
 
@@ -100,10 +102,10 @@ async fn save(ctx: &Ctx, raw_name: &str, force: bool) -> anyhow::Result<()> {
     if !session.can_write() {
         bail!("{VIEW_ONLY_SAVE}");
     }
-    guard_branch(&mut session, force)?;
+    let mut out = Output::terminal();
+    guard_branch(&mut session, force, &mut out)?;
     guard_switch(&mut session, force).await?;
     session.connect().await?;
-    let mut out = Output::terminal();
     // The version is meant to be what is on disk now, so local edits go
     // out first.
     let report = session.reconcile(&Scope::Full, Mode::Push).await?;
@@ -112,6 +114,7 @@ async fn save(ctx: &Ctx, raw_name: &str, force: bool) -> anyhow::Result<()> {
     let saved = name_current_state(&mut session, &name)?;
     session.push_local().await?;
     session.disconnect().await;
+    print_warnings(&mut out, &mut session);
     // The base stays where the reconcile put it: remote edits may have
     // arrived while waiting for the ack, and those are not on disk.
     session.save()?;

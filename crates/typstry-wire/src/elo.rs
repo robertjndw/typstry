@@ -1,16 +1,136 @@
-//! Encoding `%ELO` records and the containers that carry them.
+//! Encoding and parsing `%ELO` records and the containers that carry them.
 //!
 //! The Rust `loro-protocol` crate only parses records, so the encoders live
 //! here and mirror the npm encoder (`encodeDeltaHeaderBytes`,
 //! `encodeSnapshotHeaderBytes`, `encodeEloContainer`) byte for byte. A
 //! record's header doubles as the AEAD associated data, so any difference
 //! in encoding would make records from the other side fail to decrypt.
+//!
+//! The parsers are stricter than `loro-protocol`: they are what the server
+//! validates untrusted updates with, and clients run the same checks so
+//! they never act on a record the server would have refused.
 
-use loro_protocol::{BytesWriter, EloRecordKind};
+use std::collections::HashMap;
+use std::ops::Range;
+
+use loro_protocol::{
+    BytesReader, BytesWriter, EloHeader, EloRecordKind, decode_elo_container,
+    parse_elo_record_header,
+};
 
 pub const IV_LEN: usize = 12;
 
 pub type Iv = [u8; IV_LEN];
+
+pub type PeerId = u64;
+
+/// Per peer, an exclusive op counter: `{p: c}` means ops `[0, c)` of `p`.
+pub type Version = HashMap<PeerId, u64>;
+
+/// Loro op counters are i32, so a larger one cannot come from a real doc
+/// and would not survive encoding the coverage as a Loro version vector.
+pub const MAX_COUNTER: u64 = i32::MAX as u64;
+
+/// What a record's plaintext header says it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Record {
+    /// Ops `[start, end)` of `peer`.
+    Delta { peer: PeerId, start: u64, end: u64 },
+    /// A full copy of the doc at `vv`.
+    Snapshot { vv: Version },
+}
+
+/// A record parsed down to what decrypting it takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRecord<'a> {
+    pub record: Record,
+    pub key_id: String,
+    pub iv: Iv,
+    /// The exact header bytes, bound to the ciphertext as associated data.
+    pub aad: &'a [u8],
+    /// Ciphertext with the GCM tag.
+    pub ct: &'a [u8],
+}
+
+fn counter(value: u64) -> Result<u64, String> {
+    if value > MAX_COUNTER {
+        return Err(format!("counter {value} does not fit a Loro counter"));
+    }
+    Ok(value)
+}
+
+/// Reads the leading uleb128 count and checks it against the bytes left.
+/// The library pre-allocates from that count, so a hostile one like 2^60
+/// would abort the process before any bounds check runs.
+fn plausible_count(reader: &mut BytesReader<'_>, min_entry_bytes: usize) -> Result<(), String> {
+    let count = reader.read_uleb128()?;
+    let room = (reader.remaining() / min_entry_bytes) as u64;
+    if count > room {
+        return Err(format!("count {count} exceeds the remaining bytes"));
+    }
+    Ok(())
+}
+
+impl<'a> SealedRecord<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, String> {
+        if bytes.first() == Some(&(EloRecordKind::Snapshot as u8)) {
+            // Each vv entry is at least a one-byte length and a one-byte counter.
+            plausible_count(&mut BytesReader::new(&bytes[1..]), 2)?;
+        }
+        let parsed = parse_elo_record_header(bytes)?;
+        let (record, key_id, iv) = match parsed.header {
+            EloHeader::Delta(delta) => {
+                let record = Record::Delta {
+                    peer: parse_peer_id(&delta.peer_id).ok_or("invalid delta peer id")?,
+                    start: counter(delta.start)?,
+                    end: counter(delta.end)?,
+                };
+                (record, delta.key_id, delta.iv)
+            }
+            EloHeader::Snapshot(snapshot) => {
+                let mut vv = Version::with_capacity(snapshot.vv.len());
+                for (peer, count) in snapshot.vv {
+                    let peer = parse_peer_id(&peer).ok_or("invalid snapshot peer id")?;
+                    if vv.insert(peer, counter(count)?).is_some() {
+                        return Err("snapshot lists a peer twice".into());
+                    }
+                }
+                (Record::Snapshot { vv }, snapshot.key_id, snapshot.iv)
+            }
+        };
+        Ok(Self {
+            record,
+            key_id,
+            iv,
+            aad: parsed.aad,
+            ct: parsed.ct,
+        })
+    }
+}
+
+pub fn parse_record(bytes: &[u8]) -> Result<Record, String> {
+    SealedRecord::parse(bytes).map(|sealed| sealed.record)
+}
+
+/// Splits an update payload into its records without looking at them.
+pub fn decode_container(payload: &[u8]) -> Result<Vec<&[u8]>, String> {
+    // Every record is at least its one-byte length prefix.
+    plausible_count(&mut BytesReader::new(payload), 1)?;
+    decode_elo_container(payload)
+}
+
+/// Parses every record of one update payload. All or nothing: a single bad
+/// record rejects the whole payload, so the server never stores half of it.
+pub fn parse_container(payload: &[u8]) -> Result<Vec<(Record, &[u8])>, String> {
+    let records = decode_container(payload)?;
+    if records.is_empty() {
+        return Err("empty container".into());
+    }
+    records
+        .into_iter()
+        .map(|bytes| Ok((parse_record(bytes)?, bytes)))
+        .collect()
+}
 
 /// Packs records into one update payload: a count, then each record
 /// length-prefixed.
@@ -26,21 +146,29 @@ pub fn encode_container(records: &[&[u8]]) -> Vec<u8> {
 /// Groups records into as few containers as `limit` allows, keeping their
 /// order. A record larger than `limit` gets a container of its own.
 pub fn pack(records: &[&[u8]], limit: usize) -> Vec<Vec<u8>> {
+    pack_ranges(records, limit)
+        .into_iter()
+        .map(|range| encode_container(&records[range]))
+        .collect()
+}
+
+/// [`pack`] as the index range of each container's records, for callers
+/// that track something per record.
+pub fn pack_ranges(records: &[&[u8]], limit: usize) -> Vec<Range<usize>> {
     let mut out = Vec::new();
-    let mut batch: Vec<&[u8]> = Vec::new();
+    let mut first = 0;
     let mut size = 0;
-    for record in records {
+    for (i, record) in records.iter().enumerate() {
         let cost = record.len() + uleb_len(record.len());
-        if !batch.is_empty() && size + cost > limit {
-            out.push(encode_container(&batch));
-            batch.clear();
+        if i > first && size + cost > limit {
+            out.push(first..i);
+            first = i;
             size = 0;
         }
-        batch.push(record);
         size += cost;
     }
-    if !batch.is_empty() {
-        out.push(encode_container(&batch));
+    if first < records.len() {
+        out.push(first..records.len());
     }
     out
 }
@@ -119,9 +247,7 @@ pub fn encode_record(header: &[u8], ct: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use loro_protocol::{
-        EloDeltaHeader, EloHeader, EloSnapshotHeader, decode_elo_container, parse_elo_record_header,
-    };
+    use loro_protocol::{EloDeltaHeader, EloSnapshotHeader};
 
     use super::*;
 
@@ -211,7 +337,89 @@ mod tests {
             .map(|c| decode_elo_container(c).unwrap().len())
             .collect();
         assert_eq!(sizes, [2, 1, 1]);
+        assert_eq!(
+            pack_ranges(&[&small, &small, &huge, &small], limit),
+            [0..2, 2..3, 3..4]
+        );
         assert!(pack(&[], limit).is_empty());
+    }
+
+    fn delta(peer: &[u8], start: u64, end: u64, ct: &[u8]) -> Vec<u8> {
+        let mut w = BytesWriter::new();
+        w.push_byte(0x00);
+        w.push_var_bytes(peer);
+        w.push_uleb128(start);
+        w.push_uleb128(end);
+        w.push_var_string("k1");
+        w.push_var_bytes(&[0; 12]);
+        w.push_var_bytes(ct);
+        w.finalize()
+    }
+
+    fn snapshot(vv: &[(&[u8], u64)]) -> Vec<u8> {
+        let mut w = BytesWriter::new();
+        w.push_byte(0x01);
+        w.push_uleb128(vv.len() as u64);
+        for (peer, count) in vv {
+            w.push_var_bytes(peer);
+            w.push_uleb128(*count);
+        }
+        w.push_var_string("k1");
+        w.push_var_bytes(&[0; 12]);
+        w.push_var_bytes(b"ct");
+        w.finalize()
+    }
+
+    #[test]
+    fn parses_and_rejects_containers() {
+        let d = delta(b"7", 0, 3, b"x");
+        let s = snapshot(&[(b"7", 3)]);
+        let container = encode_container(&[&d, &s]);
+        let parsed = parse_container(&container).unwrap();
+        assert_eq!(
+            parsed[0],
+            (
+                Record::Delta {
+                    peer: 7,
+                    start: 0,
+                    end: 3
+                },
+                d.as_slice()
+            )
+        );
+        assert_eq!(
+            parsed[1].0,
+            Record::Snapshot {
+                vv: Version::from([(7, 3)])
+            }
+        );
+
+        let too_big = MAX_COUNTER + 1;
+        for bad in [
+            encode_container(&[]),
+            encode_container(&[&delta(b"07", 0, 1, b"x")]),
+            encode_container(&[&delta(b"7", 0, too_big, b"x")]),
+            encode_container(&[&snapshot(&[(b"7", too_big)])]),
+            encode_container(&[&snapshot(&[(b"7", 1), (b"7", 2)])]),
+            encode_container(&[&d, b"\x05garbage"]),
+            b"\xff\xff\xff\xff\xff\xff\xff\xff\x0f".to_vec(),
+            // A snapshot claiming 2^35 vv entries in zero bytes.
+            b"\x01\x07\x01\x80\x80\x80\x80\x80\x01".to_vec(),
+        ] {
+            assert!(parse_container(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sealed_records_keep_what_decryption_needs() {
+        let iv = [5; IV_LEN];
+        let header = encode_delta_header(3, 1, 2, "key", &iv);
+        let record = encode_record(&header, b"ct");
+        let sealed = SealedRecord::parse(&record).unwrap();
+        assert_eq!(sealed.key_id, "key");
+        assert_eq!(sealed.iv, iv);
+        assert_eq!(sealed.aad, header.as_slice());
+        assert_eq!(sealed.ct, b"ct");
     }
 
     #[test]
