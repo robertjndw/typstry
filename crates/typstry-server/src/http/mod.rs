@@ -1,6 +1,7 @@
 pub mod assets;
 mod error;
 pub mod projects;
+pub mod protocol;
 
 use std::path::Path;
 use std::time::Duration;
@@ -93,11 +94,17 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         ));
     // Uploads get no timeout: a 25 MB body on a slow link legitimately
     // takes minutes, and the size cap already bounds what one can cost.
-    let mut app = Router::new()
-        .route("/healthz", get(healthz))
+    let gated = Router::new()
         .merge(api)
         .route("/api/p/{token}/assets", post(assets::upload))
         .route("/api/p/{token}/blobs/{hash}", get(assets::blob))
+        .layer(middleware::from_fn(protocol::gate));
+    // The WebSocket checks its version itself: browsers cannot set headers
+    // on it, so it comes as a query parameter.
+    let mut app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/api/info", get(protocol::info))
+        .merge(gated)
         .route("/ws", get(ws::handler));
 
     // In dev the Vite server serves the frontend, so a missing dist is normal.

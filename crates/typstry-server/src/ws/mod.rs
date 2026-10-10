@@ -1,18 +1,35 @@
 pub mod conn;
 pub mod rate;
 
-use axum::extract::State;
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{Query, State};
 use axum::response::Response;
 use loro_protocol::MAX_MESSAGE_SIZE;
+use serde::Deserialize;
 
+use crate::http::protocol;
 use crate::state::AppState;
 
 /// Protocol messages are capped at 256 KiB; anything larger is split into
 /// fragments by the sender, so a bigger frame is a broken or hostile client.
 const MAX_FRAME: usize = MAX_MESSAGE_SIZE + 1024;
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+#[derive(Debug, Deserialize)]
+pub struct Params {
+    /// The client's protocol version, see [`protocol::accepts`].
+    protocol: Option<u32>,
+}
+
+/// Refuses an outdated client before the upgrade, so it gets a plain 426
+/// rather than a socket whose messages it may misread.
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<Params>,
+    State(state): State<AppState>,
+) -> Response {
+    if !protocol::accepts(params.protocol) {
+        return protocol::too_old();
+    }
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| {
