@@ -77,12 +77,23 @@ export class IndexedDbBackend implements DocBackend {
     factory: IDBFactory = indexedDB,
   ): Promise<IndexedDbBackend> {
     const req = factory.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    // Each schema change appends an `oldVersion < n` step and bumps
+    // DB_VERSION; never edit an earlier step, since browsers that already
+    // ran it skip it and would end up with a different schema.
+    req.onupgradeneeded = (event) => {
       const db = req.result;
-      db.createObjectStore(SNAPSHOTS, { keyPath: "projectId" });
-      const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
-      updates.createIndex(BY_PROJECT, "projectId");
+      const oldVersion = event.oldVersion;
+      if (oldVersion < 1) {
+        db.createObjectStore(SNAPSHOTS, { keyPath: "projectId" });
+        const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
+        updates.createIndex(BY_PROJECT, "projectId");
+      }
     };
+    // Fires while another tab still holds an older connection. Those tabs
+    // close on versionchange, so the open normally goes through moments
+    // later; rejecting here would drop to memory for a transient delay.
+    req.onblocked = () =>
+      console.warn("local persistence upgrade waiting on another tab");
     const db = await request(req);
     // Another tab upgrading the schema would wait on us forever otherwise.
     db.onversionchange = () => db.close();

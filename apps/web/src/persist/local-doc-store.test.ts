@@ -192,3 +192,23 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
     expect(restored).toContain("A compacts");
   });
 });
+
+describe("IndexedDbBackend schema", () => {
+  it("reopens an existing v1 database without recreating stores", async () => {
+    const factory = new IDBFactory();
+    const first = await IndexedDbBackend.open(factory);
+    await first.append("p1", new Uint8Array([1, 2]));
+
+    const second = await IndexedDbBackend.open(factory);
+    const stored = await second.load("p1");
+    expect(stored.updates).toEqual([new Uint8Array([1, 2])]);
+  });
+
+  it("creates the stores on a fresh open", async () => {
+    const backend = await IndexedDbBackend.open(new IDBFactory());
+    await expect(backend.load("none")).resolves.toEqual({
+      snapshot: null,
+      updates: [],
+    });
+  });
+});
