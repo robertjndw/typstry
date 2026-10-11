@@ -1004,6 +1004,28 @@ async fn answers_text_ping() {
 }
 
 #[tokio::test]
+async fn silent_connection_is_closed_as_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let mut c = server.connect().await;
+    // The connection's 1 s fragment sweep must not keep pushing the idle
+    // deadline back. Paused time skips ahead instead of waiting 90 s.
+    tokio::time::pause();
+    let close = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match c.ws.next().await {
+                Some(Ok(Message::Close(frame))) => return frame,
+                Some(Ok(_)) => {}
+                other => panic!("socket ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a silent connection was never closed");
+    assert_eq!(close.unwrap().reason.as_str(), "idle_timeout");
+}
+
+#[tokio::test]
 async fn doc_updates_are_rate_limited_per_connection() {
     let dir = tempfile::tempdir().unwrap();
     let limits = ConnLimits {

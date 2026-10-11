@@ -29,6 +29,7 @@ typstry-wire.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
 

@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use loro_protocol::MAX_MESSAGE_SIZE;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::room::{Outbound, Outbox, OutboxReceiver};
@@ -74,6 +74,10 @@ pub(crate) struct Socket {
     shutdown: CancellationToken,
     writer: JoinHandle<()>,
     overflowed: bool,
+    // When the client last sent anything. The idle deadline counts from here
+    // rather than from each `next` call, since a caller racing `next` against
+    // a timer restarts it far more often than the client goes quiet.
+    heard: Instant,
 }
 
 impl Socket {
@@ -92,29 +96,36 @@ impl Socket {
             shutdown: state.shutdown.clone(),
             writer: spawn_writer(sink, rx),
             overflowed: false,
+            heard: Instant::now(),
         };
         (socket, outbox)
     }
 
-    /// The next binary message, or None once the connection is over. Cancel
-    /// safe, so it can race other work in a `select!`.
+    /// The next binary message, or None once the connection is over or the
+    /// client has been silent for `idle`. Cancel safe, so it can race other
+    /// work in a `select!`.
     pub(crate) async fn next(&mut self, idle: Duration) -> Option<Bytes> {
         loop {
             tokio::select! {
-                next = timeout(idle, self.stream.next()) => match next {
-                    Ok(Some(Ok(Message::Binary(bytes)))) => return Some(bytes),
-                    Ok(Some(Ok(Message::Text(text)))) => {
-                        if text.as_str() == "ping" {
-                            self.outbox.push(Outbound::Text("pong"));
+                next = timeout_at(self.heard + idle, self.stream.next()) => {
+                    if next.is_ok() {
+                        self.heard = Instant::now();
+                    }
+                    match next {
+                        Ok(Some(Ok(Message::Binary(bytes)))) => return Some(bytes),
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if text.as_str() == "ping" {
+                                self.outbox.push(Outbound::Text("pong"));
+                            }
+                        }
+                        Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+                        Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => return None,
+                        Err(_) => {
+                            self.outbox.push(Outbound::Close(CLOSE_GOING_AWAY, "idle_timeout"));
+                            return None;
                         }
                     }
-                    Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
-                    Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => return None,
-                    Err(_) => {
-                        self.outbox.push(Outbound::Close(CLOSE_GOING_AWAY, "idle_timeout"));
-                        return None;
-                    }
-                },
+                }
                 () = self.overflow.notified() => {
                     self.overflowed = true;
                     return None;
