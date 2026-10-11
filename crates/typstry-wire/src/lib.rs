@@ -17,6 +17,7 @@ pub mod fragment;
 #[cfg(feature = "mls")]
 pub mod mls;
 pub mod mls_frame;
+pub mod relay;
 pub mod token;
 
 /// Version of the HTTP and WebSocket contract between clients and the

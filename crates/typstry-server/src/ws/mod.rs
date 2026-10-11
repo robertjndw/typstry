@@ -1,6 +1,7 @@
 pub mod conn;
 pub mod mls;
 pub mod rate;
+pub mod relay;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +28,9 @@ const MAX_FRAME: usize = MAX_MESSAGE_SIZE + 1024;
 
 /// The JS client pings every 30 s, so silence this long means a dead peer.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A deliberate close that is no error, like a peer that finished.
+pub(crate) const CLOSE_NORMAL: u16 = 1000;
 
 /// Neither code is in the JS client's fatal list (1008, 1011, 4400-4499), so
 /// it reconnects and resyncs after either.

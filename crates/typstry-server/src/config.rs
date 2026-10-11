@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::relay::RelayConfig;
 use crate::room::RoomConfig;
 use crate::store::blobs::DEFAULT_MAX_SIZE;
 use crate::ws::ConnLimits;
@@ -18,6 +19,7 @@ pub struct Config {
     pub max_upload_bytes: u64,
     pub rooms: RoomConfig,
     pub limits: ConnLimits,
+    pub relay: RelayConfig,
 }
 
 impl Default for Config {
@@ -29,6 +31,7 @@ impl Default for Config {
             max_upload_bytes: DEFAULT_MAX_SIZE,
             rooms: RoomConfig::default(),
             limits: ConnLimits::default(),
+            relay: RelayConfig::default(),
         }
     }
 }
@@ -136,6 +139,17 @@ impl Config {
         {
             config.rooms.ds.max_group_info_bytes = bytes;
         }
+        // Zero would expire every channel before anyone can join it.
+        if let Some(secs) =
+            parse("TYPSTRY_RELAY_TTL_SECS", "positive whole seconds").get_where(|&n| n >= 1)?
+        {
+            config.relay.ttl = Duration::from_secs(secs);
+        }
+        if let Some(n) =
+            parse("TYPSTRY_RELAY_MAX_CHANNELS", "a positive whole number").get_where(|&n| n >= 1)?
+        {
+            config.relay.max_channels = n;
+        }
         Ok(config)
     }
 }
@@ -198,6 +212,8 @@ mod tests {
         assert_eq!(config.rooms.ds.max_group_info_bytes, 256 * 1024);
         assert_eq!(config.rooms.ds.max_commit_bytes, 64 * 1024);
         assert_eq!(config.rooms.ds.max_log_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.relay.ttl, Duration::from_secs(300));
+        assert_eq!(config.relay.max_channels, 1000);
     }
 
     #[test]
@@ -216,6 +232,8 @@ mod tests {
             ("TYPSTRY_MAX_GROUP_INFO_BYTES", "4096"),
             ("TYPSTRY_MAX_COMMIT_BYTES", "2048"),
             ("TYPSTRY_MAX_LOG_BYTES", "99999"),
+            ("TYPSTRY_RELAY_TTL_SECS", "30"),
+            ("TYPSTRY_RELAY_MAX_CHANNELS", "5"),
         ])
         .unwrap();
         assert_eq!(config.addr.port(), 9000);
@@ -231,6 +249,8 @@ mod tests {
         assert_eq!(config.rooms.ds.max_group_info_bytes, 4096);
         assert_eq!(config.rooms.ds.max_commit_bytes, 2048);
         assert_eq!(config.rooms.ds.max_log_bytes, 99_999);
+        assert_eq!(config.relay.ttl, Duration::from_secs(30));
+        assert_eq!(config.relay.max_channels, 5);
     }
 
     #[test]
@@ -252,6 +272,8 @@ mod tests {
             ("TYPSTRY_MAX_COMMIT_BYTES", "0"),
             ("TYPSTRY_MAX_LOG_BYTES", "0"),
             ("TYPSTRY_COMMIT_RETENTION_SECS", "-1"),
+            ("TYPSTRY_RELAY_TTL_SECS", "0"),
+            ("TYPSTRY_RELAY_MAX_CHANNELS", "0"),
         ] {
             assert!(config(&[(var, value)]).is_err(), "{var}={value}");
         }
