@@ -16,7 +16,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
 - **Multi-file projects** - file tree, tabs, and uploads for images, fonts and data files. Images can also be pasted or dropped into the editor.
 - **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
-- **Sharing** - separate edit and view-only links, no accounts required.
+- **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so editors can see who is in a project and remove a member, which also replaces the links.
 - **Export** - download the compiled PDF or the whole project as a ZIP.
 - **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
 
@@ -43,17 +43,24 @@ docker run -d -p 8787:8787 -v typstry-data:/data typstry
 ┌──────────────── browser ────────────────┐          ┌──────── typstry-server ────────┐
 │ CodeMirror ◄─► LoroDoc ◄─► IndexedDB    │  /ws     │ rooms (relay + compaction)     │
 │                  │                      │ ◄──────► │ SQLite: encrypted doc records  │
-│                  ├─► encrypt + sign     │  /api    │ blobs/: encrypted uploads      │
-│                  ├─► Typst worker ─► SVG│ ◄──────► │ static frontend                │
-│                  └─► tinymist worker    │          │                                │
+│                  ├─► encrypt + sign     │  /ws/mls │ blobs/: encrypted uploads      │
+│                  ├─► MLS group (wasm)   │ ◄──────► │ delivery service: MLS commits  │
+│                  ├─► Typst worker ─► SVG│  /api    │ static frontend                │
+│                  └─► tinymist worker    │ ◄──────► │                                │
 └─────────────────────────────────────────┘          └────────────────────────────────┘
 ```
 
-Each project is a single Loro document holding the file tree, file contents and version list. The browser and the `typstry` CLI encrypt every update before it leaves your machine and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
+Each project is a single Loro document holding the file tree, file contents and version list. The browser and the `typstry` CLI encrypt every update before it leaves your machine and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers, blob sizes and the size and timing of group messages.
 
-Because the key is part of the share link, anyone with the link can read the project. Treat edit links like passwords.
+Anyone with a share link can read the project, so treat edit links like passwords. An edit link carries a 32-byte secret, from which HKDF-SHA256 derives a read key and an Ed25519 attestation key. A view link carries only the read key and the public attestation key.
 
-An edit link carries a 32-byte secret. Two keys are derived from it with HKDF-SHA256: a read key and an Ed25519 signing key. A view link carries only the read key and the public key. Every message is encrypted with AES-256-GCM under a key derived from the read key and a fresh random salt, and every doc update is signed. Viewers can decrypt and verify, but other clients refuse updates they did not sign with the edit key, so a view link stays read-only even if the server is compromised. A compromised server can still withhold or roll back updates, and it serves the app's JavaScript.
+Documents are not encrypted under the link secret itself but under per-generation document keys. The server stores a keyring holding the keys of every generation so far, sealed under the link and signed with the attestation key, so a viewer can open it but cannot forge one. A generation changes only when an editor removes a member or resets the links. Every update, blob and profile is encrypted with AES-256-GCM under a key derived from the generation's document key and a fresh random salt, and says which generation it belongs to.
+
+Each device that opens a project joins the project's MLS group (RFC 9420, via [openmls](https://github.com/openmls/openmls)) with its own signing key and a profile (name and color) that only members can read. A browser profile and a CLI folder are separate devices. Every update is signed with the device key and carries an editor's attestation of that key. Other clients refuse updates without a valid attestation, so a view link stays read-only even if the server is compromised, and the authors shown in the UI are authenticated. Presence is sealed under a key of the current group epoch and signed per device.
+
+The server acts as the group's delivery service. A newcomer with the link fetches the group's GroupInfo from it, encrypted under the link, and joins with an MLS external commit, so nobody has to be online to let them in. The server orders commits (the first one for an epoch wins) and stores and relays them as opaque bytes. It never holds a key and cannot read or add members. Editing does not wait on the group: if it stalls, documents keep syncing.
+
+To remove a member, an editor commits the removal together with a new generation: a new edit secret, document key, keyring and server tokens. The commit's rotation message carries the new links to the members who stay, so they switch automatically. The server swaps the tokens in one step, closes stale connections and keeps the old tokens only to let members who were offline catch up. The removed device can no longer follow the group or read new data. It keeps whatever it already had, and it still holds the old link, so see [SECURITY.md](SECURITY.md) for what removal does and does not cover.
 
 ## Working locally with git
 
@@ -175,17 +182,20 @@ Copy `blobs/` separately. Every record is written to the database as it arrives,
 - [Rust](https://rustup.rs) (stable, see `rust-toolchain.toml`; MSRV 1.94)
 - [Node.js](https://nodejs.org) 26 or newer
 - [pnpm](https://pnpm.io) 12 (`corepack enable` picks up the pinned version)
-- [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist for the browser
+- [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist and the crypto code for the browser
 
 ### Getting started
 
 ```sh
 pnpm install
 apps/web/scripts/build-tinymist.sh
+pnpm --filter web wasm
 pnpm dev
 ```
 
 The tinymist script builds the language server to wasm from a pinned commit into `apps/web/vendor/` (the npm package is only a stub). The first build takes a few minutes. Rerun it after the pinned commit changes.
+
+`pnpm --filter web wasm` builds `crates/typstry-wasm`, the encryption and MLS code the web app shares with the CLI, into `apps/web/vendor/typstry-wasm`. It takes about a minute. Rerun it after changing `typstry-wire` or `typstry-wasm`. Typecheck, tests and builds of the web app need both vendor directories.
 
 This starts the Vite dev server for the frontend and the Rust server on port 8787, with Vite proxying `/api` and `/ws` to it. Set `TYPSTRY_BACKEND` to point Vite at a server on a different address.
 

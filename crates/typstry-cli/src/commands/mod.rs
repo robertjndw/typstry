@@ -6,9 +6,11 @@ pub mod export;
 pub mod info;
 pub mod init;
 pub mod link;
+pub mod members;
 pub mod open;
 pub mod pull;
 pub mod push;
+pub mod share;
 pub mod status;
 pub mod sync;
 pub mod track;
@@ -63,6 +65,8 @@ pub enum Command {
     Track(track::Args),
     Init(init::Args),
     Link(link::Args),
+    Members(members::Args),
+    Share(share::Args),
     Open(open::Args),
     Info(info::Args),
     Version(version::Args),
@@ -160,6 +164,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Track(args) => track::run(&ctx, args),
         Command::Init(args) => init::run(&ctx, args).await,
         Command::Link(args) => link::run(&ctx, args),
+        Command::Members(args) => members::run(&ctx, args).await,
+        Command::Share(args) => share::run(&ctx, args).await,
         Command::Open(args) => open::run(&ctx, args),
         Command::Info(args) => info::run(&ctx, args).await,
         Command::Version(args) => version::run(&ctx, args).await,

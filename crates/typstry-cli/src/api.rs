@@ -5,6 +5,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,27 @@ pub struct ShareInfo {
     pub permission: Permission,
     /// Only sent for edit tokens.
     pub view_token: Option<String>,
+    /// A rotation replaced the token. It still names the project, so the
+    /// folder can catch up through the delivery service and find the new
+    /// links.
+    #[serde(default)]
+    pub retired: bool,
+}
+
+/// What a newcomer needs to join the project's group.
+#[derive(Debug, Clone)]
+pub struct Bootstrap {
+    pub incarnation: u64,
+    pub group_info: Vec<u8>,
+    pub keyring: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapBody {
+    incarnation: u64,
+    group_info: String,
+    keyring: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,6 +224,32 @@ impl Api {
         let body = res.bytes().await.map_err(redact)?;
         serde_json::from_slice(&body)
             .map_err(|err| anyhow::anyhow!("resolving the link failed: {err}"))
+    }
+
+    /// The sealed GroupInfo and keyring of the project. Live tokens only: a
+    /// retired one gets a 404, since it must not reach the keys of the
+    /// generation that replaced it.
+    pub async fn mls_bootstrap(&self, token: &str) -> anyhow::Result<Bootstrap> {
+        let req = self.http.get(self.project_url(token, "mls"));
+        let res = self.send(req, || "fetching the group".to_owned()).await?;
+        let status = res.status();
+        if status == StatusCode::NOT_FOUND {
+            bail!("the server has no group for this link; it may have been replaced");
+        }
+        if !status.is_success() {
+            bail!("fetching the group failed: HTTP {status}");
+        }
+        let body: BootstrapBody = res.json().await.map_err(redact)?;
+        let decode = |what: &str, text: &str| {
+            STANDARD
+                .decode(text)
+                .with_context(|| format!("the server sent an unreadable {what}"))
+        };
+        Ok(Bootstrap {
+            incarnation: body.incarnation,
+            group_info: decode("group info", &body.group_info)?,
+            keyring: decode("keyring", &body.keyring)?,
+        })
     }
 
     pub async fn get_blob(&self, token: &str, hash: &str) -> anyhow::Result<Vec<u8>> {

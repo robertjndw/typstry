@@ -21,6 +21,10 @@ pub struct ShareInfo {
     permission: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     view_token: Option<String>,
+    /// The token was replaced by a rotation. It still names the project and
+    /// what it used to grant, so a client can go and catch up.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    retired: bool,
 }
 
 /// `POST /api/projects`. Takes no body: the title belongs to the encrypted
@@ -44,12 +48,21 @@ pub async fn share(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<Json<ShareInfo>, AppError> {
-    let found = projects::resolve_share(&state.db, &token)
+    if let Some(found) = projects::resolve_share(&state.db, &token).await? {
+        return Ok(Json(ShareInfo {
+            project_id: found.project_id,
+            permission: found.permission.as_str(),
+            view_token: found.view_token,
+            retired: false,
+        }));
+    }
+    let retired = projects::resolve_retired(&state.db, &token)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(ShareInfo {
-        project_id: found.project_id,
-        permission: found.permission.as_str(),
-        view_token: found.view_token,
+        project_id: retired.project_id,
+        permission: retired.permission.as_str(),
+        view_token: None,
+        retired: true,
     }))
 }

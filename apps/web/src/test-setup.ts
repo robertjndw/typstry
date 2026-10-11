@@ -1,6 +1,21 @@
 import "@testing-library/jest-dom/vitest";
 // Projects persist to IndexedDB, which jsdom lacks.
 import "fake-indexeddb/auto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import { initSync } from "../vendor/typstry-wasm/typstry_wasm.js";
+
+// The wasm build of the crypto, compiled from the file instead of fetched:
+// loadWasm() finds it initialized already. Run `pnpm --filter web wasm` first.
+initSync({
+  module: readFileSync(
+    path.resolve(
+      import.meta.dirname,
+      "../vendor/typstry-wasm/typstry_wasm_bg.wasm",
+    ),
+  ),
+});
 
 // jsdom lacks ResizeObserver, which react-resizable-panels needs to mount.
 globalThis.ResizeObserver ??= class {

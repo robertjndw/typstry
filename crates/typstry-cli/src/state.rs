@@ -15,7 +15,8 @@ use loro::{Frontiers, LoroDoc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::LinkSecret;
+use typstry_wire::mls::{Device, MlsError, ProjectGroup};
 
 use crate::api::Permission;
 use crate::git::GitMark;
@@ -28,6 +29,13 @@ const DOC: &str = "doc.bin";
 /// Updates since `doc.bin` was written, see [`StateDir::append_doc`].
 const DOC_LOG: &str = "doc.log";
 const BASE: &str = "base.json";
+/// The device's MLS group state: its signing key, the link and keyring it
+/// holds and the group tree. Versioned inside, see `MLS_STATE_VERSION`.
+const MLS: &str = "mls.bin";
+/// The device identity, apart from the group state: a damaged `mls.bin`
+/// then rejoins as the same device and replaces its leaf instead of
+/// leaving a ghost member behind.
+const DEVICE: &str = "device.bin";
 const LOCK: &str = "lock";
 const BLOBS: &str = "blobs";
 const GITIGNORE: &str = ".gitignore";
@@ -58,6 +66,8 @@ pub struct Config {
     pub server: String,
     pub project_id: String,
     pub token: String,
+    /// The link secret the way the share link carries it. It changes when
+    /// the project's links are rotated.
     pub key: String,
     pub permission: Permission,
     /// Learned from the server for edit links, so `link` can print both.
@@ -79,7 +89,7 @@ impl Config {
     /// Always built from the view secret: the edit secret in `key` must
     /// never end up in a link meant for viewers.
     pub fn view_link(&self) -> Option<ShareLink> {
-        let secret = ProjectKey::from_base64url(&self.key).ok()?.view_secret();
+        let secret = LinkSecret::from_base64url(&self.key).ok()?.view_secret();
         let token = match self.permission {
             Permission::Read => &self.token,
             Permission::Write => self.view_token.as_ref()?,
@@ -90,7 +100,7 @@ impl Config {
     /// Whether `key` is an edit secret, which writing takes on top of an
     /// edit token.
     pub fn can_sign(&self) -> bool {
-        ProjectKey::from_base64url(&self.key).is_ok_and(|key| key.can_sign())
+        LinkSecret::from_base64url(&self.key).is_ok_and(|key| key.can_attest())
     }
 }
 
@@ -365,6 +375,52 @@ impl StateDir {
 
     pub fn save_config(&self, config: &Config) -> anyhow::Result<()> {
         write_versioned(&self.dir.join(CONFIG), config, CONFIG_VERSION)
+    }
+
+    /// The saved group state. A file that cannot be used (damaged, or a
+    /// join that never reached the server) reads as missing, which makes
+    /// the next connect join again with a fresh state; the second field
+    /// says what was dropped. One from a newer typstry is an error, since
+    /// joining again would replace state that version can still use.
+    pub fn load_mls(&self) -> anyhow::Result<(Option<ProjectGroup>, Option<String>)> {
+        let path = self.dir.join(MLS);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        match ProjectGroup::import_state(&bytes) {
+            Ok(group) => Ok((Some(group), None)),
+            Err(err @ MlsError::NewerState(_)) => {
+                Err(err).with_context(|| format!("reading {}", path.display()))
+            }
+            Err(err) => Ok((
+                None,
+                Some(format!(
+                    "ignoring {} ({err}); this folder joins the project's group again",
+                    path.display()
+                )),
+            )),
+        }
+    }
+
+    /// Saves the device first: if the state write is interrupted, the
+    /// identity survives for the rejoin.
+    pub fn save_mls(&self, group: &ProjectGroup) -> anyhow::Result<()> {
+        self.save_device(group.device())?;
+        atomic_write(&self.dir.join(MLS), &group.export_state(), true)
+    }
+
+    pub fn save_device(&self, device: &Device) -> anyhow::Result<()> {
+        atomic_write(&self.dir.join(DEVICE), &device.export(), true)
+    }
+
+    /// The identity this folder joined with, if one was saved and is
+    /// readable. A damaged file reads as missing: a new identity only
+    /// costs a ghost leaf, where failing would block the folder.
+    pub fn load_device(&self) -> Option<Device> {
+        let bytes = fs::read(self.dir.join(DEVICE)).ok()?;
+        Device::import(&bytes).ok()
     }
 
     pub fn load_base(&self) -> anyhow::Result<Base> {

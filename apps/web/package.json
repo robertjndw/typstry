@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "fixtures": "TYPSTRY_WRITE_FIXTURES=1 vitest run src/doc/fixture.test.ts src/crypto/fixture.test.ts"
+    "fixtures": "TYPSTRY_WRITE_FIXTURES=1 vitest run src/doc/fixture.test.ts",
+    "wasm": "bash scripts/build-wasm.sh"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",

@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use typstry_doc::materialize::FileContent;
-use typstry_wire::crypto::{BLOB_CONTEXT, CryptoError};
+use typstry_wire::crypto::CryptoError;
 
 use crate::hash::{BlobHash, Digest};
 use crate::worktree::{LocalFile, MAX_ASSET_BYTES, mime_for};
@@ -51,17 +51,38 @@ impl Session {
         let mut downloads =
             futures_util::stream::iter(downloads).buffer_unordered(PARALLEL_DOWNLOADS);
         while let Some((hash, sealed)) = downloads.next().await {
-            self.store_asset(&hash, &sealed?)?;
+            self.store_asset_fetching_keys(&hash, &sealed?).await?;
         }
         Ok(())
+    }
+
+    /// [`Self::store_asset`], fetching the keyring once if the blob is
+    /// from a key generation newer than ours.
+    async fn store_asset_fetching_keys(
+        &mut self,
+        hash: &str,
+        sealed: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        match self.store_asset(hash, sealed) {
+            Err(err)
+                if matches!(
+                    err.downcast_ref::<CryptoError>(),
+                    Some(CryptoError::UnknownGeneration(_))
+                ) && self.refresh_keyring().await? =>
+            {
+                self.store_asset(hash, sealed)
+            }
+            other => other,
+        }
     }
 
     /// Decrypts a downloaded asset into the cache.
     fn store_asset(&mut self, hash: &str, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
         let bytes = self
-            .key
-            .open(sealed, BLOB_CONTEXT)
+            .doc_keys()?
+            .open_blob(sealed)
             .map_err(|err| match err {
+                CryptoError::UnknownGeneration(_) => anyhow::Error::new(err),
                 CryptoError::NewerVersion(_) => anyhow::anyhow!("asset {hash} was {err}"),
                 err => anyhow::Error::new(err).context(format!(
                     "asset {hash} does not decrypt with this project's key"
@@ -99,7 +120,7 @@ impl Session {
             return Ok(bytes);
         }
         let sealed = self.api.get_blob(&self.config.token, hash).await?;
-        self.store_asset(hash, &sealed)
+        self.store_asset_fetching_keys(hash, &sealed).await
     }
 
     /// The bytes a doc entry stands for on disk.
@@ -169,7 +190,7 @@ impl Session {
                 if bytes.len() > MAX_ASSET_BYTES {
                     bail!("{path} is too large to upload");
                 }
-                let sealed = self.key.seal(&bytes, BLOB_CONTEXT);
+                let sealed = self.doc_keys()?.seal_blob(&bytes);
                 let stored = self.api.upload_blob(&self.config.token, sealed).await?;
                 self.state.write_blob(stored.hash.as_str(), &bytes)?;
                 self.base

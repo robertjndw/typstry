@@ -24,7 +24,6 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tower::ServiceExt;
-use typstry_server::config::Config;
 use typstry_server::http::{AppState, router};
 use typstry_server::room::RoomConfig;
 use typstry_server::store::docs;
@@ -52,20 +51,7 @@ impl Server {
     }
 
     async fn start_with(data: &Path, config: RoomConfig, limits: ConnLimits) -> Self {
-        let pool = common::open_db(data).await;
-        let config = Config {
-            data_dir: data.to_owned(),
-            rooms: config,
-            limits,
-            ..Config::default()
-        };
-        let state = AppState::from_config(pool, &config);
-        let app = common::app(state.clone(), data);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let common::Served { addr, state, task } = common::serve(data, config, limits).await;
         Self { addr, state, task }
     }
 

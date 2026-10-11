@@ -14,6 +14,7 @@
 //! instead of overwriting them.
 
 mod assets;
+mod membership;
 mod reconcile;
 mod remote;
 
@@ -28,7 +29,8 @@ use typstry_doc::apply::ApplyReport;
 use typstry_doc::configure;
 use typstry_doc::materialize::FileContent;
 use typstry_doc::peers::{PALETTE, normalize_peer_name, set_peer};
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::LinkSecret;
+use typstry_wire::mls::ProjectGroup;
 
 use crate::api::{Api, ShareInfo};
 use crate::git::Repo;
@@ -192,7 +194,10 @@ pub struct Session {
     pub config: Config,
     base: Base,
     doc: LoroDoc,
-    key: ProjectKey,
+    /// The folder's seat in the project's group. It holds the doc keys and
+    /// the key that signs records. None until the first connect has joined
+    /// the group.
+    group: Option<ProjectGroup>,
     worktree: Worktree,
     api: Api,
     /// What the link resolved to a moment ago, for the next connect.
@@ -247,8 +252,22 @@ pub enum SyncError {
         "the project is encrypted with key {project}, but this folder has key {folder}; is the link complete?"
     )]
     KeyMismatch { project: String, folder: String },
+    /// The link's secret opens nothing of the project's group.
+    #[error("the link does not open this project's keys; is the link complete?")]
+    WrongKey,
     #[error("the server refused this link; it may have been revoked")]
     LinkRefused,
+    /// The link was replaced by a rotation and the group did not hand this
+    /// folder the new one.
+    #[error(
+        "this link was replaced by a newer one and this folder could not follow the change; ask an editor for the current link and clone again"
+    )]
+    LinkReplaced,
+    /// An editor removed this folder from the project.
+    #[error(
+        "you were removed from this project; this folder can no longer sync. Your files here are untouched"
+    )]
+    Removed,
     /// The share endpoint does not know the token, where joining with a
     /// bad one gets [`Self::LinkRefused`].
     #[error("the server does not know this link; it may have been revoked")]
@@ -314,8 +333,10 @@ impl Session {
         // Checked here so read-only commands refuse too: they would
         // misread a layout this build does not know.
         typstry_doc::ensure_supported(&doc).map_err(SyncError::from)?;
-        let mut session = Self::assemble(state, config, base, doc, name, api)?;
+        let (group, group_note) = state.load_mls()?;
+        let mut session = Self::assemble(state, config, base, doc, group, name, api)?;
         session.warnings.extend(note);
+        session.warnings.extend(group_note);
         session.saved_vv = Some(session.doc.oplog_vv());
         session.saved_base = Some(session.base.clone());
         (session.snapshot_bytes, session.log_bytes) = session.state.doc_sizes();
@@ -324,14 +345,17 @@ impl Session {
 
     /// Links `root` to a project: writes `.typstry/` with an empty doc and
     /// base. Nothing is fetched yet. `share` is taken as fresh, so the
-    /// first [`Self::connect`] does not resolve the link again.
+    /// first [`Self::connect`] does not resolve the link again. `group` is
+    /// the folder's seat in the project's group if it created the project;
+    /// otherwise the first connect joins it.
     pub fn create(
         root: &Path,
         link: &ShareLink,
         share: &ShareInfo,
+        group: Option<ProjectGroup>,
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
-        Self::create_with_api(root, link, share, Api::new(&link.origin)?, name)
+        Self::create_with_api(root, link, share, Api::new(&link.origin)?, group, name)
     }
 
     /// [`Self::create`] with the client `share` was resolved with.
@@ -340,6 +364,7 @@ impl Session {
         link: &ShareLink,
         share: &ShareInfo,
         api: Api,
+        group: Option<ProjectGroup>,
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
         let state = StateDir::create(root)?;
@@ -354,11 +379,15 @@ impl Session {
             branch: None,
         };
         state.save_config(&config)?;
+        if let Some(group) = &group {
+            state.save_mls(group)?;
+        }
         let mut session = Self::assemble(
             state,
             config,
             Base::default(),
             LoroDoc::new(),
+            group,
             name,
             Some(api),
         )?;
@@ -371,11 +400,12 @@ impl Session {
         config: Config,
         base: Base,
         doc: LoroDoc,
+        group: Option<ProjectGroup>,
         name: Option<&str>,
         api: Option<Api>,
     ) -> anyhow::Result<Self> {
-        let key = ProjectKey::from_base64url(&config.key)
-            .context("reading the project key in .typstry/config.json")?;
+        LinkSecret::from_base64url(&config.key)
+            .context("reading the link secret in .typstry/config.json")?;
         let api = match api {
             Some(api) => api,
             None => Api::new(&config.server)?,
@@ -391,7 +421,7 @@ impl Session {
             config,
             base,
             doc,
-            key,
+            group,
             api,
             resolved: None,
             identity,
@@ -457,7 +487,7 @@ impl Session {
     /// An edit token alone is not enough: other clients only accept
     /// records signed with the key an edit secret carries.
     pub fn can_write(&self) -> bool {
-        self.config.permission.can_write() && self.key.can_sign()
+        self.config.permission.can_write() && self.config.can_sign()
     }
 
     pub fn is_connected(&self) -> bool {

@@ -6,6 +6,11 @@
     "reflog": 3
   },
   "lastSync": 1700000000005,
+  "mls": {
+    "devicePub": "85APOdcQwTcvWl4uOIW0jm7q9iS8OKtNdsFkoKBRC9Q",
+    "epoch": 0,
+    "profile": "{\"name\":\"Ada\",\"color\":\"#3366cc\"}"
+  },
   "name": "Ada",
   "pins": {
     "main.typ": "First draft"

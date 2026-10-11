@@ -10,6 +10,15 @@ export const PROTOCOL_HEADER = "X-Typstry-Protocol";
 /** Query parameter on the WebSocket URL; browsers cannot set its headers. */
 export const PROTOCOL_QUERY = "protocol";
 
+/** The WebSocket URL of `path` on the page's host, with the protocol query. */
+export function socketUrl(
+  loc: Pick<Location, "protocol" | "host">,
+  path: string,
+): string {
+  const scheme = loc.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${loc.host}${path}?${PROTOCOL_QUERY}=${PROTOCOL_VERSION}`;
+}
+
 export const RELOAD_MESSAGE =
   "A newer version of typstry is available. Reload the page.";
 

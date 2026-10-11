@@ -1,13 +1,8 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  BLOB_CONTEXT,
-  SEAL_OVERHEAD,
-  generateEditSecret,
-  importProjectKey,
-  open,
-} from "@/crypto/project-key";
+import { BLOB_OVERHEAD } from "@/crypto/project-crypto";
+import { newProject as newKeys } from "@/crypto/test-utils";
 import { createFile, getText } from "@/doc/fs-ops";
 import { NODE, initProject } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
@@ -17,7 +12,7 @@ import { projectAssets } from "./project-assets";
 import { freeName, uploadFiles } from "./upload";
 
 const TOKEN = "e".repeat(22);
-const key = await importProjectKey(generateEditSecret());
+const key = newKeys().crypto;
 const ASSETS = projectAssets(TOKEN, key, {
   cache: new AssetCache({ caches: null }),
 });
@@ -82,8 +77,8 @@ describe("uploadFiles", () => {
         expect(init?.method).toBe("POST");
         // Only ciphertext leaves the browser.
         const body = init?.body as Uint8Array;
-        expect(body.length).toBe(4 + SEAL_OVERHEAD);
-        return Array.from(await open(key, body, BLOB_CONTEXT));
+        expect(body.length).toBe(4 + BLOB_OVERHEAD);
+        return Array.from(key.openBlob(body));
       }),
     );
     expect(sent).toContainEqual([137, 80, 78, 71]);

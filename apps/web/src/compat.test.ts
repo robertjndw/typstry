@@ -2,28 +2,24 @@
 // Reads the frozen fixtures in fixtures/compat/v<N>/ with the current web
 // code. They are written once by crates/typstry-cli/tests/compat.rs and
 // never regenerated; a format bump adds a new v<N>. See
-// docs/compatibility.md.
+// docs/compatibility.md. The crypto runs through the wasm build, which
+// test-setup.ts initializes.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
-import { EphemeralStore, LoroDoc, LoroText } from "loro-crdt";
-import {
-  EloRecordKind,
-  type EloDeltaHeader,
-  type EloSnapshotHeader,
-} from "loro-protocol";
-import { describe, expect, it, vi } from "vitest";
+import { LoroDoc, LoroText } from "loro-crdt";
+import { describe, expect, it } from "vitest";
 
+import { fromBase64Url } from "./crypto/bytes";
+import { ProjectCrypto } from "./crypto/project-crypto";
 import {
-  BLOB_CONTEXT,
-  decryptRecord,
-  fromBase64Url,
-  importProjectKey,
-  open,
-  PRESENCE_CONTEXT,
-  RECORD_VERSION,
-  SEAL_VERSION,
-  secretKind,
-} from "./crypto/project-key";
+  DocKeys,
+  dsVersion,
+  Keyring,
+  LinkSecret,
+  ProjectGroup,
+  recordVersion,
+  sealVersion,
+} from "./crypto/wasm";
 import { buildPathIndex } from "./doc/paths";
 import { versionAt } from "./doc/restore";
 import {
@@ -34,8 +30,6 @@ import {
   SCHEMA_VERSION,
 } from "./doc/schema";
 import { listVersions } from "./doc/versions";
-import { parsePresence } from "./presence/presence";
-import { projectUrl } from "./project/recent";
 import { PROTOCOL_VERSION } from "./sync/protocol";
 
 const COMPAT = path.resolve(import.meta.dirname, "../../../fixtures/compat");
@@ -56,36 +50,6 @@ function compatDirs(): [number, string][] {
 
 function readJson<T>(dir: string, name: string): T {
   return JSON.parse(readFileSync(path.join(dir, name), "utf8")) as T;
-}
-
-function bytes(text: string): Uint8Array {
-  const out = fromBase64Url(text);
-  if (!out) throw new Error(`not base64url: ${text}`);
-  return out;
-}
-
-interface CryptoFixture {
-  editSecret: string;
-  viewSecret: string;
-  keyId: string;
-  editLink: string;
-  viewLink: string;
-  delta: {
-    peer: string;
-    start: number;
-    end: number;
-    record: string;
-    plaintext: string;
-    title: string;
-  };
-  snapshot: { vv: [string, number][]; record: string; plaintextFile: string };
-  blob: { sealed: string; plaintext: string };
-  presence: {
-    sealed: string;
-    plaintext: string;
-    key: string;
-    state: { name: string; color: string; fileId: string };
-  };
 }
 
 type FileFixture =
@@ -137,96 +101,36 @@ function filesOf(project: ProjectDoc): FileFixture[] {
   return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
+const bytes = (value: string) => fromBase64Url(value)!;
+
+interface CryptoFixture {
+  editSecret: string;
+  viewSecret: string;
+  fingerprint: string;
+  keyring: { signed: string; keyId: string; generation: number };
+  signer: { publicKey: string };
+  delta: {
+    peer: string;
+    start: number;
+    end: number;
+    record: string;
+    plaintext: string;
+  };
+  snapshot: {
+    vv: [string, number][];
+    record: string;
+    plaintextFile: string;
+  };
+  blob: { sealed: string; plaintext: string };
+}
+
+interface CliFixture {
+  mls: { epoch: number };
+}
+
 describe.each(compatDirs())("compat v%i", (_n, dir) => {
-  const crypto = readJson<CryptoFixture>(dir, "crypto.json");
   const expected = readJson<DocFixture>(dir, "doc.json");
   const snapshot = readFileSync(path.join(dir, "doc.loro"));
-
-  it("parses the secrets and share links", async () => {
-    expect(secretKind(crypto.editSecret)).toBe("edit");
-    expect(secretKind(crypto.viewSecret)).toBe("view");
-    const editor = await importProjectKey(crypto.editSecret);
-    expect(editor.keyId).toBe(crypto.keyId);
-    expect(editor.editSecret).toBe(crypto.editSecret);
-    expect(editor.viewSecret).toBe(crypto.viewSecret);
-    const viewer = await importProjectKey(crypto.viewSecret);
-    expect(viewer.keyId).toBe(crypto.keyId);
-    expect(viewer.editSecret).toBeNull();
-
-    for (const [link, secret] of [
-      [crypto.editLink, crypto.editSecret],
-      [crypto.viewLink, crypto.viewSecret],
-    ] as const) {
-      const url = new URL(link);
-      expect(url.hash.slice(1)).toBe(secret);
-      const token = decodeURIComponent(url.pathname.replace(/^\/p\//, ""));
-      expect(projectUrl(token, secret, url.origin)).toBe(link);
-    }
-  });
-
-  it("decrypts records, blob and presence with either secret", async () => {
-    for (const secret of [crypto.editSecret, crypto.viewSecret]) {
-      const key = await importProjectKey(secret);
-
-      const delta = await decryptRecord(key, bytes(crypto.delta.record));
-      expect(delta.kind).toBe(EloRecordKind.DeltaSpan);
-      const header = delta.header as EloDeltaHeader;
-      expect(new TextDecoder().decode(header.peerId)).toBe(crypto.delta.peer);
-      expect([header.start, header.end]).toEqual([
-        crypto.delta.start,
-        crypto.delta.end,
-      ]);
-      expect(delta.plaintext).toEqual(bytes(crypto.delta.plaintext));
-      const fromDelta = new ProjectDoc(new LoroDoc());
-      fromDelta.doc.import(delta.plaintext);
-      expect(fromDelta.title).toBe(crypto.delta.title);
-
-      const record = await decryptRecord(key, bytes(crypto.snapshot.record));
-      expect(record.kind).toBe(EloRecordKind.Snapshot);
-      const vv = (record.header as EloSnapshotHeader).vv.map(
-        ({ peerId, counter }) => [new TextDecoder().decode(peerId), counter],
-      );
-      expect(vv).toEqual(
-        [...crypto.snapshot.vv].sort(([x], [y]) =>
-          x < y ? -1 : x > y ? 1 : 0,
-        ),
-      );
-      expect(record.plaintext).toEqual(
-        new Uint8Array(
-          readFileSync(path.join(dir, crypto.snapshot.plaintextFile)),
-        ),
-      );
-
-      expect(await open(key, bytes(crypto.blob.sealed), BLOB_CONTEXT)).toEqual(
-        bytes(crypto.blob.plaintext),
-      );
-
-      const presence = await open(
-        key,
-        bytes(crypto.presence.sealed),
-        PRESENCE_CONTEXT,
-      );
-      expect(presence).toEqual(bytes(crypto.presence.plaintext));
-      // The update carries the time it was made, which a store with the
-      // usual timeout would treat as long expired. A store that keeps it
-      // also schedules its expiry sweep at half that timeout, which no
-      // timer can hold, and nothing here needs the sweep anyway.
-      const sweep = vi
-        .spyOn(globalThis, "setInterval")
-        .mockReturnValue(undefined as never);
-      const store = new EphemeralStore(Number.MAX_SAFE_INTEGER);
-      try {
-        store.apply(presence);
-        const states = store.getAllStates() as Record<string, unknown>;
-        expect(parsePresence(states[crypto.presence.key])).toEqual(
-          crypto.presence.state,
-        );
-      } finally {
-        store.destroy();
-        sweep.mockRestore();
-      }
-    }
-  });
 
   it("reads the project doc", () => {
     const doc = new LoroDoc();
@@ -288,6 +192,66 @@ describe.each(compatDirs())("compat v%i", (_n, dir) => {
   });
 });
 
+describe.each(compatDirs())("compat crypto v%i", (_n, dir) => {
+  const fixture = readJson<CryptoFixture>(dir, "crypto.json");
+
+  it("reads links, the keyring, records and blobs", () => {
+    const edit = LinkSecret.parse(fixture.editSecret);
+    expect(edit.canAttest()).toBe(true);
+    expect(edit.viewSecret()).toBe(fixture.viewSecret);
+    expect(edit.fingerprint()).toBe(fixture.fingerprint);
+    const view = LinkSecret.parse(fixture.viewSecret);
+    expect(view.canAttest()).toBe(false);
+    expect(view.fingerprint()).toBe(fixture.fingerprint);
+
+    const signed = bytes(fixture.keyring.signed);
+    for (const secret of [fixture.editSecret, fixture.viewSecret]) {
+      const crypto = ProjectCrypto.open(secret, signed);
+      expect(crypto.generation).toBe(fixture.keyring.generation);
+      expect(
+        new DocKeys(Keyring.openVerified(LinkSecret.parse(secret), signed))
+          .keyId,
+      ).toBe(fixture.keyring.keyId);
+
+      const delta = crypto.decryptRecord(bytes(fixture.delta.record));
+      expect(delta).toMatchObject({
+        kind: "delta",
+        peer: fixture.delta.peer,
+        start: fixture.delta.start,
+        end: fixture.delta.end,
+      });
+      expect(delta.plaintext).toEqual(bytes(fixture.delta.plaintext));
+      expect(delta.signer).toEqual(bytes(fixture.signer.publicKey));
+
+      const snapshot = crypto.decryptRecord(bytes(fixture.snapshot.record));
+      expect(snapshot.kind).toBe("snapshot");
+      if (snapshot.kind !== "snapshot") throw new Error("not a snapshot");
+      expect(
+        snapshot.vv.map(({ peer, counter }) => [peer, counter]).sort(),
+      ).toEqual([...fixture.snapshot.vv].sort());
+      expect(snapshot.plaintext).toEqual(
+        new Uint8Array(
+          readFileSync(path.join(dir, fixture.snapshot.plaintextFile)),
+        ),
+      );
+
+      expect(crypto.openBlob(bytes(fixture.blob.sealed))).toEqual(
+        bytes(fixture.blob.plaintext),
+      );
+    }
+  });
+
+  it("loads the CLI's saved group state", () => {
+    const cli = readJson<CliFixture>(dir, "cli.json");
+    const group = ProjectGroup.importState(
+      new Uint8Array(readFileSync(path.join(dir, "cli", "mls.bin"))),
+    );
+    expect(group.epoch).toBe(cli.mls.epoch);
+    expect(group.isActive).toBe(true);
+    expect(group.link().toBase64url()).toBe(fixture.editSecret);
+  });
+});
+
 // Without this, a format bump with no new fixture would pass on the old
 // ones while nothing reads the new format.
 it("has a compat fixture for every current format", () => {
@@ -295,8 +259,9 @@ it("has a compat fixture for every current format", () => {
   const frozen = readJson<Record<string, number>>(newest, "versions.json");
   for (const [name, current] of [
     ["schema", SCHEMA_VERSION],
-    ["seal", SEAL_VERSION],
-    ["record", RECORD_VERSION],
+    ["seal", sealVersion()],
+    ["record", recordVersion()],
+    ["ds", dsVersion()],
     ["protocol", PROTOCOL_VERSION],
   ] as const) {
     expect(

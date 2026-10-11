@@ -111,6 +111,31 @@ impl Config {
         {
             config.limits.outbox_bytes = bytes;
         }
+        // Zero is fine: the newest commits are kept regardless.
+        if let Some(secs) = parse("TYPSTRY_COMMIT_RETENTION_SECS", "whole seconds").get()? {
+            config.rooms.ds.commit_retention = Duration::from_secs(secs);
+        }
+        // The head commit must survive, or a member one epoch behind is lost.
+        if let Some(n) =
+            parse("TYPSTRY_KEEP_LAST_COMMITS", "a positive whole number").get_where(|&n| n >= 1)?
+        {
+            config.rooms.ds.keep_last_commits = n;
+        }
+        if let Some(bytes) =
+            parse("TYPSTRY_MAX_LOG_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        {
+            config.rooms.ds.max_log_bytes = bytes;
+        }
+        if let Some(bytes) =
+            parse("TYPSTRY_MAX_COMMIT_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        {
+            config.rooms.ds.max_commit_bytes = bytes;
+        }
+        if let Some(bytes) =
+            parse("TYPSTRY_MAX_GROUP_INFO_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        {
+            config.rooms.ds.max_group_info_bytes = bytes;
+        }
         Ok(config)
     }
 }
@@ -165,6 +190,14 @@ mod tests {
         assert_eq!(config.max_upload_bytes, 25 * 1024 * 1024);
         assert_eq!(config.rooms.unload_after, Duration::from_secs(60));
         assert_eq!(config.limits.update_burst, 200);
+        assert_eq!(config.rooms.ds.keep_last_commits, 1000);
+        assert_eq!(
+            config.rooms.ds.commit_retention,
+            Duration::from_secs(90 * 86_400)
+        );
+        assert_eq!(config.rooms.ds.max_group_info_bytes, 256 * 1024);
+        assert_eq!(config.rooms.ds.max_commit_bytes, 64 * 1024);
+        assert_eq!(config.rooms.ds.max_log_bytes, 16 * 1024 * 1024);
     }
 
     #[test]
@@ -178,6 +211,11 @@ mod tests {
             ("TYPSTRY_UPDATES_PER_SEC", "2.5"),
             ("TYPSTRY_MAX_ROOMS_PER_CONN", "3"),
             ("TYPSTRY_OUTBOX_BYTES", "1000"),
+            ("TYPSTRY_COMMIT_RETENTION_SECS", "60"),
+            ("TYPSTRY_KEEP_LAST_COMMITS", "7"),
+            ("TYPSTRY_MAX_GROUP_INFO_BYTES", "4096"),
+            ("TYPSTRY_MAX_COMMIT_BYTES", "2048"),
+            ("TYPSTRY_MAX_LOG_BYTES", "99999"),
         ])
         .unwrap();
         assert_eq!(config.addr.port(), 9000);
@@ -188,6 +226,11 @@ mod tests {
         assert_eq!(config.limits.updates_per_sec, 2.5);
         assert_eq!(config.limits.max_rooms, 3);
         assert_eq!(config.limits.outbox_bytes, 1000);
+        assert_eq!(config.rooms.ds.commit_retention, Duration::from_secs(60));
+        assert_eq!(config.rooms.ds.keep_last_commits, 7);
+        assert_eq!(config.rooms.ds.max_group_info_bytes, 4096);
+        assert_eq!(config.rooms.ds.max_commit_bytes, 2048);
+        assert_eq!(config.rooms.ds.max_log_bytes, 99_999);
     }
 
     #[test]
@@ -204,6 +247,11 @@ mod tests {
             ("TYPSTRY_OUTBOX_BYTES", "0"),
             ("TYPSTRY_MAX_UPLOAD_BYTES", "0"),
             ("TYPSTRY_PRESENCE_TIMEOUT_SECS", "0"),
+            ("TYPSTRY_KEEP_LAST_COMMITS", "0"),
+            ("TYPSTRY_MAX_GROUP_INFO_BYTES", "0"),
+            ("TYPSTRY_MAX_COMMIT_BYTES", "0"),
+            ("TYPSTRY_MAX_LOG_BYTES", "0"),
+            ("TYPSTRY_COMMIT_RETENTION_SECS", "-1"),
         ] {
             assert!(config(&[(var, value)]).is_err(), "{var}={value}");
         }

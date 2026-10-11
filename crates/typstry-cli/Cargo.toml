@@ -32,7 +32,7 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 typstry-doc.workspace = true
-typstry-wire = { workspace = true, features = ["crypto"] }
+typstry-wire = { workspace = true, features = ["crypto", "mls"] }
 
 [dev-dependencies]
 axum.workspace = true

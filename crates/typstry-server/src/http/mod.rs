@@ -1,5 +1,6 @@
 pub mod assets;
 mod error;
+pub mod mls;
 pub mod projects;
 pub mod protocol;
 
@@ -98,7 +99,9 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         .merge(api)
         .route("/api/p/{token}/assets", post(assets::upload))
         .route("/api/p/{token}/blobs/{hash}", get(assets::blob))
+        .route("/api/p/{token}/mls", get(mls::bootstrap))
         .route("/ws", get(ws::handler))
+        .route(typstry_wire::ds::DS_PATH, get(ws::mls::handler))
         .layer(middleware::from_fn(protocol::gate));
     let mut app = Router::new()
         .route("/healthz", get(healthz))

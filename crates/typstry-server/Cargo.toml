@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 loro.workspace = true

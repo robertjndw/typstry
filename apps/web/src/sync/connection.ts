@@ -1,7 +1,7 @@
 // Live sync of a project's LoroDoc (and optionally its presence store) with
 // crates/typstry-server over the Loro Protocol. Both rooms share one socket
 // and use the project id as room id; the share token is the join auth.
-// Everything is encrypted with the project key before it leaves the page.
+// Everything is encrypted with the project's keys before it leaves the page.
 import type { EphemeralStore, LoroDoc } from "loro-crdt";
 import {
   LoroWebsocketClient,
@@ -9,17 +9,12 @@ import {
   type LoroWebsocketClientRoom,
   type RoomJoinStatusValue,
 } from "loro-websocket";
-import type { ProjectKey } from "@/crypto/project-key";
+import type { ProjectCrypto } from "@/crypto/project-crypto";
 import { toError } from "@/lib/errors";
 
 import { EncryptedDocAdaptor } from "./encrypted-doc-adaptor";
 import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
-import {
-  fetchServerInfo,
-  isOutdated,
-  PROTOCOL_QUERY,
-  PROTOCOL_VERSION,
-} from "./protocol";
+import { fetchServerInfo, isOutdated, socketUrl } from "./protocol";
 
 export type SyncStatus = "connecting" | "connected" | "disconnected";
 
@@ -34,11 +29,13 @@ const SYNC_NOW_TIMEOUT_MS = 5000;
  */
 const OUTDATED_CHECK_MS = 30_000;
 
+const RETIRED_CHECK_MS = 2000;
+
 export interface ConnectOptions {
   projectId: string;
   /** Edit or view token; the server derives the permission from it. */
   token: string;
-  key: ProjectKey;
+  crypto: ProjectCrypto;
   /** False for view links, which must not try to upload anything. */
   canWrite: boolean;
   doc: LoroDoc;
@@ -46,12 +43,30 @@ export interface ConnectOptions {
   /** Defaults to `/ws` on the page's origin. */
   url?: string;
   onError?: (error: Error) => void;
-  /** Received data does not decrypt with `key`. */
+  /** Received data does not decrypt with `crypto`. */
   onDecryptError?: (error: Error) => void;
+  /**
+   * Received data is sealed under a key generation `crypto` lacks: the
+   * group rotated, and its new links are what open it.
+   */
+  onUnknownGeneration?: (generation: number) => void;
   /** The server no longer serves this build. Syncing has already stopped. */
   onOutdated?: () => void;
   /** Whether the server refuses this build; replaceable for tests. */
   checkOutdated?: () => Promise<boolean>;
+  /**
+   * The link was replaced by a rotation, so the server closed the doc
+   * socket for good. Syncing has already stopped; follow the group to find
+   * the new links.
+   */
+  onRetired?: () => void;
+  /**
+   * Whether `token` was retired. The browser does not tell a socket's close
+   * code apart from any other failure, so this asks the server.
+   */
+  checkRetired?: () => Promise<boolean>;
+  /** Upload a snapshot right after joining: a rotation just moved the keys. */
+  compactOnJoin?: boolean;
 }
 
 export interface ProjectConnection {
@@ -73,8 +88,7 @@ export interface ProjectConnection {
 }
 
 export function projectWsUrl(loc: Pick<Location, "protocol" | "host">): string {
-  const scheme = loc.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${loc.host}/ws?${PROTOCOL_QUERY}=${PROTOCOL_VERSION}`;
+  return socketUrl(loc, "/ws");
 }
 
 export function connectProject(opts: ConnectOptions): ProjectConnection {
@@ -102,12 +116,14 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
 
   const client = new LoroWebsocketClient({ url, onError: opts.onError });
   const docAdaptor = new EncryptedDocAdaptor(opts.doc, {
-    key: opts.key,
+    crypto: opts.crypto,
     canWrite: opts.canWrite,
     onDecryptError: opts.onDecryptError,
+    onUnknownGeneration: opts.onUnknownGeneration,
+    compactOnJoin: opts.compactOnJoin,
   });
   const ephemeralAdaptor = opts.ephemeral
-    ? new EphemeralStoreAdaptor(opts.ephemeral, opts.key)
+    ? new EphemeralStoreAdaptor(opts.ephemeral, opts.crypto)
     : undefined;
 
   const fail = () => {
@@ -137,9 +153,32 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
     );
   };
 
+  // The server ends a retired token's doc sockets with a code the page
+  // cannot read, so each drop asks whether that is why. Throttled, since a
+  // flaky connection drops often.
+  let lastRetiredCheck = -Infinity;
+  const checkRetired = opts.checkRetired;
+  const onDropped = () => {
+    if (!checkRetired) return;
+    const now = Date.now();
+    if (now - lastRetiredCheck < RETIRED_CHECK_MS) return;
+    lastRetiredCheck = now;
+    void checkRetired().then(
+      (retired) => {
+        if (!retired || finished) return;
+        fail();
+        opts.onRetired?.();
+      },
+      () => {},
+    );
+  };
+
   const stopSocketStatus = client.onStatusChange((s) => {
     socket = s;
-    if (s === "disconnected" && !finished) onDisconnect();
+    if (s === "disconnected" && !finished) {
+      onDisconnect();
+      onDropped();
+    }
     update();
   });
 

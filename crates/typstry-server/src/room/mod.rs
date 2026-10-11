@@ -4,6 +4,7 @@
 
 pub mod actor;
 pub mod elo;
+pub mod mls;
 pub mod registry;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +16,9 @@ use loro_protocol::{BatchId, CrdtType, ProtocolMessage, encode};
 use tokio::sync::{Notify, mpsc, oneshot};
 use typstry_wire::fragment::encode_update;
 
-use crate::store::projects::Permission;
+use typstry_wire::ds::ClientMessage;
+
+use crate::store::projects::{DsAccess, Permission};
 
 pub use registry::{JoinOutcome, RoomRegistry};
 
@@ -244,6 +247,9 @@ pub enum RoomCmd {
         conn: ConnId,
         crdt: CrdtType,
         permission: Permission,
+        /// The token the connection joined with, so a rotation can find
+        /// the connections it has to close.
+        token: String,
         version: Vec<u8>,
         outbox: Outbox,
         /// True when joined. False means the room already sent a JoinError.
@@ -259,7 +265,33 @@ pub enum RoomCmd {
         conn: ConnId,
         crdt: CrdtType,
     },
+    /// Opens a delivery service session. The access was resolved by the
+    /// connection; the room double-checks it against rotations it has seen
+    /// since.
+    DsHello {
+        conn: ConnId,
+        token: String,
+        access: DsAccess,
+        incarnation: u64,
+        since_epoch: u64,
+        outbox: Outbox,
+        /// False when the session could not be opened.
+        reply: oneshot::Sender<bool>,
+    },
+    DsMessage {
+        conn: ConnId,
+        msg: ClientMessage,
+    },
+    DsLeave {
+        conn: ConnId,
+    },
 }
+
+/// Close code for doc and presence connections whose link was rotated away.
+/// It is in the 4400 range the JS client treats as fatal, so it stops
+/// retrying with the dead token and looks for the new link instead.
+pub const CLOSE_LINK_ROTATED: u16 = 4401;
+pub const CLOSE_LINK_ROTATED_REASON: &str = "link_rotated";
 
 /// Cap on one presence blob. Real ones are a few hundred bytes of
 /// encrypted cursor state; anything near this is not presence.
@@ -274,6 +306,46 @@ pub struct RoomConfig {
     /// A connection's presence blob expires after this long without a
     /// refresh, so a client that froze without disconnecting fades out.
     pub ephemeral_timeout: Duration,
+    pub ds: DsConfig,
+}
+
+/// Limits of the MLS delivery service.
+///
+/// Anyone with a view link can append external commits, so each knob bounds
+/// what a project can make the server store. Clients pruned out of the log
+/// rejoin from the stored GroupInfo, which is what a lost state costs
+/// anyway.
+#[derive(Debug, Clone)]
+pub struct DsConfig {
+    /// Commits older than this are dropped, except the newest one.
+    pub commit_retention: Duration,
+    /// At most this many of the newest commits are kept, whatever their age.
+    pub keep_last_commits: u64,
+    /// At most this many bytes of the newest commits are kept per project,
+    /// except that the newest commit always is.
+    pub max_log_bytes: u64,
+    /// Cap on one commit. Real ones are about a kilobyte, growing with the
+    /// log of the member count (a 60 member group's commits are 1 to 1.4
+    /// KiB) and by 32 bytes for every rotation the project went through
+    /// (the policy travels in them), so 64 KiB leaves room for thousands of
+    /// rotations and members. The ratchet tree is not in a commit, it is in
+    /// the GroupInfo.
+    pub max_commit_bytes: usize,
+    /// Cap on each stored blob a client sends besides the commit itself:
+    /// GroupInfo, keyring and rotation envelope.
+    pub max_group_info_bytes: usize,
+}
+
+impl Default for DsConfig {
+    fn default() -> Self {
+        Self {
+            commit_retention: Duration::from_secs(90 * 24 * 60 * 60),
+            keep_last_commits: 1000,
+            max_log_bytes: 16 * 1024 * 1024,
+            max_commit_bytes: 64 * 1024,
+            max_group_info_bytes: 256 * 1024,
+        }
+    }
 }
 
 impl Default for RoomConfig {
@@ -282,6 +354,7 @@ impl Default for RoomConfig {
             unload_after: Duration::from_secs(60),
             tick: Duration::from_secs(5),
             ephemeral_timeout: Duration::from_secs(30),
+            ds: DsConfig::default(),
         }
     }
 }

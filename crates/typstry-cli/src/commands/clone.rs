@@ -80,6 +80,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 
     let api = Api::new(&link.origin)?;
     let share = api.resolve_share(&link.token).await?;
+    if share.retired {
+        bail!("this link was replaced by a newer one; ask an editor for the current link");
+    }
     let staging = match &explicit {
         Some(dir) => dir.clone(),
         None => parent.join(format!(".typstry-clone-{}", share.project_id)),
@@ -153,7 +156,7 @@ async fn fetch(
     api: Api,
     ctx: &Ctx,
 ) -> anyhow::Result<Option<String>> {
-    let mut session = Session::create_with_api(dir, link, share, api, ctx.name.as_deref())?;
+    let mut session = Session::create_with_api(dir, link, share, api, None, ctx.name.as_deref())?;
     session.connect().await?;
     session.disconnect().await;
     print_warnings(&mut Output::terminal(), &mut session);

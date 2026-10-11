@@ -1,4 +1,3 @@
-import type { PeerID } from "loro-crdt";
 import type { ProjectAssets } from "@/assets/project-assets";
 import {
   DiffIcon,
@@ -30,6 +29,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { tagAt, type GroupingOptions } from "@/doc/history";
+import { useRoster } from "@/mls/context";
 import type { ProjectDoc } from "@/doc/schema";
 import {
   deleteVersion,
@@ -39,6 +39,7 @@ import {
 import { readJson, writeJson } from "@/lib/storage";
 import { cn } from "@/lib/utils";
 import {
+  authorIdentities,
   buildHistoryItems,
   formatAbsolute,
   formatRelative,
@@ -82,6 +83,7 @@ export function HistoryPanel({
   title,
 }: HistoryPanelProps) {
   const data = useHistory(project, open, grouping);
+  const memberOfPeer = useRoster()?.memberOfPeer;
   const [previewing, setPreviewing] = useState<string | null>(null);
   const [taggedOnly, setTaggedOnly] = useState(
     () => readJson(TAGGED_ONLY_KEY) === true,
@@ -244,7 +246,10 @@ export function HistoryPanel({
               // "Unknown" says nothing in a sentence; leave those out.
               authorIdentities(
                 project,
-                item.authors.filter((peer) => project.getPeer(peer)),
+                item.authors.filter(
+                  (peer) => memberOfPeer?.(peer) ?? project.getPeer(peer),
+                ),
+                memberOfPeer,
               ).map((a) => a.name)
             }
             onOpenVersion={(target) => {
@@ -295,6 +300,7 @@ function HistoryRow({
   onPreview?: () => void;
 }) {
   const { target, tags } = item;
+  const memberOfPeer = useRoster()?.memberOfPeer;
   const when = target.time !== null ? formatRelative(target.time) : null;
   const exact = target.time !== null ? formatAbsolute(target.time) : undefined;
   const titleId = useId();
@@ -324,7 +330,7 @@ function HistoryRow({
           {item.detail}
         </span>
         <span className="ml-auto flex shrink-0 -space-x-1.5">
-          {authorIdentities(project, item.authors)
+          {authorIdentities(project, item.authors, memberOfPeer)
             .slice(0, 4)
             .map((identity) => (
               <span key={identity.key} title={identity.name}>
@@ -472,20 +478,4 @@ function LoadingRows() {
       ))}
     </div>
   );
-}
-
-const UNKNOWN = { name: "Unknown", color: "#71717a" };
-
-/**
- * Every page load is a new Loro peer, so one person shows up under several
- * peer ids. Collapse those that look identical.
- */
-function authorIdentities(project: ProjectDoc, peers: PeerID[]) {
-  const seen = new Map<string, { key: string; name: string; color: string }>();
-  for (const peer of peers) {
-    const info = project.getPeer(peer) ?? UNKNOWN;
-    const key = `${info.name}\u0000${info.color}`;
-    if (!seen.has(key)) seen.set(key, { key, ...info });
-  }
-  return [...seen.values()];
 }

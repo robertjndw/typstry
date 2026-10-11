@@ -1,14 +1,16 @@
 // Per-browser memory of projects: a "recent" list for the home page, the
 // share links of projects created here, the encryption key of every project
-// opened here, and what each share token resolved to (so a project opens
-// offline).
-import { isProjectSecret } from "@/crypto/project-key";
+// opened here, the sealed keyring the server last gave us for it, and what
+// each share token resolved to (so a project opens offline).
+import { fromBase64, toBase64 } from "@/crypto/bytes";
+import { isProjectSecret } from "@/crypto/secret";
 import { getStorage, readJson, writeJson } from "@/lib/storage";
 import { parseShareInfo, type ShareInfo } from "@/sync/api";
 
 export const RECENT_KEY = "typstry:recent";
 const LINKS_PREFIX = "typstry:links:";
 const KEY_PREFIX = "typstry:key:";
+const KEYRING_PREFIX = "typstry:keyring:";
 const SHARE_PREFIX = "typstry:share:";
 const MAX_RECENT = 12;
 
@@ -86,6 +88,18 @@ export function saveShareLinks(
   writeJson(LINKS_PREFIX + projectId, links, storage);
 }
 
+/** For a member who is no longer sent the edit link by a rotation. */
+export function clearShareLinks(
+  projectId: string,
+  storage: Storage | null = getStorage(),
+): void {
+  try {
+    storage?.removeItem(LINKS_PREFIX + projectId);
+  } catch {
+    // Best effort, like every other storage access here.
+  }
+}
+
 export function loadShareLinks(
   projectId: string,
   storage: Storage | null = getStorage(),
@@ -131,6 +145,27 @@ export function loadProjectKey(
   return typeof value === "string" && isProjectSecret(value) ? value : null;
 }
 
+/**
+ * The signed, sealed keyring as the server stores it, kept so a project
+ * opens offline. It is only readable with the link, which this browser
+ * stores next to it anyway.
+ */
+export function saveKeyring(
+  projectId: string,
+  keyring: Uint8Array,
+  storage: Storage | null = getStorage(),
+): void {
+  writeJson(KEYRING_PREFIX + projectId, toBase64(keyring), storage);
+}
+
+export function loadKeyring(
+  projectId: string,
+  storage: Storage | null = getStorage(),
+): Uint8Array | null {
+  const value = readJson(KEYRING_PREFIX + projectId, storage);
+  return typeof value === "string" ? fromBase64(value) : null;
+}
+
 export function rememberShare(
   token: string,
   share: ShareInfo,
@@ -173,6 +208,7 @@ export function forgetProject(
     if (!storage) return;
     storage.removeItem(LINKS_PREFIX + projectId);
     storage.removeItem(KEY_PREFIX + projectId);
+    storage.removeItem(KEYRING_PREFIX + projectId);
     // Removing while iterating would shift the indices.
     for (let i = 0; i < storage.length; i++) {
       const key = storage.key(i);

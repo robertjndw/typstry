@@ -50,7 +50,25 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// is busy, but it keeps pinging.
 const EVENT_BUFFER: usize = 16;
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Opens a WebSocket to `url`. Errors name the server as `shown`, so a
+/// caller can keep a query string out of them.
+pub(crate) async fn open_socket(url: &str, shown: &str) -> anyhow::Result<Socket> {
+    install_crypto_provider();
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
+        .await
+        .with_context(|| format!("connecting to {shown} timed out"))?
+    {
+        Ok((ws, _)) => Ok(ws),
+        // The server checks our version before the upgrade, so being too
+        // old shows up as the handshake's HTTP status.
+        Err(Error::Http(res)) if res.status() == StatusCode::UPGRADE_REQUIRED => {
+            Err(SyncError::protocol_too_old(url).into())
+        }
+        Err(err) => Err(err).with_context(|| format!("cannot connect to {shown}")),
+    }
+}
 
 /// What a successful join told us.
 #[derive(Debug, Clone)]
@@ -97,19 +115,7 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(url: &str, room: &str) -> anyhow::Result<Self> {
-        install_crypto_provider();
-        let (ws, _) = match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
-            .await
-            .with_context(|| format!("connecting to {url} timed out"))?
-        {
-            Ok(connected) => connected,
-            // The server checks our version before the upgrade, so being
-            // too old shows up as the handshake's HTTP status.
-            Err(Error::Http(res)) if res.status() == StatusCode::UPGRADE_REQUIRED => {
-                return Err(SyncError::protocol_too_old(url).into());
-            }
-            Err(err) => return Err(err).with_context(|| format!("cannot connect to {url}")),
-        };
+        let ws = open_socket(url, url).await?;
         Ok(Self::spawn(ws, room))
     }
 

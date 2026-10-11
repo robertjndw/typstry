@@ -1,11 +1,5 @@
 import { mimeOf } from "@/assets/file-types";
-import {
-  BLOB_CONTEXT,
-  SEAL_OVERHEAD,
-  open,
-  seal,
-  type ProjectKey,
-} from "@/crypto/project-key";
+import { BLOB_OVERHEAD, type ProjectCrypto } from "@/crypto/project-crypto";
 import type { AssetInfo } from "@/doc/schema";
 import { ApiError, MAX_UPLOAD_BYTES, uploadBlob } from "@/sync/api";
 import { AssetCache, contentHash } from "@/typst/asset-cache";
@@ -19,20 +13,20 @@ export interface ProjectAssets {
 }
 
 /** Largest file that still fits the server's limit once encrypted. */
-export const MAX_ASSET_BYTES = MAX_UPLOAD_BYTES - SEAL_OVERHEAD;
+export const MAX_ASSET_BYTES = MAX_UPLOAD_BYTES - BLOB_OVERHEAD;
 
 let sharedCache: AssetCache | null = null;
 
 export function projectAssets(
   token: string,
-  key: ProjectKey,
+  crypto: ProjectCrypto,
   opts: { cache?: AssetCache; baseUrl?: string } = {},
 ): ProjectAssets {
   const cache = opts.cache ?? (sharedCache ??= new AssetCache());
   return {
     // The cache holds ciphertext, so decrypted files never sit in Cache
     // Storage; decrypting again on each load is cheap next to compiling.
-    load: async (hash) => open(key, await cache.get(token, hash), BLOB_CONTEXT),
+    load: async (hash) => crypto.openBlob(await cache.get(token, hash)),
     async store(file, { signal } = {}) {
       if (file.size > MAX_ASSET_BYTES) {
         throw new ApiError(
@@ -41,7 +35,7 @@ export function projectAssets(
         );
       }
       const plaintext = new Uint8Array(await file.arrayBuffer());
-      const sealed = await seal(key, plaintext, BLOB_CONTEXT);
+      const sealed = crypto.sealBlob(plaintext);
       const [{ hash }, expected] = await Promise.all([
         uploadBlob(token, sealed, file.name, {
           baseUrl: opts.baseUrl,

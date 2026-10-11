@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use loro::{ExportMode, IdSpan, LoroDoc, VersionVector};
 use loro_protocol::{BatchId, UpdateStatusCode};
-use typstry_wire::crypto::{CryptoError, ProjectKey};
+use typstry_wire::crypto::{CryptoError, DocKeys, RecordSigner};
 use typstry_wire::elo::{Record, SealedRecord, decode_container, encode_container, pack_ranges};
 
 use crate::api::Permission;
 use crate::client::{Client, Event, Joined};
 use crate::link::ws_url;
 
+use super::membership::NO_KEYS;
 use super::{RemoteEvent, Session, SyncError};
 
 /// Same as the adaptor's `CONTAINER_BUDGET`: one container per send stays
@@ -50,6 +51,9 @@ pub(super) struct Conn {
     unreadable: u64,
     mismatched_key: Option<String>,
     decrypted_any: bool,
+    /// A record came from a key generation newer than ours, so the keyring
+    /// has to be fetched again, see [`Session::next_remote`].
+    stale_keys: bool,
 }
 
 /// What an unacked container carried. A refused one is never resent as is:
@@ -70,6 +74,7 @@ struct Received {
     seen: HashMap<u64, u64>,
     unreadable: u64,
     mismatched_key: Option<String>,
+    stale_keys: bool,
 }
 
 impl Conn {
@@ -86,6 +91,7 @@ impl Conn {
             unreadable: 0,
             mismatched_key: None,
             decrypted_any: false,
+            stale_keys: false,
         }
     }
 
@@ -135,6 +141,7 @@ impl Conn {
         }
         self.unreadable += received.unreadable;
         self.decrypted_any |= decrypted;
+        self.stale_keys |= received.stale_keys;
         if received.mismatched_key.is_some() {
             self.mismatched_key = received.mismatched_key;
         }
@@ -197,7 +204,12 @@ impl Conn {
 
     /// Sends every op of `doc` the server does not have yet, as delta
     /// records packed into containers of at most [`CONTAINER_BUDGET`].
-    async fn send_missing(&mut self, doc: &LoroDoc, key: &ProjectKey) -> anyhow::Result<()> {
+    async fn send_missing(
+        &mut self,
+        doc: &LoroDoc,
+        keys: &DocKeys,
+        signer: &(dyn RecordSigner + Sync),
+    ) -> anyhow::Result<()> {
         let vv = doc.oplog_vv();
         let mut spans: Vec<(u64, u64, u64)> = ends(&vv)
             .filter_map(|(peer, end)| {
@@ -208,7 +220,7 @@ impl Conn {
         spans.sort_unstable();
         let mut records = Vec::new();
         for &(peer, start, end) in &spans {
-            encrypt_span(doc, key, peer, start, end, &mut records)?;
+            encrypt_span(doc, keys, signer, peer, start, end, &mut records)?;
         }
         let bytes: Vec<&[u8]> = records
             .iter()
@@ -236,13 +248,18 @@ impl Conn {
 
     /// Sends `doc` as an encrypted snapshot that replaces the server's
     /// deltas. At most once per connection, also when it fails.
-    async fn send_snapshot(&mut self, doc: &LoroDoc, key: &ProjectKey) -> anyhow::Result<()> {
+    async fn send_snapshot(
+        &mut self,
+        doc: &LoroDoc,
+        keys: &DocKeys,
+        signer: &(dyn RecordSigner + Sync),
+    ) -> anyhow::Result<()> {
         self.snapshot_sent = true;
         let vv: Vec<(u64, u64)> = ends(&doc.oplog_vv()).collect();
         let snapshot = doc
             .export(ExportMode::Snapshot)
             .context("exporting a snapshot")?;
-        let record = key.encrypt_snapshot(&vv, &snapshot)?;
+        let record = keys.encrypt_snapshot(signer, &vv, &snapshot)?;
         let container = encode_container(&[&record]);
         let id = self.client.send_update(container).await?;
         self.in_flight.insert(id, InFlight::Snapshot);
@@ -258,10 +275,29 @@ impl Session {
     /// e.g. from an earlier run that went offline.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         self.disconnect().await;
+        // Before anything else, and with the token we hold even if a
+        // rotation retired it: the commit log is how a folder that was
+        // offline learns its new links, or that it was removed.
+        // Boxed: the group's state machines are large, and a debug build
+        // keeps them on the stack of every command that connects.
+        if let Err(err) = Box::pin(self.follow_group()).await {
+            // Doc sync never waits on the group. Only a folder with no
+            // group yet has to fail: without one it holds no doc keys.
+            let removed = matches!(err.downcast_ref::<SyncError>(), Some(SyncError::Removed));
+            if removed || self.group.is_none() {
+                return Err(err);
+            }
+            self.warnings.push(format!(
+                "could not follow the project's member group ({err:#}); syncing the document goes on, but links will not move over for this folder until this works"
+            ));
+        }
         let share = match self.resolved.take() {
             Some(share) => share,
             None => self.api.resolve_share(&self.config.token).await?,
         };
+        if share.retired {
+            return Err(SyncError::LinkReplaced.into());
+        }
         if share.project_id != self.config.project_id {
             return Err(SyncError::WrongProject {
                 now: share.project_id,
@@ -312,7 +348,7 @@ impl Session {
             self.disconnect().await;
             return Err(SyncError::KeyMismatch {
                 project,
-                folder: self.key.key_id().to_owned(),
+                folder: self.doc_keys()?.key_id().to_owned(),
             }
             .into());
         }
@@ -358,7 +394,9 @@ impl Session {
         let conn = self.conn.as_mut().context(NOT_CONNECTED)?;
         let Some(event) = conn.next_event().await else {
             if can_write {
-                conn.send_missing(&self.doc, &self.key).await?;
+                let group = self.group.as_ref().context(NO_KEYS)?;
+                conn.send_missing(&self.doc, group.doc_keys(), &group.signer())
+                    .await?;
             }
             // Cleared only once the resend went out: the sync loop drops
             // this future whenever something else wakes it, and a retry
@@ -369,6 +407,9 @@ impl Session {
         match event {
             Event::Update(container) => {
                 let imported = self.import_container(&container)?;
+                if self.conn.as_ref().is_some_and(|conn| conn.stale_keys) {
+                    self.keys_moved().await?;
+                }
                 Ok(if imported {
                     RemoteEvent::Imported
                 } else {
@@ -398,6 +439,7 @@ impl Session {
     /// Only a container whose framing is broken fails the import.
     pub fn import_container(&mut self, container: &[u8]) -> anyhow::Result<bool> {
         let records = decode_container(container).map_err(anyhow::Error::msg)?;
+        let keys = self.group.as_ref().context(NO_KEYS)?.doc_keys();
         let mut plaintexts = Vec::with_capacity(records.len());
         let mut received = Received::default();
         for bytes in records {
@@ -407,20 +449,25 @@ impl Session {
                 .map_err(CryptoError::MalformedRecord)
                 .and_then(|sealed| {
                     cover(&sealed.record, &mut received.seen);
-                    let plaintext = self.key.open_record(&sealed)?;
+                    let (plaintext, _) = keys.open_record(&sealed)?;
                     Ok((sealed.record, plaintext))
                 });
             let (record, plaintext) = match opened {
                 Ok(opened) => opened,
                 Err(err) => {
                     received.unreadable += 1;
-                    if let CryptoError::KeyMismatch(id) = &err {
-                        received.mismatched_key = Some(id.clone());
+                    match &err {
+                        CryptoError::KeyMismatch(id) => received.mismatched_key = Some(id.clone()),
+                        CryptoError::UnknownGeneration(_) => received.stale_keys = true,
+                        _ => {}
                     }
                     if !self.warned_unreadable {
                         self.warned_unreadable = true;
                         self.warnings.push(match err {
                             CryptoError::NewerVersion(_) => format!("skipping changes {err}"),
+                            CryptoError::NotEditor => {
+                                "skipping changes by an author who is not an editor of this project; the browser skips them too".to_owned()
+                            }
                             err => format!(
                                 "skipping changes that do not decrypt with this folder's key ({err}); the browser skips them too"
                             ),
@@ -461,9 +508,48 @@ impl Session {
             return Ok(());
         }
         let conn = self.conn.as_mut().context(NOT_CONNECTED)?;
-        conn.send_missing(&self.doc, &self.key).await?;
+        let group = self.group.as_ref().context(NO_KEYS)?;
+        conn.send_missing(&self.doc, group.doc_keys(), &group.signer())
+            .await?;
         self.wait_for_acks().await?;
         self.maybe_compact().await
+    }
+
+    /// Replaces the server's deltas with a snapshot under the current key
+    /// generation, which an editor does after a rotation so the project
+    /// does not depend on the deltas of keys it just retired.
+    pub async fn push_snapshot(&mut self) -> anyhow::Result<()> {
+        if !self.can_write() {
+            return Ok(());
+        }
+        self.push_local().await?;
+        let conn = self.conn.as_mut().context(NOT_CONNECTED)?;
+        let group = self.group.as_ref().context(NO_KEYS)?;
+        conn.send_snapshot(&self.doc, group.doc_keys(), &group.signer())
+            .await?;
+        self.wait_for_acks().await
+    }
+
+    /// Records arrived under a newer key generation than the keyring we
+    /// hold. Fetches the keyring; with new keys the connection starts over
+    /// so everything is read again. If the group has not reached that
+    /// generation, only following it can help, and that happens when the
+    /// server closes the stale connection or the next one opens.
+    async fn keys_moved(&mut self) -> anyhow::Result<()> {
+        if let Some(conn) = self.conn.as_mut() {
+            conn.stale_keys = false;
+        }
+        if self.refresh_keyring().await? {
+            self.conn = None;
+            return Err(
+                SyncError::Disconnected(Some("the project's keys were rotated".into())).into(),
+            );
+        }
+        let note = "some changes are under keys this folder does not have yet; they are skipped until it follows the project's group (run `typstry pull`)";
+        if !self.warnings.iter().any(|w| w == note) {
+            self.warnings.push(note.to_owned());
+        }
+        Ok(())
     }
 
     async fn wait_for_acks(&mut self) -> anyhow::Result<()> {
@@ -492,7 +578,9 @@ impl Session {
         if !wanted || !conn.compaction_due() {
             return Ok(());
         }
-        conn.send_snapshot(&self.doc, &self.key).await?;
+        let group = self.group.as_ref().context(NO_KEYS)?;
+        conn.send_snapshot(&self.doc, group.doc_keys(), &group.signer())
+            .await?;
         self.wait_for_acks().await
     }
 }
@@ -503,7 +591,8 @@ impl Session {
 /// produces one update larger than the server accepts.
 fn encrypt_span(
     doc: &LoroDoc,
-    key: &ProjectKey,
+    keys: &DocKeys,
+    signer: &dyn RecordSigner,
     peer: u64,
     start: u64,
     end: u64,
@@ -517,7 +606,7 @@ fn encrypt_span(
     if plaintext.len() <= CONTAINER_BUDGET || ops == 1 {
         out.push((
             (peer, start),
-            key.encrypt_delta(peer, start, end, &plaintext)?,
+            keys.encrypt_delta(signer, peer, start, end, &plaintext)?,
         ));
         return Ok(());
     }
@@ -533,7 +622,7 @@ fn encrypt_span(
     let mut at = start;
     while at < end {
         let next = (at + step).min(end);
-        encrypt_span(doc, key, peer, at, next, out)?;
+        encrypt_span(doc, keys, signer, peer, at, next, out)?;
         at = next;
     }
     Ok(())
@@ -575,6 +664,8 @@ fn covers(have: &VersionVector, target: &VersionVector) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use typstry_wire::crypto::{Keyring, LinkSecret, LocalSigner};
+
     use super::*;
 
     #[test]
@@ -589,17 +680,18 @@ mod tests {
         text.insert(0, &body).unwrap();
         doc.commit();
         let end = *doc.oplog_vv().get(&7).unwrap() as u64;
-        let key =
-            ProjectKey::from_base64url("AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f").unwrap();
+        let link = LinkSecret::generate_edit();
+        let keys = DocKeys::new(Keyring::new(&link));
+        let signer = LocalSigner::attested([7; 32], &link, 1);
         let mut records = Vec::new();
-        encrypt_span(&doc, &key, 7, 0, end, &mut records).unwrap();
+        encrypt_span(&doc, &keys, &signer, 7, 0, end, &mut records).unwrap();
         assert!(records.len() > 1);
 
         let copy = LoroDoc::new();
         let mut next = 0;
         let mut plaintexts = Vec::new();
         for ((peer, start), record) in &records {
-            let out = key.decrypt_record(record).unwrap();
+            let out = keys.decrypt_record(record).unwrap();
             let Record::Delta {
                 peer: p,
                 start: s,

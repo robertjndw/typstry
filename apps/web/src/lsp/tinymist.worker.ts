@@ -3,6 +3,8 @@ import initTinymist, {
 } from "../../vendor/tinymist/tinymist.js";
 import tinymistWasmUrl from "../../vendor/tinymist/tinymist_bg.wasm?url";
 
+import { toBase64 } from "@/crypto/bytes";
+
 import type { TinymistRequest, TinymistResponse } from "./protocol";
 
 // Same hand-typed worker scope as compile.worker.ts.
@@ -36,14 +38,6 @@ const files = new Map<string, Uint8Array>();
 const watched = new Set<string>();
 /** Watched files changed since the last fsChange, sent together per drain. */
 const changed = new Set<string>();
-
-function toBase64(data: Uint8Array): string {
-  let binary = "";
-  // Chunked: String.fromCharCode with the whole file overflows the stack.
-  for (let i = 0; i < data.length; i += 0x8000)
-    binary += String.fromCharCode(...data.subarray(i, i + 0x8000));
-  return btoa(binary);
-}
 
 function fileChange(uri: string) {
   const data = files.get(uri);

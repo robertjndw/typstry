@@ -14,7 +14,12 @@ base64 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 hkdf = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+openmls = { workspace = true, optional = true }
+openmls_basic_credential = { workspace = true, optional = true }
+openmls_rust_crypto = { workspace = true, optional = true }
+openmls_traits = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+tls_codec = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
 [features]
@@ -29,12 +34,24 @@ crypto = [
     "dep:thiserror",
     "dep:zeroize",
 ]
+# MLS group membership on top of the encryption. Clients only, like `crypto`.
+mls = [
+    "crypto",
+    "dep:openmls",
+    "dep:openmls_basic_credential",
+    "dep:openmls_rust_crypto",
+    "dep:openmls_traits",
+    "dep:tls_codec",
+]
+# MLS for wasm, where openmls needs the browser as its random source.
+js = ["mls", "openmls/js"]
 # Exposes the encryption entry points that take a caller-chosen salt and IV,
 # which the fixture tests need for byte-stable records.
 test-util = ["crypto"]
 
 [dev-dependencies]
 typstry-wire = { path = ".", features = ["crypto", "test-util"] }
+proptest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
