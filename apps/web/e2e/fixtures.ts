@@ -1,22 +1,27 @@
+import { readFile } from "node:fs/promises";
 import {
   expect,
   test as base,
   type Browser,
+  type Locator,
   type Page,
 } from "@playwright/test";
 
 export { expect };
 
-export const test = base.extend<{ expectedCspViolations: RegExp[] }>({
+type Identity = { name: string; color: string };
+
+export const test = base.extend<{
+  identity: Identity;
+  expectedCspViolations: RegExp[];
+}>({
+  identity: [{ name: "E2E Tester", color: "#1d4ed8" }, { option: true }],
   // Without a stored identity, opening a project asks for a name first and
   // the dialog covers the workspace.
-  context: async ({ context }, use) => {
-    await context.addInitScript(() => {
-      localStorage.setItem(
-        "typstry:identity",
-        JSON.stringify({ name: "E2E Tester", color: "#1d4ed8" }),
-      );
-    });
+  context: async ({ context, identity }, use) => {
+    await context.addInitScript((identity) => {
+      localStorage.setItem("typstry:identity", JSON.stringify(identity));
+    }, identity);
     await use(context);
   },
   expectedCspViolations: [[], { option: true }],
@@ -135,6 +140,20 @@ export function fileTree(page: Page) {
   return page.getByRole("tree", { name: "Project files" });
 }
 
+/**
+ * Renames an entry through its context menu. `path` is the full path, which
+ * is what the rename input is labelled with.
+ */
+export async function renameEntry(page: Page, path: string, name: string) {
+  await contextMenu(page, path.split("/").pop()!, "Rename");
+  const input = page.getByLabel(`Rename ${path}`);
+  // The input takes focus a frame after mounting and then preselects the
+  // stem, so filling it any earlier can leave a doubled extension.
+  await expect(input).toBeFocused();
+  await input.fill(name);
+  await input.press("Enter");
+}
+
 export async function contextMenu(page: Page, entry: string, item: string) {
   await fileTree(page)
     .getByRole("treeitem", { name: entry })
@@ -146,4 +165,34 @@ export function versions(page: Page) {
   return page
     .getByRole("dialog", { name: "History" })
     .getByRole("list", { name: "Versions" });
+}
+
+export function versionRow(page: Page, name: string) {
+  return versions(page).getByRole("listitem").filter({ hasText: name });
+}
+
+export async function tagVersion(page: Page, name: string) {
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  await page.getByRole("button", { name: "Tag current version" }).click();
+  await page.getByLabel("Tag name").fill(name);
+  await page.getByLabel("Tag name").press("Enter");
+  await expect(versions(page).getByText(name, { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+}
+
+export async function openVersion(page: Page, name: string) {
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  // The row's own button comes first; the tags and actions follow it.
+  await versionRow(page, name).getByRole("button").first().click();
+  await expect(page.getByText(`Viewing ${name}`)).toBeVisible();
+}
+
+/** Clicks a "Download PDF" button and checks that a PDF came out of it. */
+export async function downloadPdf(page: Page, button: Locator) {
+  const download = page.waitForEvent("download");
+  await button.click();
+  const file = await download;
+  const bytes = await readFile(await file.path());
+  expect(bytes.subarray(0, 5).toString()).toBe("%PDF-");
+  return { name: file.suggestedFilename(), bytes };
 }

@@ -1,32 +1,17 @@
-import { readFile } from "node:fs/promises";
-import type { Page } from "@playwright/test";
-
 import {
   appendLine,
   createProject,
+  downloadPdf,
   editor,
   expect,
   firstPage,
+  openVersion,
   tab,
+  tagVersion,
   test,
+  versionRow,
   versions,
 } from "./fixtures";
-
-async function tagVersion(page: Page, name: string) {
-  await page.getByRole("button", { name: "History", exact: true }).click();
-  await page.getByRole("button", { name: "Tag current version" }).click();
-  await page.getByLabel("Tag name").fill(name);
-  await page.getByLabel("Tag name").press("Enter");
-  await expect(versions(page).getByText(name, { exact: true })).toBeVisible();
-  await page.keyboard.press("Escape");
-}
-
-async function openVersion(page: Page, name: string) {
-  await page.getByRole("button", { name: "History", exact: true }).click();
-  // The row's own button comes first; the tags and actions follow it.
-  await versionRow(page, name).getByRole("button").first().click();
-  await expect(page.getByText(`Viewing ${name}`)).toBeVisible();
-}
 
 test("tagged versions can be browsed and show their changes", async ({
   page,
@@ -79,10 +64,6 @@ test("restoring a version rolls the project back", async ({ page }) => {
   await expect(editor(page)).not.toContainText("A mistake");
 });
 
-function versionRow(page: Page, name: string) {
-  return versions(page).getByRole("listitem").filter({ hasText: name });
-}
-
 test("versions can be previewed, diffed and untagged from the history", async ({
   page,
 }) => {
@@ -102,12 +83,11 @@ test("versions can be previewed, diffed and untagged from the history", async ({
   await expect(preview.getByRole("img", { name: "Page 1" })).not.toContainText(
     "Second thoughts",
   );
-  const download = page.waitForEvent("download");
-  await preview.getByRole("button", { name: "Download PDF" }).click();
-  const file = await download;
-  expect(file.suggestedFilename()).toMatch(/First.draft.*\.pdf$/);
-  const pdf = await readFile(await file.path());
-  expect(pdf.subarray(0, 5).toString()).toBe("%PDF-");
+  const { name } = await downloadPdf(
+    page,
+    preview.getByRole("button", { name: "Download PDF" }),
+  );
+  expect(name).toMatch(/First.draft.*\.pdf$/);
 
   // Stepping to the newer version recompiles the same preview in place.
   await page.keyboard.press("ArrowRight");

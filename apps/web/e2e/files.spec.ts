@@ -8,6 +8,7 @@ import {
   fileTree,
   firstPage,
   preview,
+  renameEntry,
   tab,
   test,
 } from "./fixtures";
@@ -60,10 +61,7 @@ test("renaming a file updates its tab and breaks old references", async ({
   await appendLine(page, '#include "chapter.typ"');
   await expect(preview(page).getByLabel("Up to date")).toBeVisible();
 
-  await contextMenu(page, "chapter.typ", "Rename");
-  const input = page.getByLabel("Rename chapter.typ");
-  await input.fill("intro.typ");
-  await input.press("Enter");
+  await renameEntry(page, "chapter.typ", "intro.typ");
 
   await expect(
     fileTree(page).getByRole("treeitem", { name: "intro.typ" }),
