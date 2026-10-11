@@ -18,13 +18,10 @@ import {
 import { isEditSecret, secretKind } from "@/crypto/secret";
 import { loadWasm } from "@/crypto/wasm";
 import { isSchemaTooNew, migrate, ProjectDoc } from "@/doc/schema";
+import { localIdentity, mergeOwnGraph } from "@/mls/identity";
 import { MlsSession, type GroupKeys } from "@/mls/session";
 import { useMlsSnapshot } from "@/mls/useMlsSnapshot";
-import {
-  defaultBackend,
-  LocalDocStore,
-  type StoredRotation,
-} from "@/persist/local-doc-store";
+import { defaultBackend, LocalDocStore } from "@/persist/local-doc-store";
 import {
   loadIdentity,
   provisionalIdentity,
@@ -45,7 +42,7 @@ import {
 import { RELOAD_MESSAGE } from "@/sync/protocol";
 
 import {
-  clearShareLinks,
+  keepRotation,
   forgetShare,
   loadKeyring,
   loadProjectKey,
@@ -54,7 +51,6 @@ import {
   rememberShare,
   saveKeyring,
   saveProjectKey,
-  saveShareLinks,
   updateRecentTitle,
 } from "./recent";
 
@@ -134,39 +130,6 @@ function openError(error: unknown): string {
   // key match; anything else typed is this family too.
   if (error instanceof CryptoError) return WRONG_KEY;
   return "This project could not be opened.";
-}
-
-/**
- * Stores the links of a rotation where the next visit finds them: the key
- * for the fragment, the tokens, and what to open from the recent list.
- */
-function keepRotation(
-  projectId: string,
-  rotation: StoredRotation,
-  title: string,
-): void {
-  saveProjectKey(projectId, rotation.link);
-  if (rotation.canEdit && rotation.viewToken) {
-    saveShareLinks(projectId, {
-      editToken: rotation.token,
-      viewToken: rotation.viewToken,
-    });
-    rememberShare(rotation.token, {
-      projectId,
-      permission: "write",
-      viewToken: rotation.viewToken,
-    });
-    rememberShare(rotation.viewToken, { projectId, permission: "read" });
-  } else {
-    // Not sent the edit link, e.g. a viewer: there is no other token.
-    clearShareLinks(projectId);
-    rememberShare(rotation.token, { projectId, permission: "read" });
-  }
-  rememberProject({
-    projectId,
-    token: rotation.token,
-    title: title || "Untitled",
-  });
 }
 
 /** The server holds no group, and so no keyring, for the project. */
@@ -317,6 +280,8 @@ export function useProjectSession(
       },
       fetchBootstrap: (t) => fetchMlsBootstrap(t),
       identity: () => identityRef.current,
+      localIdentity: async () => localIdentity(await defaultBackend()),
+      mergeGraph: async (graph) => mergeOwnGraph(await defaultBackend(), graph),
       // Keep the new links before anything else: they are the only way
       // back into the project, and nothing else holds them.
       onRotated: (rotation) => {

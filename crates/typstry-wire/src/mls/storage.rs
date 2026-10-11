@@ -49,7 +49,7 @@ pub fn hpke_config() -> HpkeConfig {
 /// The signature key has to outlive the group state. Resyncing replaces the
 /// old leaf only if the new one has the same signature key, and a new key
 /// would leave a ghost leaf of the lost state in the tree.
-pub struct Device {
+pub struct LeafKeys {
     sig_seed: Zeroizing<[u8; KEY_LEN]>,
     hpke_ikm: Zeroizing<[u8; KEY_LEN]>,
     id: [u8; DEVICE_ID_LEN],
@@ -57,15 +57,15 @@ pub struct Device {
     hpke: HpkeKeyPair,
 }
 
-impl std::fmt::Debug for Device {
+impl std::fmt::Debug for LeafKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Device")
+        f.debug_struct("LeafKeys")
             .field("signer", &self.signing.verifying_key().to_bytes())
             .finish_non_exhaustive()
     }
 }
 
-impl Device {
+impl LeafKeys {
     pub fn generate() -> Self {
         Self::from_parts(Zeroizing::new(random()), Zeroizing::new(random()), random())
             .expect("a random seed derives a key pair")
@@ -173,7 +173,7 @@ pub struct SavedPending {
 /// What [`encode`] saves of a project group and [`decode`] returns.
 pub struct SavedState {
     pub group_id: Vec<u8>,
-    pub device: Device,
+    pub device: LeafKeys,
     /// The link secret, in its shareable form.
     pub link: Zeroizing<String>,
     /// The keyring as [`crate::crypto::Keyring::export`] writes it.
@@ -331,7 +331,7 @@ pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
     }
     Ok(SavedState {
         group_id,
-        device: Device::from_parts(seed, ikm, id)?,
+        device: LeafKeys::from_parts(seed, ikm, id)?,
         link,
         keyring,
         profile,
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn a_device_survives_saving() {
-        let device = Device::generate();
+        let device = LeafKeys::generate();
         let copy = device.duplicate();
         assert_eq!(copy.signer_pub(), device.signer_pub());
         assert_eq!(copy.hpke_pub(), device.hpke_pub());

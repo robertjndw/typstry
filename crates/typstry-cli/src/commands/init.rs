@@ -359,7 +359,7 @@ fn dirty_count(dir: &Path) -> Option<usize> {
     .map(|out| out.lines().count())
 }
 
-fn confirm(question: &str) -> anyhow::Result<bool> {
+pub(super) fn confirm(question: &str) -> anyhow::Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("not asking for confirmation without a terminal; check the preview and pass --yes");
     }
@@ -387,8 +387,9 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     // The project's group starts with this folder as its only member, before
     // anything else is uploaded, so every record has an author the group
     // vouches for.
-    let identity = Identity::resolve(ctx.name.as_deref(), None, root);
-    let group = create_group(&link, &identity).await?;
+    let local = crate::user::load_or_create_identity()?;
+    let identity = Identity::resolve(ctx.name.as_deref(), None, local.graph.profile(), root);
+    let group = create_group(&link, &identity, &local).await?;
     // Before .typstry/ exists, so the key cannot slip into a commit even if
     // the rest fails halfway.
     if let Some((repo, _)) = &plan.repo {
@@ -434,6 +435,7 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     session.set_base_to_doc();
     session.push_local().await?;
     session.disconnect().await;
+    session.remember_project();
     print_warnings(&mut out, &mut session);
     session.save()?;
     track_branch(&mut session, &mut out)?;

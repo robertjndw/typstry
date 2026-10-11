@@ -4,10 +4,12 @@
 
 mod common;
 
-use common::{Server, binary, clone, failed, read, stderr, stdout, temp, typstry};
+use common::{Server, binary, binary_with, clone, failed, read, stderr, stdout, temp, typstry};
 
 use std::fs;
 use std::path::Path;
+
+use base64::Engine;
 
 use typstry_cli::engine::Session;
 use typstry_cli::link::ShareLink;
@@ -57,7 +59,14 @@ async fn clone_joins_the_group_and_members_lists_everyone() {
     assert!(listing.contains("Browser"), "{listing}");
     assert!(listing.contains("Seeder"), "{listing}");
     assert_eq!(listing.matches("(you)").count(), 1, "{listing}");
-    assert_eq!(listing.matches("editor").count(), 3, "{listing}");
+    // Everyone in these tests shares one config dir, so one owner person.
+    let owners = listing
+        .lines()
+        .filter(|l| l.starts_with("    #") && l.contains("owner"))
+        .count();
+    assert_eq!(owners, 3, "{listing}");
+    assert!(listing.contains("(owner)"), "{listing}");
+    assert_eq!(listing.matches("editor").count(), 0, "{listing}");
     assert_eq!(listing.matches("viewer").count(), 1, "{listing}");
     assert!(listing.contains("Members (4)"), "{listing}");
 
@@ -65,9 +74,9 @@ async fn clone_joins_the_group_and_members_lists_everyone() {
     let from_view = stdout(&binary(&v, &["members"]).await);
     assert!(from_view.contains("Members (4)"), "{from_view}");
     let err = failed(&binary(&v, &["members", "remove", "0"]).await);
-    assert!(err.contains("only editors"), "{err}");
+    assert!(err.contains("only the project owner"), "{err}");
     let err = failed(&binary(&v, &["share", "reset"]).await);
-    assert!(err.contains("only editors"), "{err}");
+    assert!(err.contains("only the project owner"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -377,7 +386,9 @@ async fn a_group_that_cannot_be_followed_does_not_stop_doc_sync() {
     // its config that join fails.
     let path = a.join(STATE_DIR).join("mls.bin");
     let group = ProjectGroup::import_state(&fs::read(&path).unwrap()).unwrap();
-    let (_next, reset) = group.reset(b"{\"name\":\"a\",\"color\":\"#000\"}").unwrap();
+    let (_next, reset) = group
+        .reset(b"{\"name\":\"a\",\"color\":\"#000\"}", None)
+        .unwrap();
     let cfg = config(&a);
     let mut ds = Ds::connect(&cfg.server, &cfg.token, 0, group.epoch())
         .await
@@ -399,4 +410,262 @@ async fn a_group_that_cannot_be_followed_does_not_stop_doc_sync() {
     let out = binary(&b, &["push"]).await;
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stderr(&out).contains("member group"), "{}", stderr(&out));
+}
+
+/// Runs the binary as the person whose keys live in `config`.
+async fn as_person(dir: &Path, config: &Path, args: &[&str]) -> std::process::Output {
+    let config = config.to_str().unwrap();
+    binary_with(dir, args, "", &[("TYPSTRY_CONFIG_DIR", config)]).await
+}
+
+/// Creates a project from a new folder as the person whose keys live in
+/// `config`, which makes that person its owner.
+async fn init_as(server: &Server, parent: &Path, name: &str, config: &Path) -> std::path::PathBuf {
+    let out = as_person(
+        parent,
+        config,
+        &["init", name, "--server", &server.origin, "--yes"],
+    )
+    .await;
+    stdout(&out);
+    parent.join(name).canonicalize().unwrap()
+}
+
+async fn clone_as(link: &str, parent: &Path, name: &str, config: &Path) -> std::path::PathBuf {
+    let out = as_person(parent, config, &["clone", link, name]).await;
+    stdout(&out);
+    parent.join(name).canonicalize().unwrap()
+}
+
+/// The fingerprint on the first `Person` line that is marked `(you)`.
+fn own_fingerprint(listing: &str) -> String {
+    listing
+        .lines()
+        .find(|l| l.contains("Person ") && l.contains("(you)"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or_else(|| panic!("no own person in {listing}"))
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn devices_of_one_person_are_listed_together_and_removed_together() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let (_other_cfg, other_cfg) = temp();
+    let c = init_as(&server, &work, "c", &other_cfg).await;
+    let edit = stdout(&as_person(&c, &other_cfg, &["link", "--edit"]).await);
+    let a = clone_as(edit.trim(), &work, "a", &cfg).await;
+    let b = clone_as(edit.trim(), &work, "b", &cfg).await;
+
+    let listing = stdout(&as_person(&a, &cfg, &["members"]).await);
+    let fingerprint = own_fingerprint(&listing);
+    println!("{listing}");
+    let own: Vec<_> = listing
+        .lines()
+        .skip_while(|l| !l.contains(&fingerprint))
+        .skip(1)
+        .take_while(|l| l.starts_with("    #"))
+        .collect();
+    assert_eq!(own.len(), 2, "{listing}");
+    assert_eq!(listing.matches("(this device)").count(), 1, "{listing}");
+
+    // A prefix is enough, and the owner removes both.
+    let out = as_person(&c, &other_cfg, &["members", "remove", &fingerprint[..6]]).await;
+    let text = stdout(&out);
+    assert!(text.contains("Removed person"), "{text}");
+    for dir in [&a, &b] {
+        let err = failed(&as_person(dir, &cfg, &["members"]).await);
+        assert!(err.contains("you were removed"), "{err}");
+    }
+    let listing = stdout(&as_person(&c, &other_cfg, &["members"]).await);
+    assert!(!listing.contains(&fingerprint), "{listing}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_person_needs_a_unique_fingerprint_and_another_device() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let a = init_as(&server, &work, "a", &cfg).await;
+
+    let listing = stdout(&as_person(&a, &cfg, &["members"]).await);
+    let fingerprint = own_fingerprint(&listing);
+    let err = failed(&as_person(&a, &cfg, &["members", "remove", &fingerprint]).await);
+    assert!(err.contains("cannot remove itself"), "{err}");
+    let err = failed(&as_person(&a, &cfg, &["members", "remove", "zzzzzzzz"]).await);
+    assert!(err.contains("no member named"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clones_are_recorded_in_the_project_list() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Listed").await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let a = clone_as(&edit, &work, "a", &cfg).await;
+
+    let file: serde_json::Value =
+        serde_json::from_slice(&fs::read(cfg.join("projects.json")).unwrap()).unwrap();
+    assert_eq!(file["version"], 1);
+    let projects = file["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1, "{file}");
+    assert_eq!(projects[0]["dir"], a.to_str().unwrap());
+    assert_eq!(projects[0]["link"], edit);
+    assert_eq!(projects[0]["title"], "Listed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(cfg.join("device.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // A rotation moves the stored link along. It takes the owner to make one.
+    let owner = clone(&edit, &work, "owner").await;
+    stdout(&binary(&owner, &["share", "reset"]).await);
+    stdout(&as_person(&a, &cfg, &["pull"]).await);
+    let file: serde_json::Value =
+        serde_json::from_slice(&fs::read(cfg.join("projects.json")).unwrap()).unwrap();
+    assert_eq!(file["projects"].as_array().unwrap().len(), 1, "{file}");
+    assert_ne!(file["projects"][0]["link"], edit);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_device_key_is_an_error_and_stays() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Damaged").await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    fs::write(cfg.join("device.key"), b"not a key").unwrap();
+
+    let out = as_person(&work, &cfg, &["clone", &edit, "a"]).await;
+    let err = failed(&out);
+    assert!(err.contains("device.key"), "{err}");
+    assert_eq!(fs::read(cfg.join("device.key")).unwrap(), b"not a key");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_person_graph_is_an_error_and_stays() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Damaged graph").await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    fs::write(cfg.join("person.graph"), b"not a graph").unwrap();
+
+    let out = as_person(&work, &cfg, &["clone", &edit, "a"]).await;
+    let err = failed(&out);
+    assert!(err.contains("person.graph"), "{err}");
+    assert_eq!(fs::read(cfg.join("person.graph")).unwrap(), b"not a graph");
+}
+
+/// The number of the first member listed as `role` that is not this device.
+fn other_leaf(listing: &str, role: &str) -> String {
+    listing
+        .lines()
+        .filter(|l| l.trim_start().starts_with('#') && !l.contains("(this device)"))
+        .find(|l| l.contains(role))
+        .and_then(|l| l.trim_start().strip_prefix('#'))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no {role} in {listing}"))
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_creator_is_the_owner_and_the_person_is_pinned() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let a = init_as(&server, &work, "a", &cfg).await;
+
+    // No owner key exists any more: ownership is the person.
+    assert!(!cfg.join("owners.json").exists());
+    #[cfg(unix)]
+    for name in ["device.key", "person.graph"] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(cfg.join(name)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+    }
+    // The owner person is pinned for later rejoins.
+    assert!(config(&a).owner_person.is_some());
+    let listing = stdout(&as_person(&a, &cfg, &["members"]).await);
+    assert!(listing.contains("(owner)"), "{listing}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_owner_removes_members_or_resets_links() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_owner_cfg, owner_cfg) = temp();
+    let (_editor_cfg, editor_cfg) = temp();
+    let (_other_cfg, other_cfg) = temp();
+    let o = init_as(&server, &work, "o", &owner_cfg).await;
+    let edit = stdout(&as_person(&o, &owner_cfg, &["link", "--edit"]).await);
+    let e = clone_as(edit.trim(), &work, "e", &editor_cfg).await;
+    let x = clone_as(edit.trim(), &work, "x", &other_cfg).await;
+
+    let listing = stdout(&as_person(&e, &editor_cfg, &["members"]).await);
+    assert!(listing.contains("editor"), "{listing}");
+    let leaf = other_leaf(&listing, "owner");
+    let err = failed(&as_person(&e, &editor_cfg, &["members", "remove", &leaf]).await);
+    assert!(
+        err.contains("Only the project owner can remove members or reset links."),
+        "{err}"
+    );
+    let err = failed(&as_person(&e, &editor_cfg, &["share", "reset"]).await);
+    assert!(err.contains("Only the project owner"), "{err}");
+
+    // Nothing moved, and the owner can.
+    let before = config(&e).token;
+    let listing = stdout(&as_person(&o, &owner_cfg, &["members"]).await);
+    let leaf = other_leaf(&listing, "editor");
+    stdout(&as_person(&o, &owner_cfg, &["members", "remove", &leaf]).await);
+    assert_ne!(config(&o).token, before);
+    stdout(&as_person(&o, &owner_cfg, &["share", "reset"]).await);
+    drop(x);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_refuses_a_group_whose_owner_is_not_the_pinned_one() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Pinned").await;
+    let (_work, work) = temp();
+    let a = clone(&edit, &work, "a").await;
+    assert!(config(&a).owner_person.is_some());
+
+    let path = a.join(STATE_DIR).join("config.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    json["ownerPerson"] =
+        serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]));
+    fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    fs::remove_file(a.join(STATE_DIR).join("mls.bin")).unwrap();
+
+    let err = typstry(&a, &["pull"]).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains(
+            "The project's member group now claims a different owner. Refusing to rejoin."
+        ),
+        "{err:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_owner_pin_stops_the_join_and_leaves_the_config() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Damaged pin").await;
+    let (_work, work) = temp();
+    let a = clone(&edit, &work, "a").await;
+
+    let path = a.join(STATE_DIR).join("config.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    json["ownerPerson"] = serde_json::json!("not a person id");
+    fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    let damaged = fs::read(&path).unwrap();
+    fs::remove_file(a.join(STATE_DIR).join("mls.bin")).unwrap();
+
+    let err = typstry(&a, &["pull"]).await.unwrap_err();
+    assert!(format!("{err:#}").contains("is damaged"), "{err:#}");
+    assert_eq!(fs::read(&path).unwrap(), damaged);
 }

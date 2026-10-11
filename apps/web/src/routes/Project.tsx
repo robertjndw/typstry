@@ -9,8 +9,8 @@ import {
 import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 
+import { AccountMenu } from "@/components/AccountMenu";
 import { ConnectionStatus } from "@/components/ConnectionStatus";
-import { IdentityControl } from "@/components/IdentityControl";
 import { Notice } from "@/components/Notice";
 import { ProjectWorkspace } from "@/components/ProjectWorkspace";
 import { RemovedNotice } from "@/components/RemovedNotice";
@@ -180,7 +180,7 @@ function ProjectSessionView({
                     />
                   }
                   identity={
-                    <IdentityControl
+                    <AccountMenu
                       identity={identity}
                       firstVisit={stored === null}
                     />

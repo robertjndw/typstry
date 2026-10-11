@@ -116,3 +116,28 @@ test("dropping a zip on the start page imports it", async ({ page }) => {
   ).toBeVisible();
   await expect(firstPage(page)).toBeVisible();
 });
+
+test("a name changed on the start page shows up in a project", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: /^You are E2E Tester/ }).click();
+  await page.getByRole("menuitem", { name: "Name and color…" }).click();
+  await page.getByRole("textbox", { name: "Your name" }).fill("Renamed Tester");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(
+    page.getByRole("button", { name: /^You are Renamed Tester/ }),
+  ).toBeVisible();
+
+  // The fixture seeds the identity on every navigation, so create the
+  // project without a reload, the way createProject would after its goto.
+  await page.getByLabel("Project title").fill("Named");
+  await page.getByRole("button", { name: "New project" }).click();
+  await expect(page).toHaveURL(/\/p\/[^/#]+#.+/);
+  await expect(syncStatus(page)).toHaveText("Connected");
+  await expect(
+    page.getByRole("banner").getByRole("button", {
+      name: /^You are Renamed Tester/,
+    }),
+  ).toBeVisible();
+});

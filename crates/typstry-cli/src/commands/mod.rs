@@ -2,12 +2,15 @@
 //! and an async `run`.
 
 pub mod clone;
+pub mod devices;
 pub mod export;
 pub mod info;
 pub mod init;
 pub mod link;
+pub mod list;
 pub mod members;
 pub mod open;
+pub mod pair;
 pub mod pull;
 pub mod push;
 pub mod share;
@@ -68,6 +71,9 @@ pub enum Command {
     Members(members::Args),
     Share(share::Args),
     Open(open::Args),
+    Pair(pair::Args),
+    List(list::Args),
+    Devices(devices::Args),
     Info(info::Args),
     Version(version::Args),
     Export(export::Args),
@@ -167,6 +173,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Members(args) => members::run(&ctx, args).await,
         Command::Share(args) => share::run(&ctx, args).await,
         Command::Open(args) => open::run(&ctx, args),
+        Command::Pair(args) => pair::run(&ctx, args).await,
+        Command::List(args) => list::run(args),
+        Command::Devices(args) => devices::run(&ctx, args).await,
         Command::Info(args) => info::run(&ctx, args).await,
         Command::Version(args) => version::run(&ctx, args).await,
         Command::Export(args) => export::run(&ctx, args).await,
@@ -302,6 +311,22 @@ impl Output {
 }
 
 /// Prints `label` and the paths under it, if there are any.
+/// Shortest fingerprint prefix taken as one, so a short device name is not
+/// mistaken for the start of a fingerprint.
+const MIN_PREFIX: usize = 4;
+
+/// The one item of `items`, None if there is none, and the error from
+/// `ambiguous` if there are several.
+fn unique<T>(
+    mut items: impl Iterator<Item = T>,
+    ambiguous: impl FnOnce() -> anyhow::Error,
+) -> anyhow::Result<Option<T>> {
+    match (items.next(), items.next()) {
+        (Some(_), Some(_)) => Err(ambiguous()),
+        (first, _) => Ok(first),
+    }
+}
+
 fn print_list(out: &mut Output, label: &str, items: impl IntoIterator<Item = String>) {
     let items: Vec<String> = items.into_iter().collect();
     if items.is_empty() {

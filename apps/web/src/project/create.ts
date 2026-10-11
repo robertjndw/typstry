@@ -14,6 +14,7 @@ import {
   loadIdentity,
   provisionalIdentity,
 } from "@/presence/identity";
+import { localIdentity } from "@/mls/identity";
 import { createGroup, type DsClientOptions } from "@/mls/ds-client";
 import { createProject, type ApiOptions } from "@/sync/api";
 
@@ -60,23 +61,27 @@ export async function createLocalProject(
   const created = await createProject(opts);
   const link = LinkSecret.generateEdit();
   const key = link.toBase64url();
+  const backend = opts.backend ?? (await defaultBackend());
+  const identity = await localIdentity(backend);
   const { group, message } = ProjectGroup.create(
     link,
     encodeProfile(loadIdentity() ?? provisionalIdentity()),
+    identity.deviceSeed,
+    identity.graph,
   );
   await createGroup(created.editToken, message, opts.ds);
 
   const doc = new LoroDoc();
-  const backend = opts.backend ?? (await defaultBackend());
   // The group exists on the server now, and this device is its first
   // member. Keeping it is what lets the creator follow the group (and
   // remove people from it) instead of joining their own project as a
   // newcomer on the first visit.
   await backend.saveMls(created.projectId, {
     state: group.exportState(),
-    device: group.device().export(),
+    device: group.leafKeys().export(),
     removed: false,
     rotation: null,
+    ownerPerson: group.ownerPerson(),
   });
   const store = new LocalDocStore(created.projectId, doc, backend);
   // Load first: the store only writes what changed after it loaded.

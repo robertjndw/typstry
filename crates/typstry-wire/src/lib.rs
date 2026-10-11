@@ -14,11 +14,17 @@ pub mod crypto;
 pub mod ds;
 pub mod elo;
 pub mod fragment;
+#[cfg(feature = "crypto")]
+pub mod identity;
 #[cfg(feature = "mls")]
 pub mod mls;
 pub mod mls_frame;
+#[cfg(feature = "pairing")]
+pub mod pairing;
 pub mod relay;
 pub mod token;
+#[cfg(feature = "crypto")]
+mod words;
 
 /// Version of the HTTP and WebSocket contract between clients and the
 /// server. Bump it when a client starts relying on a new endpoint or field,

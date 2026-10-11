@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use typstry_wire::relay::RELAY_API_PATH;
 use typstry_wire::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 
 use crate::engine::SyncError;
@@ -85,6 +86,16 @@ pub struct CreatedProject {
     pub project_id: String,
     pub edit_token: String,
     pub view_token: String,
+}
+
+/// A pairing channel the server opened for this device.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayChannel {
+    pub channel: u16,
+    /// Proves this device allocated the channel; it takes the first seat.
+    pub claim: String,
+    pub expires_in: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,6 +211,24 @@ impl Api {
             bail!("creating the project failed: HTTP {}", res.status());
         }
         Ok(res.json().await.map_err(redact)?)
+    }
+
+    /// Opens a channel on the relay for pairing two devices.
+    pub async fn allocate_relay(&self) -> anyhow::Result<RelayChannel> {
+        let req = self.http.post(format!("{}{RELAY_API_PATH}", self.origin));
+        let res = self
+            .send(req, || format!("cannot reach {}", self.origin))
+            .await?;
+        match res.status() {
+            s if s.is_success() => Ok(res.json().await.map_err(redact)?),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                bail!("the server has no free pairing channel right now; try again in a minute")
+            }
+            StatusCode::NOT_FOUND => {
+                bail!("this server does not offer pairing; it may be an older typstry server")
+            }
+            s => bail!("opening a pairing channel failed: HTTP {s}"),
+        }
     }
 
     pub async fn resolve_share(&self, token: &str) -> anyhow::Result<ShareInfo> {

@@ -1,11 +1,15 @@
 import type { RouteObject } from "react-router";
 
 import { Home } from "@/routes/Home";
+import { Pair } from "@/routes/Pair";
+import { Recover } from "@/routes/Recover";
 import { Project } from "@/routes/Project";
 
 export const routes: RouteObject[] = [
   { path: "/", element: <Home /> },
   { path: "/p/:token", element: <Project /> },
+  { path: "/pair", element: <Pair /> },
+  { path: "/recover", element: <Recover /> },
 ];
 
 if (import.meta.env.DEV) {

@@ -7,12 +7,13 @@
 //! after every change, and never run two operations on one group at once.
 
 use serde::Serialize;
-use typstry_wire::mls::{self, Outcome, ProjectGroup, Role};
+use typstry_wire::identity::{self, person_fingerprint};
+use typstry_wire::mls::{self, LocalIdentity, Outcome, ProjectGroup, Role};
 use wasm_bindgen::prelude::*;
 
 use crate::ds::ClientDto;
-use crate::error::{from_mls, from_serde};
-use crate::keys::{DocKeys, LinkSecret, Signer};
+use crate::error::{from_graph, from_mls, from_serde};
+use crate::keys::{DocKeys, LinkSecret, Signer, device_key};
 use crate::presence::PresenceKey;
 
 fn num(value: f64) -> Result<u64, JsValue> {
@@ -27,19 +28,37 @@ fn num(value: f64) -> Result<u64, JsValue> {
     }
 }
 
-/// A device identity that outlives the group state, so a device that lost
-/// its state can rejoin as itself (a resync) instead of leaving a ghost
-/// leaf behind.
+/// The person graphs (`PersonGraph.encode` bytes) the leaves of a project
+/// carry, read from its sealed GroupInfo and keyring without joining. A
+/// device that lost everything uses it to find the person a recovery key
+/// belongs to.
+#[wasm_bindgen(js_name = graphsInGroupInfo, unchecked_return_type = "Uint8Array[]")]
+pub fn graphs_in_group_info(
+    link: &LinkSecret,
+    group_info: &[u8],
+    keyring: &[u8],
+) -> Result<JsValue, JsValue> {
+    let graphs = mls::graphs_in_group_info(&link.inner, group_info, keyring).map_err(from_mls)?;
+    Ok(graphs
+        .iter()
+        .map(|graph| js_sys::Uint8Array::from(graph.encode().as_slice()))
+        .collect::<js_sys::Array>()
+        .into())
+}
+
+/// A project's leaf keys, which outlive the group state, so a device that
+/// lost its state can rejoin as itself (a resync) instead of leaving a ghost
+/// leaf behind. Per project, unlike the `DeviceKey` of the person.
 #[wasm_bindgen]
-pub struct Device {
-    inner: mls::Device,
+pub struct LeafKeys {
+    inner: mls::LeafKeys,
 }
 
 #[wasm_bindgen]
-impl Device {
-    pub fn generate() -> Device {
+impl LeafKeys {
+    pub fn generate() -> LeafKeys {
         Self {
-            inner: mls::Device::generate(),
+            inner: mls::LeafKeys::generate(),
         }
     }
 
@@ -47,8 +66,8 @@ impl Device {
         self.inner.export().to_vec()
     }
 
-    pub fn import(bytes: &[u8]) -> Result<Device, JsValue> {
-        mls::Device::import(bytes)
+    pub fn import(bytes: &[u8]) -> Result<LeafKeys, JsValue> {
+        mls::LeafKeys::import(bytes)
             .map(|inner| Self { inner })
             .map_err(from_mls)
     }
@@ -97,8 +116,13 @@ impl From<mls::Rotation> for RotationDto {
 enum OutcomeDto {
     Advanced,
     Rotated(RotationDto),
-    Removed,
-    Invalid { reason: String },
+    Removed {
+        #[serde(with = "serde_bytes")]
+        person: Option<Vec<u8>>,
+    },
+    Invalid {
+        reason: String,
+    },
     AlreadyApplied,
 }
 
@@ -107,7 +131,9 @@ impl From<Outcome> for OutcomeDto {
         match outcome {
             Outcome::Advanced => Self::Advanced,
             Outcome::Rotated(rotation) => Self::Rotated((*rotation).into()),
-            Outcome::Removed => Self::Removed,
+            Outcome::Removed { person } => Self::Removed {
+                person: person.map(|graph| graph.encode()),
+            },
             Outcome::Invalid(reason) => Self::Invalid { reason },
             Outcome::AlreadyApplied => Self::AlreadyApplied,
         }
@@ -124,6 +150,69 @@ struct MemberDto {
     is_self: bool,
     #[serde(with = "serde_bytes")]
     sig_pub: Vec<u8>,
+    person_state: &'static str,
+    #[serde(with = "serde_bytes")]
+    person_id: Option<Vec<u8>>,
+    person_fingerprint: Option<String>,
+    #[serde(with = "serde_bytes")]
+    device_pub: Option<Vec<u8>>,
+    device_revoked: bool,
+    #[serde(with = "serde_bytes")]
+    person_profile: Option<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct RemovalDto {
+    message: ClientDto,
+    removed: Vec<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityStepDto {
+    #[serde(with = "serde_bytes")]
+    merged: Option<Vec<u8>>,
+    needs_refresh: bool,
+    revoked_own: Vec<u32>,
+}
+
+/// What a device brings to a project: its `DeviceKey.export` and the
+/// `PersonGraph.encode` that lists it. Bytes rather than the classes, because
+/// wasm-bindgen would move them out of the caller's objects.
+fn local_identity(device_seed: &[u8], graph: &[u8]) -> Result<LocalIdentity, JsValue> {
+    Ok(LocalIdentity {
+        device: device_key(device_seed)?,
+        graph: graph_of(graph)?,
+    })
+}
+
+/// [`local_identity`] where a device may have none, as when it joins a
+/// project it only views. Both or neither.
+fn identity_of(
+    device_seed: Option<Vec<u8>>,
+    graph: Option<Vec<u8>>,
+) -> Result<Option<LocalIdentity>, JsValue> {
+    match (device_seed, graph) {
+        (None, None) => Ok(None),
+        (Some(seed), Some(graph)) => local_identity(&seed, &graph).map(Some),
+        _ => Err(crate::error::invalid(
+            "Malformed",
+            "a device key and a person graph go together",
+        )),
+    }
+}
+
+fn graph_of(bytes: &[u8]) -> Result<identity::PersonGraph, JsValue> {
+    identity::PersonGraph::decode(bytes).map_err(from_graph)
+}
+
+fn pinned_person(bytes: Option<Vec<u8>>) -> Result<Option<identity::PersonId>, JsValue> {
+    bytes.map(|bytes| person_id(&bytes)).transpose()
+}
+
+fn person_id(bytes: &[u8]) -> Result<identity::PersonId, JsValue> {
+    identity::PersonId::try_from(bytes)
+        .map_err(|_| crate::error::invalid("MalformedKey", "not a person id".to_string()))
 }
 
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
@@ -208,15 +297,37 @@ export interface Rotation {
 export type Outcome =
   | { type: "advanced" }
   | ({ type: "rotated" } & Rotation)
-  | { type: "removed" }
+  /** `person`: the group's copy of this device's person at removal, to merge into the stored graph. */
+  | { type: "removed"; person?: Uint8Array }
   | { type: "invalid"; reason: string }
   | { type: "alreadyApplied" };
 export interface Member {
   leaf: number;
-  role: "editor" | "viewer";
+  role: "owner" | "editor" | "viewer";
   profile?: Uint8Array;
   isSelf: boolean;
   sigPub: Uint8Array;
+  personState: "anonymous" | "verified" | "unverified";
+  /** The verified person's id, else undefined. */
+  personId?: Uint8Array;
+  personFingerprint?: string;
+  /** The device key that vouched for this leaf, for a verified person. */
+  devicePub?: Uint8Array;
+  /** The person's merged graph in this project shows the device revoked. */
+  deviceRevoked: boolean;
+  /** The verified person's own profile bytes from their graph. */
+  personProfile?: Uint8Array;
+}
+export interface RevokedRemoval {
+  message: Unsent<SubmitMessage>;
+  /** The leaves the commit removes. */
+  removed: number[];
+}
+export interface IdentityStep {
+  /** The stored graph with the group's copy merged in, if that adds anything. */
+  merged?: Uint8Array;
+  needsRefresh: boolean;
+  revokedOwn: number[];
 }
 export interface DecryptedDelta {
   kind: "delta";
@@ -253,56 +364,95 @@ pub struct Group {
 #[wasm_bindgen(js_class = ProjectGroup)]
 impl Group {
     /// Creates the group of a new project from a fresh edit link. Returns
-    /// `{ group, message }`, the message being the server's `init`.
+    /// `{ group, message }`, the message being the server's `init`. The
+    /// creator's person becomes the project's owner, so the device key and
+    /// graph are not optional.
     #[wasm_bindgen(unchecked_return_type = "Joined<InitMessage>")]
-    pub fn create(link: &LinkSecret, profile: &[u8]) -> Result<JsValue, JsValue> {
-        let (group, init) = ProjectGroup::create(&link.inner, profile).map_err(from_mls)?;
+    pub fn create(
+        link: &LinkSecret,
+        profile: &[u8],
+        device_seed: &[u8],
+        graph: &[u8],
+    ) -> Result<JsValue, JsValue> {
+        let identity = local_identity(device_seed, graph)?;
+        let (group, init) =
+            ProjectGroup::create(&link.inner, profile, &identity).map_err(from_mls)?;
         pair(group, init.into_message(0).into())
     }
 
     /// Joins with an external commit as a new device. Returns `{ group,
     /// message }` with the `submit` for the server. Call `confirmPending`
     /// once the server answers `accepted`; on `conflict`, drop the group and
-    /// join again from the newer GroupInfo.
+    /// join again from the newer GroupInfo. `pinnedOwner` is the owner's
+    /// person id as first seen for the project (`ownerPerson`), which the
+    /// group must still have (else `OwnerChanged`). A device of the owner
+    /// joins as the owner by bringing its identity.
     #[wasm_bindgen(js_name = joinExternal, unchecked_return_type = "Joined<SubmitMessage>")]
     pub fn join_external(
         link: &LinkSecret,
         group_info: &[u8],
         keyring: &[u8],
         profile: &[u8],
+        device_seed: Option<Vec<u8>>,
+        graph: Option<Vec<u8>>,
+        pinned_owner: Option<Vec<u8>>,
     ) -> Result<JsValue, JsValue> {
-        let (group, submit) =
-            ProjectGroup::join_external(&link.inner, group_info, keyring, profile)
-                .map_err(from_mls)?;
+        let identity = identity_of(device_seed, graph)?;
+        let (group, submit) = ProjectGroup::join_external(
+            &link.inner,
+            group_info,
+            keyring,
+            profile,
+            identity.as_ref(),
+            pinned_person(pinned_owner)?,
+        )
+        .map_err(from_mls)?;
         pair(group, submit.into_message(0).into())
     }
 
     /// [`Self::join_external`] as a known device. Rejoining with the device
     /// of lost state replaces that device's old leaf.
+    #[allow(clippy::too_many_arguments)]
     #[wasm_bindgen(js_name = joinExternalAs, unchecked_return_type = "Joined<SubmitMessage>")]
     pub fn join_external_as(
-        device: &Device,
+        leaf_keys: &LeafKeys,
         link: &LinkSecret,
         group_info: &[u8],
         keyring: &[u8],
         profile: &[u8],
+        device_seed: Option<Vec<u8>>,
+        graph: Option<Vec<u8>>,
+        pinned_owner: Option<Vec<u8>>,
     ) -> Result<JsValue, JsValue> {
+        let identity = identity_of(device_seed, graph)?;
         let (group, submit) = ProjectGroup::join_external_as(
-            device.inner.duplicate(),
+            leaf_keys.inner.duplicate(),
             &link.inner,
             group_info,
             keyring,
             profile,
+            identity.as_ref(),
+            pinned_person(pinned_owner)?,
         )
         .map_err(from_mls)?;
         pair(group, submit.into_message(0).into())
     }
 
     /// Starts over with a new group of the same project when this one is
-    /// stuck. Returns `{ group, message }` with the `reset`.
+    /// stuck. Returns `{ group, message }` with the `reset`. The leaf keeps
+    /// its identity unless `deviceSeed` and `graph` give a new one.
     #[wasm_bindgen(unchecked_return_type = "Joined<ResetMessage>")]
-    pub fn reset(&self, profile: &[u8]) -> Result<JsValue, JsValue> {
-        let (group, reset) = self.inner.reset(profile).map_err(from_mls)?;
+    pub fn reset(
+        &self,
+        profile: &[u8],
+        device_seed: Option<Vec<u8>>,
+        graph: Option<Vec<u8>>,
+    ) -> Result<JsValue, JsValue> {
+        let identity = identity_of(device_seed, graph)?;
+        let (group, reset) = self
+            .inner
+            .reset(profile, identity.as_ref())
+            .map_err(from_mls)?;
         pair(group, reset.into_message(0).into())
     }
 
@@ -369,6 +519,42 @@ impl Group {
         to_js(&ClientDto::from(submit.into_message(0)))
     }
 
+    /// Removes the leaves of this device's own person that the group's merged
+    /// graph shows as revoked and rotates the links, in a project this
+    /// device need not own. The revoke has to be in the group already: put
+    /// it there with `selfUpdate(profile, graph)` first. Returns
+    /// `{ message, removed }` with the leaves the commit removes. Throws
+    /// `NothingRevoked` when there is nothing to remove.
+    #[wasm_bindgen(js_name = removeRevoked, unchecked_return_type = "RevokedRemoval")]
+    pub fn remove_revoked(&mut self) -> Result<JsValue, JsValue> {
+        let removal = self.inner.remove_revoked().map_err(from_mls)?;
+        to_js(&RemovalDto {
+            message: ClientDto::from(removal.submit.into_message(0)),
+            removed: removal.removed,
+        })
+    }
+
+    /// What to do to keep this device's identity in line with its person,
+    /// in one pass over the tree, given `graph`, the `PersonGraph.encode`
+    /// stored here. Returns `{ merged?, needsRefresh, revokedOwn }`: store
+    /// `merged` when set, commit `selfUpdate(profile, merged ?? graph)` when
+    /// `needsRefresh`, and `removeRevoked` when `revokedOwn` is not empty.
+    /// After committing a refresh ask again, as it can change `revokedOwn`.
+    /// Throws what merging throws when the group's copy of the person does
+    /// not merge with `graph`.
+    #[wasm_bindgen(js_name = identityStep, unchecked_return_type = "IdentityStep")]
+    pub fn identity_step(&self, graph: &[u8]) -> Result<JsValue, JsValue> {
+        let step = self
+            .inner
+            .identity_step(&graph_of(graph)?)
+            .map_err(from_mls)?;
+        to_js(&IdentityStepDto {
+            merged: step.merged.map(|graph| graph.encode()),
+            needs_refresh: step.needs_refresh,
+            revoked_own: step.revoked_own,
+        })
+    }
+
     /// Rotates the links without removing anyone.
     #[wasm_bindgen(js_name = resetLinks, unchecked_return_type = "Unsent<SubmitMessage>")]
     pub fn reset_links(&mut self) -> Result<JsValue, JsValue> {
@@ -376,10 +562,21 @@ impl Group {
         to_js(&ClientDto::from(submit.into_message(0)))
     }
 
-    /// Refreshes this editor's leaf with a new profile.
+    /// Refreshes this editor's leaf with a new profile. With a `graph` (a
+    /// `PersonGraph.encode`) the leaf's graph is extended by it; throws
+    /// `ForeignGraph` for another person's and `NoIdentity` for a leaf that
+    /// has none.
     #[wasm_bindgen(js_name = selfUpdate, unchecked_return_type = "Unsent<SubmitMessage>")]
-    pub fn self_update(&mut self, profile: &[u8]) -> Result<JsValue, JsValue> {
-        let submit = self.inner.self_update(profile).map_err(from_mls)?;
+    pub fn self_update(
+        &mut self,
+        profile: &[u8],
+        graph: Option<Vec<u8>>,
+    ) -> Result<JsValue, JsValue> {
+        let graph = graph.map(|bytes| graph_of(&bytes)).transpose()?;
+        let submit = self
+            .inner
+            .self_update(profile, graph.as_ref())
+            .map_err(from_mls)?;
         to_js(&ClientDto::from(submit.into_message(0)))
     }
 
@@ -390,18 +587,43 @@ impl Group {
             .members()
             .map_err(from_mls)?
             .into_iter()
-            .map(|m| MemberDto {
-                leaf: m.leaf,
-                role: match m.role {
-                    Role::Editor => "editor",
-                    Role::Viewer => "viewer",
-                },
-                profile: m.profile,
-                is_self: m.is_self,
-                sig_pub: m.sig_pub.to_vec(),
+            .map(|m| {
+                let (person_state, id, device, device_revoked) = match m.person {
+                    mls::Person::Anonymous => ("anonymous", None, None, false),
+                    mls::Person::Unverified => ("unverified", None, None, false),
+                    mls::Person::Verified {
+                        id,
+                        device,
+                        revoked,
+                    } => ("verified", Some(id), Some(device), revoked),
+                };
+                MemberDto {
+                    leaf: m.leaf,
+                    role: match m.role {
+                        Role::Owner => "owner",
+                        Role::Editor => "editor",
+                        Role::Viewer => "viewer",
+                    },
+                    profile: m.profile,
+                    is_self: m.is_self,
+                    sig_pub: m.sig_pub.to_vec(),
+                    person_state,
+                    person_fingerprint: id.as_ref().map(person_fingerprint),
+                    person_id: id.map(|id| id.to_vec()),
+                    device_pub: device.map(|device| device.to_vec()),
+                    device_revoked,
+                    person_profile: m.person_profile,
+                }
             })
             .collect();
         to_js(&members)
+    }
+
+    /// The leaves of a verified person other than this device, for removing
+    /// them all in one commit. Resolve it at commit time: leaves move.
+    #[wasm_bindgen(js_name = leavesOf)]
+    pub fn leaves_of(&self, person: &[u8]) -> Result<Vec<u32>, JsValue> {
+        self.inner.leaves_of(&person_id(person)?).map_err(from_mls)
     }
 
     /// This epoch's presence key, with the roster and signer it needs.
@@ -440,10 +662,20 @@ impl Group {
         }
     }
 
-    pub fn device(&self) -> Device {
-        Device {
+    #[wasm_bindgen(js_name = leafKeys)]
+    pub fn leaf_keys(&self) -> LeafKeys {
+        LeafKeys {
             inner: self.inner.device().duplicate(),
         }
+    }
+
+    /// The project owner's person id, i.e. the person in the group whose tag
+    /// the policy holds. Pin it the first time a project is seen and pass it
+    /// as `pinnedOwner` to later joins. Undefined while none of the owner's
+    /// devices is in the group, as after a reset.
+    #[wasm_bindgen(js_name = ownerPerson)]
+    pub fn owner_person(&self) -> Option<Vec<u8>> {
+        self.inner.owner_person().map(|id| id.to_vec())
     }
 
     /// Whether the group rotated past the keyring this device holds.

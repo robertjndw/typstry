@@ -152,11 +152,18 @@ describe("MLS group", () => {
 
   it("creates, joins, removes and rotates through the wasm", () => {
     const link = wasm.LinkSecret.generateEdit();
-    const { group, message: init } = wasm.ProjectGroup.create(link, profile);
+    const device = wasm.DeviceKey.generate().export();
+    const graph = wasm.PersonGraph.genesis(device).encode();
+    const { group, message: init } = wasm.ProjectGroup.create(
+      link,
+      profile,
+      device,
+      graph,
+    );
     expect(init.type).toBe("init");
     expect(group.epoch).toBe(0);
     expect(group.members()).toHaveLength(1);
-    expect(group.members()[0]).toMatchObject({ role: "editor", isSelf: true });
+    expect(group.members()[0]).toMatchObject({ role: "owner", isSelf: true });
 
     // The delivery service, reduced to storing what Init and Submit carry.
     const { group: joiner, message: submit } = wasm.ProjectGroup.joinExternal(

@@ -6,23 +6,30 @@
 //! [`Session::connect`]: a stalled group only costs rotations, so it is a
 //! warning, not an error.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use typstry_wire::crypto::{DocKeys, PublicKey};
 use typstry_wire::ds::{Permission as DsPermission, ServerMessage};
+use typstry_wire::identity::PersonId;
 use typstry_wire::mls::{
-    Device, MemberInfo, MlsError, Outcome, ProjectGroup, Rotation, SubmitPayload,
+    IdentityStep, LeafKeys, MemberInfo, MlsError, Outcome, ProjectGroup, Role, Rotation,
+    SubmitPayload,
 };
 
 use crate::api::Permission;
-use crate::mls::{Ds, Reply, jitter, join_group, refusal_text};
+use crate::mls::{Ds, Reply, jitter, join_group, profile_bytes, refusal_text};
 use crate::state::Config;
+use crate::user;
 
 use super::{Session, SyncError};
 
 pub(super) const NO_KEYS: &str =
     "this folder has no group keys; run `typstry pull` to join the project again";
+
+pub const NOT_OWNER: &str = "Only the project owner can remove members or reset links.";
 
 /// Rejoins in a row before giving up, e.g. against a group that keeps being
 /// reset.
@@ -76,7 +83,9 @@ impl Session {
                 Box::pin(self.join_again()).await?;
             }
             match Box::pin(self.catch_up()).await? {
-                Followed::Current(ds) => return Ok(ds.map(|ds| *ds)),
+                Followed::Current(ds) => {
+                    return Box::pin(self.refresh_identity(ds.map(|ds| *ds))).await;
+                }
                 Followed::Rejoin => rejoin = true,
             }
         }
@@ -88,15 +97,33 @@ impl Session {
     async fn join_again(&mut self) -> anyhow::Result<()> {
         // The device outlives the group state (see `StateDir::save_device`),
         // so a folder whose mls.bin was damaged still replaces its old leaf.
+        let pinned = self.config.pinned_owner().map_err(|_| {
+            anyhow::anyhow!(
+                "the owner recorded in {} is damaged, so the project's owner cannot be \
+                 checked; restore the file from a backup or clone the project again",
+                self.state.dir().join("config.json").display()
+            )
+        })?;
         let device = match &self.group {
             Some(group) => Some(group.device().duplicate()),
             None => self.state.load_device(),
         };
-        let device = device.unwrap_or_else(Device::generate);
+        let device = device.unwrap_or_else(LeafKeys::generate);
         // Before the join, so a refused or interrupted attempt keeps it.
         self.state.save_device(&device)?;
         let link = self.config.link();
-        let group = join_group(&self.api, &link, device, &self.identity).await?;
+        if self.local.is_none() {
+            self.local = Some(user::load_or_create_identity()?);
+        }
+        let local = self.local.as_ref().expect("loaded right above");
+        let group = join_group(&self.api, &link, device, &self.identity, local, pinned).await?;
+        // The first join pins the project's owner for good.
+        if self.config.owner_person.is_none()
+            && let Some(owner) = group.owner_person()
+        {
+            self.config.pin_owner(&owner);
+            self.state.save_config(&self.config)?;
+        }
         self.state.save_mls(&group)?;
         self.group = Some(group);
         Ok(())
@@ -155,14 +182,31 @@ impl Session {
                         // the rotation, but losing the new link would lock the
                         // folder out.
                         self.state.save_config(&self.config)?;
+                        remember(self.state.root(), &self.config, &mut self.warnings);
                         self.resolved = None;
                         rotated = true;
                         hop = true;
                         break;
                     }
-                    Ok(Outcome::Removed) => {
+                    Ok(Outcome::Removed { person }) => {
                         self.state.save_mls(group)?;
                         ds.close().await;
+                        // This folder cannot follow the group any more, so
+                        // this is its last chance to hear why. Usually that
+                        // is a revoke of this device, which the other
+                        // devices of the person should not have to repeat.
+                        if let Some(person) = person {
+                            match user::merge_graph(&person) {
+                                Ok(saved) => {
+                                    if let Some(local) = &mut self.local {
+                                        local.graph = saved;
+                                    }
+                                }
+                                Err(err) => self.warnings.push(format!(
+                                    "could not merge your devices from the group: {err:#}"
+                                )),
+                            }
+                        }
                         return Err(SyncError::Removed.into());
                     }
                     Ok(Outcome::Invalid(why)) => {
@@ -208,6 +252,122 @@ impl Session {
         Ok(Followed::Current(open))
     }
 
+    /// Folds what the group knows of this person's devices into the local
+    /// graph, and puts the local graph's newer entries into this device's
+    /// leaf, e.g. a device revoked since the leaf was last committed. Best
+    /// effort: a lost race is tried again after catching up, and the next
+    /// run does it if this one cannot. Hands back `ds` untouched when
+    /// nothing was needed.
+    async fn refresh_identity(&mut self, mut ds: Option<Ds>) -> anyhow::Result<Option<Ds>> {
+        // A viewer's commit is always refused, so don't open a connection
+        // just to find that out.
+        if !self.can_write() {
+            return Ok(ds);
+        }
+        if self.local.is_none() {
+            self.local = user::load_identity()?;
+        }
+        for attempt in 1..=COMMIT_ATTEMPTS {
+            let step = match self.identity_step() {
+                Ok(Some(step)) => step,
+                Ok(None) => return Ok(ds),
+                Err(err) => {
+                    self.warnings.push(format!(
+                        "could not merge your devices from the group: {err:#}"
+                    ));
+                    return Ok(ds);
+                }
+            };
+            let Some(local) = self.local.as_mut() else {
+                return Ok(ds);
+            };
+            if let Some(merged) = &step.merged {
+                match user::merge_graph(merged) {
+                    Ok(saved) => local.graph = saved,
+                    Err(err) => {
+                        self.warnings.push(format!(
+                            "could not merge your devices from the group: {err:#}"
+                        ));
+                        return Ok(ds);
+                    }
+                }
+            }
+            let group = self.group.as_mut().context(NO_KEYS)?;
+            if group.has_pending() || !step.needs_refresh {
+                return Ok(ds);
+            }
+            let mut conn = match ds.take() {
+                Some(ds) => ds,
+                None => {
+                    Ds::connect(
+                        &self.config.server,
+                        &self.config.token,
+                        u64::from(group.incarnation()),
+                        group.epoch(),
+                    )
+                    .await?
+                }
+            };
+            // A commit built behind the head can only lose.
+            if conn.ready.permission != DsPermission::Write || group.epoch() < conn.ready.head {
+                conn.close().await;
+                return Ok(None);
+            }
+            let payload = group.self_update(&profile_bytes(&self.identity), Some(&local.graph))?;
+            self.state.save_mls(group)?;
+            let reply = conn.request(1, &payload.into_message(1)).await;
+            conn.close().await;
+            match reply? {
+                Reply::Accepted => {
+                    group.confirm_pending()?;
+                    self.state.save_mls(group)?;
+                    return Ok(None);
+                }
+                Reply::Conflict => {
+                    group.discard_pending()?;
+                    self.state.save_mls(group)?;
+                    if attempt == COMMIT_ATTEMPTS {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(jitter(attempt)).await;
+                    match Box::pin(self.catch_up()).await? {
+                        Followed::Current(next) => ds = next.map(|ds| *ds),
+                        Followed::Rejoin => return Ok(None),
+                    }
+                }
+                // Only a refresh: it shows on the next try.
+                Reply::Refused(_) => {
+                    group.discard_pending()?;
+                    self.state.save_mls(group)?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// What this device has to do to keep its identity in the group in
+    /// line with its person, judged on the graph as this run last saw it
+    /// (see [`ProjectGroup::identity_step`]). None while the machine is not
+    /// a person.
+    pub fn identity_step(&self) -> anyhow::Result<Option<IdentityStep>> {
+        let group = self.group.as_ref().context(NO_KEYS)?;
+        let Some(local) = &self.local else {
+            return Ok(None);
+        };
+        Ok(Some(group.identity_step(&local.graph)?))
+    }
+
+    /// Fails unless this device is the project owner's, as of the last
+    /// time the group was followed.
+    pub fn ensure_owner(&self) -> anyhow::Result<()> {
+        let is_owner = self
+            .members()?
+            .iter()
+            .any(|m| m.is_self && m.role == Role::Owner);
+        if is_owner { Ok(()) } else { bail!(NOT_OWNER) }
+    }
+
     /// Fetches the keyring the server holds and applies it. False when the
     /// group has not reached its generation yet, which only following the
     /// group's commits can fix.
@@ -219,6 +379,20 @@ impl Session {
         }
         self.state.save_mls(group)?;
         Ok(true)
+    }
+
+    /// Records this folder in the user's project list, with the project's
+    /// current title. A failure is only a warning: the list is a
+    /// convenience for pairing, not part of the project.
+    pub fn remember_project(&mut self) {
+        let title = typstry_doc::title(&self.doc);
+        if let Err(err) =
+            user::remember_project(self.state.root(), &self.config.link(), title.as_deref())
+        {
+            self.warnings.push(format!(
+                "could not update the list of your projects: {err:#}"
+            ));
+        }
     }
 
     /// The members as of the last time the group was followed.
@@ -250,6 +424,72 @@ impl Session {
             Ok(group.remove_and_rotate(&leaves)?)
         })
         .await
+    }
+
+    /// Removes every other device of `person` and rotates the links. The
+    /// devices are looked up right before the commit, like in
+    /// [`Self::remove_members`], so one that joined in between goes too.
+    pub async fn remove_person(&mut self, person: &PersonId) -> anyhow::Result<()> {
+        self.rotate(|group| {
+            let leaves = group.leaves_of(person)?;
+            if leaves.is_empty() {
+                bail!("that person has no other devices in the project; see `typstry members`");
+            }
+            Ok(group.remove_and_rotate(&leaves)?)
+        })
+        .await
+    }
+
+    /// Removes the devices of this device's own person that its graph
+    /// revokes from the group, and rotates the links. Any editor may, owner
+    /// or not. The revoke has to be in the group already, which following
+    /// puts there. Returns how many devices went; with none to remove the
+    /// links stay as they are.
+    pub async fn remove_revoked(&mut self) -> anyhow::Result<usize> {
+        let group = self.group.as_ref().context(NO_KEYS)?;
+        // Counted again when the commit is built, after following: by then
+        // another device may have removed some, or the refresh revealed more.
+        let removed = AtomicUsize::new(group.revoked_own_leaves().len());
+        if removed.load(Ordering::Relaxed) == 0 {
+            return Ok(0);
+        }
+        self.rotate(|group| {
+            let removal = group.remove_revoked()?;
+            removed.store(removal.removed.len(), Ordering::Relaxed);
+            Ok(removal.submit)
+        })
+        .await?;
+        Ok(removed.into_inner())
+    }
+
+    /// Removes the leaves of this person's revoked devices, e.g. the ones a
+    /// recovery key revoked, which no device of the person was around to
+    /// clean up. Best effort: a failure is a warning and the next run tries
+    /// again. Returns whether the links were replaced.
+    pub(super) async fn remove_own_revoked_devices(&mut self) -> bool {
+        if !self.can_write() {
+            return false;
+        }
+        match self.remove_revoked().await {
+            Ok(0) => false,
+            Ok(count) => {
+                self.warnings.push(format!(
+                    "removed {count} revoked device(s) of yours from the project and replaced its links"
+                ));
+                true
+            }
+            Err(err) => {
+                self.warnings.push(format!(
+                    "could not remove your revoked devices from the project yet ({err:#})"
+                ));
+                false
+            }
+        }
+    }
+
+    /// The person that owns the project, as far as the group shows it.
+    pub fn owner_person(&self) -> Option<PersonId> {
+        self.group.as_ref()?.owner_person()
     }
 
     /// Replaces the links without removing anyone.
@@ -319,7 +559,10 @@ impl Session {
             }
             let payload = match group.pending_submit() {
                 Some(pending) => pending.clone(),
-                None => build(group)?,
+                None => build(group).map_err(|err| match err.downcast_ref::<MlsError>() {
+                    Some(MlsError::NotOwner) => anyhow::anyhow!(NOT_OWNER),
+                    _ => err,
+                })?,
             };
             let rotate = payload
                 .rotate
@@ -336,6 +579,7 @@ impl Session {
                     debug_assert_eq!(rotation.tokens.edit.as_deref(), Some(&*rotate.edit_token));
                     adopt(&mut self.config, &rotation);
                     self.state.save_config(&self.config)?;
+                    remember(self.state.root(), &self.config, &mut self.warnings);
                     self.state.save_mls(group)?;
                     self.resolved = None;
                     return Ok(());
@@ -359,6 +603,15 @@ impl Session {
             }
         }
         bail!("other members kept changing the project's group; try again")
+    }
+}
+
+/// Updates the stored link of the folder at `root` after a rotation.
+fn remember(root: &Path, config: &Config, warnings: &mut Vec<String>) {
+    if let Err(err) = user::remember_project(root, &config.link(), None) {
+        warnings.push(format!(
+            "could not update the list of your projects: {err:#}"
+        ));
     }
 }
 

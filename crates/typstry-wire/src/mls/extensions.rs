@@ -7,9 +7,16 @@
 //! - `0xff01` on a leaf: the member's profile (name, color) sealed under
 //!   the doc key of a generation, so the server and removed members cannot
 //!   read it.
+//! - `0xff02` on a leaf: the identity, i.e. a device key's binding of the
+//!   leaf key and the person graph that says whether that device counts,
+//!   sealed under the identity key. A leaf keeps its device for its whole
+//!   life; a commit copies the identity unchanged or extends the graph.
 //! - `0xff10` in the GroupContext: the policy, i.e. the attestation public
-//!   key of every generation. Every member checks commits against it, and
-//!   only a commit can change it.
+//!   key of every generation and the owner tag. The tag stands for the
+//!   owner's person (see [`crate::crypto::Keyring::owner_tag`]); an owner is
+//!   an editor whose leaf identity resolves to that person, so there is no
+//!   owner extension on leaves. Every member checks commits against the
+//!   policy, and only a commit can change it.
 //!
 //! openmls only lets a leaf carry an extension type, or a group require
 //! one, when the leaf's capabilities list it. A joiner that forgets one
@@ -23,6 +30,7 @@ use crate::crypto::{Attestation, KEY_LEN, PublicKey, SIGNATURE_LEN};
 
 pub const EXT_EDITOR: u16 = 0xff00;
 pub const EXT_PROFILE: u16 = 0xff01;
+pub const EXT_IDENTITY: u16 = 0xff02;
 pub const EXT_POLICY: u16 = 0xff10;
 
 /// X25519, AES-128-GCM, SHA-256, Ed25519: the suite every MLS client has to
@@ -79,12 +87,16 @@ pub struct Policy {
     /// length is the current generation. Leaves attested in an older
     /// generation stay valid, so every key has to stay.
     pub attest_pubs: Vec<PublicKey>,
+    /// The tag of the owner's person, fixed for the life of the project and
+    /// kept by every rotation and reset.
+    pub owner_tag: [u8; KEY_LEN],
 }
 
 impl Policy {
-    pub fn new(attest_pub: PublicKey) -> Self {
+    pub fn new(attest_pub: PublicKey, owner_tag: [u8; KEY_LEN]) -> Self {
         Self {
             attest_pubs: vec![attest_pub],
+            owner_tag,
         }
     }
 
@@ -107,6 +119,7 @@ impl Policy {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = BytesWriter::new();
         w.push_byte(POLICY_VERSION);
+        w.push_bytes(&self.owner_tag);
         w.push_uleb128(self.attest_pubs.len() as u64);
         for key in &self.attest_pubs {
             w.push_bytes(key);
@@ -117,6 +130,7 @@ impl Policy {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let mut r = BytesReader::new(bytes);
         version(&mut r, POLICY_VERSION)?;
+        let owner_tag = r.read_bytes(KEY_LEN)?.try_into().expect("read 32 bytes");
         let count = bounded(&mut r, KEY_LEN)?;
         if count == 0 {
             return Err("policy without a generation".into());
@@ -126,7 +140,10 @@ impl Policy {
             attest_pubs.push(r.read_bytes(KEY_LEN)?.try_into().expect("read 32 bytes"));
         }
         done(&r)?;
-        Ok(Self { attest_pubs })
+        Ok(Self {
+            attest_pubs,
+            owner_tag,
+        })
     }
 }
 
@@ -166,32 +183,39 @@ pub fn capabilities() -> Capabilities {
         .extensions(vec![
             ExtensionType::Unknown(EXT_EDITOR),
             ExtensionType::Unknown(EXT_PROFILE),
+            ExtensionType::Unknown(EXT_IDENTITY),
             ExtensionType::Unknown(EXT_POLICY),
         ])
         .build()
 }
 
 /// The extensions of a leaf: `editor` only for editors, `profile` already
-/// sealed.
+/// sealed. `sealed_identity` is the sealed leaf identity, for members that
+/// have a person.
 pub fn leaf_extensions(
     editor: Option<&EditorInfo>,
     sealed_profile: Vec<u8>,
+    sealed_identity: Option<Vec<u8>>,
 ) -> Result<Extensions<LeafNode>, String> {
-    let mut exts = Vec::with_capacity(2);
+    let mut exts = Vec::with_capacity(3);
     if let Some(editor) = editor {
         exts.push(unknown(EXT_EDITOR, editor.encode()));
     }
     exts.push(unknown(EXT_PROFILE, sealed_profile));
+    if let Some(identity) = sealed_identity {
+        exts.push(unknown(EXT_IDENTITY, identity));
+    }
     Extensions::from_vec(exts).map_err(|e| e.to_string())
 }
 
 pub fn leaf_parameters(
     editor: Option<&EditorInfo>,
     sealed_profile: Vec<u8>,
+    sealed_identity: Option<Vec<u8>>,
 ) -> Result<LeafNodeParameters, String> {
     Ok(LeafNodeParameters::builder()
         .with_capabilities(capabilities())
-        .with_extensions(leaf_extensions(editor, sealed_profile)?)
+        .with_extensions(leaf_extensions(editor, sealed_profile, sealed_identity)?)
         .build())
 }
 
@@ -221,6 +245,7 @@ pub fn read_policy(exts: &Extensions<GroupContext>) -> Result<Policy, String> {
 pub struct LeafInfo {
     pub editor: Result<Option<EditorInfo>, String>,
     pub sealed_profile: Option<Vec<u8>>,
+    pub sealed_identity: Option<Vec<u8>>,
 }
 
 pub fn read_leaf(leaf: &LeafNode) -> LeafInfo {
@@ -231,6 +256,7 @@ pub fn read_leaf(leaf: &LeafNode) -> LeafInfo {
             .map(|ext| EditorInfo::decode(&ext.0))
             .transpose(),
         sealed_profile: leaf.extensions().unknown(EXT_PROFILE).map(|e| e.0.clone()),
+        sealed_identity: leaf.extensions().unknown(EXT_IDENTITY).map(|e| e.0.clone()),
     }
 }
 
@@ -258,7 +284,7 @@ mod tests {
 
     #[test]
     fn policy_round_trips_and_refuses_junk() {
-        let policy = Policy::new([1; 32]).next([2; 32]);
+        let policy = Policy::new([1; 32], [9; 32]).next([2; 32]);
         assert_eq!(policy.generation(), 2);
         assert_eq!(policy.attest_pub(1), Some(&[1; 32]));
         assert_eq!(policy.attest_pub(0), None);
@@ -268,8 +294,15 @@ mod tests {
         for len in 0..bytes.len() {
             assert!(Policy::decode(&bytes[..len]).is_err(), "{len}");
         }
+        assert!(Policy::decode(&[bytes.clone(), vec![0]].concat()).is_err());
         // A count far beyond the data must not allocate.
-        assert!(Policy::decode(&[POLICY_VERSION, 0xff, 0xff, 0xff, 0x7f]).is_err());
-        assert!(Policy::decode(&[POLICY_VERSION, 0, 0]).is_err());
+        let mut huge = vec![POLICY_VERSION];
+        huge.extend([9; 32]);
+        huge.extend([0xff, 0xff, 0xff, 0x7f]);
+        assert!(Policy::decode(&huge).is_err());
+        let mut none = vec![POLICY_VERSION];
+        none.extend([9; 32]);
+        none.push(0);
+        assert!(Policy::decode(&none).is_err());
     }
 }

@@ -11,8 +11,7 @@ import {
   UserXIcon,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { toast } from "sonner";
+import { useState } from "react";
 
 import { MembersSection } from "@/components/MembersSection";
 import { Button } from "@/components/ui/button";
@@ -31,6 +30,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { guard, type ProjectCrypto } from "@/crypto/project-crypto";
+import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { LinkSecret } from "@/crypto/wasm";
 import { cn } from "@/lib/utils";
 import type { MlsSession } from "@/mls/session";
@@ -184,22 +184,10 @@ function LinkRow({
   Icon: LucideIcon;
   url: string;
 }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const { copied, copy } = useCopyToClipboard(
+    "Copying failed. Select the link and copy it manually.",
+  );
   const id = `share-${label.replace(/\s+/g, "-").toLowerCase()}`;
-
-  useEffect(() => () => clearTimeout(timer.current), []);
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      clearTimeout(timer.current);
-      timer.current = setTimeout(() => setCopied(false), 2000);
-    } catch {
-      toast.error("Copying failed. Select the link and copy it manually.");
-    }
-  }
 
   return (
     <div className="grid gap-1.5">
@@ -231,7 +219,7 @@ function LinkRow({
               size="icon"
               aria-label={`Copy ${label.toLowerCase()} link`}
               className={cn(copied && "text-success hover:text-success")}
-              onClick={copy}
+              onClick={() => void copy(url)}
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
             </Button>

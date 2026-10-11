@@ -1,15 +1,18 @@
 use anyhow::{Context, bail};
-use typstry_wire::mls::{MemberInfo, Role};
+use typstry_wire::identity::{PersonId, person_fingerprint};
+use typstry_wire::mls::{MemberInfo, Person, Role};
 
-use super::link::print_links;
-use super::{Ctx, Output, connected, print_warnings};
+use super::link::write_links;
+use super::{Ctx, MIN_PREFIX, Output, connected, print_warnings, unique};
 use crate::engine::Session;
 use crate::mls::profile_name;
 
 /// List the people with access to the project, or remove one.
 ///
 /// Every device that joined with a link is a member, listed by the name it
-/// gave. Removing a member replaces the project's links (the new ones are
+/// gave and grouped under the person it belongs to. The owner's person is
+/// marked "owner", and devices their person has revoked "revoked".
+/// Removing a member replaces the project's links (the new ones are
 /// printed), so what the removed device holds stops working; the members
 /// who stay are switched over automatically the next time they sync.
 #[derive(Debug, clap::Args)]
@@ -24,9 +27,11 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Action {
-    /// Remove a member and replace the links. Editors only.
+    /// Remove a member and replace the links. The project owner only.
     Remove {
-        /// The member's number from `typstry members`, or its name.
+        /// A device's number from `typstry members` or its name, or a
+        /// person's fingerprint (the start is enough) to remove all of
+        /// their devices.
         member: String,
     },
 }
@@ -54,19 +59,83 @@ fn list(session: &Session, out: &mut Output) -> anyhow::Result<()> {
         .map(|m| display_name(m).chars().count())
         .max()
         .unwrap_or(0);
-    for member in &members {
+    let device = |out: &mut Output, member: &MemberInfo| {
+        let revoked = matches!(member.person, Person::Verified { revoked: true, .. });
         out.out(format!(
-            "  #{:<3} {:<width$}  {}{}",
+            "    #{:<3} {:<width$}  {}{}{}",
             member.leaf,
             display_name(member),
             match member.role {
+                Role::Owner => "owner",
                 Role::Editor => "editor",
                 Role::Viewer => "viewer",
             },
-            if member.is_self { "  (you)" } else { "" },
+            if revoked { "  (revoked)" } else { "" },
+            if member.is_self {
+                "  (this device)"
+            } else {
+                ""
+            },
         ));
+    };
+    let owner = session.owner_person();
+    for person in people(&members) {
+        let devices: Vec<_> = members
+            .iter()
+            .filter(|m| matches!(m.person, Person::Verified { id, .. } if id == person))
+            .collect();
+        let mut marks = String::new();
+        if owner == Some(person) {
+            marks.push_str("  (owner)");
+        }
+        if devices.iter().any(|m| m.is_self) {
+            marks.push_str("  (you)");
+        }
+        // Every device of the person carries the same graph profile.
+        let name = devices
+            .iter()
+            .find_map(|m| m.person_profile.as_deref())
+            .and_then(profile_name)
+            .or_else(|| devices.first().map(|m| display_name(m)));
+        out.out(format!(
+            "  Person {}{}{marks}",
+            person_fingerprint(&person),
+            name.map(|n| format!("  {n}")).unwrap_or_default()
+        ));
+        for member in devices {
+            device(out, member);
+        }
+    }
+    for (heading, kind) in [
+        ("Anonymous devices:", Person::Anonymous),
+        (
+            "Unverified devices (their person could not be checked):",
+            Person::Unverified,
+        ),
+    ] {
+        let group: Vec<_> = members.iter().filter(|m| m.person == kind).collect();
+        if group.is_empty() {
+            continue;
+        }
+        out.out(format!("  {heading}"));
+        for member in group {
+            device(out, member);
+        }
     }
     Ok(())
+}
+
+/// The verified people in the group, in order of their first device.
+fn people(members: &[MemberInfo]) -> Vec<PersonId> {
+    let mut people = Vec::new();
+    for member in members {
+        if let Person::Verified { id, .. } = member.person
+            && !people.contains(&id)
+        {
+            people.push(id);
+        }
+    }
+    people
 }
 
 fn display_name(member: &MemberInfo) -> String {
@@ -77,40 +146,88 @@ fn display_name(member: &MemberInfo) -> String {
         .unwrap_or_else(|| "(unnamed)".to_owned())
 }
 
-/// The member `query` names: a leaf number, else a name.
-fn find(members: &[MemberInfo], query: &str) -> anyhow::Result<MemberInfo> {
+/// What `members remove` was pointed at.
+enum Target {
+    Device(MemberInfo),
+    Person(PersonId),
+}
+
+/// What `query` names: a leaf number, else a person's fingerprint (a
+/// unique prefix is enough), else a device name.
+fn find(members: &[MemberInfo], query: &str) -> anyhow::Result<Target> {
     if let Ok(leaf) = query.parse::<u32>() {
         return members
             .iter()
             .find(|m| m.leaf == leaf)
             .cloned()
+            .map(Target::Device)
             .with_context(|| format!("no member #{leaf}; see `typstry members`"));
     }
-    let wanted = query.trim().to_lowercase();
-    let mut found = members
-        .iter()
-        .filter(|m| display_name(m).to_lowercase() == wanted);
-    match (found.next(), found.next()) {
-        (Some(member), None) => Ok(member.clone()),
-        (None, _) => bail!("no member named {query:?}; see `typstry members`"),
-        (Some(_), Some(_)) => {
-            bail!("more than one member is named {query:?}; use the number from `typstry members`")
+    let query = query.trim();
+    if query.len() >= MIN_PREFIX {
+        let matching = people(members)
+            .into_iter()
+            .filter(|p| person_fingerprint(p).starts_with(query));
+        if let Some(person) = unique(matching, || {
+            anyhow::anyhow!(
+                "more than one person starts with {query:?}; type more of the fingerprint"
+            )
+        })? {
+            return Ok(Target::Person(person));
         }
     }
+    let wanted = query.to_lowercase();
+    let found = members
+        .iter()
+        .filter(|m| display_name(m).to_lowercase() == wanted);
+    unique(found, || {
+        anyhow::anyhow!(
+            "more than one member is named {query:?}; use the number from `typstry members`"
+        )
+    })?
+    .cloned()
+    .map(Target::Device)
+    .with_context(|| format!("no member named {query:?}; see `typstry members`"))
 }
 
 async fn remove(session: &mut Session, query: &str, out: &mut Output) -> anyhow::Result<()> {
     if !session.can_write() {
-        bail!("only editors can remove members, and this folder has a view-only link");
+        bail!("only the project owner can remove members, and this folder has a view-only link");
     }
     session.follow_group().await?;
-    let target = find(&session.members()?, query)?;
-    if target.is_self {
-        bail!("#{} is this folder; it cannot remove itself", target.leaf);
+    session.ensure_owner()?;
+    let members = session.members()?;
+    match find(&members, query)? {
+        Target::Device(target) => {
+            if target.is_self {
+                bail!("#{} is this folder; it cannot remove itself", target.leaf);
+            }
+            let name = display_name(&target);
+            session.remove_members(&[target.sig_pub]).await?;
+            out.out(format!("Removed #{} {name}.", target.leaf));
+        }
+        Target::Person(person) => {
+            let devices: Vec<_> = members
+                .iter()
+                .filter(|m| {
+                    !m.is_self && matches!(m.person, Person::Verified { id, .. } if id == person)
+                })
+                .collect();
+            if devices.is_empty() {
+                bail!("that person's only device here is this folder; it cannot remove itself");
+            }
+            let names: Vec<_> = devices
+                .iter()
+                .map(|m| format!("#{} {}", m.leaf, display_name(m)))
+                .collect();
+            session.remove_person(&person).await?;
+            out.out(format!(
+                "Removed person {} ({}).",
+                person_fingerprint(&person),
+                names.join(", ")
+            ));
+        }
     }
-    let name = display_name(&target);
-    session.remove_members(&[target.sig_pub]).await?;
-    out.out(format!("Removed #{} {name}.", target.leaf));
     publish_rotation(session, out).await
 }
 
@@ -121,7 +238,7 @@ pub(super) async fn publish_rotation(
     out: &mut Output,
 ) -> anyhow::Result<()> {
     out.out("The project's links changed. Anyone who still needs access needs the new ones:");
-    print_links(&session.config, None)?;
+    write_links(out, &session.config);
     // The rotation is done; failing to upload the snapshot only leaves the
     // server with records under the keys of the old generation, which
     // members can still read, so this does not fail the command.

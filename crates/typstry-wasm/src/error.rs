@@ -7,7 +7,9 @@
 use std::fmt::Display;
 
 use typstry_wire::crypto::CryptoError;
+use typstry_wire::identity::{AdoptError, GraphError, RecoverError, RecoveryError};
 use typstry_wire::mls::MlsError;
+use typstry_wire::pairing::{CodeError, PairError};
 use wasm_bindgen::JsValue;
 
 #[derive(Debug, PartialEq)]
@@ -47,6 +49,41 @@ pub fn crypto_kind(error: &CryptoError) -> Kind {
     }
 }
 
+pub fn graph_kind(error: &GraphError) -> Kind {
+    match error {
+        GraphError::Malformed(_) | GraphError::MissingParent | GraphError::Genesis => {
+            plain("Malformed")
+        }
+        GraphError::NewerVersion(version) => Kind {
+            kind: "NewerVersion",
+            detail: Some(("version", f64::from(*version))),
+        },
+        GraphError::BadSignature => plain("BadSignature"),
+        GraphError::TooLarge => plain("TooLarge"),
+        GraphError::ForeignGraph => plain("ForeignGraph"),
+        GraphError::NotValid => plain("NotValid"),
+        GraphError::DeviceRevoked => plain("DeviceRevoked"),
+    }
+}
+
+pub fn adopt_kind(error: &AdoptError) -> Kind {
+    match error {
+        AdoptError::ForeignIdentity { .. } => plain("ForeignIdentity"),
+        AdoptError::NotListed => plain("NotListed"),
+        AdoptError::Graph(inner) => graph_kind(inner),
+    }
+}
+
+pub fn recover_kind(error: &RecoverError) -> Kind {
+    match error {
+        RecoverError::UnknownKey => plain("UnknownRecoveryKey"),
+        RecoverError::KeyRevoked => plain("RecoveryKeyRevoked"),
+        RecoverError::OwnRevoked => plain("OwnDeviceRevoked"),
+        RecoverError::Adopt(inner) => adopt_kind(inner),
+        RecoverError::Graph(inner) => graph_kind(inner),
+    }
+}
+
 pub fn mls_kind(error: &MlsError) -> Kind {
     match error {
         MlsError::Crypto(inner) => crypto_kind(inner),
@@ -54,17 +91,37 @@ pub fn mls_kind(error: &MlsError) -> Kind {
         MlsError::Malformed(_) => plain("Malformed"),
         MlsError::Envelope(_) => plain("Envelope"),
         MlsError::NotEditor => plain("NotEditor"),
+        MlsError::NotOwner => plain("NotOwner"),
         MlsError::NotActive => plain("NotActive"),
         MlsError::Pending => plain("Pending"),
         MlsError::NoPending => plain("NoPending"),
         MlsError::Epoch { .. } => plain("Epoch"),
         MlsError::Mismatch(_) => plain("Mismatch"),
+        MlsError::OwnerChanged(_) => plain("OwnerChanged"),
         MlsError::BadLeaf(_) => plain("BadLeaf"),
         MlsError::NewerState(version) => Kind {
             kind: "NewerVersion",
             detail: Some(("version", f64::from(*version))),
         },
         MlsError::Unconfirmed => plain("Unconfirmed"),
+        MlsError::Identity(inner) => graph_kind(inner),
+        MlsError::NoIdentity => plain("NoIdentity"),
+        MlsError::NothingRevoked => plain("NothingRevoked"),
+    }
+}
+
+pub fn pair_kind(error: &PairError) -> Kind {
+    match error {
+        PairError::WrongCode => plain("WrongCode"),
+        PairError::RoleConflict => plain("RoleConflict"),
+        PairError::Unexpected => plain("Unexpected"),
+        PairError::Finished => plain("Finished"),
+        PairError::Tampered => plain("Tampered"),
+        PairError::NewerVersion(version) => Kind {
+            kind: "NewerVersion",
+            detail: Some(("version", f64::from(*version))),
+        },
+        PairError::Malformed(_) => plain("Malformed"),
     }
 }
 
@@ -88,8 +145,32 @@ pub fn from_crypto(error: CryptoError) -> JsValue {
     build(crypto_kind(&error), &error.to_string())
 }
 
+pub fn from_graph(error: GraphError) -> JsValue {
+    build(graph_kind(&error), &error.to_string())
+}
+
+pub fn from_adopt(error: AdoptError) -> JsValue {
+    build(adopt_kind(&error), &error.to_string())
+}
+
+pub fn from_recover(error: RecoverError) -> JsValue {
+    build(recover_kind(&error), &error.to_string())
+}
+
 pub fn from_mls(error: MlsError) -> JsValue {
     build(mls_kind(&error), &error.to_string())
+}
+
+pub fn from_pair(error: PairError) -> JsValue {
+    build(pair_kind(&error), &error.to_string())
+}
+
+pub fn from_code(error: CodeError) -> JsValue {
+    build(plain("BadCode"), &error.to_string())
+}
+
+pub fn from_recovery(error: RecoveryError) -> JsValue {
+    build(plain("BadRecoveryWords"), &error.to_string())
 }
 
 pub fn from_serde(error: serde_wasm_bindgen::Error) -> JsValue {
@@ -118,5 +199,34 @@ mod tests {
         );
         assert_eq!(mls_kind(&MlsError::NewerState(2)).kind, "NewerVersion");
         assert_eq!(crypto_kind(&CryptoError::ReadOnly).kind, "ReadOnly");
+        assert_eq!(graph_kind(&GraphError::ForeignGraph).kind, "ForeignGraph");
+        assert_eq!(
+            mls_kind(&MlsError::Identity(GraphError::NotValid)).kind,
+            "NotValid"
+        );
+        assert_eq!(
+            graph_kind(&GraphError::NewerVersion(2)).detail,
+            Some(("version", 2.0))
+        );
+        assert_eq!(pair_kind(&PairError::WrongCode).kind, "WrongCode");
+        assert_eq!(
+            recover_kind(&RecoverError::Adopt(AdoptError::ForeignIdentity {
+                stored: [0; 32]
+            }))
+            .kind,
+            "ForeignIdentity"
+        );
+        assert_eq!(
+            recover_kind(&RecoverError::Graph(GraphError::TooLarge)).kind,
+            "TooLarge"
+        );
+        assert_eq!(
+            recover_kind(&RecoverError::OwnRevoked).kind,
+            "OwnDeviceRevoked"
+        );
+        assert_eq!(
+            pair_kind(&PairError::NewerVersion(4)).detail,
+            Some(("version", 4.0))
+        );
     }
 }

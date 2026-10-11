@@ -10,8 +10,8 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Action {
-    /// Replace the links with new ones, for a link that leaked. Editors
-    /// only. Members keep their access and switch over automatically the
+    /// Replace the links with new ones, for a link that leaked. The
+    /// project owner only. Members keep their access and switch over the
     /// next time they sync; anyone who only has an old link loses access.
     Reset,
 }
@@ -21,7 +21,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let mut session = ctx.open()?;
     let mut out = Output::terminal();
     if !session.can_write() {
-        anyhow::bail!("only editors can reset the links, and this folder has a view-only link");
+        anyhow::bail!(
+            "only the project owner can reset the links, and this folder has a view-only link"
+        );
     }
     session.reset_links().await?;
     publish_rotation(&mut session, &mut out).await

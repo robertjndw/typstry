@@ -5,8 +5,9 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use clap::Parser;
 use tempfile::TempDir;
@@ -22,6 +23,18 @@ use typstry_server::http::{AppState, router};
 use typstry_server::store::blobs::BlobStore;
 use typstry_server::store::db;
 use typstry_wire::crypto::LinkSecret;
+
+/// The user-level state (person key, project list) of this test binary: a
+/// temp folder, so the tests never touch the real config dir. Every folder
+/// cloned in-process is then the same person; tests that need distinct
+/// people or an inspectable config pass their own `TYPSTRY_CONFIG_DIR` to
+/// [`binary_with`].
+pub fn config_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    typstry_cli::user::override_config_dir(dir.path().to_owned());
+    dir.path().to_owned()
+}
 
 /// A server on the test's runtime, stopped when dropped.
 pub struct Server {
@@ -39,6 +52,7 @@ impl Drop for Server {
 
 impl Server {
     pub async fn start() -> Self {
+        config_dir();
         let data = tempfile::tempdir().unwrap();
         let pool = db::open(&data.path().join("test.db")).await.unwrap();
         let state = AppState::new(pool, BlobStore::new(data.path()));
@@ -69,6 +83,7 @@ impl Server {
 
 /// Runs a command in-process, as `typstry -C dir --name Tester args..`.
 pub async fn typstry(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    config_dir();
     let mut argv = vec!["typstry", "-C", dir.to_str().unwrap(), "--name", "Tester"];
     argv.extend(args);
     commands::run(Cli::try_parse_from(argv)?).await
@@ -109,6 +124,7 @@ pub async fn binary(dir: &Path, args: &[&str]) -> Output {
 /// typstry variables of whoever runs the tests are cleared first.
 pub async fn binary_with(dir: &Path, args: &[&str], input: &str, env: &[(&str, &str)]) -> Output {
     use std::io::Write;
+    let config = config_dir();
     assert!(dir.is_absolute());
     let dir = dir.to_path_buf();
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
@@ -132,6 +148,7 @@ pub async fn binary_with(dir: &Path, args: &[&str], input: &str, env: &[(&str, &
             // Fails loudly instead of opening anything, should a test ever
             // reach the real opener.
             .env("TYPSTRY_BROWSER", "/nonexistent/typstry-test-browser")
+            .env("TYPSTRY_CONFIG_DIR", &config)
             .envs(env)
             .spawn()
             .unwrap();
@@ -210,14 +227,20 @@ pub async fn create_project(origin: &str) -> (ShareLink, ShareLink) {
     let view = ShareLink::new(origin, &created.view_token, &secret.view_secret());
     // The browser that creates a project starts its group; everyone else
     // joins it. This one only stands in for that, it does not sync.
-    typstry_cli::mls::create_group(&edit, &Identity::new("Browser"))
-        .await
-        .unwrap();
+    config_dir();
+    typstry_cli::mls::create_group(
+        &edit,
+        &Identity::new("Browser"),
+        &typstry_cli::user::load_or_create_identity().unwrap(),
+    )
+    .await
+    .unwrap();
     (edit, view)
 }
 
 /// A connected session standing in for a browser.
 pub async fn seeder(link: &ShareLink, dir: &Path) -> Session {
+    config_dir();
     let share = Api::new(&link.origin)
         .unwrap()
         .resolve_share(&link.token)
@@ -238,4 +261,113 @@ pub async fn seeded_project(origin: &str, title: &str) -> (String, String) {
     session.push_local().await.unwrap();
     session.disconnect().await;
     (edit.to_string(), view.to_string())
+}
+
+/// A `typstry pair` that shows a code, still running.
+pub struct Shower {
+    child: Child,
+    pub code: String,
+}
+
+impl Shower {
+    /// Starts `pair` in `dir` with `config` and reads its code off stdout.
+    pub async fn start(dir: &Path, config: &Path, args: &[&str]) -> Self {
+        let dir = dir.to_path_buf();
+        let config = config.to_path_buf();
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_typstry"))
+                .arg("-C")
+                .arg(&dir)
+                .args(["--name", "Tester", "pair"])
+                .args(&args)
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env_remove("TYPSTRY_SERVER")
+                .env("TYPSTRY_CONFIG_DIR", &config)
+                .spawn()
+                .unwrap();
+            let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            let code = loop {
+                let line = lines
+                    .next()
+                    .expect("pair exited before showing a code")
+                    .unwrap();
+                if let Some(code) = line.strip_prefix("Pairing code: ") {
+                    break code.to_owned();
+                }
+            };
+            // Keep draining so the child never blocks on a full pipe; the
+            // rest is read from the final output.
+            std::mem::forget(lines);
+            Self { child, code }
+        })
+        .await
+        .unwrap()
+    }
+
+    pub async fn finish(self) -> std::process::Output {
+        tokio::task::spawn_blocking(move || {
+            let mut child = self.child;
+            // stdout was handed to the reader above; stderr carries what
+            // these tests need.
+            let status = child.wait().unwrap();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                std::io::Read::read_to_end(&mut pipe, &mut stderr).unwrap();
+            }
+            std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            }
+        })
+        .await
+        .unwrap()
+    }
+}
+
+pub fn config_in(dir: &Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+/// Clones `link` as the person whose config is `config`.
+pub async fn clone_as(config: &Path, link: &str, parent: &Path, name: &str) -> std::path::PathBuf {
+    let env = [("TYPSTRY_CONFIG_DIR", config.to_str().unwrap())];
+    stdout(&binary_with(parent, &["clone", link, name], "", &env).await);
+    parent.join(name).canonicalize().unwrap()
+}
+
+/// Creates a project from a new folder as the person whose keys are in `config`.
+pub async fn init_as(
+    server: &Server,
+    parent: &Path,
+    name: &str,
+    config: &Path,
+) -> std::path::PathBuf {
+    let env = [("TYPSTRY_CONFIG_DIR", config.to_str().unwrap())];
+    let args = ["init", name, "--server", &server.origin, "--yes"];
+    stdout(&binary_with(parent, &args, "", &env).await);
+    parent.join(name).canonicalize().unwrap()
+}
+
+pub async fn run_as(dir: &Path, config: &Path, args: &[&str]) -> std::process::Output {
+    let env = [("TYPSTRY_CONFIG_DIR", config.to_str().unwrap())];
+    binary_with(dir, args, "", &env).await
+}
+
+/// The number of the first member that is not this device and has `role`.
+pub fn other_leaf(listing: &str, role: &str) -> String {
+    listing
+        .lines()
+        .filter(|l| l.trim_start().starts_with('#') && !l.contains("(this device)"))
+        .find(|l| l.contains(role))
+        .and_then(|l| l.trim_start().strip_prefix('#'))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no {role} in {listing}"))
+        .to_owned()
 }

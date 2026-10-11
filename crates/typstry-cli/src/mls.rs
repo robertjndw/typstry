@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message;
 use typstry_wire::crypto::LinkSecret;
 use typstry_wire::ds::{ClientMessage, Permission, RefusalCode, ServerMessage};
-use typstry_wire::mls::{Device, MlsError, ProjectGroup};
+use typstry_wire::identity::PersonId;
+use typstry_wire::mls::{LeafKeys, LocalIdentity, MlsError, ProjectGroup};
 
 use crate::api::Api;
 use crate::client::{Socket, open_socket};
@@ -185,11 +186,36 @@ pub fn profile_name(profile: &[u8]) -> Option<String> {
         .map(|p| p.name)
 }
 
+/// The identity a person's profile bytes describe, if this build can read
+/// them and they hold a name.
+pub fn profile_identity(profile: &[u8]) -> Option<Identity> {
+    let Profile { name, color } = serde_json::from_slice(profile).ok()?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    let identity = Identity::new(&name);
+    // The person's color wins over the one derived from the name, so every
+    // device shows up the same.
+    Some(Identity {
+        color: if color.is_empty() {
+            identity.color
+        } else {
+            color
+        },
+        ..identity
+    })
+}
+
 /// Creates the group of a new project and registers it with the server.
 /// `link` is the project's edit link, whose token is not yet in use.
-pub async fn create_group(link: &ShareLink, identity: &Identity) -> anyhow::Result<ProjectGroup> {
+/// The creator's person becomes the project's owner.
+pub async fn create_group(
+    link: &ShareLink,
+    identity: &Identity,
+    local: &LocalIdentity,
+) -> anyhow::Result<ProjectGroup> {
     let secret = LinkSecret::from_base64url(&link.key).context("reading the new link")?;
-    let (group, init) = ProjectGroup::create(&secret, &profile_bytes(identity))?;
+    let (group, init) = ProjectGroup::create(&secret, &profile_bytes(identity), local)?;
     let mut ds = Ds::connect(&link.origin, &link.token, 0, 0).await?;
     let reply = ds.request(1, &init.into_message(1)).await;
     ds.close().await;
@@ -206,8 +232,10 @@ pub async fn create_group(link: &ShareLink, identity: &Identity) -> anyhow::Resu
 pub async fn join_group(
     api: &Api,
     link: &ShareLink,
-    device: Device,
+    device: LeafKeys,
     identity: &Identity,
+    local: &LocalIdentity,
+    pinned_owner: Option<PersonId>,
 ) -> anyhow::Result<ProjectGroup> {
     let secret = LinkSecret::from_base64url(&link.key).context("reading the link")?;
     let profile = profile_bytes(identity);
@@ -221,10 +249,13 @@ pub async fn join_group(
             &boot.group_info,
             &boot.keyring,
             &profile,
+            Some(local),
+            pinned_owner,
         )
         // The sealed parts only open with the project's keys, so this is
         // where a truncated or wrong link shows.
         .map_err(|err| match err {
+            MlsError::OwnerChanged(_) => anyhow::Error::from(SyncError::OwnerChanged),
             MlsError::Crypto(_) | MlsError::Mismatch(_) => anyhow::Error::from(SyncError::WrongKey),
             err => err.into(),
         })?;

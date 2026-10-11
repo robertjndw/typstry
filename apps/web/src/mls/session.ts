@@ -16,9 +16,9 @@
 // get the lock applies it and the others find it `alreadyApplied` (or
 // older than their state) and move on. A BroadcastChannel tells the rest to
 // reload.
-import { toHex } from "@/crypto/bytes";
+import { sameBytes, toHex } from "@/crypto/bytes";
 import {
-  Device,
+  LeafKeys,
   LinkSecret,
   ProjectGroup,
   type DocKeys,
@@ -29,7 +29,8 @@ import {
   type SubmitMessage,
   type Unsent,
 } from "@/crypto/wasm";
-import { toError } from "@/lib/errors";
+import { errorKind, toError } from "@/lib/errors";
+import type { LocalIdentity } from "@/mls/identity";
 import {
   type DocBackend,
   type MlsRecord,
@@ -99,6 +100,16 @@ export interface MlsSessionOptions {
   fetchBootstrap: (token: string) => Promise<MlsBootstrap | null>;
   /** The profile to put in this device's leaf, read when one is needed. */
   identity: () => Identity;
+  /**
+   * This browser's device key and person graph, so the devices of one
+   * person show up as one. Without it the leaf carries no identity.
+   */
+  localIdentity?: () => Promise<LocalIdentity>;
+  /**
+   * Folds a graph into the one this browser stores and returns the result.
+   * Needed with `localIdentity` to keep the graph in step with the group.
+   */
+  mergeGraph?: (graph: Uint8Array) => Promise<Uint8Array>;
   /**
    * The links moved on; keep them durably, they are the only way back in.
    * For a rotation this device made it is called before the new group state
@@ -176,14 +187,6 @@ function defaultLocker(): Locker {
   return pageLock;
 }
 
-function kindOf(error: unknown): string | undefined {
-  return (error as { kind?: unknown } | null)?.kind as string | undefined;
-}
-
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-  return a.length === b.length && a.every((byte, i) => byte === b[i]);
-}
-
 function storedOf(rotation: Rotation): StoredRotation {
   const { tokens } = rotation;
   return {
@@ -209,14 +212,17 @@ function sameRoster(
         m.color === n.color &&
         m.isSelf === n.isSelf &&
         m.signer === n.signer &&
-        m.anonymous === n.anonymous
+        m.anonymous === n.anonymous &&
+        m.person === n.person &&
+        m.personState === n.personState &&
+        m.deviceRevoked === n.deviceRevoked
       );
     })
   );
 }
 
 function deviceOf(group: ProjectGroup): Uint8Array {
-  const device = group.device();
+  const device = group.leafKeys();
   try {
     return device.export();
   } finally {
@@ -237,6 +243,12 @@ interface Tx {
    * server is part of the state, which is the point: see `commitIn`.
    */
   save(patch?: Partial<MlsRecord>): Promise<void>;
+}
+
+/** What `syncIdentity` found out and did. */
+export interface IdentitySync {
+  /** This device may commit, so the project is cleaned up as far as it goes. */
+  canCommit: boolean;
 }
 
 type CommitResult = { type: "done" } | { type: "unsettled" };
@@ -273,8 +285,17 @@ export class MlsSession {
   /** The commit this tab sent last, which the log may still settle. */
   private sent: Sent | null = null;
   private readonly settleListeners = new Set<() => void>();
+  /** The last roster read from the tree, and the state it was read at. */
+  private roster: { key: string; members: RosterMember[] } | null = null;
   /** Waiting for the socket to say what this token may do again. */
   private readonly permissionListeners = new Set<() => void>();
+  /** The server answered and the group caught up, on the current socket. */
+  private synced = false;
+  private readonly syncedListeners = new Set<() => void>();
+  /** Leaves of the person's revoked devices this session removed. */
+  private removedCount = 0;
+  /** The identity refresh that is under way, if any. */
+  private identitySync: Promise<IdentitySync> | null = null;
   /** A rotation read from the log, held back until its token works. */
   private unannounced: StoredRotation | null = null;
   private stalled = false;
@@ -373,6 +394,7 @@ export class MlsSession {
       onMessage: (message) => this.onMessage(message),
       onDown: () => {
         this.permission = null;
+        this.synced = false;
         this.clearSilence();
       },
       onFatal: () => {
@@ -410,6 +432,7 @@ export class MlsSession {
     this.stalled = false;
     this.sent = null;
     this.unannounced = null;
+    this.synced = false;
     this.settleListeners.clear();
     for (const listener of [...this.permissionListeners]) listener();
   }
@@ -454,7 +477,7 @@ export class MlsSession {
         // Unreadable state is a lost group: the device is still ours, so
         // joining again replaces its old leaf. A newer build's state is
         // not ours to throw away.
-        if (kindOf(error) === "NewerVersion") throw error;
+        if (errorKind(error) === "NewerVersion") throw error;
         console.warn("discarding unreadable group state:", error);
       }
     }
@@ -514,6 +537,11 @@ export class MlsSession {
     return this.terminal?.phase ?? (this.running ? "joining" : "idle");
   }
 
+  private mayCommit(members: readonly RosterMember[]): boolean {
+    const me = members.find((m) => m.isSelf);
+    return !!me && me.role !== "viewer" && this.permission === "write";
+  }
+
   /** Ends the join with `phase`; a later successful join clears it. */
   private end(phase: MlsPhase, error: string | null = null): void {
     this.terminal = { phase, error };
@@ -523,16 +551,15 @@ export class MlsSession {
   private publish(): void {
     const group = this.group;
     const active = group?.isActive ?? false;
-    const roster = active ? rosterOf(group!.members()) : [];
+    const roster = active ? this.rosterAt(group!) : [];
     const prev = this.snapshot;
     // Most publishes change nothing the UI shows; keeping the old objects
     // spares every subscriber a re-render.
     const members = sameRoster(prev.members, roster) ? prev.members : roster;
-    const me = members.find((m) => m.isSelf);
     const next: MlsSnapshot = {
       phase: this.phase(),
       members,
-      canCommit: me?.role === "editor" && this.permission === "write",
+      canCommit: this.mayCommit(members),
       stalled: this.stalled,
       error: this.terminal?.error ?? null,
     };
@@ -546,6 +573,18 @@ export class MlsSession {
       return;
     this.snapshot = next;
     this.notify();
+  }
+
+  /**
+   * The group's roster, read from the tree again only when it can have
+   * changed: the tree moves with the epoch, and which identities open
+   * depends on the keyring, which can arrive within an epoch.
+   */
+  private rosterAt(group: ProjectGroup): RosterMember[] {
+    const key = `${group.incarnation}:${group.epoch}:${group.needsKeyring()}`;
+    if (this.roster?.key !== key)
+      this.roster = { key, members: rosterOf(group.members()) };
+    return this.roster.members;
   }
 
   private notify(): void {
@@ -723,6 +762,34 @@ export class MlsSession {
     await this.settle();
     // The name may have changed while the join was under way.
     this.updateProfile();
+    this.synced = true;
+    for (const listener of [...this.syncedListeners]) listener();
+  }
+
+  /**
+   * Resolves true once the server has answered and the group is caught up,
+   * false when that takes longer than `timeoutMs`. For callers that run a
+   * session headless, to act on a project that is not open.
+   */
+  untilSynced(timeoutMs: number): Promise<boolean> {
+    if (this.synced) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const finish = (ok: boolean) => {
+        clearTimeout(timer);
+        this.syncedListeners.delete(check);
+        resolve(ok);
+      };
+      const check = () => {
+        if (this.synced) finish(true);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      this.syncedListeners.add(check);
+    });
+  }
+
+  /** How many leaves of the person's revoked devices this session removed. */
+  get removedLeaves(): number {
+    return this.removedCount;
   }
 
   private async rejoinIfBehindIncarnation(incarnation: number): Promise<void> {
@@ -761,6 +828,8 @@ export class MlsSession {
       const found = {
         gap: false,
         removed: false,
+        /** The group's copy of this device's person as it removed it. */
+        person: null as Uint8Array | null,
         invalid: null as string | null,
         rotation: null as StoredRotation | null,
         /** The rotation is the one this device made, so its tokens work. */
@@ -793,7 +862,7 @@ export class MlsSession {
           this.markSent(waiting.commit, own ? "confirmed" : "discarded");
         }
         if (failure) {
-          const kind = kindOf(failure);
+          const kind = errorKind(failure);
           if (kind === "NotActive") {
             found.removed = true;
             break;
@@ -819,6 +888,7 @@ export class MlsSession {
           if (own) found.keyring = waiting.keyring ?? null;
         } else if (outcome!.type === "removed") {
           found.removed = true;
+          found.person = outcome!.person ?? null;
           break;
         }
       }
@@ -834,6 +904,14 @@ export class MlsSession {
       this.ds?.stop();
       this.ds = null;
       this.publish();
+      // This device cannot follow the group any more, so this is its last
+      // chance to hear why. Usually that is a revoke of this device, which
+      // the person's other devices should not have to repeat.
+      if (result.person && this.opts.mergeGraph) {
+        await this.opts.mergeGraph(result.person).catch((error) => {
+          console.warn("could not merge your devices from the group", error);
+        });
+      }
       return;
     }
     if (result.rotation) {
@@ -864,6 +942,7 @@ export class MlsSession {
     this.token = rotation.token;
     this.link = rotation.link;
     this.permission = null;
+    this.synced = false;
     this.target = 0;
     if (this.terminal?.phase === "lost") this.terminal = null;
     this.ds?.restart();
@@ -895,6 +974,59 @@ export class MlsSession {
         this.opts.onError?.(toError(error));
       }
     }
+    this.syncIdentity().catch((error: unknown) => this.report(error));
+  }
+
+  /**
+   * Brings this device's identity in line with its person: merges what the
+   * group knows of the person's graph into the one stored here, puts what
+   * the leaf lacks into it, and, for an editor, removes the person's leaves
+   * whose device was revoked. Not through the queue: committing queues its
+   * own turns. Runs after every round of commits and when a revocation is
+   * applied by hand; calls that overlap share one run.
+   */
+  syncIdentity(): Promise<IdentitySync> {
+    this.identitySync ??= this.runIdentitySync().finally(() => {
+      this.identitySync = null;
+    });
+    return this.identitySync;
+  }
+
+  private async runIdentitySync(): Promise<IdentitySync> {
+    const { localIdentity, mergeGraph } = this.opts;
+    const result: IdentitySync = { canCommit: false };
+    if (!localIdentity || !mergeGraph || !this.group?.isActive) return result;
+    let { graph } = await localIdentity();
+    if (!this.group?.isActive) return result;
+    let step = this.group.identityStep(graph);
+    // `merged` is only set while the group knows something the stored graph
+    // lacks, so this storage write does not repeat on every settle.
+    if (step.merged) graph = await mergeGraph(step.merged);
+    result.canCommit = this.mayCommit(this.snapshot.members);
+    if (!result.canCommit) return result;
+    if (step.needsRefresh) {
+      await this.commit((g) =>
+        g.selfUpdate(encodeProfile(this.opts.identity()), graph),
+      );
+      // The refresh put our revokes into the tree, which can make more of
+      // the person's leaves read as revoked.
+      if (!this.group?.isActive) return result;
+      step = this.group.identityStep(graph);
+    }
+    if (step.revokedOwn.length === 0) return result;
+    let removed = 0;
+    try {
+      await this.commit((g) => {
+        const removal = g.removeRevoked();
+        removed = removal.removed.length;
+        return removal.message;
+      });
+      this.removedCount += removed;
+    } catch (error) {
+      // Another member removed them first.
+      if (errorKind(error) !== "NothingRevoked") throw error;
+    }
+    return result;
   }
 
   /**
@@ -959,8 +1091,8 @@ export class MlsSession {
     if (!ds) return;
     if (this.permission === "retired") return;
     const device = tx.record.device
-      ? Device.import(tx.record.device)
-      : (tx.group?.device() ?? Device.generate());
+      ? LeafKeys.import(tx.record.device)
+      : (tx.group?.leafKeys() ?? LeafKeys.generate());
     try {
       if (!tx.record.device) {
         // Stored before the join so a refused attempt or a crash keeps the
@@ -970,6 +1102,8 @@ export class MlsSession {
       }
       const link = LinkSecret.parse(this.link);
       const profile = encodeProfile(this.opts.identity());
+      const identity = await this.opts.localIdentity?.();
+      const pinned = tx.record.ownerPerson;
       const jitter = this.opts.jitter ?? defaultJitter;
       for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
         const boot = await this.opts.fetchBootstrap(this.token);
@@ -985,11 +1119,24 @@ export class MlsSession {
             boot.groupInfo,
             boot.keyring,
             profile,
+            identity?.deviceSeed,
+            identity?.graph,
+            pinned,
           );
         } catch (error) {
           // The sealed parts only open with the project's keys, so this
           // is where a truncated or wrong link shows.
-          const kind = kindOf(error);
+          const kind = errorKind(error);
+          if (kind === "NotValid")
+            return this.fail(
+              new Error("This device was removed from your account."),
+            );
+          if (kind === "OwnerChanged")
+            return this.fail(
+              new Error(
+                "This project claims a different owner than before, so it was not opened.",
+              ),
+            );
           if (kind === "KeyMismatch" || kind === "Mismatch")
             return this.fail(
               new Error("This link's key does not match the project."),
@@ -1013,7 +1160,11 @@ export class MlsSession {
             this.markSent(this.sent.commit, "discarded");
           // A device that was removed and holds a live link again is a
           // member again.
-          await tx.save({ removed: false, rotation: null });
+          await tx.save({
+            removed: false,
+            rotation: null,
+            ownerPerson: tx.record.ownerPerson ?? group.ownerPerson(),
+          });
           this.stalled = false;
           this.terminal = null;
           return;
@@ -1056,6 +1207,22 @@ export class MlsSession {
     });
   }
 
+  /**
+   * Removes every other device of the person with the key `personHex` in one
+   * commit, resolved when the commit is built since leaves move.
+   */
+  removePerson(personHex: string): Promise<void> {
+    return this.commit((group) => {
+      const key = group
+        .members()
+        .find((m) => m.personId && toHex(m.personId) === personHex)?.personId;
+      const leaves = key ? group.leavesOf(key) : new Uint32Array();
+      if (leaves.length === 0)
+        throw new Error("That person is no longer in the project.");
+      return group.removeAndRotate(leaves);
+    });
+  }
+
   /** Replaces the links without removing anyone. */
   resetLinks(): Promise<void> {
     return this.commit((group) => group.resetLinks());
@@ -1079,13 +1246,23 @@ export class MlsSession {
     if (!this.running || !this.group?.isActive) return;
     const me = this.snapshot.members.find((m) => m.isSelf);
     const want = this.opts.identity();
-    if (!me || (me.name === want.name && me.color === want.color)) return;
-    if (this.permission === "retired" || this.permission === null) return;
-    if (me.role === "editor" && this.permission === "write") {
-      await this.commit((group) => group.selfUpdate(encodeProfile(want)));
-    } else {
-      await this.enqueue(() => this.locked((tx) => this.join(tx)));
+    if (!me || this.permission === "retired" || this.permission === null)
+      return;
+    if (me.name !== want.name || me.color !== want.color) {
+      if (me.role !== "viewer" && this.permission === "write") {
+        // The graph carries the same change, which is how the other
+        // devices of this person learn it.
+        const graph = (await this.opts.localIdentity?.())?.graph;
+        await this.commit((group) =>
+          group.selfUpdate(encodeProfile(want), graph),
+        );
+      } else {
+        await this.enqueue(() => this.locked((tx) => this.join(tx)));
+      }
     }
+    // The graph entry for a new name is written a moment after the name
+    // itself, so it may only be there now.
+    await this.syncIdentity();
   }
 
   private async commit(
@@ -1282,8 +1459,11 @@ export class MlsSession {
         const group = tx.group;
         const ds = this.ds;
         if (!group?.isActive || !ds) return;
+        const identity = await this.opts.localIdentity?.();
         const { group: next, message } = group.reset(
           encodeProfile(this.opts.identity()),
+          identity?.deviceSeed,
+          identity?.graph,
         );
         let reply: Reply;
         try {

@@ -16,7 +16,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use typstry_wire::crypto::LinkSecret;
-use typstry_wire::mls::{Device, MlsError, ProjectGroup};
+use typstry_wire::identity::PersonId;
+use typstry_wire::mls::{LeafKeys, MlsError, ProjectGroup};
 
 use crate::api::Permission;
 use crate::git::GitMark;
@@ -79,9 +80,35 @@ pub struct Config {
     /// The git branch typstry syncs on; see [`crate::git`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The person that owned the project when this folder first joined
+    /// (base64url person id). Every rejoin checks the group still names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_person: Option<String>,
 }
 
+/// The pinned owner in a config is present but not a person id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the recorded project owner is damaged")]
+pub struct DamagedPin;
+
 impl Config {
+    /// `None` only when nothing was pinned yet. A value that cannot be
+    /// decoded is an error: reading it as "no pin" would let the next join
+    /// accept, and re-pin, whatever owner the server names.
+    pub fn pinned_owner(&self) -> Result<Option<PersonId>, DamagedPin> {
+        let Some(text) = self.owner_person.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| DamagedPin)?;
+        PersonId::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| DamagedPin)
+    }
+
+    pub fn pin_owner(&mut self, owner: &PersonId) {
+        self.owner_person = Some(URL_SAFE_NO_PAD.encode(owner));
+    }
+
     pub fn link(&self) -> ShareLink {
         ShareLink::new(&self.server, &self.token, &self.key)
     }
@@ -411,16 +438,16 @@ impl StateDir {
         atomic_write(&self.dir.join(MLS), &group.export_state(), true)
     }
 
-    pub fn save_device(&self, device: &Device) -> anyhow::Result<()> {
+    pub fn save_device(&self, device: &LeafKeys) -> anyhow::Result<()> {
         atomic_write(&self.dir.join(DEVICE), &device.export(), true)
     }
 
     /// The identity this folder joined with, if one was saved and is
     /// readable. A damaged file reads as missing: a new identity only
     /// costs a ghost leaf, where failing would block the folder.
-    pub fn load_device(&self) -> Option<Device> {
+    pub fn load_device(&self) -> Option<LeafKeys> {
         let bytes = fs::read(self.dir.join(DEVICE)).ok()?;
-        Device::import(&bytes).ok()
+        LeafKeys::import(&bytes).ok()
     }
 
     pub fn load_base(&self) -> anyhow::Result<Base> {
@@ -893,6 +920,7 @@ pub(crate) mod tests {
             view_token: None,
             name: None,
             branch: None,
+            owner_person: None,
         }
     }
 
