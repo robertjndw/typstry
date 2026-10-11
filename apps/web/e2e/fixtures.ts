@@ -196,3 +196,67 @@ export async function downloadPdf(page: Page, button: Locator) {
   expect(bytes.subarray(0, 5).toString()).toBe("%PDF-");
   return { name: file.suggestedFilename(), bytes };
 }
+
+/**
+ * The whole document as text. The editor's own text also contains the
+ * names on remote carets, so those are cut out of a copy of each line.
+ */
+export function docText(page: Page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll(".cm-content .cm-line")]
+      .map((line) => {
+        const copy = line.cloneNode(true) as Element;
+        copy
+          .querySelectorAll(
+            ".cm-remote-label, .cm-remote-caret, .cm-widgetBuffer",
+          )
+          .forEach((node) => node.remove());
+        return copy.textContent;
+      })
+      .join("\n"),
+  );
+}
+
+/**
+ * Waits until every page shows the same text for its open file and that
+ * text has all the tokens. The order of concurrent edits is arbitrary, so
+ * tokens are checked for presence only.
+ */
+export async function expectConverged(
+  pages: Page[],
+  tokens: string[] = [],
+  timeout = 15_000,
+) {
+  await expect
+    .poll(
+      async () => {
+        const texts = await Promise.all(pages.map(docText));
+        const same = texts.every((text) => text === texts[0]);
+        const missing = tokens.filter((token) => !texts[0]!.includes(token));
+        return same ? missing : texts;
+      },
+      { timeout },
+    )
+    .toEqual([]);
+}
+
+/** Types at the end of the file that is open, without touching its tab. */
+export async function typeAtEnd(page: Page, text: string) {
+  await editor(page).click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.type(text);
+  // Dismisses tinymist's completions so a later Enter can't accept one.
+  await page.keyboard.press("Escape");
+}
+
+export async function openFile(page: Page, name: string) {
+  await fileTree(page).getByRole("treeitem", { name }).click();
+  await expect(tab(page, name)).toHaveAttribute("aria-selected", "true");
+}
+
+export async function newFileIn(page: Page, folder: string, name: string) {
+  await contextMenu(page, folder, "New file");
+  await page.getByLabel("New file name").fill(name);
+  await page.getByLabel("New file name").press("Enter");
+  await expect(tab(page, name)).toHaveAttribute("aria-selected", "true");
+}

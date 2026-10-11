@@ -3,14 +3,16 @@ import type { Locator, Page } from "@playwright/test";
 
 import {
   appendLine,
-  contextMenu,
   createEntry,
   createProject,
   downloadPdf,
   editor,
   expect,
+  expectConverged,
   fileTree,
   firstPage,
+  newFileIn,
+  openFile,
   openElsewhere,
   openVersion,
   preview,
@@ -20,55 +22,13 @@ import {
   tab,
   tagVersion,
   test,
+  typeAtEnd,
   versionRow,
   versions,
 } from "./fixtures";
 import { readPdf } from "./pdf";
 
 const RED_PNG = path.join(import.meta.dirname, "files/red.png");
-
-/**
- * The whole document as text. The editor's own text also contains the
- * names on remote carets, so those are cut out of a copy of each line.
- */
-function docText(page: Page) {
-  return page.evaluate(() =>
-    [...document.querySelectorAll(".cm-content .cm-line")]
-      .map((line) => {
-        const copy = line.cloneNode(true) as Element;
-        copy
-          .querySelectorAll(
-            ".cm-remote-label, .cm-remote-caret, .cm-widgetBuffer",
-          )
-          .forEach((node) => node.remove());
-        return copy.textContent;
-      })
-      .join("\n"),
-  );
-}
-
-/**
- * Waits until every page shows the same text for its open file and that
- * text has all the tokens. The order of concurrent edits is arbitrary, so
- * tokens are checked for presence only.
- */
-async function expectConverged(
-  pages: Page[],
-  tokens: string[] = [],
-  timeout = 15_000,
-) {
-  await expect
-    .poll(
-      async () => {
-        const texts = await Promise.all(pages.map(docText));
-        const same = texts.every((text) => text === texts[0]);
-        const missing = tokens.filter((token) => !texts[0]!.includes(token));
-        return same ? missing : texts;
-      },
-      { timeout },
-    )
-    .toEqual([]);
-}
 
 function people(page: Page) {
   return page.getByRole("list", { name: "People in this project" });
@@ -82,27 +42,6 @@ function avatars(page: Page, name: string) {
 // avatar lingers next to the new one until the presence timeout.
 function person(page: Page, name: string) {
   return avatars(page, name).first();
-}
-
-/** Types at the end of the file that is open, without touching its tab. */
-async function typeAtEnd(page: Page, text: string) {
-  await editor(page).click();
-  await page.keyboard.press("ControlOrMeta+End");
-  await page.keyboard.type(text);
-  // Dismisses tinymist's completions so a later Enter can't accept one.
-  await page.keyboard.press("Escape");
-}
-
-async function openFile(page: Page, name: string) {
-  await fileTree(page).getByRole("treeitem", { name }).click();
-  await expect(tab(page, name)).toHaveAttribute("aria-selected", "true");
-}
-
-async function newFileIn(page: Page, folder: string, name: string) {
-  await contextMenu(page, folder, "New file");
-  await page.getByLabel("New file name").fill(name);
-  await page.getByLabel("New file name").press("Enter");
-  await expect(tab(page, name)).toHaveAttribute("aria-selected", "true");
 }
 
 function problems(page: Page, message: RegExp) {
