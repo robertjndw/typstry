@@ -16,7 +16,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
 - **Multi-file projects** - file tree, tabs, and uploads for images, fonts and data files. Images can also be pasted or dropped into the editor.
 - **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
-- **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so editors can see who is in a project and remove a member, which also replaces the links.
+- **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so members can see who is in a project and its owner can remove a member, which also replaces the links.
 - **Export** - download the compiled PDF or the whole project as a ZIP.
 - **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
 
@@ -54,13 +54,17 @@ Each project is a single Loro document holding the file tree, file contents and 
 
 Anyone with a share link can read the project, so treat edit links like passwords. An edit link carries a 32-byte secret, from which HKDF-SHA256 derives a read key and an Ed25519 attestation key. A view link carries only the read key and the public attestation key.
 
-Documents are not encrypted under the link secret itself but under per-generation document keys. The server stores a keyring holding the keys of every generation so far, sealed under the link and signed with the attestation key, so a viewer can open it but cannot forge one. A generation changes only when an editor removes a member or resets the links. Every update, blob and profile is encrypted with AES-256-GCM under a key derived from the generation's document key and a fresh random salt, and says which generation it belongs to.
+Documents are not encrypted under the link secret itself but under per-generation document keys. The server stores a keyring holding the keys of every generation so far, sealed under the link and signed with the attestation key, so a viewer can open it but cannot forge one. A generation changes only when the owner removes a member or resets the links. Every update, blob and profile is encrypted with AES-256-GCM under a key derived from the generation's document key and a fresh random salt, and says which generation it belongs to.
 
 Each device that opens a project joins the project's MLS group (RFC 9420, via [openmls](https://github.com/openmls/openmls)) with its own signing key and a profile (name and color) that only members can read. A browser profile and a CLI folder are separate devices. Every update is signed with the device key and carries an editor's attestation of that key. Other clients refuse updates without a valid attestation, so a view link stays read-only even if the server is compromised, and the authors shown in the UI are authenticated. Presence is sealed under a key of the current group epoch and signed per device.
 
 The server acts as the group's delivery service. A newcomer with the link fetches the group's GroupInfo from it, encrypted under the link, and joins with an MLS external commit, so nobody has to be online to let them in. The server orders commits (the first one for an epoch wins) and stores and relays them as opaque bytes. It never holds a key and cannot read or add members. Editing does not wait on the group: if it stalls, documents keep syncing.
 
-To remove a member, an editor commits the removal together with a new generation: a new edit secret, document key, keyring and server tokens. The commit's rotation message carries the new links to the members who stay, so they switch automatically. The server swaps the tokens in one step, closes stale connections and keeps the old tokens only to let members who were offline catch up. The removed device can no longer follow the group or read new data. It keeps whatever it already had, and it still holds the old link, so see [SECURITY.md](SECURITY.md) for what removal does and does not cover.
+Only the project's owner can remove members or reset the links. The owner is a person rather than a key: the group state names the creator's person by a tag that only members can compute and that differs between projects, and any valid device of that person counts as the owner. To remove a member, the owner commits the removal together with a new generation: a new edit secret, document key, keyring and server tokens. The commit's rotation message carries the new links to the members who stay, so they switch automatically. The server swaps the tokens in one step, closes stale connections and keeps the old tokens only to let members who were offline catch up. The removed device can no longer follow the group or read new data. It keeps whatever it already had, and it still holds the old link, so see [SECURITY.md](SECURITY.md) for what removal does and does not cover.
+
+A person is a set of devices. Each browser and CLI has its own device key, which never leaves it. The devices that belong together are listed in a person graph: entries such as "add this device", "revoke that one" or "set name and color", each signed by a device that was valid at the time and linked to the entries it builds on, like commits in git. Two devices can write to it at the same time and the copies merge: a revoke always wins, and whatever a revoked device added before it was revoked stays. The person is identified by the graph's first entry, so no secret is shared between devices. In each project a device signs its per-project leaf key with its device key, and the leaf carries the graph, sealed so that only members can read it and the server cannot link a person across projects.
+
+To add a device, one device shows a short code (`42-ivory-galaxy`) as text, QR code or link, and the other enters it. The two run SPAKE2 over a one-off relay channel on the server, and after a confirmation on the device that already belongs to the person, it adds the new device to the graph and hands over the graph and the project links. The server only relays and never sees the code. A lost device is revoked from any other one: the revoke spreads with the graph, the device loses its owner rights at once, and each device of the person that can edit a project removes the revoked device from it and replaces the links. A recovery key, 17 words to keep offline, can add a new device and revoke the others when every device is gone.
 
 ## Working locally with git
 
@@ -81,6 +85,9 @@ Pick one way to get edits from your co-authors. If they use typstry, don't also 
 ```sh
 # Once, joining an existing project
 typstry clone 'https://typstry.example/p/<token>#<key>' thesis --git
+# Once, on a new device after `typstry pair`: see your projects, copy one by number
+typstry list
+typstry clone 2
 # Once, starting from a repository you already have
 cd thesis && typstry init --server https://typstry.example   # prints the links to share
 
@@ -111,26 +118,31 @@ Without the live mode, the same day is `typstry pull`, edit, then `typstry push`
 
 ### Commands
 
-| Command                         | What it does                                                                        |
-| ------------------------------- | ----------------------------------------------------------------------------------- |
-| `clone <link> [dir] [--git]`    | Copy a project into a new folder. `--git` also creates a repository and commits it  |
-| `init [dir]`                    | Turn a folder (for example an existing git repository) into a new project           |
-| `sync`                          | Keep the folder and the project in sync until Ctrl+C                                |
-| `status`, `pull`, `push`        | One-shot sync: show, receive or publish changes. While `sync` runs, it answers them |
-| `link`, `open`                  | Print the edit and view links, or open the project in the browser                   |
-| `info`                          | Project, permission, tracked branch and pending changes                             |
-| `version list`, `version save`  | Named versions (tags in the browser's history panel). Also work while `sync` runs   |
-| `export [--at <version>] <dir>` | Write the project, now or at a named version, to a plain folder                     |
-| `track <branch>`                | Change the git branch typstry syncs on (stop `sync` first)                          |
+| Command                                      | What it does                                                                                                   |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `clone <link> [dir] [--git]`                 | Copy a project into a new folder. `--git` also creates a repository and commits it                             |
+| `init [dir]`                                 | Turn a folder (for example an existing git repository) into a new project                                      |
+| `sync`                                       | Keep the folder and the project in sync until Ctrl+C                                                           |
+| `status`, `pull`, `push`                     | One-shot sync: show, receive or publish changes. While `sync` runs, it answers them                            |
+| `link`, `open`                               | Print the edit and view links, or open the project in the browser                                              |
+| `info`                                       | Project, permission, tracked branch and pending changes                                                        |
+| `version list`, `version save`               | Named versions (tags in the browser's history panel). Also work while `sync` runs                              |
+| `export [--at <version>] <dir>`              | Write the project, now or at a named version, to a plain folder                                                |
+| `track <branch>`                             | Change the git branch typstry syncs on (stop `sync` first)                                                     |
+| `pair [code]`                                | Add a device: without a code, show one to enter on the other device; with one, pair with the device showing it |
+| `devices [revoke <device>]`                  | List the devices that are you, or revoke a lost one and remove it from your projects                           |
+| `devices recovery`, `devices recover <link>` | Create a recovery key, or use one to make this machine you again after losing every device                     |
+| `devices profile`                            | Show your name and color, or set them for all your devices with `--name` and `--color`                         |
 
 Every command takes `-C <dir>` to run as if started in another folder, and `--name <name>` to set the author name shown in the project history (defaults to `git config user.name`). `typstry <command> --help` shows all options.
 
-| Variable          | Used for                                                        |
-| ----------------- | --------------------------------------------------------------- |
-| `TYPSTRY_LINK`    | The share link for `clone` when the argument is left out        |
-| `TYPSTRY_SERVER`  | The server for `init` when `--server` is left out               |
-| `TYPSTRY_BROWSER` | The program `open` starts instead of the system default browser |
-| `TYPSTRY_LOG`     | Log filter in `RUST_LOG` syntax, `warn` by default              |
+| Variable             | Used for                                                                                                              |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `TYPSTRY_LINK`       | The share link for `clone` when the argument is left out                                                              |
+| `TYPSTRY_SERVER`     | The server for `init` when `--server` is left out                                                                     |
+| `TYPSTRY_BROWSER`    | The program `open` starts instead of the system default browser                                                       |
+| `TYPSTRY_LOG`        | Log filter in `RUST_LOG` syntax, `warn` by default                                                                    |
+| `TYPSTRY_CONFIG_DIR` | Where the device key, the person graph and the list of project folders live, instead of the platform config directory |
 
 ### Things to know
 
