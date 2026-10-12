@@ -12,7 +12,7 @@ typstry is pre-1.0. Fixes land on `main` only, so please check that the issue st
 
 ## Scope
 
-The README's [How it works](README.md#how-it-works) section describes what the encryption protects. In particular, these are in scope:
+The [documentation](docs/README.md) describes how the encryption works. In particular, these are in scope:
 
 - A server, or anyone who can read its data directory, learning the contents of documents or uploads.
 - A view link being used to make edits that other clients accept.
