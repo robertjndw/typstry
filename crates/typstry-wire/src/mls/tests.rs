@@ -2547,6 +2547,7 @@ fn the_identity_step_refreshes_then_removes_the_revoked_leaves() {
         IdentityStep {
             merged: None,
             needs_refresh: false,
+            rejoin: false,
             revoked_own: Vec::new(),
         }
     );
@@ -2622,4 +2623,63 @@ fn the_identity_step_reports_a_graph_that_does_not_merge() {
         on_a.g.identity_step(&right),
         Err(MlsError::Identity(GraphError::TooLarge))
     ));
+}
+
+#[test]
+fn a_device_that_switched_persons_rejoins_as_the_new_one() {
+    let (mut ds, [mut alice, mut laptop, mut phone], link, robert) = two_devices();
+    // A third machine of robert's opened the link before it was paired, so
+    // it joined as a person of its own.
+    let desk_key = DeviceKey::generate();
+    let alone = PersonGraph::genesis(&desk_key);
+    let mut desk = join_as(&mut ds, &link, "desk", &local(&desk_key, &alone));
+    for client in [&mut alice, &mut laptop, &mut phone] {
+        client.sync(&ds);
+    }
+    let members = alice.roster().len();
+    assert_eq!(
+        person_of(&alice, "desk"),
+        verified(alone.id(), &desk_key, false)
+    );
+    assert!(!desk.g.identity_step(&alone).unwrap().rejoin);
+
+    // Pairing makes it one of robert's devices.
+    let mut paired = robert.graph.clone();
+    paired.append(&robert.laptop, add(&desk_key)).unwrap();
+    let step = desk.g.identity_step(&paired).unwrap();
+    assert!(step.rejoin);
+    assert!(!step.needs_refresh);
+    assert!(!laptop.g.identity_step(&paired).unwrap().rejoin);
+    // A graph that does not list the leaf's device is not a reason to move.
+    assert!(!desk.g.identity_step(&robert.graph).unwrap().rejoin);
+
+    let (mut g, payload) = ProjectGroup::join_external_as(
+        desk.g.device().duplicate(),
+        &link,
+        &ds.group_info,
+        &ds.keyring,
+        b"desk",
+        Some(&local(&desk_key, &paired)),
+        None,
+    )
+    .unwrap();
+    ds.submit(payload).unwrap();
+    g.confirm_pending().unwrap();
+    let rejoined = Client { name: "desk", g };
+    for client in [&mut alice, &mut laptop, &mut phone] {
+        assert!(
+            matches!(client.sync(&ds)[..], [Outcome::Advanced]),
+            "{}",
+            client.name
+        );
+        assert_eq!(client.roster().len(), members, "{}", client.name);
+        assert_eq!(
+            person_of(client, "desk"),
+            verified(robert.graph.id(), &desk_key, false),
+            "{}",
+            client.name
+        );
+    }
+    assert!(!rejoined.g.identity_step(&paired).unwrap().rejoin);
+    assert!(matches!(desk.sync(&ds)[..], [Outcome::Removed { .. }]));
 }

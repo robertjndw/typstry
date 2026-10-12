@@ -48,8 +48,13 @@ enum Followed {
     /// Up to date. Holds the connection the last catch-up ended on when it
     /// can still be used to submit a commit (see [`Session::follow`]).
     Current(Option<Box<Ds>>),
-    /// The folder's state cannot follow the group any more.
+    /// The folder has to join again: its state cannot follow the group any
+    /// more, or its leaf names a person this machine has left.
     Rejoin,
+}
+
+fn current(ds: Option<Ds>) -> Followed {
+    Followed::Current(ds.map(Box::new))
 }
 
 impl Session {
@@ -75,6 +80,7 @@ impl Session {
     /// commit can go out on it without a second hello.
     async fn follow(&mut self) -> anyhow::Result<Option<Ds>> {
         let mut rejoin = self.group.is_none();
+        let mut switched = false;
         for _ in 0..RESYNCS {
             if self.group.as_ref().is_some_and(|g| !g.is_active()) {
                 return Err(SyncError::Removed.into());
@@ -84,7 +90,22 @@ impl Session {
             }
             match Box::pin(self.catch_up()).await? {
                 Followed::Current(ds) => {
-                    return Box::pin(self.refresh_identity(ds.map(|ds| *ds))).await;
+                    match Box::pin(self.refresh_identity(ds.map(|ds| *ds))).await? {
+                        Followed::Current(ds) => return Ok(ds.map(|ds| *ds)),
+                        // Once per run, so a join that keeps the old person
+                        // cannot loop. If it fails, the folder syncs as the
+                        // old person and the next run tries again.
+                        Followed::Rejoin if !switched => {
+                            switched = true;
+                            if let Err(err) = Box::pin(self.join_again()).await {
+                                self.warnings.push(format!(
+                                    "could not move this folder over to your person: {err:#}"
+                                ));
+                                return Ok(None);
+                            }
+                        }
+                        Followed::Rejoin => return Ok(None),
+                    }
                 }
                 Followed::Rejoin => rejoin = true,
             }
@@ -257,29 +278,38 @@ impl Session {
     /// leaf, e.g. a device revoked since the leaf was last committed. Best
     /// effort: a lost race is tried again after catching up, and the next
     /// run does it if this one cannot. Hands back `ds` untouched when
-    /// nothing was needed.
-    async fn refresh_identity(&mut self, mut ds: Option<Ds>) -> anyhow::Result<Option<Ds>> {
-        // A viewer's commit is always refused, so don't open a connection
-        // just to find that out.
-        if !self.can_write() {
-            return Ok(ds);
-        }
+    /// nothing was needed. [`Followed::Rejoin`] when this folder joined as
+    /// another person than the machine is now, e.g. it was cloned before
+    /// `typstry pair --replace`: such a leaf can only move over by joining
+    /// again with the same leaf keys, viewers included.
+    async fn refresh_identity(&mut self, mut ds: Option<Ds>) -> anyhow::Result<Followed> {
         if self.local.is_none() {
             self.local = user::load_identity()?;
         }
         for attempt in 1..=COMMIT_ATTEMPTS {
             let step = match self.identity_step() {
                 Ok(Some(step)) => step,
-                Ok(None) => return Ok(ds),
+                Ok(None) => return Ok(current(ds)),
                 Err(err) => {
                     self.warnings.push(format!(
                         "could not merge your devices from the group: {err:#}"
                     ));
-                    return Ok(ds);
+                    return Ok(current(ds));
                 }
             };
+            if step.rejoin {
+                if let Some(ds) = ds {
+                    ds.close().await;
+                }
+                return Ok(Followed::Rejoin);
+            }
+            // A viewer's commit is always refused, so don't open a
+            // connection just to find that out.
+            if !self.can_write() {
+                return Ok(current(ds));
+            }
             let Some(local) = self.local.as_mut() else {
-                return Ok(ds);
+                return Ok(current(ds));
             };
             if let Some(merged) = &step.merged {
                 match user::merge_graph(merged) {
@@ -288,13 +318,13 @@ impl Session {
                         self.warnings.push(format!(
                             "could not merge your devices from the group: {err:#}"
                         ));
-                        return Ok(ds);
+                        return Ok(current(ds));
                     }
                 }
             }
             let group = self.group.as_mut().context(NO_KEYS)?;
             if group.has_pending() || !step.needs_refresh {
-                return Ok(ds);
+                return Ok(current(ds));
             }
             let mut conn = match ds.take() {
                 Some(ds) => ds,
@@ -311,7 +341,7 @@ impl Session {
             // A commit built behind the head can only lose.
             if conn.ready.permission != DsPermission::Write || group.epoch() < conn.ready.head {
                 conn.close().await;
-                return Ok(None);
+                return Ok(Followed::Current(None));
             }
             let payload = group.self_update(&profile_bytes(&self.identity), Some(&local.graph))?;
             self.state.save_mls(group)?;
@@ -321,29 +351,29 @@ impl Session {
                 Reply::Accepted => {
                     group.confirm_pending()?;
                     self.state.save_mls(group)?;
-                    return Ok(None);
+                    return Ok(Followed::Current(None));
                 }
                 Reply::Conflict => {
                     group.discard_pending()?;
                     self.state.save_mls(group)?;
                     if attempt == COMMIT_ATTEMPTS {
-                        return Ok(None);
+                        return Ok(Followed::Current(None));
                     }
                     tokio::time::sleep(jitter(attempt)).await;
                     match Box::pin(self.catch_up()).await? {
                         Followed::Current(next) => ds = next.map(|ds| *ds),
-                        Followed::Rejoin => return Ok(None),
+                        Followed::Rejoin => return Ok(Followed::Current(None)),
                     }
                 }
                 // Only a refresh: it shows on the next try.
                 Reply::Refused(_) => {
                     group.discard_pending()?;
                     self.state.save_mls(group)?;
-                    return Ok(None);
+                    return Ok(Followed::Current(None));
                 }
             }
         }
-        Ok(None)
+        Ok(Followed::Current(None))
     }
 
     /// What this device has to do to keep its identity in the group in

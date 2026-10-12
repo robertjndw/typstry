@@ -5,6 +5,7 @@ import {
   LinkSecret,
   PersonGraph,
   ProjectGroup,
+  devicePublicKey,
 } from "@/crypto/wasm";
 import {
   MemoryBackend,
@@ -141,16 +142,19 @@ function world() {
 
   /**
    * A second browser of Alice's: its device key is added to her graph and
-   * both are stored the way pairing leaves them.
+   * both are stored the way pairing leaves them. `backend` is one that
+   * already has a key, e.g. a browser that opened a link before pairing.
    */
   async function pairedWithAlice(
     alice: Device,
-  ): Promise<{ backend: MemoryBackend; pub: Uint8Array }> {
-    const backend = new MemoryBackend();
-    const key = DeviceKey.generate();
-    const seed = key.export();
-    const pub = key.publicKey();
-    await backend.saveDeviceKey(seed);
+    backend: DocBackend = new MemoryBackend(),
+  ): Promise<{ backend: DocBackend; pub: Uint8Array }> {
+    let seed = await backend.loadDeviceKey();
+    if (!seed) {
+      seed = DeviceKey.generate().export();
+      await backend.saveDeviceKey(seed);
+    }
+    const pub = devicePublicKey(seed);
     const { graph } = await localIdentity(alice.backend);
     const next = PersonGraph.decode(graph);
     next.addDevice(aliceSeed, pub);
@@ -589,6 +593,29 @@ describe("MlsSession", () => {
     expect(members.every((m) => m.role === "owner")).toBe(true);
     expect(members[0]!.person).not.toBeNull();
     expect(members[0]!.person).toBe(members[1]!.person);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("joins again as the person it paired into after opening the link first", async () => {
+    const { creator, join, pairedWithAlice, sessions } = world();
+    const alice = await creator();
+    const desk = await join("Desk", "edit");
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().members).toHaveLength(2),
+    );
+    const persons = () =>
+      new Set(alice.session.getSnapshot().members.map((m) => m.person));
+    expect(persons().size).toBe(2);
+
+    // Pairing into Alice's person, the way a grant with `replace` leaves it.
+    await pairedWithAlice(alice, desk.backend);
+
+    await desk.session.syncIdentity();
+    await vi.waitFor(() => {
+      expect(alice.session.getSnapshot().members).toHaveLength(2);
+      expect(persons().size).toBe(1);
+    });
+    expect(desk.errors).toEqual([]);
     sessions.forEach((s) => s.stop());
   });
 

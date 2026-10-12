@@ -188,6 +188,12 @@ impl PersonGraph {
             .collect()
     }
 
+    /// Whether `own` is the only device this person ever had: no other
+    /// device, no recovery key, nothing revoked.
+    pub fn only_ever_had(&self, own: &PublicKey) -> bool {
+        matches!(&self.devices()[..], [only] if only.device == *own && only.state == DeviceState::Valid)
+    }
+
     /// Sorted by key.
     pub fn valid_devices(&self) -> Vec<PublicKey> {
         self.validity.valid.iter().copied().collect()

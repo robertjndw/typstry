@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -5,7 +6,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
 use typstry_wire::crypto::PublicKey;
-use typstry_wire::identity::{DeviceState, PersonGraph, device_fingerprint, person_fingerprint};
+use typstry_wire::identity::{
+    DeviceState, PersonGraph, PersonId, device_fingerprint, person_fingerprint,
+};
 use typstry_wire::mls::LocalIdentity;
 use typstry_wire::pairing::{
     Code, Event, Grant, GrantedProject, PairError, Pairing, Role, fit_device_name,
@@ -19,8 +22,8 @@ use crate::client::{PING_INTERVAL, Socket, open_socket};
 use crate::link::{ShareLink, relay_url};
 use crate::state::StateDir;
 use crate::user::{
-    AvailableProject, load_identity, load_or_create_device, merge_graph, projects,
-    remember_available, save_paired_graph, set_device_label,
+    AvailableProject, KnownProject, catalog, load_identity, load_or_create_device, merge_graph,
+    projects, remember_available, save_paired_graph, set_device_label,
 };
 
 /// Pair this device with another one of yours.
@@ -45,7 +48,10 @@ pub struct Args {
     #[arg(long, value_name = "URL", env = "TYPSTRY_SERVER")]
     pub server: Option<String>,
     /// Join as a new device even though this one is already a person. It
-    /// switches to the other person; its own graph is discarded.
+    /// switches to the other person; its own graph is discarded, and the
+    /// folders here join their projects again as the other person on their
+    /// next sync. Entering a code on a machine that only became a person by
+    /// cloning asks about this by itself.
     #[arg(long)]
     pub replace: bool,
     /// Approve the other device without asking.
@@ -64,14 +70,27 @@ struct Meeting {
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let mut identity = load_identity()?;
-    if args.replace
-        && let Some(identity) = &identity
-    {
-        guard_replace(&identity.graph, &identity.device.public())?;
+    let mut replace = args.replace;
+    if let Some(identity) = &identity {
+        let own = identity.device.public();
+        if replace {
+            guard_replace(&identity.graph, &own)?;
+        } else if is_disposable(&identity.graph, &own)? {
+            // Asked before connecting: the role decides the first frame.
+            if args.code.is_some() {
+                replace = offer_switch(args.yes)?;
+            } else {
+                eprintln!(
+                    "Note: this machine has no other devices yet. If you already use typstry on \
+                     the other device, show the code there instead and enter it here."
+                );
+            }
+        }
     }
+    let old_person = identity.as_ref().map(|identity| identity.graph.id());
     // A revoked device cannot vouch for anyone, but it may join a person
     // again as a new device, the way `adopt` lets it leave the old one.
-    if args.replace
+    if replace
         || identity
             .as_ref()
             .is_some_and(|i| i.graph.device_state(&i.device.public()) != DeviceState::Valid)
@@ -126,14 +145,14 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             &meeting.code,
             identity.as_mut(),
             &device_name,
-            &args,
+            args.yes,
         ),
     )
     .await;
     let _ = ws.close(None).await;
     match outcome {
         Ok(Ok(Outcome::Approved)) => Ok(()),
-        Ok(Ok(Outcome::Granted(grant))) => joined(grant, args.replace),
+        Ok(Ok(Outcome::Granted(grant))) => joined(grant, replace, old_person),
         Ok(Err(err)) => Err(err),
         Err(_) => {
             bail!("The code expired before the pairing finished. Start over with a new code.")
@@ -153,7 +172,7 @@ async fn pair(
     code: &Code,
     mut identity: Option<&mut LocalIdentity>,
     device_name: &str,
-    args: &Args,
+    yes: bool,
 ) -> anyhow::Result<Outcome> {
     let (mut pairing, first) = match &identity {
         Some(_) => Pairing::start_holder(code),
@@ -206,7 +225,7 @@ async fn pair(
                     .as_deref_mut()
                     .context("approval asked of a device that is not a person yet")?;
                 let tag = device_fingerprint(&device_pub);
-                let approved = args.yes || ask(ws, &new_name, &tag, &mut ping).await?;
+                let approved = yes || ask(ws, &new_name, &tag, &mut ping).await?;
                 if !approved {
                     send(ws, pairing.reject().map_err(explain)?).await?;
                     bail!("Declined. {new_name} was not added.");
@@ -275,8 +294,9 @@ async fn ask(
     }
 }
 
-/// What the new device does with a grant.
-fn joined(grant: Grant, replace: bool) -> anyhow::Result<()> {
+/// What the new device does with a grant. `old_person` is the person this
+/// machine was before, if any.
+fn joined(grant: Grant, replace: bool, old_person: Option<PersonId>) -> anyhow::Result<()> {
     let graph = PersonGraph::decode(&grant.graph)
         .map_err(|err| anyhow::anyhow!("the received device graph is unusable: {err}"))?;
     let device = load_or_create_device()?;
@@ -297,6 +317,18 @@ fn joined(grant: Grant, replace: bool) -> anyhow::Result<()> {
         "Paired. This device is now you ({}).",
         person_fingerprint(&graph.id())
     );
+    if old_person.is_some_and(|old| old != graph.id()) {
+        // The pairing is saved by now, so failing to list the folders must
+        // not fail the command.
+        let moving = local_folders().unwrap_or_default();
+        if !moving.is_empty() {
+            println!(
+                "These folders joined their projects as your old person and switch to you on \
+                 their next sync: {}",
+                moving.join(", ")
+            );
+        }
+    }
     if grant.projects.is_empty() {
         println!("The other device has no projects to hand over.");
         return Ok(());
@@ -315,11 +347,26 @@ fn joined(grant: Grant, replace: bool) -> anyhow::Result<()> {
 /// a project it has a folder for. A recovery key counts as a device here,
 /// since it can still bring the person back.
 pub(super) fn guard_replace(graph: &PersonGraph, own: &PublicKey) -> anyhow::Result<()> {
-    let person = graph.id();
     if graph.valid_devices() != [*own] {
         return Ok(());
     }
-    let owned: Vec<String> = projects()?
+    let owned = owned_folders(graph)?;
+    if owned.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "This device is the only one of your person that is valid, and you own {}. Switching to \
+         another person would leave {} without an owner. Pair a second device or create a \
+         recovery key (`typstry devices recovery`) first.",
+        owned.join(", "),
+        if owned.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// The folders on this machine whose project `graph`'s person owns.
+fn owned_folders(graph: &PersonGraph) -> anyhow::Result<Vec<String>> {
+    let person = graph.id();
+    Ok(projects()?
         .iter()
         .filter(|known| {
             // A damaged pin may well be this person's, and wrongly allowing
@@ -330,22 +377,47 @@ pub(super) fn guard_replace(graph: &PersonGraph, own: &PublicKey) -> anyhow::Res
                     .map_or(true, |owner| owner == Some(person))
             })
         })
-        .map(|known| {
-            known
-                .title
-                .clone()
-                .unwrap_or_else(|| known.dir.display().to_string())
-        })
-        .collect();
-    if owned.is_empty() {
-        return Ok(());
+        .map(KnownProject::display_title)
+        .collect())
+}
+
+/// The folders this machine still has, by title.
+fn local_folders() -> anyhow::Result<Vec<String>> {
+    Ok(catalog()?
+        .into_iter()
+        .filter(|entry| entry.dir.is_some())
+        .map(|entry| entry.title)
+        .collect())
+}
+
+/// Whether this machine's person is one it most likely became by
+/// accident, by cloning before pairing: this device is the only one the
+/// graph ever had, and it owns no project here. Leaving such a person for
+/// another one loses nothing.
+fn is_disposable(graph: &PersonGraph, own: &PublicKey) -> anyhow::Result<bool> {
+    Ok(graph.only_ever_had(own) && owned_folders(graph)?.is_empty())
+}
+
+/// Asks whether a machine that [`is_disposable`] should join the person of
+/// the device showing the code. Usually it should, but a machine that has
+/// only cloned so far may also be the first one, about to add a device.
+/// So without a terminal, or with `--yes` (which approves the other side,
+/// not a switch), it stays the holder, and `--replace` switches without
+/// asking.
+fn offer_switch(yes: bool) -> anyhow::Result<bool> {
+    if yes || !std::io::stdin().is_terminal() {
+        return Ok(false);
     }
-    bail!(
-        "This device is the only one of your person that is valid, and you own {}. Switching to \
-         another person would leave {} without an owner. Pair a second device or create a \
-         recovery key (`typstry devices recovery`) first.",
-        owned.join(", "),
-        if owned.len() == 1 { "it" } else { "them" },
+    let folders = local_folders()?;
+    let opened = if folders.is_empty() {
+        String::new()
+    } else {
+        format!(" when it opened {}", folders.join(", "))
+    };
+    println!("This machine became a person of its own{opened}, and has no other devices yet.");
+    confirm(
+        "Does the device showing the code already belong to you, so this machine should join \
+         it? Its folders switch over on their next sync. (No: add that device to this machine.)",
     )
 }
 

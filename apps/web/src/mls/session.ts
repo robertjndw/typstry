@@ -296,6 +296,8 @@ export class MlsSession {
   private removedCount = 0;
   /** The identity refresh that is under way, if any. */
   private identitySync: Promise<IdentitySync> | null = null;
+  /** Whether this session joined again to move its leaf to a new person. */
+  private switchedPerson = false;
   /** A rotation read from the log, held back until its token works. */
   private unannounced: StoredRotation | null = null;
   private stalled = false;
@@ -1002,6 +1004,25 @@ export class MlsSession {
     // `merged` is only set while the group knows something the stored graph
     // lacks, so this storage write does not repeat on every settle.
     if (step.merged) graph = await mergeGraph(step.merged);
+    if (step.rejoin) {
+      // A leaf cannot change its person in a commit, so a device that paired
+      // into another person after it joined (it opened the link first) joins
+      // again with the same leaf keys, which replaces its old leaf. Viewers
+      // too, since a join is not a member commit. Once per session, so a
+      // join that keeps the old person cannot loop. `join` checks the
+      // connection and permission itself, but a join that does nothing must
+      // not use up that one try.
+      if (
+        this.switchedPerson ||
+        !this.ds ||
+        this.permission === null ||
+        this.permission === "retired"
+      )
+        return result;
+      this.switchedPerson = true;
+      await this.enqueue(() => this.locked((tx) => this.join(tx)));
+      return result;
+    }
     result.canCommit = this.mayCommit(this.snapshot.members);
     if (!result.canCommit) return result;
     if (step.needsRefresh) {

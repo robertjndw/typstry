@@ -151,6 +151,18 @@ impl PersonGraph {
         self.inner.encode()
     }
 
+    /// The person's id, as `ProjectGroup.ownerPerson` returns it.
+    pub fn id(&self) -> Vec<u8> {
+        self.inner.id().to_vec()
+    }
+
+    /// Whether `devicePub` is the only device this person ever had: no
+    /// other device, no recovery key, nothing revoked.
+    #[wasm_bindgen(js_name = onlyEverHad)]
+    pub fn only_ever_had(&self, device_pub: &[u8]) -> Result<bool, JsValue> {
+        Ok(self.inner.only_ever_had(&public_key(device_pub)?))
+    }
+
     /// Adds a device, signed by `deviceSeed`'s device. `recovery` marks it as
     /// a recovery device. Throws `NotValid` when the signer is not a valid
     /// device of the person.

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use typstry_wire::identity::person_fingerprint;
 
 use super::init::absolute;
 use super::{Ctx, Output, print_report, print_warnings, track_branch};
@@ -80,6 +81,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         );
     }
 
+    // The join below makes this machine a person if it is not one yet,
+    // which is easy to do by accident on a machine meant to be paired.
+    let new_person = crate::user::load_identity()?.is_none();
     let api = Api::new(&link.origin)?;
     let share = api.resolve_share(&link.token).await?;
     if share.retired {
@@ -148,6 +152,15 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             ""
         }
     );
+    // Only a hint, so a failure to read the identity back must not fail a
+    // clone that worked.
+    if new_person && let Ok(Some(identity)) = crate::user::load_identity() {
+        println!(
+            "This machine is now a new person ({}). Already use typstry on another device? \
+             Run `typstry pair` there and enter the code here; this folder moves over.",
+            person_fingerprint(&identity.graph.id())
+        );
+    }
     Ok(())
 }
 

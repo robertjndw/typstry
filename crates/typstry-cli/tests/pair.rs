@@ -201,8 +201,11 @@ async fn replace_switches_a_device_that_owns_nothing_to_the_other_person() {
     let holder_cfg = config_in(&work, "holder-cfg");
     let other_cfg = config_in(&work, "other-cfg");
     let a = clone_as(&holder_cfg, &edit, &work, "a").await;
-    clone_as(&other_cfg, &edit, &work, "b").await;
+    let b = clone_as(&other_cfg, &edit, &work, "b").await;
     let before = std::fs::read(other_cfg.join("person.graph")).unwrap();
+    let persons = |listing: &str| listing.matches("  Person ").count();
+    let roster = stdout(&run_as(&a, &holder_cfg, &["members"]).await);
+    let strangers = persons(&roster);
 
     let shower = Shower::start(&a, &holder_cfg, &["--yes"]).await;
     let out = run_as(
@@ -217,7 +220,7 @@ async fn replace_switches_a_device_that_owns_nothing_to_the_other_person() {
         ],
     )
     .await;
-    stdout(&out);
+    let output = stdout(&out);
     let holder = shower.finish().await;
     assert!(holder.status.success());
     let after = std::fs::read(other_cfg.join("person.graph")).unwrap();
@@ -226,6 +229,37 @@ async fn replace_switches_a_device_that_owns_nothing_to_the_other_person() {
         after,
         std::fs::read(holder_cfg.join("person.graph")).unwrap()
     );
+    assert!(
+        output.contains("switch to you on their next sync: Switch"),
+        "{output}"
+    );
+
+    // The folder it cloned before pairing joins again as the new person,
+    // replacing its leaf rather than leaving the old person behind.
+    stdout(&run_as(&b, &other_cfg, &["pull"]).await);
+    let listing = stdout(&run_as(&b, &other_cfg, &["members"]).await);
+    let mine = listing
+        .split("Person ")
+        .find(|block| block.contains("(you)"))
+        .unwrap_or_else(|| panic!("{listing}"));
+    assert_eq!(mine.matches("    #").count(), 2, "{listing}");
+    stdout(&run_as(&a, &holder_cfg, &["pull"]).await);
+    let roster = stdout(&run_as(&a, &holder_cfg, &["members"]).await);
+    assert_eq!(persons(&roster), strangers - 1, "{roster}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_clone_that_makes_the_person_suggests_pairing() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Hint").await;
+    let (_work, work) = temp();
+    let cfg = config_in(&work, "cfg");
+    let env = [("TYPSTRY_CONFIG_DIR", cfg.to_str().unwrap())];
+    let hint = "typstry pair";
+    let first = stdout(&binary_with(&work, &["clone", &edit, "a"], "", &env).await);
+    assert!(first.contains(hint), "{first}");
+    let second = stdout(&binary_with(&work, &["clone", &edit, "b"], "", &env).await);
+    assert!(!second.contains(hint), "{second}");
 }
 
 /// Pairs the machine of `new_cfg` to the person of `holder_cfg`, whose

@@ -12,7 +12,7 @@ import { ApiError } from "@/sync/api";
 
 import { defaultDeviceName } from "./device-name";
 import type { PairSession, PairState } from "./session";
-import { isHolder, startEntering, startShowing } from "./start";
+import { isDisposable, isHolder, startEntering, startShowing } from "./start";
 
 const NO_SUBSCRIPTION = () => () => {};
 
@@ -32,6 +32,9 @@ export function usePairingFlow() {
   const [session, setSession] = useState<PairSession | null>(null);
   const [code, setCode] = useState<string | null>(null);
   const [holder, setHolder] = useState<boolean | null>(null);
+  // A holder that most likely only became a person by opening a link before
+  // it was paired, so the page can offer to join the other device instead.
+  const [disposable, setDisposable] = useState(false);
   const [deviceName, setDeviceName] = useState(defaultDeviceName);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -54,8 +57,17 @@ export function usePairingFlow() {
     let live = true;
     // The name checks run in the wasm, so nothing that asks for a name may
     // render before it is loaded; `holder` gates all of it.
-    void Promise.all([isHolder(), loadWasm()]).then(
-      ([is]) => live && setHolder(is),
+    // Only an offer, so failing to work it out must not block pairing.
+    const offer = isDisposable().catch((e: unknown) => {
+      console.error(e);
+      return false;
+    });
+    void Promise.all([isHolder(), offer, loadWasm()]).then(
+      ([is, alone]) => {
+        if (!live) return;
+        setDisposable(alone);
+        setHolder(is);
+      },
       (e: unknown) => {
         console.error(e);
         if (live) setError(`Could not start pairing: ${toError(e).message}`);
@@ -109,11 +121,12 @@ export function usePairingFlow() {
     [begin, deviceName],
   );
   const enterCode = useCallback(
-    (input: string) =>
+    (input: string, switchPerson = false) =>
       begin(async () => ({
         session: await startEntering(
           input,
           fitDeviceName(deviceName) ?? defaultDeviceName(),
+          { switchPerson },
         ),
         code: null,
       })),
@@ -126,6 +139,7 @@ export function usePairingFlow() {
     state,
     code,
     holder,
+    disposable,
     deviceName,
     setDeviceName,
     nameOk,

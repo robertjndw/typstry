@@ -173,6 +173,7 @@ struct IdentityStepDto {
     #[serde(with = "serde_bytes")]
     merged: Option<Vec<u8>>,
     needs_refresh: bool,
+    rejoin: bool,
     revoked_own: Vec<u32>,
 }
 
@@ -327,6 +328,8 @@ export interface IdentityStep {
   /** The stored graph with the group's copy merged in, if that adds anything. */
   merged?: Uint8Array;
   needsRefresh: boolean;
+  /** The leaf names another person than the graph, which lists its device. */
+  rejoin: boolean;
   revokedOwn: number[];
 }
 export interface DecryptedDelta {
@@ -536,9 +539,11 @@ impl Group {
 
     /// What to do to keep this device's identity in line with its person,
     /// in one pass over the tree, given `graph`, the `PersonGraph.encode`
-    /// stored here. Returns `{ merged?, needsRefresh, revokedOwn }`: store
-    /// `merged` when set, commit `selfUpdate(profile, merged ?? graph)` when
-    /// `needsRefresh`, and `removeRevoked` when `revokedOwn` is not empty.
+    /// stored here. Returns `{ merged?, needsRefresh, rejoin, revokedOwn }`:
+    /// on `rejoin` join again with `joinExternalAs` and the same leaf keys
+    /// and do nothing else; otherwise store `merged` when set, commit
+    /// `selfUpdate(profile, merged ?? graph)` when `needsRefresh`, and
+    /// `removeRevoked` when `revokedOwn` is not empty.
     /// After committing a refresh ask again, as it can change `revokedOwn`.
     /// Throws what merging throws when the group's copy of the person does
     /// not merge with `graph`.
@@ -551,6 +556,7 @@ impl Group {
         to_js(&IdentityStepDto {
             merged: step.merged.map(|graph| graph.encode()),
             needs_refresh: step.needs_refresh,
+            rejoin: step.rejoin,
             revoked_own: step.revoked_own,
         })
     }

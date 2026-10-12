@@ -237,6 +237,20 @@ describe("applyGrant", () => {
     ).rejects.toBeInstanceOf(GrantRefusedError);
   });
 
+  it("gives up a person of its own when told to replace it", async () => {
+    const backend = new MemoryBackend();
+    const { graph: own } = await localIdentity(backend);
+    const { graph } = await grantFor(backend);
+    await applyGrant(
+      { graph, projects: [], holderName: "Desk" },
+      backend,
+      "Phone",
+      { replace: true },
+    );
+    expect(await backend.loadGraph()).toEqual(graph);
+    expect(graph).not.toEqual(own);
+  });
+
   it("merges a grant of the person it already belongs to", async () => {
     const backend = new MemoryBackend();
     const { deviceSeed, graph: own } = await localIdentity(backend);

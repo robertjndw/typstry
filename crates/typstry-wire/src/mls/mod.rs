@@ -206,6 +206,13 @@ pub struct IdentityStep {
     /// Whether the merged graph (else the local one) holds entries of this
     /// device's person that its own leaf lacks.
     pub needs_refresh: bool,
+    /// Whether this device's leaf names another person than `local`, which
+    /// lists the leaf's device as valid: the device switched persons since
+    /// it joined, e.g. after it became a person of its own by opening a
+    /// link before pairing. A leaf cannot change its person in a commit, so
+    /// the way over is an external join with the same [`LeafKeys`], which
+    /// replaces the old leaf.
+    pub rejoin: bool,
     /// [`ProjectGroup::revoked_own_leaves`] of the tree as it is.
     pub revoked_own: Vec<u32>,
 }
@@ -1396,7 +1403,9 @@ impl ProjectGroup {
     /// Run it after catching up. Store [`IdentityStep::merged`] when there
     /// is one, commit [`Self::self_update`] with the graph it was judged on
     /// when [`IdentityStep::needs_refresh`], and remove
-    /// [`IdentityStep::revoked_own`] with [`Self::remove_revoked`]. A refresh
+    /// [`IdentityStep::revoked_own`] with [`Self::remove_revoked`]. On
+    /// [`IdentityStep::rejoin`] do none of that and join again with
+    /// [`Self::join_external_as`] and the same device instead. A refresh
     /// changes the tree, which can make more leaves read revoked, so after
     /// committing one run this again rather than acting on the old answer.
     /// Whether the device may commit at all (a writer, nothing pending) is
@@ -1420,8 +1429,14 @@ impl ProjectGroup {
             && tree.own_identity().is_some_and(|own| {
                 own.graph.id() == current.id() && !own.graph.is_superset_of(current)
             });
+        let rejoin = self.is_active()
+            && tree.own_identity().is_some_and(|own| {
+                own.graph.id() != local.id()
+                    && local.device_state(&own.binding.device) == DeviceState::Valid
+            });
         Ok(IdentityStep {
             needs_refresh,
+            rejoin,
             revoked_own: tree.revoked_own(),
             merged,
         })

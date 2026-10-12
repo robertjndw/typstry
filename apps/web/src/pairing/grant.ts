@@ -103,6 +103,8 @@ export async function applyGrant(
   opts: ApiOptions & {
     /** A key made for this pairing that is not stored yet. */
     deviceSeed?: Uint8Array;
+    /** Give up the person this browser has for the granted one. */
+    replace?: boolean;
   } = {},
 ): Promise<PairedProject[]> {
   await loadWasm();
@@ -134,7 +136,7 @@ export async function applyGrant(
   // the merge sees that inside the transaction that stores the grant.
   await backend.mergeGraph(grant.graph, (stored, incoming) => {
     try {
-      return adoptGraph(stored, incoming, pub, false);
+      return adoptGraph(stored, incoming, pub, opts.replace ?? false);
     } catch (error) {
       if (errorKind(error) === "ForeignIdentity")
         throw new GrantRefusedError(
