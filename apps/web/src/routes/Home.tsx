@@ -24,7 +24,6 @@ import { toast } from "sonner";
 import { AccountMenu } from "@/components/AccountMenu";
 import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
 import { PageShell } from "@/components/PageShell";
-import { ThemeToggle } from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { readDrop, readPicked, type PendingImport } from "@/import/sources";
@@ -192,12 +191,7 @@ export function Home() {
           typstry
         </span>
       }
-      actions={
-        <div className="flex items-center gap-1">
-          <ThemeToggle />
-          <AccountMenu identity={stored ?? provisional} />
-        </div>
-      }
+      actions={<AccountMenu identity={stored ?? provisional} />}
       mainClassName="max-w-xl gap-12 sm:pt-20"
       outside={
         <>

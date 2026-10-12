@@ -13,6 +13,7 @@ import { DevicesDialog } from "@/components/DevicesDialog";
 import { NameDialog } from "@/components/NameDialog";
 import { PersonAvatar } from "@/components/PresenceBar";
 import { RecoveryDialog } from "@/components/RecoveryDialog";
+import { ThemeMenuItems } from "@/components/ThemeToggle";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -118,6 +119,8 @@ export function AccountMenu({
             </a>
           </DropdownMenuItem>
           {children}
+          <DropdownMenuSeparator />
+          <ThemeMenuItems />
         </DropdownMenuContent>
       </DropdownMenu>
       <NameDialog
