@@ -48,8 +48,8 @@ pub struct SealedRecord<'a> {
     pub iv: Iv,
     /// The exact header bytes, bound to the ciphertext as associated data.
     pub aad: &'a [u8],
-    /// The record body: salt, ciphertext with the GCM tag, and signature
-    /// (see the `crypto` module).
+    /// The record body: version, salt, ciphertext with the GCM tag, and
+    /// signature (see the `crypto` module).
     pub ct: &'a [u8],
 }
 

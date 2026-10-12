@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use typstry_wire::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 
 use crate::engine::SyncError;
 use crate::hash::BlobHash;
@@ -16,11 +18,27 @@ use crate::link::percent_encode;
 /// the plaintext, see [`crate::worktree::MAX_ASSET_BYTES`].
 pub const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
     Write,
     Read,
+}
+
+/// By hand, so a permission from a newer server or a newer typstry's
+/// config.json asks for an upgrade instead of failing with serde's bare
+/// "unknown variant".
+impl<'de> Deserialize<'de> for Permission {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(d)?;
+        match value.as_str() {
+            "write" => Ok(Self::Write),
+            "read" => Ok(Self::Read),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown permission {other:?}, probably from a newer typstry; upgrade typstry"
+            ))),
+        }
+    }
 }
 
 impl Permission {
@@ -86,22 +104,16 @@ pub struct Api {
 }
 
 fn client(read_timeout: Option<Duration>) -> anyhow::Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL_VERSION));
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("typstry-cli/", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
         .connect_timeout(Duration::from_secs(15));
     if let Some(timeout) = read_timeout {
         builder = builder.read_timeout(timeout);
     }
     builder.build().context("creating the HTTP client")
-}
-
-/// Sends `req` with the URL, and so the share token, kept out of the
-/// error.
-async fn send(
-    req: reqwest::RequestBuilder,
-    what: impl FnOnce() -> String,
-) -> anyhow::Result<reqwest::Response> {
-    req.send().await.map_err(redact).with_context(what)
 }
 
 /// Whether a response is a bare status, which is how the typstry server
@@ -124,6 +136,21 @@ impl Api {
         })
     }
 
+    /// Sends `req` with the URL, and so the share token, kept out of the
+    /// error. A 426 is fatal for every call: the server no longer serves
+    /// this typstry and retrying won't change that.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: impl FnOnce() -> String,
+    ) -> anyhow::Result<reqwest::Response> {
+        let res = req.send().await.map_err(redact).with_context(what)?;
+        if res.status() == StatusCode::UPGRADE_REQUIRED {
+            return Err(SyncError::protocol_too_old(&self.origin).into());
+        }
+        Ok(res)
+    }
+
     /// `<origin>/api/<scope>/<token>`, plus `/<tail>` unless it is empty.
     /// The token is encoded here so no caller can forget to.
     fn token_url(&self, scope: &str, token: &str, tail: &str) -> String {
@@ -143,7 +170,9 @@ impl Api {
     /// Registers an empty project; its content arrives later, encrypted.
     pub async fn create_project(&self) -> anyhow::Result<CreatedProject> {
         let req = self.http.post(format!("{}/api/projects", self.origin));
-        let res = send(req, || format!("cannot reach {}", self.origin)).await?;
+        let res = self
+            .send(req, || format!("cannot reach {}", self.origin))
+            .await?;
         if !res.status().is_success() {
             bail!("creating the project failed: HTTP {}", res.status());
         }
@@ -152,7 +181,9 @@ impl Api {
 
     pub async fn resolve_share(&self, token: &str) -> anyhow::Result<ShareInfo> {
         let req = self.http.get(self.token_url("share", token, ""));
-        let res = send(req, || format!("cannot reach {}", self.origin)).await?;
+        let res = self
+            .send(req, || format!("cannot reach {}", self.origin))
+            .await?;
         let status = res.status();
         if !status.is_success() {
             // Typed, so live sync stops instead of retrying a link that
@@ -165,12 +196,18 @@ impl Api {
             }
             bail!("resolving the link failed: HTTP {status}");
         }
-        Ok(res.json().await.map_err(redact)?)
+        // Not res.json(): its error hides the reason, like an unknown
+        // permission, behind "error decoding response body".
+        let body = res.bytes().await.map_err(redact)?;
+        serde_json::from_slice(&body)
+            .map_err(|err| anyhow::anyhow!("resolving the link failed: {err}"))
     }
 
     pub async fn get_blob(&self, token: &str, hash: &str) -> anyhow::Result<Vec<u8>> {
         let url = self.project_url(token, &format!("blobs/{}", percent_encode(hash)));
-        let res = send(self.http.get(url), || format!("downloading {hash}")).await?;
+        let res = self
+            .send(self.http.get(url), || format!("downloading {hash}"))
+            .await?;
         if !res.status().is_success() {
             bail!("downloading {hash} failed: HTTP {}", res.status());
         }
@@ -197,7 +234,7 @@ impl Api {
             .timeout(deadline)
             .header("content-type", "application/octet-stream")
             .body(sealed);
-        let res = send(req, || "uploading an asset".to_owned()).await?;
+        let res = self.send(req, || "uploading an asset".to_owned()).await?;
         match res.status() {
             StatusCode::FORBIDDEN => bail!("this link is read-only"),
             StatusCode::PAYLOAD_TOO_LARGE => {
@@ -225,7 +262,7 @@ impl Api {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -245,24 +282,32 @@ mod tests {
     }
 
     /// Answers every request with `response`, for as long as the test runs.
-    async fn fake_server(response: &'static [u8]) -> String {
+    /// Returns its origin and the requests it got, lowercased.
+    pub(crate) async fn fake_server(
+        response: &'static [u8],
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, requests) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = [0; 1024];
-                let _ = socket.read(&mut request).await;
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let _ = seen.send(String::from_utf8_lossy(&request[..n]).to_lowercase());
                 let _ = socket.write_all(response).await;
             }
         });
-        origin
+        (origin, requests)
     }
+
+    pub(crate) const UPGRADE_REQUIRED: &[u8] =
+        b"HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
     #[tokio::test]
     async fn a_revoked_link_is_fatal() {
-        let origin = fake_server(
+        let (origin, _) = fake_server(
             b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         )
         .await;
@@ -278,8 +323,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_outdated_typstry_is_told_to_upgrade() {
+        let (origin, mut requests) = fake_server(UPGRADE_REQUIRED).await;
+        let err = Api::new(&origin)
+            .unwrap()
+            .resolve_share("tok")
+            .await
+            .unwrap_err();
+        let request = requests.recv().await.unwrap();
+        assert!(
+            request.contains(&format!("{PROTOCOL_HEADER}: {PROTOCOL_VERSION}\r\n")),
+            "{request}"
+        );
+        assert!(
+            matches!(
+                SyncError::fatal(&err),
+                Some(SyncError::ProtocolTooOld { .. })
+            ),
+            "{err:#}"
+        );
+        let host = origin.trim_start_matches("http://");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("this typstry is too old for the server at {host}; upgrade typstry")
+        );
+    }
+
+    #[tokio::test]
     async fn a_foreign_404_is_not_fatal() {
-        let origin = fake_server(
+        let (origin, _) = fake_server(
             b"HTTP/1.1 404 Not Found\r\ncontent-type: text/html\r\ncontent-length: 13\r\n\
               connection: close\r\n\r\n<h1>404</h1>\n",
         )
@@ -293,10 +365,38 @@ mod tests {
         assert!(format!("{err:#}").contains("HTTP 404"), "{err:#}");
     }
 
+    #[test]
+    fn an_unknown_permission_asks_for_an_upgrade() {
+        let parse = |p: &str| serde_json::from_str::<Permission>(&format!("{p:?}"));
+        assert_eq!(parse("write").unwrap(), Permission::Write);
+        assert_eq!(parse("read").unwrap(), Permission::Read);
+        let err = parse("comment").unwrap_err();
+        assert!(err.to_string().contains("upgrade typstry"), "{err}");
+        assert_eq!(
+            serde_json::to_string(&Permission::Write).unwrap(),
+            r#""write""#
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_permission_from_the_server_asks_for_an_upgrade() {
+        let (origin, _) = fake_server(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 38\r\n\
+              connection: close\r\n\r\n{\"projectId\":\"p\",\"permission\":\"admin\"}",
+        )
+        .await;
+        let err = Api::new(&origin)
+            .unwrap()
+            .resolve_share("tok")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+    }
+
     #[tokio::test]
     async fn blobs_must_match_their_hash() {
         // Serves "abc" for any blob, whatever hash was asked for.
-        let origin =
+        let (origin, _) =
             fake_server(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc")
                 .await;
         let api = Api::new(&origin).unwrap();

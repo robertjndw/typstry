@@ -21,11 +21,13 @@ use loro_protocol::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use typstry_wire::fragment::{Reassembler, encode_batch, random_batch_id};
 
 use crate::api::install_crypto_provider;
+use crate::engine::SyncError;
 
 /// Same interval as the JS client. The server drops connections that stay
 /// silent for 90 s.
@@ -96,10 +98,18 @@ pub struct Client {
 impl Client {
     pub async fn connect(url: &str, room: &str) -> anyhow::Result<Self> {
         install_crypto_provider();
-        let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
+        let (ws, _) = match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
             .await
             .with_context(|| format!("connecting to {url} timed out"))?
-            .with_context(|| format!("cannot connect to {url}"))?;
+        {
+            Ok(connected) => connected,
+            // The server checks our version before the upgrade, so being
+            // too old shows up as the handshake's HTTP status.
+            Err(Error::Http(res)) if res.status() == StatusCode::UPGRADE_REQUIRED => {
+                return Err(SyncError::protocol_too_old(url).into());
+            }
+            Err(err) => return Err(err).with_context(|| format!("cannot connect to {url}")),
+        };
         Ok(Self::spawn(ws, room))
     }
 
@@ -486,6 +496,22 @@ mod tests {
         }
         assert!(typstry_wire::elo::decode_container(&hostile).is_err());
         client.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_outdated_typstry_is_told_to_upgrade() {
+        let (origin, _) = crate::api::tests::fake_server(crate::api::tests::UPGRADE_REQUIRED).await;
+        let addr = origin.trim_start_matches("http://");
+        let url = crate::link::ws_url(&origin).unwrap();
+        let err = Client::connect(&url, "room").await.err().unwrap();
+        assert!(
+            matches!(
+                SyncError::fatal(&err),
+                Some(SyncError::ProtocolTooOld { server }) if server == addr
+            ),
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
     }
 
     /// A server that never reads fills the send buffer, which leaves the

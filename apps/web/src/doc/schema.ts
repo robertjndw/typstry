@@ -11,7 +11,12 @@ import {
   type TreeID,
 } from "loro-crdt";
 
-/** Bumped whenever the document layout changes incompatibly. */
+/**
+ * Bumped when an older client writing into the doc would corrupt it.
+ * Additive data older clients can ignore (like deletedVersions) does not
+ * count. Docs are never rewritten wholesale, so readers keep handling every
+ * schema from 1 up. Must match SCHEMA_VERSION in crates/typstry-doc.
+ */
 export const SCHEMA_VERSION = 1;
 
 export const ROOT = {
@@ -195,4 +200,44 @@ export function initProject(
   project.meta.set(META.title, opts.title);
   project.doc.commit({ message: "init project" });
   return project;
+}
+
+/**
+ * A doc this new must not be written to, since editing a layout we don't
+ * know would corrupt it for everyone. Mirrors ensure_supported in Rust.
+ */
+export function isSchemaTooNew(schema: number | null): boolean {
+  return schema !== null && schema > SCHEMA_VERSION;
+}
+
+/** One migration step: MIGRATIONS[i] brings a doc from schema i+1 to i+2. */
+type Migration = (project: ProjectDoc) => void;
+
+/**
+ * Steps must be deterministic and idempotent: two peers can migrate the same
+ * doc at once and the CRDT keeps both sets of ops, so every peer has to write
+ * the same thing, and rerunning a step on a (partly) migrated doc must change
+ * nothing. No random ids, timestamps or anything from the peer. Must match
+ * MIGRATIONS in crates/typstry-doc step by step.
+ */
+const MIGRATIONS: readonly Migration[] = [];
+
+if (MIGRATIONS.length !== SCHEMA_VERSION - 1)
+  throw new Error("every schema bump needs its migration step");
+
+/**
+ * Brings an older doc up to SCHEMA_VERSION; returns whether it changed
+ * anything. Writers only, and only once the doc has caught up with the
+ * server so the steps see the whole project. Docs without a schema (empty
+ * or about to be seeded) and newer docs are left alone.
+ */
+export function migrate(project: ProjectDoc): boolean {
+  const from = project.schemaVersion;
+  if (from === null || from >= SCHEMA_VERSION) return false;
+  // Schemas start at 1, so anything smaller is garbage. Run every step.
+  const first = Math.max(0, Math.ceil(from) - 1);
+  for (const step of MIGRATIONS.slice(first)) step(project);
+  project.meta.set(META.schema, SCHEMA_VERSION);
+  project.doc.commit({ message: "migrate schema", origin: META_ORIGIN });
+  return true;
 }

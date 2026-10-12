@@ -253,9 +253,24 @@ pub enum SyncError {
     /// bad one gets [`Self::LinkRefused`].
     #[error("the server does not know this link; it may have been revoked")]
     UnknownLink,
+    #[error(transparent)]
+    SchemaTooNew(#[from] typstry_doc::SchemaTooNew),
+    /// The server answered 426: it no longer serves this protocol version.
+    #[error("this typstry is too old for the server at {server}; upgrade typstry")]
+    ProtocolTooOld { server: String },
 }
 
 impl SyncError {
+    /// For a 426 from `url`, named by its host since the scheme and path
+    /// differ between the HTTP and WebSocket endpoints of one server.
+    pub fn protocol_too_old(url: &str) -> Self {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        Self::ProtocolTooOld {
+            server: host.to_owned(),
+        }
+    }
+
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::Disconnected(_))
     }
@@ -295,8 +310,12 @@ impl Session {
         let state = StateDir::discover(start)?;
         let config = state.load_config()?;
         let base = state.load_base()?;
-        let doc = state.load_doc()?;
+        let (doc, note) = state.load_doc()?;
+        // Checked here so read-only commands refuse too: they would
+        // misread a layout this build does not know.
+        typstry_doc::ensure_supported(&doc).map_err(SyncError::from)?;
         let mut session = Self::assemble(state, config, base, doc, name, api)?;
+        session.warnings.extend(note);
         session.saved_vv = Some(session.doc.oplog_vv());
         session.saved_base = Some(session.base.clone());
         (session.snapshot_bytes, session.log_bytes) = session.state.doc_sizes();
@@ -356,7 +375,7 @@ impl Session {
         api: Option<Api>,
     ) -> anyhow::Result<Self> {
         let key = ProjectKey::from_base64url(&config.key)
-            .context("the project key in .typstry/config.json is malformed")?;
+            .context("reading the project key in .typstry/config.json")?;
         let api = match api {
             Some(api) => api,
             None => Api::new(&config.server)?,
@@ -580,6 +599,29 @@ mod tests {
             Identity::new(&"x".repeat(100)).name.len(),
             typstry_doc::peers::MAX_PEER_NAME_UTF16
         );
+    }
+
+    #[test]
+    fn a_doc_from_a_newer_typstry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        state
+            .save_config(&crate::state::tests::test_config())
+            .unwrap();
+        let doc = LoroDoc::new();
+        doc.get_map(typstry_doc::root::META)
+            .insert(typstry_doc::meta::SCHEMA, 2.0)
+            .unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        drop(state);
+
+        let err = Session::open(dir.path(), None).err().unwrap();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+        assert!(matches!(
+            SyncError::fatal(&err),
+            Some(SyncError::SchemaTooNew(_))
+        ));
     }
 
     #[test]

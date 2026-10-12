@@ -20,7 +20,11 @@ use std::str::FromStr;
 
 use loro::{LoroDoc, LoroMap, LoroText, LoroValue, TreeID, ValueOrContainer};
 
-/// Bumped whenever the document layout changes incompatibly.
+/// Bumped whenever the document layout changes incompatibly, meaning an
+/// older client writing into the doc would corrupt it. Additive data older
+/// clients ignore (like `deletedVersions`) doesn't count. Docs are never
+/// rewritten wholesale, so readers have to keep handling every schema from
+/// 1 up. Must match `SCHEMA_VERSION` in schema.ts.
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// The doc's `meta.schema`, or None for a doc that was never initialized.
@@ -37,6 +41,69 @@ pub fn schema_version(doc: &LoroDoc) -> Option<i64> {
         LoroValue::Double(v) if v.is_finite() => Some(v.ceil() as i64),
         _ => None,
     }
+}
+
+/// The doc was written in a layout newer than this build understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "this project uses document layout {found}, but this typstry only supports up to {supported}; upgrade typstry"
+)]
+pub struct SchemaTooNew {
+    pub found: i64,
+    pub supported: i64,
+}
+
+/// Fails for a doc whose `meta.schema` is newer than [`SCHEMA_VERSION`].
+/// Anyone about to write into the doc must check this first: an older
+/// client editing a newer layout would corrupt it for everyone. A doc
+/// without a schema yet (still syncing, or not initialized) passes.
+pub fn ensure_supported(doc: &LoroDoc) -> Result<(), SchemaTooNew> {
+    match schema_version(doc) {
+        Some(found) if found > SCHEMA_VERSION => Err(SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// One migration step: `MIGRATIONS[i]` brings a doc from schema `i + 1` to
+/// `i + 2`.
+type Migration = fn(&LoroDoc) -> loro::LoroResult<()>;
+
+/// Steps must be deterministic and idempotent: two peers can migrate the
+/// same doc at once and the CRDT merges both sets of ops, so a step has to
+/// write exactly what any other peer would, and do nothing on a doc that is
+/// already (partly) migrated. No random ids, timestamps or peer ids.
+/// Mirrors `MIGRATIONS` in schema.ts step by step.
+const MIGRATIONS: &[Migration] = &[];
+
+const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1);
+
+/// Brings an older doc up to [`SCHEMA_VERSION`] and returns whether it
+/// changed anything. Only for writers, and only once the doc has caught up
+/// with the server so the steps see the whole project. Docs without a
+/// schema (empty, or about to be seeded by their creator) and newer docs
+/// are left alone; call [`ensure_supported`] first for the latter.
+pub fn migrate(doc: &LoroDoc) -> loro::LoroResult<bool> {
+    let Some(from) = schema_version(doc) else {
+        return Ok(false);
+    };
+    if from >= SCHEMA_VERSION {
+        return Ok(false);
+    }
+    // Schemas start at 1, so anything smaller is garbage. Run every step.
+    let first = usize::try_from(from.max(1) - 1).unwrap_or(0);
+    for step in &MIGRATIONS[first..] {
+        step(doc)?;
+    }
+    // A double, like the browser writes, so concurrent migrations from
+    // both sides store the same value.
+    doc.get_map(root::META)
+        .insert(meta::SCHEMA, SCHEMA_VERSION as f64)?;
+    doc.set_next_commit_message("migrate schema");
+    doc.commit();
+    Ok(true)
 }
 
 /// Loro merges consecutive local commits into one change while they are at
@@ -246,6 +313,40 @@ mod tests {
         assert_eq!(decoded, expected);
         let single: Frontiers = loro::ID::new(7, 3).into();
         assert_eq!(single.encode(), [1, 7, 6]);
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused() {
+        let doc = LoroDoc::new();
+        assert_eq!(ensure_supported(&doc), Ok(()));
+        let meta_map = doc.get_map(root::META);
+        meta_map
+            .insert(meta::SCHEMA, SCHEMA_VERSION as f64)
+            .unwrap();
+        assert_eq!(ensure_supported(&doc), Ok(()));
+        meta_map.insert(meta::SCHEMA, 2.0).unwrap();
+        let err = ensure_supported(&doc).unwrap_err();
+        assert_eq!(
+            err,
+            SchemaTooNew {
+                found: 2,
+                supported: SCHEMA_VERSION
+            }
+        );
+        assert!(err.to_string().contains("upgrade typstry"), "{err}");
+    }
+
+    #[test]
+    fn migrate_leaves_a_current_doc_alone() {
+        let doc = LoroDoc::new();
+        assert!(!migrate(&doc).unwrap());
+        assert_eq!(schema_version(&doc), None);
+
+        init::init_project(&doc, "T").unwrap();
+        let before = doc.oplog_vv();
+        assert!(!migrate(&doc).unwrap());
+        assert_eq!(doc.oplog_vv(), before);
+        assert_eq!(schema_version(&doc), Some(SCHEMA_VERSION));
     }
 
     #[test]

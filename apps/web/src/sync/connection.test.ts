@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
 
 import { connectProject, projectWsUrl, type SyncStatus } from "./connection";
+import { PROTOCOL_VERSION } from "./protocol";
 
 const key = await importProjectKey(generateEditSecret());
 
@@ -76,10 +77,10 @@ beforeEach(() => {
 describe("projectWsUrl", () => {
   it("follows the page protocol", () => {
     expect(projectWsUrl({ protocol: "https:", host: "a.b" })).toBe(
-      "wss://a.b/ws",
+      `wss://a.b/ws?protocol=${PROTOCOL_VERSION}`,
     );
     expect(projectWsUrl({ protocol: "http:", host: "localhost:5173" })).toBe(
-      "ws://localhost:5173/ws",
+      `ws://localhost:5173/ws?protocol=${PROTOCOL_VERSION}`,
     );
   });
 });
@@ -178,6 +179,47 @@ describe("connectProject", () => {
     expect(destroy).toHaveBeenCalled();
     expect(fake.clients.at(-1)!.destroyed).toBe(true);
     expect(listener).toHaveBeenLastCalledWith("disconnected");
+  });
+});
+
+describe("an outdated page", () => {
+  function connect(outdated: boolean) {
+    const checkOutdated = vi.fn(() => Promise.resolve(outdated));
+    const onOutdated = vi.fn();
+    const conn = connectProject({
+      projectId: "p",
+      token: "t",
+      key,
+      canWrite: true,
+      doc: new LoroDoc(),
+      url: "ws://x/ws",
+      checkOutdated,
+      onOutdated,
+    });
+    return { conn, client: lastClient(), checkOutdated, onOutdated };
+  }
+
+  it("stops for good once the server says it is too old", async () => {
+    const { conn, client, checkOutdated, onOutdated } = connect(true);
+    client.setStatus("disconnected");
+    await vi.waitFor(() => expect(onOutdated).toHaveBeenCalledOnce());
+    expect(checkOutdated).toHaveBeenCalledOnce();
+    expect(conn.getStatus()).toBe("disconnected");
+    expect(fake.clients.at(-1)!.destroyed).toBe(true);
+  });
+
+  it("keeps retrying and rate-limits the check while still served", async () => {
+    const { conn, client, checkOutdated, onOutdated } = connect(false);
+    for (let i = 0; i < 3; i++) {
+      client.setStatus("disconnected");
+      client.setStatus("connecting");
+    }
+    await Promise.resolve();
+    // Repeated failures share one check.
+    expect(checkOutdated).toHaveBeenCalledOnce();
+    expect(onOutdated).not.toHaveBeenCalled();
+    expect(fake.clients.at(-1)!.destroyed).toBe(false);
+    conn.close();
   });
 });
 

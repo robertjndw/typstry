@@ -34,6 +34,23 @@ const GITIGNORE: &str = ".gitignore";
 
 const LOCK_GRACE: Duration = Duration::from_millis(500);
 
+/// Format versions of `config.json` and `base.json`. Bump one when an
+/// older typstry would misread the file, and add the step that brings the
+/// previous version up to it to the matching `*_MIGRATIONS`. Files from
+/// before versions existed count as version 1.
+pub const CONFIG_VERSION: u32 = 1;
+pub const BASE_VERSION: u32 = 1;
+
+/// `CONFIG_MIGRATIONS[i]` turns a version `i + 1` config into version
+/// `i + 2`, on the raw JSON before it is parsed.
+const CONFIG_MIGRATIONS: &[Migration] = &[];
+const BASE_MIGRATIONS: &[Migration] = &[];
+
+type Migration = fn(&mut serde_json::Value);
+
+const _: () = assert!(CONFIG_MIGRATIONS.len() as u32 == CONFIG_VERSION - 1);
+const _: () = assert!(BASE_MIGRATIONS.len() as u32 == BASE_VERSION - 1);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -259,7 +276,7 @@ impl StateDir {
             .canonicalize()
             .with_context(|| format!("cannot open {}", start.display()))?;
         match Self::find_root(&start) {
-            Some(dir) => read_json(&dir.join(STATE_DIR).join(CONFIG)),
+            Some(dir) => read_config(&dir.join(STATE_DIR).join(CONFIG)),
             None => bail!(
                 "{} is not inside a typstry project (no {STATE_DIR}/ found)",
                 start.display()
@@ -343,11 +360,11 @@ impl StateDir {
     }
 
     pub fn load_config(&self) -> anyhow::Result<Config> {
-        read_json(&self.dir.join(CONFIG))
+        read_config(&self.dir.join(CONFIG))
     }
 
     pub fn save_config(&self, config: &Config) -> anyhow::Result<()> {
-        write_json(&self.dir.join(CONFIG), config)
+        write_versioned(&self.dir.join(CONFIG), config, CONFIG_VERSION)
     }
 
     pub fn load_base(&self) -> anyhow::Result<Base> {
@@ -355,28 +372,51 @@ impl StateDir {
         if !path.exists() {
             return Ok(Base::default());
         }
-        read_json(&path)
+        read_versioned(&path, BASE_VERSION, BASE_MIGRATIONS)
     }
 
     pub fn save_base(&self, base: &Base) -> anyhow::Result<()> {
-        write_json(&self.dir.join(BASE), base)
+        write_versioned(&self.dir.join(BASE), base, BASE_VERSION)
     }
 
-    /// The cached doc, or an empty one before the first sync. A log entry
-    /// that a crash cut off is dropped from the file, so the next append
-    /// does not land behind it. A damaged entry with more after it is an
-    /// error instead, see [`log_entries`].
-    pub fn load_doc(&self) -> anyhow::Result<LoroDoc> {
+    /// The cached doc, or an empty one before the first sync, plus a
+    /// warning when it had to drop the log. A log entry that a crash cut
+    /// off is dropped from the file, so the next append does not land
+    /// behind it. A damaged entry with more after it is an error instead,
+    /// see [`log_entries`].
+    ///
+    /// A log from before the preamble is folded into a fresh snapshot right
+    /// away, so nothing gets appended to it. One from a newer typstry is
+    /// dropped. It is only a cache over `doc.bin`, and what of it reached
+    /// the server comes back on the next connect. `base.json` stays, it
+    /// describes the folder.
+    pub fn load_doc(&self) -> anyhow::Result<(LoroDoc, Option<String>)> {
         let (doc, log) = read_doc_and_log(&self.dir)?;
-        if log.torn {
-            let path = self.dir.join(DOC_LOG);
-            OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .and_then(|file| file.set_len(log.valid))
-                .with_context(|| format!("repairing {}", path.display()))?;
+        let path = self.dir.join(DOC_LOG);
+        match log.format {
+            LogFormat::Current if log.torn => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_len(log.valid))
+                    .with_context(|| format!("repairing {}", path.display()))?;
+            }
+            LogFormat::Current | LogFormat::Missing => {}
+            LogFormat::Legacy => {
+                self.save_doc(&doc)?;
+            }
+            LogFormat::Unknown(version) => {
+                remove_if_exists(&path)?;
+                return Ok((
+                    doc,
+                    Some(format!(
+                        "dropped {} (format {version}, written by a newer typstry); changes in it that reached the server come back on the next sync",
+                        path.display()
+                    )),
+                ));
+            }
         }
-        Ok(doc)
+        Ok((doc, None))
     }
 
     /// Sizes in bytes of the snapshot and of the log on top of it.
@@ -415,7 +455,12 @@ impl StateDir {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         let before = file.metadata()?.len();
-        let frame = log_frame(update);
+        let mut frame = log_frame(update);
+        // In one write with the first entry, so a crash cannot leave a log
+        // that has entries but no preamble.
+        if before == 0 {
+            frame.splice(0..0, log_preamble());
+        }
         let result = file.write_all(&frame).and_then(|()| file.sync_data());
         if let Err(err) = result {
             let _ = file.set_len(before);
@@ -458,10 +503,62 @@ impl StateDir {
 /// What reading the log found.
 #[derive(Debug, Default)]
 struct LogRead {
-    /// Bytes of whole, intact entries from the start.
+    format: LogFormat,
+    /// Bytes of the preamble and whole, intact entries from the start.
     valid: u64,
     /// Something follows them: an entry cut off by a crash.
     torn: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    /// No log, or an empty one.
+    #[default]
+    Missing,
+    /// [`LOG_FORMAT`], or a preamble a crash cut off, whose entries
+    /// then start at 0.
+    Current,
+    /// Entries without a preamble, as typstry wrote them before it had one.
+    /// The entries themselves are framed the same way.
+    Legacy,
+    /// A preamble with another version, from a newer typstry.
+    Unknown(u32),
+}
+
+/// The log starts with this and [`LOG_FORMAT`] (u32 LE), so a typstry
+/// that changes how entries are framed can tell its logs from older ones.
+/// A preambleless log can never start with it: its first four bytes would
+/// be a length, and the next four would have to be its complement.
+const LOG_MAGIC: &[u8; 8] = b"TYPSTRYL";
+/// Format of `doc.log`, written into its preamble. Bump it when entries are
+/// framed differently, so an older typstry drops the log instead of
+/// misreading it.
+pub const LOG_FORMAT: u32 = 1;
+const LOG_PREAMBLE: usize = LOG_MAGIC.len() + 4;
+
+fn log_preamble() -> [u8; LOG_PREAMBLE] {
+    let mut preamble = [0; LOG_PREAMBLE];
+    preamble[..LOG_MAGIC.len()].copy_from_slice(LOG_MAGIC);
+    preamble[LOG_MAGIC.len()..].copy_from_slice(&LOG_FORMAT.to_le_bytes());
+    preamble
+}
+
+/// The format of `log` and where its entries start.
+fn log_format(log: &[u8]) -> (LogFormat, usize) {
+    if log.is_empty() {
+        return (LogFormat::Missing, 0);
+    }
+    let magic = &log[..log.len().min(LOG_MAGIC.len())];
+    if magic != &LOG_MAGIC[..magic.len()] {
+        return (LogFormat::Legacy, 0);
+    }
+    let Some(version) = log.get(LOG_MAGIC.len()..LOG_PREAMBLE) else {
+        return (LogFormat::Current, 0);
+    };
+    match u32::from_le_bytes(version.try_into().expect("4 bytes")) {
+        LOG_FORMAT => (LogFormat::Current, LOG_PREAMBLE),
+        other => (LogFormat::Unknown(other), LOG_PREAMBLE),
+    }
 }
 
 /// Each log entry: the update's length (u32 LE), its bitwise complement,
@@ -489,12 +586,13 @@ fn log_frame(update: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// The intact entries at the start of `log`. Only the last append can be
-/// torn, since each one is synced before the next, so the first damaged
-/// entry is taken for a torn one only when no intact entry follows it.
+/// The intact entries at the start of `log`, and how many bytes they take.
+/// Only the last append can be torn, since each one is synced before the
+/// next, so the first damaged entry is taken for a torn one only when no
+/// intact entry follows it.
 /// Otherwise cutting there would lose entries that were synced; that is
 /// `Err` with its offset, for someone to look at.
-fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
+fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, usize), usize> {
     let mut entries = Vec::new();
     let mut at = 0;
     while at < log.len() {
@@ -507,11 +605,7 @@ fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
         entries.push(body);
         at += LOG_HEADER + body.len();
     }
-    let read = LogRead {
-        valid: at as u64,
-        torn: at < log.len(),
-    };
-    Ok((entries, read))
+    Ok((entries, at))
 }
 
 /// The update of the intact entry starting at `at`, if there is one.
@@ -551,24 +645,86 @@ fn read_doc_and_log(dir: &Path) -> anyhow::Result<(LoroDoc, LogRead)> {
     let path = dir.join(DOC_LOG);
     let mut read = LogRead::default();
     if let Some(log) = read_optional(&path)? {
-        let (entries, found) = log_entries(&log).map_err(|at| {
+        let (format, start) = log_format(&log);
+        match format {
+            LogFormat::Unknown(_) => return Ok((doc, LogRead { format, ..read })),
+            // The first append was cut off inside the preamble, before
+            // any entry made it.
+            LogFormat::Current if start == 0 => {
+                let read = LogRead {
+                    format,
+                    valid: 0,
+                    torn: true,
+                };
+                return Ok((doc, read));
+            }
+            _ => {}
+        }
+        let (entries, intact) = log_entries(&log[start..]).map_err(|at| {
             anyhow::anyhow!(
-                "{} is corrupt: the entry at byte {at} is damaged and more follow it",
-                path.display()
+                "{} is corrupt: the entry at byte {} is damaged and more follow it",
+                path.display(),
+                start + at
             )
         })?;
         if !entries.is_empty() {
             doc.import_batch(&entries.iter().map(|e| e.to_vec()).collect::<Vec<_>>())
                 .with_context(|| format!("{} is corrupt", path.display()))?;
         }
-        read = found;
+        let valid = start + intact;
+        read = LogRead {
+            format,
+            valid: valid as u64,
+            torn: valid < log.len(),
+        };
     }
     Ok((doc, read))
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+fn read_config(path: &Path) -> anyhow::Result<Config> {
+    read_versioned(path, CONFIG_VERSION, CONFIG_MIGRATIONS)
+}
+
+/// Reads a JSON file that carries a format `version`, migrating an older
+/// one up to `current` first. A newer one is refused, since saving it
+/// again would drop the fields this build does not know.
+fn read_versioned<T: DeserializeOwned>(
+    path: &Path,
+    current: u32,
+    migrations: &[Migration],
+) -> anyhow::Result<T> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("{} is malformed", path.display()))
+    let malformed = || format!("{} is malformed", path.display());
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).with_context(malformed)?;
+    let version = match value.get("version") {
+        // Files from before versions existed.
+        None => 1,
+        Some(v) => v
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v >= 1)
+            .with_context(|| format!("{}: version {v} is not valid", malformed()))?,
+    };
+    if version > current {
+        bail!(
+            "{} was written by a newer typstry (format {version}, this one reads up to {current}); upgrade typstry",
+            path.display()
+        );
+    }
+    for step in &migrations[version as usize - 1..] {
+        step(&mut value);
+    }
+    serde_json::from_value(value).with_context(malformed)
+}
+
+/// Writes `value` with `version` set to `current`. Only the file has a
+/// version; the structs don't carry one.
+fn write_versioned<T: Serialize>(path: &Path, value: &T, current: u32) -> anyhow::Result<()> {
+    let mut value = serde_json::to_value(value)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("version".to_owned(), current.into());
+    }
+    write_json(path, &value)
 }
 
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
@@ -654,25 +810,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
     fn lock_is_exclusive() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::create(dir.path()).unwrap();
-        state
-            .save_config(&Config {
-                server: "http://x".into(),
-                project_id: "p".into(),
-                token: "t".into(),
-                key: "k".into(),
-                permission: Permission::Write,
-                view_token: None,
-                name: None,
-                branch: None,
-            })
-            .unwrap();
+        state.save_config(&test_config()).unwrap();
         let err = StateDir::discover(dir.path()).unwrap_err();
         assert!(err.to_string().contains("another typstry command"), "{err}");
         drop(state);
@@ -680,6 +825,140 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         let found = StateDir::discover(&sub).unwrap();
         assert_eq!(found.root(), dir.path().canonicalize().unwrap());
+    }
+
+    pub(crate) fn test_config() -> Config {
+        Config {
+            server: "http://x".into(),
+            project_id: "p".into(),
+            token: "t".into(),
+            key: "k".into(),
+            permission: Permission::Write,
+            view_token: None,
+            name: None,
+            branch: None,
+        }
+    }
+
+    #[test]
+    fn config_and_base_without_a_version_load_as_version_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        fs::write(
+            state.dir().join(CONFIG),
+            r#"{"server":"http://x","projectId":"p","token":"t","key":"k","permission":"write"}"#,
+        )
+        .unwrap();
+        fs::write(state.dir().join(BASE), r#"{"frontiers":""}"#).unwrap();
+        let config = state.load_config().unwrap();
+        assert_eq!(config.project_id, "p");
+        assert_eq!(state.load_base().unwrap(), Base::default());
+
+        state.save_config(&config).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.dir().join(CONFIG)).unwrap()).unwrap();
+        assert_eq!(saved["version"], CONFIG_VERSION);
+        state.save_base(&Base::default()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.dir().join(BASE)).unwrap()).unwrap();
+        assert_eq!(saved["version"], BASE_VERSION);
+    }
+
+    #[test]
+    fn newer_config_and_base_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let mut config = serde_json::to_value(test_config()).unwrap();
+        config["version"] = (CONFIG_VERSION + 1).into();
+        fs::write(state.dir().join(CONFIG), config.to_string()).unwrap();
+        let err = state.load_config().unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+        let err = StateDir::peek_config(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+
+        let base = format!(r#"{{"version":{},"frontiers":""}}"#, BASE_VERSION + 1);
+        fs::write(state.dir().join(BASE), base).unwrap();
+        let err = state.load_base().unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+
+        fs::write(state.dir().join(BASE), r#"{"version":"x"}"#).unwrap();
+        let err = state.load_base().unwrap_err();
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+    }
+
+    #[test]
+    fn a_log_without_preamble_is_folded_into_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let doc = LoroDoc::new();
+        let text = doc.get_text("t");
+        text.insert(0, "snapshot").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let saved = doc.oplog_vv();
+        text.insert(text.len_unicode(), " logged").unwrap();
+        doc.commit();
+        // How typstry wrote the log before it had a preamble.
+        let update = doc.export(loro::ExportMode::updates(&saved)).unwrap();
+        let log = state.dir().join(DOC_LOG);
+        fs::write(&log, log_frame(&update)).unwrap();
+
+        assert_eq!(
+            read_doc(state.dir()).unwrap().get_text("t").to_string(),
+            "snapshot logged"
+        );
+        let (loaded, note) = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot logged");
+        assert_eq!(note, None);
+        assert!(!log.exists());
+        let loaded = state.load_doc().unwrap().0;
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot logged");
+    }
+
+    #[test]
+    fn a_log_from_a_newer_typstry_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        state.save_base(&Base::default()).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "snapshot").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let log = state.dir().join(DOC_LOG);
+        let mut bytes = LOG_MAGIC.to_vec();
+        bytes.extend_from_slice(&(LOG_FORMAT + 1).to_le_bytes());
+        bytes.extend_from_slice(b"whatever comes next");
+        fs::write(&log, bytes).unwrap();
+
+        assert_eq!(
+            read_doc(state.dir()).unwrap().get_text("t").to_string(),
+            "snapshot"
+        );
+        let (loaded, note) = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot");
+        assert!(note.unwrap().contains("newer typstry"));
+        assert!(!log.exists());
+        assert!(state.dir().join(BASE).exists());
+    }
+
+    #[test]
+    fn a_preamble_cut_off_by_a_crash_reads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let log = state.dir().join(DOC_LOG);
+        fs::write(&log, &log_preamble()[..5]).unwrap();
+        state.load_doc().unwrap();
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0);
+
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "after").unwrap();
+        doc.commit();
+        state
+            .append_doc(&doc.export(loro::ExportMode::all_updates()).unwrap())
+            .unwrap();
+        assert!(fs::read(&log).unwrap().starts_with(LOG_MAGIC));
+        let loaded = state.load_doc().unwrap().0;
+        assert_eq!(loaded.get_text("t").to_string(), "after");
     }
 
     #[test]
@@ -719,7 +998,7 @@ mod tests {
             state.append_doc(&update).unwrap();
             saved = doc.oplog_vv();
         }
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
 
         // A crash halfway through the next append.
@@ -732,18 +1011,18 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
         file.write_all(&frame[..frame.len() / 2]).unwrap();
         drop(file);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
         // Cut back to the whole entries, so the next one is readable.
         assert_eq!(fs::metadata(&log).unwrap().len(), whole);
         state.append_doc(&update).unwrap();
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
 
         // A snapshot covers the log and replaces it.
         state.save_doc(&doc).unwrap();
         assert!(!log.exists());
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
     }
 
@@ -779,7 +1058,7 @@ mod tests {
         let log = state.dir().join(DOC_LOG);
         // Garbage in the last entry's body, as a crash can leave.
         flip_byte(&log, fs::metadata(&log).unwrap().len() - 1);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two");
         assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
@@ -820,7 +1099,7 @@ mod tests {
         let starts = three_entry_log(&state);
         let log = state.dir().join(DOC_LOG);
         flip_byte(&log, starts[2] + 3);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two");
         assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
@@ -835,7 +1114,7 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
         file.write_all(&[0; 64]).unwrap();
         drop(file);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two three");
         assert_eq!(fs::metadata(&log).unwrap().len(), whole);
     }

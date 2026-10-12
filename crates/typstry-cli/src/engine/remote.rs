@@ -317,6 +317,9 @@ impl Session {
             .into());
         }
         if self.can_write() {
+            // Only from here on does the doc hold the whole project, which
+            // migrating needs. The result goes out with the push below.
+            typstry_doc::migrate(&self.doc).context("migrating the project")?;
             self.push_local().await?;
         }
         Ok(())
@@ -416,9 +419,12 @@ impl Session {
                     }
                     if !self.warned_unreadable {
                         self.warned_unreadable = true;
-                        self.warnings.push(format!(
-                            "skipping changes that do not decrypt with this folder's key ({err}); the browser skips them too"
-                        ));
+                        self.warnings.push(match err {
+                            CryptoError::NewerVersion(_) => format!("skipping changes {err}"),
+                            err => format!(
+                                "skipping changes that do not decrypt with this folder's key ({err}); the browser skips them too"
+                            ),
+                        });
                     }
                     continue;
                 }
@@ -442,6 +448,9 @@ impl Session {
                 raise(&mut conn.server, peer, end);
             }
         }
+        // A newer client may migrate the project while we sync. Fatal, so
+        // a running sync stops instead of writing into the new layout.
+        typstry_doc::ensure_supported(&self.doc).map_err(SyncError::from)?;
         Ok(self.doc.oplog_vv() != before)
     }
 
@@ -581,7 +590,7 @@ mod tests {
         doc.commit();
         let end = *doc.oplog_vv().get(&7).unwrap() as u64;
         let key =
-            ProjectKey::from_base64url("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
+            ProjectKey::from_base64url("AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f").unwrap();
         let mut records = Vec::new();
         encrypt_span(&doc, &key, 7, 0, end, &mut records).unwrap();
         assert!(records.len() > 1);

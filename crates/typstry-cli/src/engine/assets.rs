@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use typstry_doc::materialize::FileContent;
-use typstry_wire::crypto::BLOB_CONTEXT;
+use typstry_wire::crypto::{BLOB_CONTEXT, CryptoError};
 
 use crate::hash::{BlobHash, Digest};
 use crate::worktree::{LocalFile, MAX_ASSET_BYTES, mime_for};
@@ -61,7 +61,12 @@ impl Session {
         let bytes = self
             .key
             .open(sealed, BLOB_CONTEXT)
-            .with_context(|| format!("asset {hash} does not decrypt with this project's key"))?;
+            .map_err(|err| match err {
+                CryptoError::NewerVersion(_) => anyhow::anyhow!("asset {hash} was {err}"),
+                err => anyhow::Error::new(err).context(format!(
+                    "asset {hash} does not decrypt with this project's key"
+                )),
+            })?;
         self.state.write_blob(hash, &bytes)?;
         self.base
             .assets

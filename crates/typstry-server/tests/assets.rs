@@ -4,13 +4,14 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
-use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use typstry_server::http::AppState;
 use typstry_server::store::blobs::BlobStore;
 
 mod common;
+
+use common::json;
 
 struct Harness {
     dir: TempDir,
@@ -99,10 +100,6 @@ impl Harness {
             .await
             .unwrap()
     }
-}
-
-async fn json(res: Response) -> Value {
-    serde_json::from_slice(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap()
 }
 
 /// Stands in for an encrypted asset; the server never looks inside.

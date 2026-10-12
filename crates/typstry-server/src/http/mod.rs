@@ -1,6 +1,7 @@
 pub mod assets;
 mod error;
 pub mod projects;
+pub mod protocol;
 
 use std::path::Path;
 use std::time::Duration;
@@ -93,12 +94,16 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         ));
     // Uploads get no timeout: a 25 MB body on a slow link legitimately
     // takes minutes, and the size cap already bounds what one can cost.
-    let mut app = Router::new()
-        .route("/healthz", get(healthz))
+    let gated = Router::new()
         .merge(api)
         .route("/api/p/{token}/assets", post(assets::upload))
         .route("/api/p/{token}/blobs/{hash}", get(assets::blob))
-        .route("/ws", get(ws::handler));
+        .route("/ws", get(ws::handler))
+        .layer(middleware::from_fn(protocol::gate));
+    let mut app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/api/info", get(protocol::info))
+        .merge(gated);
 
     // In dev the Vite server serves the frontend, so a missing dist is normal.
     if web_dist.is_dir() {

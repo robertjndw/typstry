@@ -21,6 +21,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from "./protocol";
+import { FONT_CACHE } from "./cache-names";
 import { CompileScheduler } from "./scheduler";
 
 // typst.ts 0.7 fetches its default fonts from typst-assets on jsdelivr. We
@@ -31,7 +32,6 @@ const FONT_PREFIX = {
   text: "https://cdn.jsdelivr.net/gh/typst/typst-assets@v0.14.2/files/fonts/",
   _: "https://cdn.jsdelivr.net/gh/typst/typst-dev-assets@v0.13.1/files/fonts/",
 };
-const FONT_CACHE = "typstry-fonts-v1";
 
 // Set to false to send a full vector artifact on every compile instead of
 // incremental deltas. The renderer handles both; deltas are much smaller

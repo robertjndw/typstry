@@ -23,6 +23,7 @@ import {
   importProjectKey,
   open,
   seal,
+  SECRET_EDIT_V1,
   toBase64Url,
 } from "./project-key";
 
@@ -33,8 +34,10 @@ const FIXTURES = path.resolve(
 const JS_RECORDS = path.join(FIXTURES, "js-records.json");
 const RUST_RECORDS = path.join(FIXTURES, "rust-records.json");
 
-// Bytes 0..32, shared with the Rust side.
-const RAW_KEY = toBase64Url(Uint8Array.from({ length: 32 }, (_, i) => i));
+// The edit kind byte, then key bytes 0..32, shared with the Rust side.
+const RAW_KEY = toBase64Url(
+  Uint8Array.from({ length: 33 }, (_, i) => (i === 0 ? SECRET_EDIT_V1 : i - 1)),
+);
 
 // Peers 9 and 10 sort differently as text and as numbers, so the snapshot
 // header only parses if both sides order its version vector by bytes.

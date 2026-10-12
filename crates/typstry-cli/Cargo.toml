@@ -38,6 +38,10 @@ typstry-wire = { workspace = true, features = ["crypto"] }
 axum.workspace = true
 tempfile.workspace = true
 typstry-server.workspace = true
+# The compat fixture generator writes doc.json the way typstry-doc reads it.
+typstry-doc = { workspace = true, features = ["test-util"] }
+# The compat fixture generator seals with fixed salts and IVs.
+typstry-wire = { workspace = true, features = ["crypto", "test-util"] }
 
 [lints]
 workspace = true

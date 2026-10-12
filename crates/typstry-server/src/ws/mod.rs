@@ -12,6 +12,7 @@ use crate::state::AppState;
 /// fragments by the sender, so a bigger frame is a broken or hostile client.
 const MAX_FRAME: usize = MAX_MESSAGE_SIZE + 1024;
 
+/// Outdated clients never get here, see [`crate::http::protocol::gate`].
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)

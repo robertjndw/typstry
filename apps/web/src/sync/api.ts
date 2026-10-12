@@ -3,6 +3,8 @@
 // travels encrypted, so these calls carry tokens and ciphertext alone.
 import { ownBuffer } from "@/crypto/project-key";
 
+import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
+
 export interface CreatedProject {
   projectId: string;
   editToken: string;
@@ -28,6 +30,27 @@ export class ApiError extends Error {
   }
 }
 
+/** 426: the server no longer serves this build of the page. */
+export class OutdatedClientError extends ApiError {
+  constructor() {
+    super(426, RELOAD_MESSAGE);
+    this.name = "OutdatedClientError";
+  }
+}
+
+/** fetch with the protocol header, turning a 426 into OutdatedClientError. */
+export async function apiFetch(
+  url: string,
+  init: RequestInit = {},
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set(PROTOCOL_HEADER, String(PROTOCOL_VERSION));
+  const res = await fetchFn(url, { ...init, headers });
+  if (res.status === 426) throw new OutdatedClientError();
+  return res;
+}
+
 export interface ApiOptions {
   /** Origin to talk to; empty means same origin (the Vite proxy in dev). */
   baseUrl?: string;
@@ -41,7 +64,7 @@ export interface ApiOptions {
 export async function createProject(
   opts: ApiOptions = {},
 ): Promise<CreatedProject> {
-  const res = await fetch(`${opts.baseUrl ?? ""}/api/projects`, {
+  const res = await apiFetch(`${opts.baseUrl ?? ""}/api/projects`, {
     method: "POST",
     signal: opts.signal,
   });
@@ -55,7 +78,7 @@ export async function resolveShare(
   token: string,
   opts: ApiOptions = {},
 ): Promise<ShareInfo | null> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${opts.baseUrl ?? ""}/api/share/${encodeURIComponent(token)}`,
     { signal: opts.signal },
   );
@@ -104,7 +127,7 @@ export async function uploadBlob(
   name: string,
   opts: ApiOptions = {},
 ): Promise<StoredBlob> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/assets`,
     {
       method: "POST",

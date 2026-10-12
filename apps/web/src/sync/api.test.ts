@@ -4,9 +4,11 @@ import {
   ApiError,
   blobUrl,
   createProject,
+  OutdatedClientError,
   resolveShare,
   uploadBlob,
 } from "./api";
+import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
 
 function mockFetch(status: number, body?: unknown) {
   const fn = vi.fn<typeof fetch>(
@@ -105,5 +107,32 @@ describe("blobUrl", () => {
     expect(blobUrl("tok", "sha256:ab", { baseUrl: "http://h" })).toBe(
       "http://h/api/p/tok/blobs/sha256%3Aab",
     );
+  });
+});
+
+describe("protocol version", () => {
+  it("goes with every call", async () => {
+    const fetch = mockFetch(200, { projectId: "p", permission: "read" });
+    await resolveShare("t");
+    mockFetch(201, { projectId: "p", editToken: "e", viewToken: "v" });
+    await createProject();
+    const upload = mockFetch(200, { hash: "sha256:00", size: 1 });
+    await uploadBlob("t", new Uint8Array([1]), "a.png");
+    for (const call of [fetch.mock.calls[0]!, upload.mock.calls[0]!]) {
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get(PROTOCOL_HEADER)).toBe(String(PROTOCOL_VERSION));
+    }
+    // Keeps the call's own headers.
+    expect(
+      new Headers(upload.mock.calls[0]![1]?.headers).get("content-type"),
+    ).toBe("application/octet-stream");
+  });
+
+  it("turns a 426 into the error that asks for a reload", async () => {
+    mockFetch(426, { error: "too old" });
+    const err = await resolveShare("t").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(OutdatedClientError);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as Error).message).toBe(RELOAD_MESSAGE);
   });
 });

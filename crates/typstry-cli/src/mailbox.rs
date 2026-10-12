@@ -34,6 +34,15 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(150);
 
 const POLL: Duration = Duration::from_millis(50);
 
+/// Sent with every request, since a running sync survives an upgrade and
+/// may be an older build than the command. Bump it when an existing request
+/// or [`Response`] changes. A new request needs no bump, an older sync
+/// already answers unknown ones with an error.
+pub const PROTOCOL: u32 = 1;
+const PROTOCOL_KEY: &str = "protocol";
+
+const OTHER_VERSION: &str = "the running `typstry sync` is a different typstry version than this command; stop it with Ctrl+C and start it again";
+
 /// What a command asks the running sync to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "camelCase")]
@@ -67,7 +76,7 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
     let id = random_hex(8);
     let request_path = dir.join(format!("{id}{REQUEST}"));
     let response_path = dir.join(format!("{id}{RESPONSE}"));
-    write_json(&request_path, request)?;
+    write_json(&request_path, &Envelope::new(request))?;
 
     let started = Instant::now();
     let mut taken = false;
@@ -76,8 +85,9 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
         match fs::read(&response_path) {
             Ok(bytes) => {
                 let _ = fs::remove_file(&response_path);
-                let response: Response =
-                    serde_json::from_slice(&bytes).context("typstry sync answered garbage")?;
+                let response: Response = serde_json::from_slice(&bytes).map_err(|err| {
+                    anyhow::anyhow!("{OTHER_VERSION} (cannot read its answer: {err})")
+                })?;
                 for line in &response.lines {
                     line.print();
                 }
@@ -116,6 +126,36 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
             );
         }
     }
+}
+
+/// A request as it goes into the mailbox, with the protocol next to the
+/// command. The field name must match [`PROTOCOL_KEY`].
+#[derive(Serialize)]
+struct Envelope<'a> {
+    protocol: u32,
+    #[serde(flatten)]
+    request: &'a Request,
+}
+
+impl<'a> Envelope<'a> {
+    fn new(request: &'a Request) -> Self {
+        Self {
+            protocol: PROTOCOL,
+            request,
+        }
+    }
+}
+
+/// Checks the protocol before parsing the command, so a mismatch gets the
+/// restart hint and not some random parse error.
+fn parse_request(bytes: &[u8]) -> anyhow::Result<Request> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|err| anyhow::anyhow!("typstry sync cannot read the request: {err}"))?;
+    let protocol = value.get(PROTOCOL_KEY).and_then(serde_json::Value::as_u64);
+    if protocol != Some(u64::from(PROTOCOL)) {
+        bail!("{OTHER_VERSION}");
+    }
+    serde_json::from_value(value).map_err(|err| anyhow::anyhow!("{OTHER_VERSION} ({err})"))
 }
 
 /// Sync's end of the mailbox.
@@ -174,8 +214,7 @@ impl Mailbox {
             if fs::remove_file(&path).is_err() {
                 continue;
             }
-            let request = serde_json::from_slice(&bytes)
-                .map_err(|err| anyhow::anyhow!("typstry sync cannot read the request: {err}"));
+            let request = parse_request(&bytes);
             waiting.push((modified, id.to_owned(), request));
         }
         waiting.sort_by_key(|(modified, id, _)| (*modified, id.clone()));
@@ -190,5 +229,78 @@ impl Mailbox {
         if let Err(err) = write_json(&path, response) {
             eprintln!("sync: cannot answer a request: {err:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox_with(request: &str) -> (tempfile::TempDir, Mailbox) {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = Mailbox::open(dir.path()).unwrap();
+        fs::write(mailbox.dir.join(format!("abc{REQUEST}")), request).unwrap();
+        (dir, mailbox)
+    }
+
+    fn take_one(mailbox: &Mailbox) -> anyhow::Result<Request> {
+        let mut waiting = mailbox.take().unwrap();
+        assert_eq!(waiting.len(), 1);
+        let (id, request) = waiting.remove(0);
+        assert_eq!(id, "abc");
+        request
+    }
+
+    #[test]
+    fn requests_round_trip_with_the_protocol() {
+        let request = Request::VersionSave {
+            name: "v1".into(),
+            force: true,
+        };
+        let json = serde_json::to_value(Envelope::new(&request)).unwrap();
+        assert_eq!(json[PROTOCOL_KEY], PROTOCOL);
+        let (_dir, mailbox) = mailbox_with(&json.to_string());
+        assert_eq!(take_one(&mailbox).unwrap(), request);
+    }
+
+    #[test]
+    fn another_protocol_gets_a_restart_hint() {
+        // A command from before the protocol existed.
+        let (_dir, mailbox) = mailbox_with(r#"{"command":"status"}"#);
+        let err = take_one(&mailbox).unwrap_err();
+        assert!(
+            err.to_string().contains("different typstry version"),
+            "{err}"
+        );
+        // What sync then answers, as the asking command reads it.
+        mailbox.answer(
+            "abc",
+            &Response {
+                lines: Vec::new(),
+                error: Some(format!("{err:#}")),
+            },
+        );
+        let answer = fs::read(mailbox.dir.join(format!("abc{RESPONSE}"))).unwrap();
+        let answer: Response = serde_json::from_slice(&answer).unwrap();
+        assert!(answer.error.unwrap().contains("start it again"));
+
+        let newer = format!(r#"{{"command":"status","protocol":{}}}"#, PROTOCOL + 1);
+        let (_dir, mailbox) = mailbox_with(&newer);
+        let err = take_one(&mailbox).unwrap_err();
+        assert!(
+            err.to_string().contains("different typstry version"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_command_gets_a_restart_hint() {
+        let request = format!(r#"{{"command":"fly","protocol":{PROTOCOL}}}"#);
+        let (_dir, mailbox) = mailbox_with(&request);
+        let err = take_one(&mailbox).unwrap_err();
+        assert!(
+            err.to_string().contains("different typstry version"),
+            "{err}"
+        );
     }
 }
