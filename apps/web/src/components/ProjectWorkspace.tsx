@@ -91,7 +91,7 @@ export function ProjectWorkspace({
   }, [documentTitle, title]);
 
   const compiler = useProjectCompiler();
-  const tinymist = useProjectTinymist();
+  const tinymist = useProjectTinymist(compiler);
   const [reveal, setReveal] = useState<RevealRequest | null>(null);
 
   // A version brings its own compiler. The live one would keep compiling

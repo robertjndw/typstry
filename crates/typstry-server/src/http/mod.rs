@@ -83,6 +83,30 @@ async fn app_csp(req: Request, next: Next) -> Response {
     res
 }
 
+/// Vite puts a content hash in every file name under `/assets/`, so those
+/// files never change and the browser can keep them forever. The compiler and
+/// tinymist wasm are tens of megabytes, too big to revalidate on every visit.
+/// Pages are always revalidated, otherwise a deploy keeps serving the old
+/// `index.html` with its stale asset names.
+async fn cache_control(req: Request, next: Next) -> Response {
+    let hashed = req.uri().path().starts_with("/assets/");
+    let mut res = next.run(req).await;
+    // A missing asset falls back to index.html with a 200; caching that
+    // forever would pin the page under the asset's name.
+    let is_html = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+    let policy = if hashed && res.status() == StatusCode::OK && !is_html {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    res
+}
+
 /// Small database lookups; anything slower than this is stuck.
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -114,11 +138,17 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
     // In dev the Vite server serves the frontend, so a missing dist is normal.
     if web_dist.is_dir() {
         let index = web_dist.join("index.html");
-        let pages = ServeDir::new(web_dist).fallback(ServeFile::new(index));
+        // The build writes .br and .gz next to each compressible asset (see
+        // vite.config.ts); the wasm shrinks to about a third.
+        let pages = ServeDir::new(web_dist)
+            .precompressed_br()
+            .precompressed_gzip()
+            .fallback(ServeFile::new(index));
         app = app.fallback_service(
             Router::new()
                 .fallback_service(pages)
-                .layer(middleware::from_fn(app_csp)),
+                .layer(middleware::from_fn(app_csp))
+                .layer(middleware::from_fn(cache_control)),
         );
     } else {
         tracing::info!(path = %web_dist.display(), "web dist not found, static serving disabled");

@@ -102,6 +102,15 @@ export interface SpaceConnection {
   close(): void;
 }
 
+/**
+ * loro-websocket reports a join sent before the socket is open as an error,
+ * but it also queues the join and sends it once the socket opens. Every
+ * join made while connecting hits this, so there is nothing to report.
+ */
+function isQueuedJoin(error: Error): boolean {
+  return error.message === "WebSocket not open during join";
+}
+
 export function projectWsUrl(loc: Pick<Location, "protocol" | "host">): string {
   return socketUrl(loc, "/ws");
 }
@@ -129,7 +138,15 @@ export function connectSpace(opts: ConnectOptions): SpaceConnection {
     for (const listener of [...listeners]) listener(status);
   };
 
-  const client = new LoroWebsocketClient({ url, onError: opts.onError });
+  const onError = opts.onError;
+  const client = new LoroWebsocketClient({
+    url,
+    onError: onError
+      ? (error) => {
+          if (!isQueuedJoin(error)) onError(error);
+        }
+      : undefined,
+  });
   const docAdaptor = new EncryptedDocAdaptor(opts.doc, {
     crypto: opts.crypto,
     canWrite: opts.canWrite,
