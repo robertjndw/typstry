@@ -47,7 +47,7 @@ describe("a browser only gets an identity when it needs one", () => {
       key: "Enter",
     });
     fireEvent.click(
-      await screen.findByRole("menuitem", { name: "Recovery key…" }),
+      await screen.findByRole("menuitem", { name: "Show recovery key…" }),
     );
     await screen.findByRole("button", { name: "Create recovery key" });
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });

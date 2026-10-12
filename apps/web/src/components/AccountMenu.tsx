@@ -17,6 +17,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -82,11 +84,19 @@ export function AccountMenu({
           </TooltipTrigger>
           <TooltipContent>You ({identity.name})</TooltipContent>
         </Tooltip>
-        <DropdownMenuContent align="end">
+        <DropdownMenuContent align="end" className="min-w-64">
+          <div className="flex items-center gap-2.5 px-1.5 py-1.5">
+            <PersonAvatar identity={identity} />
+            <span className="truncate text-sm font-medium">
+              {identity.name}
+            </span>
+          </div>
           <DropdownMenuItem onSelect={() => setEditing(true)}>
             <PaletteIcon />
             Name and color…
           </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>Devices</DropdownMenuLabel>
           <DropdownMenuItem onSelect={() => setAddingDevice(true)}>
             <SmartphoneIcon />
             Add a device…
@@ -95,14 +105,16 @@ export function AccountMenu({
             <LaptopIcon />
             Your devices…
           </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>Recovery</DropdownMenuLabel>
           <DropdownMenuItem onSelect={() => setRecovering(true)}>
             <KeyRoundIcon />
-            Recovery key…
+            Show recovery key…
           </DropdownMenuItem>
           <DropdownMenuItem asChild>
             <a href="/recover">
               <LifeBuoyIcon />
-              Recover with a recovery key
+              Restore with a key…
             </a>
           </DropdownMenuItem>
           {children}
