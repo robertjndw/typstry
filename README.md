@@ -1,7 +1,7 @@
 # typstry
 
 [![CI](https://github.com/robertjndw/typstry/actions/workflows/ci.yml/badge.svg)](https://github.com/robertjndw/typstry/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A self-hostable, real-time collaborative editor for [Typst](https://typst.app), built on CRDTs and end-to-end encrypted.
 
@@ -224,6 +224,8 @@ The document schema exists on both sides. Changes to one must be reflected in th
 
 Issues and pull requests are welcome. Before opening a PR, please make sure formatting, linting and tests pass locally (see [Common tasks](#common-tasks)). Commit messages follow [Conventional Commits](https://www.conventionalcommits.org).
 
+Please report security issues privately as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
-Licensed under the [MIT License](https://opensource.org/licenses/MIT).
+Licensed under the [MIT License](LICENSE).
