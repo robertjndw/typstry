@@ -36,6 +36,7 @@ export function useCompilerClient(
 const noopSubscribe = () => () => {};
 const getNull = () => null;
 const getUndefined = () => undefined;
+const getFalse = () => false;
 
 /**
  * Just the diagnostics, so a caller re-renders when they change rather than
@@ -47,6 +48,17 @@ export function usePreviewDiagnostics(
   return useSyncExternalStore(
     client ? client.subscribe : noopSubscribe,
     client ? () => client.getState().diagnostics : getUndefined,
+  );
+}
+
+/**
+ * Whether the compiler has finished loading (or failed to). Stays false
+ * while `client` is null, so callers can wait for one to exist.
+ */
+export function usePreviewStarted(client: CompilerClient | null): boolean {
+  return useSyncExternalStore(
+    client ? client.subscribe : noopSubscribe,
+    client ? () => client.getState().status !== "starting" : getFalse,
   );
 }
 

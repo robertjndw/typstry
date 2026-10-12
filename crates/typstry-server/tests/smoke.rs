@@ -99,6 +99,46 @@ async fn app_pages_carry_a_strict_csp() {
 }
 
 #[tokio::test]
+async fn hashed_assets_are_cached_for_good_and_precompressed() {
+    let dir = tempfile::tempdir().unwrap();
+    let dist = dir.path().join("dist");
+    std::fs::create_dir_all(dist.join("assets")).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html>app").unwrap();
+    std::fs::write(dist.join("assets/app-Ab1_x.wasm"), "plain").unwrap();
+    std::fs::write(dist.join("assets/app-Ab1_x.wasm.br"), "brotli").unwrap();
+    let pool = common::open_db(dir.path()).await;
+    let app = router(AppState::new(pool, BlobStore::new(dir.path())), &dist);
+
+    let get = |path: &str, encoding: &str| {
+        let req = Request::get(path)
+            .header("accept-encoding", encoding)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req)
+    };
+
+    let res = get("/assets/app-Ab1_x.wasm", "gzip, br").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(res.headers()["content-encoding"], "br");
+    assert_eq!(to_bytes(res.into_body(), 1024).await.unwrap(), "brotli");
+
+    let res = get("/assets/app-Ab1_x.wasm", "identity").await.unwrap();
+    assert!(res.headers().get("content-encoding").is_none());
+    assert_eq!(to_bytes(res.into_body(), 1024).await.unwrap(), "plain");
+
+    // Pages, and the index.html a missing asset falls back to, must be
+    // revalidated, or a deploy would never reach the browser.
+    for path in ["/", "/p/sometoken", "/assets/gone-Zz9.js"] {
+        let res = get(path, "br").await.unwrap();
+        assert_eq!(res.headers()["cache-control"], "no-cache", "{path}");
+    }
+}
+
+#[tokio::test]
 async fn migrations_create_schema_in_wal_mode() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
