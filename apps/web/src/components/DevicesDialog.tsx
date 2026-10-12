@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { toError } from "@/lib/errors";
 import { RECOVERY_LABEL } from "@/mls/recovery";
-import { revokeDevice, type ProjectRevoke } from "@/mls/revoke";
+import { revokeDevice, secured, type RevokeOutcome } from "@/mls/revoke";
 import { defaultBackend } from "@/persist/local-doc-store";
 
 interface DeviceRow {
@@ -78,7 +78,7 @@ export function DevicesDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Replaceable for tests. */
-  revoke?: (pub: Uint8Array) => Promise<ProjectRevoke[]>;
+  revoke?: (pub: Uint8Array) => Promise<RevokeOutcome>;
 }) {
   const [devices, setDevices] = useState<DeviceRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -86,7 +86,7 @@ export function DevicesDialog({
   const [working, setWorking] = useState(false);
   const [report, setReport] = useState<{
     name: string;
-    projects: ProjectRevoke[];
+    outcome: RevokeOutcome;
   } | null>(null);
   const [reload, setReload] = useState(0);
 
@@ -108,8 +108,8 @@ export function DevicesDialog({
     setPending(null);
     setWorking(true);
     try {
-      const projects = await revoke(device.pub);
-      setReport({ name: device.name, projects });
+      const outcome = await revoke(device.pub);
+      setReport({ name: device.name, outcome });
     } catch (e) {
       console.error(e);
       toast.error(`Could not revoke the device: ${toError(e).message}`);
@@ -226,23 +226,49 @@ export function DevicesDialog({
 function RevokeReport({
   report,
 }: {
-  report: { name: string; projects: ProjectRevoke[] };
+  report: { name: string; outcome: RevokeOutcome };
 }) {
-  const missed = report.projects.filter((p) => p.result.status === "unreached");
-  const cleaned = report.projects.filter((p) => p.result.status === "cleaned");
-  const left = report.projects.filter(
-    (p) => p.result.status === "left-to-owner",
-  );
+  const { personal, projects } = report.outcome;
+  const missed = projects.filter((p) => p.result.status === "unreached");
+  const cleaned = projects.filter((p) => p.result.status === "cleaned");
+  const reset = projects.filter((p) => p.result.status === "links-reset");
+  const left = projects.filter((p) => p.result.status === "left-to-owner");
   return (
     <div role="status" className="flex flex-col gap-2 text-sm">
       <p className="font-medium">{report.name} was revoked.</p>
-      {report.projects.length === 0 ? (
+      {!secured(personal) ? (
+        <p className="text-destructive">
+          Your project list could not be secured
+          {personal.status === "unreached" && ` (${personal.reason})`}, so no
+          project links were replaced and {report.name} can still read them.
+          Revoke it again once this device can reach the list.
+        </p>
+      ) : projects.length === 0 ? (
         <p className="text-muted-foreground">You have no projects here.</p>
       ) : (
         <p className="text-muted-foreground">
-          Removed from {cleaned.length} of {report.projects.length}{" "}
-          {report.projects.length === 1 ? "project" : "projects"}.
+          Removed from {cleaned.length} of {projects.length}{" "}
+          {projects.length === 1 ? "project" : "projects"}.
         </p>
+      )}
+      {personal.status === "links-reset" && (
+        <p className="text-muted-foreground">
+          The links to your project list were replaced.
+        </p>
+      )}
+      {reset.length > 0 && (
+        <>
+          <p className="text-muted-foreground">
+            Links replaced, since you own {reset.length === 1 ? "it" : "them"}:
+          </p>
+          <ul className="flex flex-col gap-1">
+            {reset.map((p) => (
+              <li key={p.projectId} className="font-medium">
+                {p.title}
+              </li>
+            ))}
+          </ul>
+        </>
       )}
       {left.length > 0 && (
         <>

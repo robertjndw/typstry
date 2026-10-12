@@ -151,7 +151,7 @@ impl PersonGraph {
         self.inner.encode()
     }
 
-    /// The person's id, as `ProjectGroup.ownerPerson` returns it.
+    /// The person's id, as `SpaceGroup.ownerPerson` returns it.
     pub fn id(&self) -> Vec<u8> {
         self.inner.id().to_vec()
     }

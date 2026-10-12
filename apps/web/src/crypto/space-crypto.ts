@@ -168,10 +168,10 @@ export type VersionEntries = { peer: string; counter: number }[];
  * Keys change underneath a session: the group's keys replace the starting
  * ones once it is joined, and the presence key follows the MLS epoch.
  * Readers that cached anything derived from them subscribe with `onChange`.
- * A rotation hands out a new link, so it is a new `ProjectCrypto`, never new
+ * A rotation hands out a new link, so it is a new `SpaceCrypto`, never new
  * keys under this one.
  */
-export class ProjectCrypto {
+export class SpaceCrypto {
   readonly link: LinkSecret;
   private keys: DocKeys;
   private signer: Signer | null;
@@ -199,10 +199,10 @@ export class ProjectCrypto {
    * server stores. Throws a `KeyMismatchError`, `BadSignatureError` or
    * `NewerVersionError` when the link does not belong to the keyring.
    */
-  static open(secret: string, signedKeyring: Uint8Array): ProjectCrypto {
+  static open(secret: string, signedKeyring: Uint8Array): SpaceCrypto {
     return guard(() => {
       const link = LinkSecret.parse(secret);
-      return new ProjectCrypto(
+      return new SpaceCrypto(
         link,
         new DocKeys(Keyring.openVerified(link, signedKeyring)),
       );
@@ -244,6 +244,11 @@ export class ProjectCrypto {
   /** Whether this device can write records of the current generation. */
   get canWrite(): boolean {
     return this.signer?.canWrite(this.keys.generation) ?? false;
+  }
+
+  /** Records are signed with this device's leaf key, not a stand-in. */
+  get grouped(): boolean {
+    return this.presence !== null;
   }
 
   /**

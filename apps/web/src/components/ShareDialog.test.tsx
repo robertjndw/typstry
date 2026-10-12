@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { newProject } from "@/crypto/test-utils";
 import { LinkSecret } from "@/crypto/wasm";
-import { projectUrl, saveProjectKey, saveShareLinks } from "@/project/recent";
+import { projectUrl } from "@/project/recent";
+import { saveSpaceKey, saveShareLinks } from "@/space/space-links";
 
 import { ShareDialog } from "./ShareDialog";
 
@@ -15,7 +16,7 @@ describe("ShareDialog", () => {
     const before = newProject();
     const after = LinkSecret.generateEdit();
     // What a rotation keeps: the new key and the new tokens, together.
-    saveProjectKey("p", after.toBase64url());
+    saveSpaceKey("p", after.toBase64url());
     saveShareLinks("p", { editToken: "edit-2", viewToken: "view-2" });
 
     render(

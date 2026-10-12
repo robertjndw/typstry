@@ -18,7 +18,7 @@ use super::{
     RoomCmd, update_frames,
 };
 use crate::store::docs::{self, Write};
-use crate::store::projects::Permission;
+use crate::store::spaces::Permission;
 
 /// A connection's latest presence. Each blob is that client's whole state,
 /// encrypted, so the newest one replaces everything it sent before.
@@ -28,7 +28,7 @@ struct Presence {
 }
 
 pub(super) struct RoomActor {
-    project_id: String,
+    space_id: String,
     generation: u64,
     registry: Arc<Inner>,
     index: DocIndex,
@@ -53,9 +53,9 @@ pub(super) struct RoomActor {
 }
 
 impl RoomActor {
-    pub(super) fn new(project_id: String, generation: u64, registry: Arc<Inner>) -> Self {
+    pub(super) fn new(space_id: String, generation: u64, registry: Arc<Inner>) -> Self {
         Self {
-            project_id,
+            space_id,
             generation,
             registry,
             index: DocIndex::default(),
@@ -72,11 +72,11 @@ impl RoomActor {
 
     pub(super) async fn run(mut self, mut rx: mpsc::Receiver<RoomCmd>) {
         if let Err(err) = self.load().await {
-            tracing::error!(project = %self.project_id, %err, "failed to load room");
-            self.registry.remove(&self.project_id, self.generation);
+            tracing::error!(space = %self.space_id, %err, "failed to load room");
+            self.registry.remove(&self.space_id, self.generation);
             return;
         }
-        tracing::debug!(project = %self.project_id, seq = self.last_seq, "room loaded");
+        tracing::debug!(space = %self.space_id, seq = self.last_seq, "room loaded");
 
         let stop = self.registry.stop.clone();
         let mut tick = interval(self.registry.config.tick);
@@ -100,16 +100,16 @@ impl RoomActor {
                     while let Some(cmd) = rx.recv().await {
                         self.handle(cmd).await;
                     }
-                    self.registry.remove(&self.project_id, self.generation);
+                    self.registry.remove(&self.space_id, self.generation);
                     break;
                 }
             }
         }
-        tracing::debug!(project = %self.project_id, "room unloaded");
+        tracing::debug!(space = %self.space_id, "room unloaded");
     }
 
     async fn load(&mut self) -> anyhow::Result<()> {
-        let records = docs::load(&self.registry.db, &self.project_id).await?;
+        let records = docs::load(&self.registry.db, &self.space_id).await?;
         self.last_seq = records.last().map_or(0, |(seq, _)| *seq);
         self.index = DocIndex::load(records)?;
         Ok(())
@@ -127,7 +127,7 @@ impl RoomActor {
         idle_long_enough
             && self
                 .registry
-                .remove_if_idle(&self.project_id, self.generation, rx)
+                .remove_if_idle(&self.space_id, self.generation, rx)
     }
 
     async fn handle(&mut self, cmd: RoomCmd) {
@@ -176,7 +176,7 @@ impl RoomActor {
                 {
                     let ctx = Ctx {
                         db: &self.registry.db,
-                        project_id: &self.project_id,
+                        space_id: &self.space_id,
                         config: &self.registry.config.ds,
                         retired_here: &self.retired_here,
                     };
@@ -216,13 +216,13 @@ impl RoomActor {
         if self.ds.is_some() {
             return true;
         }
-        match DsState::load(&self.registry.db, &self.project_id).await {
+        match DsState::load(&self.registry.db, &self.space_id).await {
             Ok(ds) => {
                 self.ds = Some(ds);
                 true
             }
             Err(err) => {
-                tracing::error!(project = %self.project_id, %err, "failed to load group");
+                tracing::error!(space = %self.space_id, %err, "failed to load group");
                 false
             }
         }
@@ -232,7 +232,7 @@ impl RoomActor {
         let Some(ds) = &mut self.ds else { return };
         let ctx = Ctx {
             db: &self.registry.db,
-            project_id: &self.project_id,
+            space_id: &self.space_id,
             config: &self.registry.config.ds,
             retired_here: &self.retired_here,
         };
@@ -292,7 +292,7 @@ impl RoomActor {
         if self.retired_here.contains_key(&token) {
             outbox.push_message(&ProtocolMessage::JoinError {
                 crdt,
-                room_id: self.project_id.clone(),
+                room_id: self.space_id.clone(),
                 code: JoinErrorCode::AuthFailed,
                 message: "auth_failed".into(),
                 receiver_version: None,
@@ -302,7 +302,7 @@ impl RoomActor {
         }
         // Checked before the backfill is built, which for most versions
         // means copying the doc.
-        let Some(backfill) = outbox.start_backfill(&self.project_id, crdt) else {
+        let Some(backfill) = outbox.start_backfill(&self.space_id, crdt) else {
             return false;
         };
         let (server_version, extra, frames): (_, _, Arc<[Bytes]>) = match crdt {
@@ -317,7 +317,7 @@ impl RoomActor {
                             // with an empty version, which gets everything.
                             outbox.push_message(&ProtocolMessage::JoinError {
                                 crdt,
-                                room_id: self.project_id.clone(),
+                                room_id: self.space_id.clone(),
                                 code: JoinErrorCode::VersionUnknown,
                                 message: "cannot decode version vector".into(),
                                 receiver_version: None,
@@ -342,7 +342,7 @@ impl RoomActor {
                     .iter()
                     .filter(|&(&other, _)| other != conn)
                     .flat_map(|(_, presence)| {
-                        update_frames(crdt, &self.project_id, presence.data.to_vec())
+                        update_frames(crdt, &self.space_id, presence.data.to_vec())
                     })
                     .collect();
                 (Vec::new(), None, others)
@@ -352,7 +352,7 @@ impl RoomActor {
 
         let ok = ProtocolMessage::JoinResponseOk {
             crdt,
-            room_id: self.project_id.clone(),
+            room_id: self.space_id.clone(),
             permission: match permission {
                 Permission::Write => loro_protocol::Permission::Write,
                 Permission::Read => loro_protocol::Permission::Read,
@@ -381,7 +381,7 @@ impl RoomActor {
         }
         let frames: Arc<[Bytes]> = elo::pack(&self.index.backfill(client))
             .into_iter()
-            .flat_map(|container| update_frames(CrdtType::Elo, &self.project_id, container))
+            .flat_map(|container| update_frames(CrdtType::Elo, &self.space_id, container))
             .collect();
         if full {
             self.full_backfill = Some(frames.clone());
@@ -403,7 +403,7 @@ impl RoomActor {
                 Ok(records) => records,
                 Err(err) => {
                     // Earlier payloads of the message were fine and are kept.
-                    tracing::debug!(project = %self.project_id, %err, "rejected update");
+                    tracing::debug!(space = %self.space_id, %err, "rejected update");
                     status = UpdateStatusCode::InvalidUpdate;
                     break;
                 }
@@ -440,13 +440,13 @@ impl RoomActor {
         if writes.is_empty() {
             self.index.commit();
         } else {
-            match docs::write_batch(&self.registry.db, &self.project_id, &writes).await {
+            match docs::write_batch(&self.registry.db, &self.space_id, &writes).await {
                 Ok(()) => {
                     self.index.commit();
                     self.full_backfill = None;
                 }
                 Err(err) => {
-                    tracing::error!(project = %self.project_id, %err, "failed to store records");
+                    tracing::error!(space = %self.space_id, %err, "failed to store records");
                     self.index.rollback();
                     status = UpdateStatusCode::Unknown;
                     relays.clear();
@@ -494,7 +494,7 @@ impl RoomActor {
         };
         self.last_seq += 1;
         tracing::debug!(
-            project = %self.project_id,
+            space = %self.space_id,
             seq = self.last_seq,
             replaced = obsolete.len(),
             bytes = bytes.len(),
@@ -540,7 +540,7 @@ impl RoomActor {
     fn ack(&mut self, conn: ConnId, crdt: CrdtType, ref_id: BatchId, status: UpdateStatusCode) {
         let msg = ProtocolMessage::Ack {
             crdt,
-            room_id: self.project_id.clone(),
+            room_id: self.space_id.clone(),
             ref_id,
             status,
         };
@@ -555,7 +555,7 @@ impl RoomActor {
     /// Relays an accepted update to every other peer of the same CRDT.
     fn broadcast(&mut self, from: ConnId, crdt: CrdtType, update: Vec<u8>) {
         let magic = crdt.magic_bytes();
-        let frames = update_frames(crdt, &self.project_id, update);
+        let frames = update_frames(crdt, &self.space_id, update);
         let mut dead = Vec::new();
         for (&(conn, peer_magic), outbox) in &self.peers {
             if conn == from || peer_magic != magic {

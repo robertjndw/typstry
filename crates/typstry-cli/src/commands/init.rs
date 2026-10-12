@@ -7,17 +7,15 @@ use anyhow::{Context, bail};
 use typstry_doc::init::{DEFAULT_MAIN_FILE, init_bare_project, set_main_file, starter_content};
 use typstry_doc::names::validate_path;
 use typstry_doc::paths::build_path_index;
-use typstry_wire::crypto::LinkSecret;
 
 use super::{
     Ctx, Output, link::print_links, print_not_applied, print_report_warnings, print_warnings,
     track_branch,
 };
-use crate::api::{Api, Permission, ShareInfo};
 use crate::engine::{Flush, Identity, Mode, Scope, Session, set_peer_info};
 use crate::git::{self, Head, Repo};
-use crate::link::{ShareLink, ws_url};
-use crate::mls::create_group;
+use crate::link::ws_url;
+use crate::space::{Created, create_space, sync_server};
 use crate::state::{STATE_DIR, StateDir};
 use crate::worktree::{GIT_FILE_REASON, LocalFile, Skipped, Worktree, case_clashes};
 
@@ -129,6 +127,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                 if plan.starter { 1 } else { plan.files.len() }
             );
             print_links(&session.config, None)?;
+            sync_server(&session.config.server).await;
             Ok(())
         }
         Err(err) => {
@@ -371,25 +370,21 @@ pub(super) fn confirm(question: &str) -> anyhow::Result<bool> {
 }
 
 async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Result<Session> {
-    let api = Api::new(server)?;
-    let created = api.create_project().await?;
-    let link = ShareLink::new(
-        server,
-        &created.edit_token,
-        &LinkSecret::generate_edit().to_base64url(),
-    );
-    let share = ShareInfo {
-        project_id: created.project_id,
-        permission: Permission::Write,
-        view_token: Some(created.view_token),
-        retired: false,
-    };
-    // The project's group starts with this folder as its only member, before
-    // anything else is uploaded, so every record has an author the group
-    // vouches for.
     let local = crate::user::load_or_create_identity()?;
     let identity = Identity::resolve(ctx.name.as_deref(), None, local.graph.profile(), root);
-    let group = create_group(&link, &share.project_id, &identity, &local).await?;
+    let Created {
+        link,
+        share,
+        api,
+        group,
+    } = create_space(server, &identity, &local).await?;
+    // The person's other devices need it to reset this project's links.
+    if let Some(current) = group.owner_secret()
+        && let Err(err) =
+            crate::directory::record_owner_keys(&link.origin, &share.space_id, current)
+    {
+        eprintln!("warning: could not share the owner key with your devices: {err:#}");
+    }
     // Before .typstry/ exists, so the key cannot slip into a commit even if
     // the rest fails halfway.
     if let Some((repo, _)) = &plan.repo {

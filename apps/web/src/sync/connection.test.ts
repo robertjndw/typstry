@@ -3,7 +3,7 @@ import { LoroDoc } from "loro-crdt";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { newProject } from "@/crypto/test-utils";
 
-import { connectProject, projectWsUrl, type SyncStatus } from "./connection";
+import { connectSpace, projectWsUrl, type SyncStatus } from "./connection";
 import { PROTOCOL_VERSION } from "./protocol";
 
 const crypto = newProject().crypto;
@@ -85,10 +85,10 @@ describe("projectWsUrl", () => {
   });
 });
 
-describe("connectProject", () => {
+describe("connectSpace", () => {
   it("joins doc and presence rooms with the token as auth", () => {
-    const conn = connectProject({
-      projectId: "proj",
+    const conn = connectSpace({
+      spaceId: "proj",
       token: "tok",
       crypto,
       canWrite: true,
@@ -110,8 +110,8 @@ describe("connectProject", () => {
   });
 
   it("is connected only once the socket is open and the doc room joined", () => {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
       crypto,
       canWrite: true,
@@ -144,8 +144,8 @@ describe("connectProject", () => {
   });
 
   it("gives up and rejects synced when the join fails", async () => {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "bad",
       crypto,
       canWrite: true,
@@ -162,8 +162,8 @@ describe("connectProject", () => {
   });
 
   it("close() stops the client and detaches adaptors", () => {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
       crypto,
       canWrite: true,
@@ -186,8 +186,8 @@ describe("an outdated page", () => {
   function connect(outdated: boolean) {
     const checkOutdated = vi.fn(() => Promise.resolve(outdated));
     const onOutdated = vi.fn();
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
       crypto,
       canWrite: true,
@@ -225,8 +225,8 @@ describe("an outdated page", () => {
 
 describe("syncNow", () => {
   function connect() {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
       crypto,
       canWrite: true,

@@ -59,7 +59,7 @@ fn decrypts_every_compat_fixture() {
             Keyring::open_verified(&viewer, &signed).unwrap().export(),
             "v{n}"
         );
-        // Another project's link refuses it.
+        // Another space's link refuses it.
         let stranger = LinkSecret::generate_edit();
         assert!(Keyring::open_verified(&stranger, &signed).is_err(), "v{n}");
         let keys = DocKeys::new(Keyring::open_verified(&viewer, &signed).unwrap());

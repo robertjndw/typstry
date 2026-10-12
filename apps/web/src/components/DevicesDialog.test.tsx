@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { toHex } from "@/crypto/bytes";
 import { DeviceKey, PersonGraph } from "@/crypto/wasm";
 import { localIdentity } from "@/mls/identity";
-import type { ProjectRevoke } from "@/mls/revoke";
+import type { RevokeOutcome } from "@/mls/revoke";
 import { MemoryBackend } from "@/persist/local-doc-store";
 
 import { DevicesDialog } from "./DevicesDialog";
@@ -43,7 +43,10 @@ async function withDevices() {
 }
 
 function open(
-  revoke = vi.fn<(pub: Uint8Array) => Promise<ProjectRevoke[]>>(async () => []),
+  revoke = vi.fn<(pub: Uint8Array) => Promise<RevokeOutcome>>(async () => ({
+    personal: { status: "none" },
+    projects: [],
+  })),
 ) {
   render(<DevicesDialog open onOpenChange={() => {}} revoke={revoke} />);
   return revoke;
@@ -66,26 +69,34 @@ describe("DevicesDialog", () => {
   it("asks first, then revokes the device and reports the projects", async () => {
     const { phone } = await withDevices();
     const revoke = open(
-      vi.fn(async (): Promise<ProjectRevoke[]> => [
-        {
-          projectId: "p1",
-          title: "Thesis",
-          result: { status: "cleaned", removed: 1 },
-        },
-        {
-          projectId: "p2",
-          title: "Notes",
-          result: {
-            status: "unreached",
-            reason: "you can only view it",
+      vi.fn(async (): Promise<RevokeOutcome> => ({
+        personal: { status: "cleaned", removed: 1 },
+        projects: [
+          {
+            projectId: "p1",
+            title: "Thesis",
+            result: { status: "cleaned", removed: 1 },
           },
-        },
-        {
-          projectId: "p3",
-          title: "Slides",
-          result: { status: "left-to-owner" },
-        },
-      ]),
+          {
+            projectId: "p2",
+            title: "Notes",
+            result: {
+              status: "unreached",
+              reason: "you can only view it",
+            },
+          },
+          {
+            projectId: "p3",
+            title: "Slides",
+            result: { status: "left-to-owner" },
+          },
+          {
+            projectId: "p4",
+            title: "Paper",
+            result: { status: "links-reset" },
+          },
+        ],
+      })),
     );
     fireEvent.click(
       await screen.findByRole("button", { name: "Revoke Phone" }),
@@ -100,14 +111,36 @@ describe("DevicesDialog", () => {
     await waitFor(() => expect(revoke).toHaveBeenCalledWith(phone));
     expect(await screen.findByText("Phone was revoked.")).toBeInTheDocument();
     expect(
-      screen.getByText("Removed from 1 of 3 projects."),
+      screen.getByText("Removed from 1 of 4 projects."),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/Left for the owner to remove/),
     ).toBeInTheDocument();
     expect(screen.getByText("Slides")).toBeInTheDocument();
+    expect(screen.getByText(/Links replaced/)).toBeInTheDocument();
+    expect(screen.getByText("Paper")).toBeInTheDocument();
     expect(screen.getByText("Notes")).toBeInTheDocument();
     expect(screen.getByText(/you can only view it/)).toBeInTheDocument();
+  });
+
+  it("says when the personal space could not be cleaned", async () => {
+    await withDevices();
+    open(
+      vi.fn(async (): Promise<RevokeOutcome> => ({
+        personal: { status: "unreached", reason: "the server did not answer" },
+        projects: [],
+      })),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Revoke Phone" }),
+    );
+    const confirm = await screen.findByRole("dialog", {
+      name: "Revoke Phone?",
+    });
+    fireEvent.click(within(confirm).getByRole("button", { name: "Revoke" }));
+    expect(
+      await screen.findByText(/project list could not be secured/),
+    ).toBeInTheDocument();
   });
 
   it("does not make a person of a browser that has none", async () => {

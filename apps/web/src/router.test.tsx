@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { RECENT_KEY } from "@/project/recent";
+import { seedProject, token } from "@/directory/test-utils";
 import { routes } from "@/router";
 
 function renderAt(path: string) {
@@ -20,21 +20,15 @@ describe("routes", () => {
     localStorage.clear();
   });
 
-  it("renders the home page with a new project button and recent projects", () => {
-    localStorage.setItem(
-      RECENT_KEY,
-      JSON.stringify([
-        { projectId: "p1", token: "tok1", title: "Thesis", visitedAt: 1 },
-      ]),
-    );
+  it("renders the home page with a new project button and the project list", async () => {
+    await seedProject("p1", 1, { title: "Thesis" });
     renderAt("/");
     expect(
       screen.getByRole("button", { name: /new project/i }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /thesis/i })).toHaveAttribute(
-      "href",
-      "/p/tok1",
-    );
+    expect(
+      await screen.findByRole("link", { name: /thesis/i }),
+    ).toHaveAttribute("href", expect.stringMatching(`^/p/${token(1)}#.+`));
   });
 
   it("shows a not-found page for unknown share tokens", async () => {

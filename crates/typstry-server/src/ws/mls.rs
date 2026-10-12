@@ -3,7 +3,7 @@
 //!
 //! It is its own socket because Loro's `CrdtType` is a closed enum. The
 //! connection only decodes, rate limits and forwards: what a token may do
-//! is decided by the project's room, which sees rotations in the same
+//! is decided by the space's room, which sees rotations in the same
 //! order as everything else and so never acts on a stale permission.
 
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use super::{
 };
 use crate::room::{ConnId, JoinOutcome, Outbound, Outbox, RoomCmd};
 use crate::state::AppState;
-use crate::store::projects;
+use crate::store::spaces;
 
 /// Frames buffered per connection before the client counts as too slow.
 const OUTBOX_FRAMES: usize = 512;
@@ -43,7 +43,7 @@ struct Conn {
     id: ConnId,
     state: AppState,
     outbox: Outbox,
-    /// The project's room, once the Hello was accepted.
+    /// The space's room, once the Hello was accepted.
     room: Option<mpsc::Sender<RoomCmd>>,
     requests: TokenBucket,
 }
@@ -135,7 +135,7 @@ impl Conn {
     }
 
     async fn hello(&mut self, token: String, incarnation: u64, since_epoch: u64) -> bool {
-        let resolved = match projects::resolve_ds(&self.state.db, &token).await {
+        let resolved = match spaces::resolve_ds(&self.state.db, &token).await {
             Ok(resolved) => resolved,
             Err(err) => {
                 tracing::error!(%err, "token lookup failed");
@@ -143,7 +143,7 @@ impl Conn {
                 return false;
             }
         };
-        let Some((project_id, access)) = resolved else {
+        let Some((space_id, access)) = resolved else {
             // Unknown tokens and malformed ones look the same.
             self.send(&ServerMessage::Refused {
                 req: 0,
@@ -155,7 +155,7 @@ impl Conn {
         let outcome = self
             .state
             .rooms
-            .join(&project_id, |reply| RoomCmd::DsHello {
+            .join(&space_id, |reply| RoomCmd::DsHello {
                 conn: self.id,
                 token: token.clone(),
                 access: access.clone(),

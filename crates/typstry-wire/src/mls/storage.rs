@@ -1,10 +1,10 @@
-//! A device's identity and the saved form of a project's group state.
+//! A device's identity and the saved form of a space's group state.
 //!
 //! openmls keeps its state in a provider storage. The in-memory one is a
 //! plain map of byte strings, so saving is dumping that map in a compact
 //! binary layout (the library's own serializer is test-only). One provider
-//! holds one project, which keeps a state file self-contained and means a
-//! removed project can be forgotten by deleting its file.
+//! holds one space, which keeps a state file self-contained and means a
+//! removed space can be forgotten by deleting its file.
 //!
 //! The format is versioned by [`MLS_STATE_VERSION`], and an openmls upgrade
 //! that changes what the map holds has to bump it as well, since old
@@ -173,7 +173,7 @@ pub struct SavedPending {
     pub profile: Option<Vec<u8>>,
 }
 
-/// What [`encode`] saves of a project group and [`decode`] returns.
+/// What [`encode`] saves of a space group and [`decode`] returns.
 pub struct SavedState {
     pub group_id: Vec<u8>,
     pub device: LeafKeys,
@@ -182,7 +182,7 @@ pub struct SavedState {
     /// The keyring as [`crate::crypto::Keyring::export`] writes it.
     pub keyring: Zeroizing<Vec<u8>>,
     pub profile: Vec<u8>,
-    /// The project's owner key secrets this device holds. One may be the
+    /// The space's owner key secrets this device holds. One may be the
     /// only copy, so they are saved like the link.
     pub owner: OwnerSecrets,
     /// The owner key the server holds, as this device last heard.

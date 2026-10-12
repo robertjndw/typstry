@@ -71,7 +71,7 @@ impl Server {
     }
 
     /// A new, empty project: `(edit link, view link)`.
-    pub async fn create_project(&self) -> (String, String) {
+    pub async fn create_space(&self) -> (String, String) {
         let (edit, view) = create_project(&self.origin).await;
         (edit.to_string(), view.to_string())
     }
@@ -234,7 +234,7 @@ pub fn cached_doc(dir: &Path) -> loro::LoroDoc {
 
 /// A new, empty project on the server at `origin`: `(edit, view)`.
 pub async fn create_project(origin: &str) -> (ShareLink, ShareLink) {
-    let created = Api::new(origin).unwrap().create_project().await.unwrap();
+    let created = Api::new(origin).unwrap().create_space().await.unwrap();
     let secret = LinkSecret::generate_edit();
     let edit = ShareLink::new(origin, &created.edit_token, &secret.to_base64url());
     let view = ShareLink::new(origin, &created.view_token, &secret.view_secret());
@@ -245,7 +245,7 @@ pub async fn create_project(origin: &str) -> (ShareLink, ShareLink) {
     config_dir();
     typstry_cli::mls::create_group(
         &edit,
-        &created.project_id,
+        &created.space_id,
         &Identity::new("Browser"),
         &typstry_cli::user::load_or_create_identity().unwrap(),
     )

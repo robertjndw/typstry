@@ -9,11 +9,16 @@ import {
   type LoroWebsocketClientRoom,
   type RoomJoinStatusValue,
 } from "loro-websocket";
-import type { ProjectCrypto } from "@/crypto/project-crypto";
 import { toError } from "@/lib/errors";
 
-import { EncryptedDocAdaptor } from "./encrypted-doc-adaptor";
-import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
+import {
+  EncryptedDocAdaptor,
+  type RecordCrypto,
+} from "./encrypted-doc-adaptor";
+import {
+  EphemeralStoreAdaptor,
+  type PresenceCrypto,
+} from "./ephemeral-adaptor";
 import { fetchServerInfo, isOutdated, socketUrl } from "./protocol";
 
 export type SyncStatus = "connecting" | "connected" | "disconnected";
@@ -32,10 +37,10 @@ const OUTDATED_CHECK_MS = 30_000;
 const RETIRED_CHECK_MS = 2000;
 
 export interface ConnectOptions {
-  projectId: string;
+  spaceId: string;
   /** Edit or view token; the server derives the permission from it. */
   token: string;
-  crypto: ProjectCrypto;
+  crypto: RecordCrypto & PresenceCrypto;
   /** False for view links, which must not try to upload anything. */
   canWrite: boolean;
   doc: LoroDoc;
@@ -65,11 +70,21 @@ export interface ConnectOptions {
    * code apart from any other failure, so this asks the server.
    */
   checkRetired?: () => Promise<boolean>;
+  /**
+   * Whether the space's doc is what the caller meant to open, asked before
+   * this device uploads anything; see EncryptedDocAdaptorOptions.accept.
+   */
+  accept?: (doc: LoroDoc) => boolean | undefined;
+  /**
+   * `accept` said no. Nothing was uploaded and syncing has already
+   * stopped.
+   */
+  onRefused?: () => void;
   /** Upload a snapshot right after joining: a rotation just moved the keys. */
   compactOnJoin?: boolean;
 }
 
-export interface ProjectConnection {
+export interface SpaceConnection {
   getStatus(): SyncStatus;
   /** Calls `listener` with the current status right away, then on change. */
   subscribe(listener: (status: SyncStatus) => void): () => void;
@@ -91,7 +106,7 @@ export function projectWsUrl(loc: Pick<Location, "protocol" | "host">): string {
   return socketUrl(loc, "/ws");
 }
 
-export function connectProject(opts: ConnectOptions): ProjectConnection {
+export function connectSpace(opts: ConnectOptions): SpaceConnection {
   const url = opts.url ?? projectWsUrl(window.location);
   const auth = new TextEncoder().encode(opts.token);
   const listeners = new Set<(status: SyncStatus) => void>();
@@ -121,6 +136,12 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
     onDecryptError: opts.onDecryptError,
     onUnknownGeneration: opts.onUnknownGeneration,
     compactOnJoin: opts.compactOnJoin,
+    accept: opts.accept,
+    onRefused: () => {
+      if (finished) return;
+      fail();
+      opts.onRefused?.();
+    },
   });
   const ephemeralAdaptor = opts.ephemeral
     ? new EphemeralStoreAdaptor(opts.ephemeral, opts.crypto)
@@ -183,7 +204,7 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
   });
 
   const docJoin: Promise<LoroWebsocketClientRoom> = client.join({
-    roomId: opts.projectId,
+    roomId: opts.spaceId,
     crdtAdaptor: docAdaptor,
     auth,
     onStatusChange: (s) => {
@@ -199,7 +220,7 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
   if (ephemeralAdaptor) {
     client
       .join({
-        roomId: opts.projectId,
+        roomId: opts.spaceId,
         crdtAdaptor: ephemeralAdaptor,
         auth,
       })

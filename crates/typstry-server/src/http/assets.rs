@@ -8,7 +8,7 @@ use tokio_util::io::ReaderStream;
 
 use super::{AppError, AppState};
 use crate::store::blobs;
-use crate::store::projects::{self, Permission};
+use crate::store::spaces::{self, Permission};
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 // Blobs are client-encrypted and always served as octet-stream, but they
@@ -30,7 +30,7 @@ pub async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, Json<Uploaded>), AppError> {
-    let (project_id, permission) = projects::resolve_token(&state.db, &token)
+    let (space_id, permission) = spaces::resolve_token(&state.db, &token)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
     if permission != Permission::Write {
@@ -50,7 +50,7 @@ pub async fn upload(
     // The hash names the ciphertext, the only form the server ever sees.
     // Clients keep the plaintext's metadata inside the encrypted doc.
     let hash = stored.hash();
-    blobs::record(&state.db, &project_id, &hash, stored.size).await?;
+    blobs::record(&state.db, &space_id, &hash, stored.size).await?;
     Ok((
         StatusCode::CREATED,
         Json(Uploaded {
@@ -66,10 +66,10 @@ pub async fn blob(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let hex = blobs::parse_hash(&hash).ok_or(StatusCode::BAD_REQUEST)?;
-    let (project_id, _) = projects::resolve_token(&state.db, &token)
+    let (space_id, _) = spaces::resolve_token(&state.db, &token)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let size = blobs::lookup(&state.db, &project_id, &hash)
+    let size = blobs::lookup(&state.db, &space_id, &hash)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
 

@@ -4,6 +4,7 @@
 //! read and write the same containers.
 
 pub mod apply;
+pub mod directory;
 pub mod init;
 pub mod materialize;
 pub mod names;
@@ -53,16 +54,45 @@ pub struct SchemaTooNew {
     pub supported: i64,
 }
 
-/// Fails for a doc whose `meta.schema` is newer than [`SCHEMA_VERSION`].
-/// Anyone about to write into the doc must check this first: an older
-/// client editing a newer layout would corrupt it for everyone. A doc
-/// without a schema yet (still syncing, or not initialized) passes.
-pub fn ensure_supported(doc: &LoroDoc) -> Result<(), SchemaTooNew> {
+/// The doc's `meta.kind`, or None while it is unset or not a string.
+pub fn doc_kind(doc: &LoroDoc) -> Option<String> {
+    string_value(doc.get_map(root::META).get(meta::KIND))
+}
+
+/// The doc is some other kind of space than a project, say a person's
+/// directory reached through a link that was meant for a project.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("this link does not open a project")]
+pub struct ForeignKind {
+    pub found: String,
+}
+
+/// Why a project doc must not be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error(transparent)]
+    TooNew(#[from] SchemaTooNew),
+    #[error(transparent)]
+    ForeignKind(#[from] ForeignKind),
+}
+
+/// Fails for a doc that is not a project, or whose `meta.schema` is newer
+/// than [`SCHEMA_VERSION`]. Anyone about to write into the doc must check
+/// this first: an older client editing a newer layout would corrupt it for
+/// everyone. A doc without a kind or schema yet (still syncing, or not
+/// initialized) passes.
+pub fn ensure_supported(doc: &LoroDoc) -> Result<(), Unsupported> {
+    if let Some(found) = doc_kind(doc)
+        && found != kind::PROJECT
+    {
+        return Err(ForeignKind { found }.into());
+    }
     match schema_version(doc) {
         Some(found) if found > SCHEMA_VERSION => Err(SchemaTooNew {
             found,
             supported: SCHEMA_VERSION,
-        }),
+        }
+        .into()),
         _ => Ok(()),
     }
 }
@@ -116,6 +146,11 @@ pub const CHANGE_MERGE_INTERVAL_S: i64 = 30;
 /// this before its first commit.
 pub fn configure(doc: &LoroDoc) {
     doc.get_tree(root::FS).disable_fractional_index();
+    configure_commits(doc);
+}
+
+/// The part of [`configure`] every kind of doc shares.
+pub(crate) fn configure_commits(doc: &LoroDoc) {
     doc.set_record_timestamp(true);
     doc.set_change_merge_interval(CHANGE_MERGE_INTERVAL_S);
 }
@@ -204,8 +239,18 @@ pub mod peer {
     pub const COLOR: &str = "color";
 }
 
+/// Values of `meta.kind`. A project link must never open a directory, nor
+/// the other way around.
+pub mod kind {
+    pub const PROJECT: &str = "project";
+    pub const DIRECTORY: &str = "directory";
+}
+
 /// Keys inside the `meta` map.
 pub mod meta {
+    /// Which kind of doc this is, see [`super::kind`]. Absent on docs
+    /// written before the marker existed, which are projects.
+    pub const KIND: &str = "kind";
     pub const SCHEMA: &str = "schema";
     pub const TITLE: &str = "title";
     pub const MAIN_FILE: &str = "mainFile";
@@ -328,12 +373,39 @@ mod tests {
         let err = ensure_supported(&doc).unwrap_err();
         assert_eq!(
             err,
-            SchemaTooNew {
+            Unsupported::TooNew(SchemaTooNew {
                 found: 2,
                 supported: SCHEMA_VERSION
-            }
+            })
         );
         assert!(err.to_string().contains("upgrade typstry"), "{err}");
+    }
+
+    #[test]
+    fn a_foreign_kind_is_refused() {
+        let doc = LoroDoc::new();
+        let meta_map = doc.get_map(root::META);
+        meta_map.insert(meta::KIND, kind::PROJECT).unwrap();
+        assert_eq!(ensure_supported(&doc), Ok(()));
+        meta_map.insert(meta::KIND, kind::DIRECTORY).unwrap();
+        let err = ensure_supported(&doc).unwrap_err();
+        assert_eq!(
+            err,
+            Unsupported::ForeignKind(ForeignKind {
+                found: "directory".to_owned()
+            })
+        );
+        assert_eq!(err.to_string(), "this link does not open a project");
+    }
+
+    #[test]
+    fn init_marks_the_doc_as_a_project() {
+        let doc = LoroDoc::new();
+        init::init_project(&doc, "T").unwrap();
+        assert_eq!(doc_kind(&doc).as_deref(), Some(kind::PROJECT));
+        let bare = LoroDoc::new();
+        init::init_bare_project(&bare, "T").unwrap();
+        assert_eq!(doc_kind(&bare).as_deref(), Some(kind::PROJECT));
     }
 
     #[test]

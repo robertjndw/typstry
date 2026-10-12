@@ -8,6 +8,8 @@ use common::{
     stderr, stdout, temp, typstry,
 };
 
+use std::path::{Path, PathBuf};
+
 use typstry_wire::pairing::Code;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -55,8 +57,14 @@ async fn a_new_device_joins_the_person_and_gets_the_projects() {
         .find(|l| l.contains("valid") && !l.contains("(this device)"))
         .unwrap_or_else(|| panic!("{devices}"));
     assert!(holder_line.trim_start().starts_with("Tester"), "{devices}");
-    assert!(output.contains("typstry list"), "{output}");
+    // The first pass already brought the directory, so the list is printed.
+    assert!(
+        output.contains("Paired") && output.contains("typstry clone 1"),
+        "{output}"
+    );
     assert!(!new_cfg.join("projects.json").exists());
+    assert!(!new_cfg.join("available.json").exists());
+    assert!(new_cfg.join("spaces").is_dir());
 
     // The handed-over project is listed and cloned by its number.
     let listed = stdout(&binary_with(&work, &["list"], "", &env).await);
@@ -132,7 +140,7 @@ async fn two_devices_that_are_people_are_a_role_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_paired_device_is_an_owner_that_gets_the_key_from_another_owner_device() {
+async fn a_paired_device_is_an_owner_that_gets_the_key_from_the_directory() {
     let server = Server::start().await;
     let (_work, work) = temp();
     let holder_cfg = config_in(&work, "holder-cfg");
@@ -164,28 +172,11 @@ async fn a_paired_device_is_an_owner_that_gets_the_key_from_another_owner_device
     assert_eq!(owners, 2, "{listing}");
     assert!(listing.contains("(owner)"), "{listing}");
 
-    // An owner by the tree, but the owner key only comes from a device that
-    // holds it, and pairing does not carry it.
-    assert!(listing.contains("(no owner key here yet)"), "{listing}");
-    let leaf = other_leaf(&listing, "editor");
-    let before = std::fs::read(b.join(".typstry/config.json")).unwrap();
-    for args in [&["members", "remove", &leaf][..], &["share", "reset"]] {
-        let err = failed(&run_as(&b, &new_cfg, args).await);
-        assert!(
-            err.contains("This device does not have the project's owner key yet."),
-            "{err}"
-        );
-    }
-    assert_eq!(
-        std::fs::read(b.join(".typstry/config.json")).unwrap(),
-        before
-    );
-
-    // The first device hands it over the next time it opens the project, so
-    // the new one can remove someone, and the first one follows.
-    stdout(&run_as(&a, &holder_cfg, &["pull"]).await);
-    let listing = stdout(&run_as(&b, &new_cfg, &["members"]).await);
+    // The owner key reached the new device through the personal space's
+    // directory, so it can act as an owner before the first device hands it
+    // over inside the group.
     assert!(!listing.contains("no owner key"), "{listing}");
+    let leaf = other_leaf(&listing, "editor");
     stdout(&run_as(&b, &new_cfg, &["members", "remove", &leaf]).await);
     stdout(&run_as(&a, &holder_cfg, &["members"]).await);
     stdout(&run_as(&a, &holder_cfg, &["share", "reset"]).await);
@@ -264,6 +255,48 @@ async fn replace_switches_a_device_that_owns_nothing_to_the_other_person() {
     stdout(&run_as(&a, &holder_cfg, &["pull"]).await);
     let roster = stdout(&run_as(&a, &holder_cfg, &["members"]).await);
     assert_eq!(persons(&roster), strangers - 1, "{roster}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switching_device_merges_its_projects_into_the_other_persons_directory() {
+    let server = Server::start().await;
+    let (mine, _) = server.seeded_project("Mine").await;
+    let (theirs, _) = server.seeded_project("Theirs").await;
+    let (_work, work) = temp();
+    let holder_cfg = config_in(&work, "holder-cfg");
+    let other_cfg = config_in(&work, "other-cfg");
+    let a = clone_as(&holder_cfg, &mine, &work, "a").await;
+    clone_as(&other_cfg, &theirs, &work, "b").await;
+
+    let shower = Shower::start(&a, &holder_cfg, &["--yes"]).await;
+    let out = run_as(
+        &work,
+        &other_cfg,
+        &[
+            "pair",
+            &shower.code,
+            "--replace",
+            "--server",
+            &server.origin,
+        ],
+    )
+    .await;
+    assert!(out.status.success(), "{}", failed(&out));
+    // The switching device lists its old project next to the holder's.
+    let listing = stdout(&out);
+    assert!(
+        listing.contains("Mine") && listing.contains("Theirs"),
+        "{listing}"
+    );
+    let holder = shower.finish().await;
+    assert!(holder.status.success(), "{}", failed(&holder));
+
+    // Its entry was uploaded by the first pass, so the holder hears of it.
+    let listed = stdout(&run_as(&work, &holder_cfg, &["list"]).await);
+    assert!(
+        listed.contains("Mine") && listed.contains("Theirs"),
+        "{listed}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -382,4 +415,132 @@ async fn the_new_device_shows_the_key_the_holder_asks_about() {
         .find(|l| l.contains("(this device)"))
         .unwrap_or_else(|| panic!("{devices}"));
     assert!(mine.contains(&key), "{devices}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_reads_the_directory_and_keeps_projects_whose_folder_is_gone() {
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Listed").await;
+    let (_work, work) = temp();
+    let cfg = config_in(&work, "cfg");
+    let a = clone_as(&cfg, &edit, &work, "a").await;
+
+    // The clone put the project in the server's directory doc.
+    let spaces: Vec<_> = std::fs::read_dir(cfg.join("spaces")).unwrap().collect();
+    assert_eq!(spaces.len(), 1);
+    assert!(!cfg.join("available.json").exists());
+    let listed = stdout(&run_as(&work, &cfg, &["list"]).await);
+    assert!(listed.contains("Listed"), "{listed}");
+    assert!(listed.contains(a.to_str().unwrap()), "{listed}");
+
+    // Without the folder the directory still has it.
+    std::fs::remove_dir_all(&a).unwrap();
+    let listed = stdout(&run_as(&work, &cfg, &["list"]).await);
+    assert!(listed.contains("Listed"), "{listed}");
+    assert!(listed.contains("typstry clone 1"), "{listed}");
+}
+
+/// Pairs `new_cfg` with the device of `holder_cfg` through a code.
+async fn pair_devices(server: &Server, holder_dir: &Path, holder_cfg: &Path, new_cfg: &Path) {
+    let shower = Shower::start(holder_dir, holder_cfg, &["--yes"]).await;
+    let entered = run_as(
+        holder_dir,
+        new_cfg,
+        &["pair", &shower.code, "--server", &server.origin],
+    )
+    .await;
+    assert!(entered.status.success(), "{}", failed(&entered));
+    let holder = shower.finish().await;
+    assert!(holder.status.success(), "{}", failed(&holder));
+    assert!(!stderr(&holder).contains("warning"), "{}", stderr(&holder));
+    assert!(
+        !stderr(&entered).contains("warning"),
+        "{}",
+        stderr(&entered)
+    );
+}
+
+/// The one directory dir of a config dir.
+fn directory_dir(config: &Path) -> PathBuf {
+    let mut dirs: Vec<_> = std::fs::read_dir(config.join("spaces"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    dirs.remove(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn paired_devices_share_the_project_list_through_the_personal_space() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let holder_cfg = config_in(&work, "holder-cfg");
+    let new_cfg = config_in(&work, "new-cfg");
+    let third_cfg = config_in(&work, "third-cfg");
+    let a = init_as(&server, &work, "alpha", &holder_cfg).await;
+    // Nothing creates a personal space until a pairing needs one.
+    assert!(!directory_dir(&holder_cfg).join("config.json").exists());
+
+    pair_devices(&server, &a, &holder_cfg, &new_cfg).await;
+    let bound = std::fs::read(directory_dir(&holder_cfg).join("config.json")).unwrap();
+    assert!(directory_dir(&new_cfg).join("config.json").exists());
+
+    // A project made afterwards on the holder reaches the new device.
+    init_as(&server, &work, "beta", &holder_cfg).await;
+    let listed = stdout(&run_as(&work, &new_cfg, &["list"]).await);
+    assert!(listed.contains("alpha"), "{listed}");
+    assert!(listed.contains("beta"), "{listed}");
+    // And back: the new device's own project shows up on the holder.
+    init_as(&server, &work, "gamma", &new_cfg).await;
+    let listed = stdout(&run_as(&work, &holder_cfg, &["list"]).await);
+    assert!(listed.contains("gamma"), "{listed}");
+
+    // A second pairing reuses the space instead of making another.
+    pair_devices(&server, &a, &holder_cfg, &third_cfg).await;
+    assert_eq!(
+        std::fs::read(directory_dir(&holder_cfg).join("config.json")).unwrap(),
+        bound
+    );
+    let listed = stdout(&run_as(&work, &third_cfg, &["list"]).await);
+    for title in ["alpha", "beta", "gamma"] {
+        assert!(listed.contains(title), "{listed}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_personal_space_that_holds_a_project_is_not_written_to() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let cfg = config_in(&work, "cfg");
+    let a = init_as(&server, &work, "alpha", &cfg).await;
+    // Bind the directory to the project's own space, as a wrong link would.
+    std::fs::copy(
+        a.join(".typstry/config.json"),
+        directory_dir(&cfg).join("config.json"),
+    )
+    .unwrap();
+    let out = run_as(&work, &cfg, &["list"]).await;
+    assert!(
+        stderr(&out).contains("does not hold a directory"),
+        "{}",
+        stderr(&out)
+    );
+    // Nothing of the directory went into the project.
+    let b = clone_as(
+        &config_in(&work, "other"),
+        &edit_link(&a, &cfg).await,
+        &work,
+        "b",
+    )
+    .await;
+    assert_eq!(
+        typstry_doc::doc_kind(&common::cached_doc(&b)).as_deref(),
+        Some("project")
+    );
+}
+
+async fn edit_link(dir: &Path, config: &Path) -> String {
+    stdout(&run_as(dir, config, &["link", "--edit"]).await)
+        .trim()
+        .to_owned()
 }

@@ -8,24 +8,44 @@ import {
   devicePublicKey,
   graphsInGroupInfo,
   loadWasm,
-  mergeOwnerSecrets,
+  ownerSecretList,
   ownerShareForRecovery,
+  personSpacesForRecovery,
   recoverIdentity,
+  type PersonSpaceBinding,
   type RecoveredIdentity,
 } from "@/crypto/wasm";
+import { mapConcurrent } from "@/lib/concurrent";
 import { errorKind, toError } from "@/lib/errors";
+import { adoptPersonalSpace } from "@/directory/adopt-space";
+import { clearBinding } from "@/directory/binding";
+import { ensureSpace } from "@/directory/ensure-space";
+import { recordOwnerSecret } from "@/directory/record";
+import {
+  refreshDirectoryService,
+  stopDirectoryService,
+  waitForDirectorySync,
+} from "@/directory/service";
+import { directory, resetDirectory } from "@/directory/store";
 import type { DocBackend } from "@/persist/local-doc-store";
 import { defaultDeviceName } from "@/pairing/device-name";
-import { adoptProjectLink, parseProjectLink } from "@/project/recent";
+import {
+  adoptProjectLink,
+  parseProjectLink,
+  projectUrl,
+} from "@/project/recent";
+import { loadSpaceKey } from "@/space/space-links";
 import {
   fetchMlsBootstrap,
   resolveShare,
   type ApiOptions,
   type MlsBootstrap,
+  type ShareInfo,
 } from "@/sync/api";
 
 import { adoptProfile, localIdentity, mergeOwnGraph } from "./identity";
-import { emptyRecord } from "./session";
+import { cleanAll, secured } from "./revoke";
+import { keepOwnerKey } from "./session";
 
 export const RECOVERY_LABEL = "Recovery key";
 
@@ -54,12 +74,24 @@ type CreateBackend = Pick<
 /**
  * Makes a recovery key and adds it to this person's graph, signed by this
  * device. Returns the words, which exist nowhere else: the graph only holds
- * the public half.
+ * the public half. The personal space is made first: the leaves point at it
+ * for the recovery key, and without one recovery reaches a single project.
  */
 export async function createRecoveryKey(
-  backend: CreateBackend,
+  backend: CreateBackend & DocBackend,
+  opts: ApiOptions = {},
 ): Promise<string> {
   await loadWasm();
+  try {
+    await ensureSpace({ ...opts, backend });
+  } catch (error) {
+    throw new RecoveryError(
+      `Could not set up your personal space, which a recovery key needs: ${toError(error).message}`,
+    );
+  }
+  void refreshDirectoryService().catch((error) =>
+    console.warn("could not start the directory sync", error),
+  );
   const { deviceSeed, graph } = await localIdentity(backend);
   const generated = RecoveryKey.generate();
   const pub = devicePublicKey(generated.deviceSeed);
@@ -212,31 +244,149 @@ export function recoveredOwnerKey(
   }
 }
 
+/** How long the first directory sync may take before recovery goes on. */
+const DIRECTORY_WAIT_MS = 20_000;
+const OWNER_KEY_CONCURRENCY = 4;
+
 /**
- * Adds `ownerSecrets` (from `recoveredOwnerKey`) to the project's group
- * record, where the join that follows picks them up: with them the
- * recovered device can remove the lost devices and replace the links they
- * hold. What the record kept already stays.
+ * The personal space links the project's leaves hold for the recovery key,
+ * best first. Read with the other recovery material, before the lost
+ * devices go. Any leaf of the person can carry one, so a stolen device could
+ * have planted a pointer: `restorePersonalSpace` tries them in order and
+ * takes the first that really is the person's space.
  */
-export async function keepOwnerKey(
+export function recoveredPersonSpaces(
+  words: string,
+  link: LinkSecret,
+  boot: Pick<MlsBootstrap, "groupInfo" | "keyring">,
+): PersonSpaceBinding[] {
+  try {
+    return personSpacesForRecovery(
+      link,
+      boot.groupInfo,
+      boot.keyring,
+      recoverySeed(words),
+    );
+  } catch (error) {
+    console.warn(
+      "could not read the personal space for the recovery key",
+      error,
+    );
+    return [];
+  }
+}
+
+/**
+ * The first of `candidates` that is a live space whose owner key share
+ * opens for the recovery key. The share is what ties a pointer to the
+ * person: it only opens when the secret derives the key the server names.
+ */
+async function pickPersonalSpace(
+  words: string,
+  candidates: PersonSpaceBinding[],
+  opts: ApiOptions,
+): Promise<{
+  binding: PersonSpaceBinding;
+  share: ShareInfo;
+  owner: Uint8Array;
+} | null> {
+  const seed = recoverySeed(words);
+  for (const binding of candidates) {
+    let link: LinkSecret | null = null;
+    try {
+      const [share, boot] = await Promise.all([
+        resolveShare(binding.token, opts),
+        fetchMlsBootstrap(binding.token, opts),
+      ]);
+      if (!share || share.retired || !boot) continue;
+      link = LinkSecret.parse(binding.secret);
+      const owner = ownerShareForRecovery(
+        link,
+        boot.groupInfo,
+        boot.keyring,
+        boot.ownerKey,
+        seed,
+      );
+      if (owner) return { binding, share, owner };
+    } catch (error) {
+      console.warn("skipping a personal space candidate", error);
+    } finally {
+      link?.free();
+    }
+  }
+  return null;
+}
+
+/**
+ * Takes the personal space among `candidates`, which lists every project of
+ * the person, and the owner key of each project they own. Returns how many
+ * owner keys came back, or null when no candidate was the person's space.
+ * The caller removes the lost devices afterwards. Needs the words, so it
+ * runs before they are dropped.
+ */
+async function restorePersonalSpace(
   backend: Pick<DocBackend, "loadMls" | "saveMls">,
-  projectId: string,
-  ownerSecrets: Uint8Array,
-): Promise<void> {
-  const record = await backend.loadMls(projectId);
-  await backend.saveMls(projectId, {
-    ...(record ?? emptyRecord()),
-    ownerSecrets: mergeOwnerSecrets(record?.ownerSecrets, ownerSecrets),
-  });
+  words: string,
+  candidates: PersonSpaceBinding[],
+  opts: ApiOptions,
+): Promise<number | null> {
+  const picked = await pickPersonalSpace(words, candidates, opts);
+  if (!picked) {
+    console.warn("no personal space of the recovery key could be restored");
+    return null;
+  }
+  const { binding, share, owner } = picked;
+  await adoptPersonalSpace(backend, { ...binding, share, ownerSecrets: owner });
+  await waitForDirectorySync(DIRECTORY_WAIT_MS);
+
+  const entries = (await directory())
+    .list(Date.now())
+    .filter((entry) => entry.state !== "forgotten");
+  const restored = await mapConcurrent(
+    entries,
+    OWNER_KEY_CONCURRENCY,
+    async (entry) => {
+      try {
+        const [entryShare, projectBoot] = await Promise.all([
+          resolveShare(entry.link.token, opts),
+          fetchMlsBootstrap(entry.link.token, opts),
+        ]);
+        // The directory is only as honest as its last writer: the token has
+        // to lead to the project it is filed under.
+        if (entryShare?.spaceId !== entry.projectId || !projectBoot)
+          return false;
+        const projectLink = loadSpaceKey(entry.projectId) ?? entry.link.secret;
+        const secret = LinkSecret.parse(projectLink);
+        let key: Uint8Array | undefined;
+        try {
+          key = recoveredOwnerKey(words, secret, projectBoot);
+        } finally {
+          secret.free();
+        }
+        if (!key) return false;
+        await keepOwnerKey(backend, entry.projectId, key);
+        await recordOwnerSecret(entry.projectId, ownerSecretList(key)[0]);
+        return true;
+      } catch (error) {
+        console.warn("could not recover the owner key of a project", error);
+        return false;
+      }
+    },
+  );
+  return restored.filter(Boolean).length;
 }
 
 /**
  * Recovers from the words and a link of one of the person's projects: reads
- * the person graphs out of the project's GroupInfo, then recovers. Returns
- * the path to open, which joins the project as the person.
+ * the person graphs out of the project's GroupInfo, then recovers. Through
+ * the personal space the leaves point at, the whole project list and the
+ * owner key of every project comes back too, and the lost devices leave all
+ * of them. Returns the path to open, which joins the project as the person.
+ * Any step beyond the one project that fails is logged and leaves the
+ * recovery of that project as it is.
  */
 export async function recoverFromLink(
-  backend: CreateBackend & Pick<DocBackend, "loadMls" | "saveMls">,
+  backend: CreateBackend & DocBackend,
   input: {
     words: string;
     link: string;
@@ -244,7 +394,7 @@ export async function recoverFromLink(
     replace?: boolean;
   },
   opts: ApiOptions = {},
-): Promise<{ path: string }> {
+): Promise<{ path: string; projects: number }> {
   await loadWasm();
   recoverySeed(input.words);
   const parsed = parseProjectLink(input.link.trim());
@@ -260,10 +410,12 @@ export async function recoverFromLink(
   if (!boot) throw new RecoveryError("That project has no members to read.");
   let graphs: Uint8Array[];
   let ownerSecrets: Uint8Array | undefined;
+  let personal: PersonSpaceBinding[];
   const secret = LinkSecret.parse(parsed.key);
   try {
     graphs = graphsInGroupInfo(secret, boot.groupInfo, boot.keyring);
     ownerSecrets = recoveredOwnerKey(input.words, secret, boot);
+    personal = recoveredPersonSpaces(input.words, secret, boot);
   } catch (error) {
     throw new RecoveryError(
       `That link does not open the project: ${toError(error).message}`,
@@ -272,8 +424,47 @@ export async function recoverFromLink(
     secret.free();
   }
   await recoverDevice(backend, { ...input, graphs });
-  if (ownerSecrets) await keepOwnerKey(backend, share.projectId, ownerSecrets);
+  if (ownerSecrets) await keepOwnerKey(backend, share.spaceId, ownerSecrets);
 
-  adoptProjectLink(parsed, share, "");
-  return { path: `/p/${encodeURIComponent(parsed.token)}#${parsed.key}` };
+  // The binding, list and owner keys belonged to the person this browser
+  // gives up; none of it may upload into the recovered person's space.
+  if (input.replace) {
+    clearBinding();
+    stopDirectoryService();
+    await resetDirectory();
+  }
+  await adoptProjectLink(parsed, share, "");
+  let projects = 0;
+  if (personal.length > 0) {
+    try {
+      const restored = await restorePersonalSpace(
+        backend,
+        input.words,
+        personal,
+        opts,
+      );
+      if (restored !== null) {
+        projects = restored;
+        if (!input.keepOthers) await removeLostDevices(backend);
+      }
+    } catch (error) {
+      console.warn("could not bring back the personal space", error);
+    }
+  }
+  // Removing the lost devices replaced the project's links, and the one
+  // typed in is retired by now.
+  const current = (await directory()).bestLink(share.spaceId, Date.now());
+  const open = current ? { token: current.token, key: current.secret } : parsed;
+  return { path: projectUrl(open.token, open.key, ""), projects };
+}
+
+/**
+ * The recovery already revoked the lost devices in the graph; this applies
+ * that to the personal space first (its directory holds every project's
+ * links) and then to the projects whose owner key came back.
+ */
+async function removeLostDevices(backend: DocBackend): Promise<void> {
+  const { personal } = await cleanAll(backend);
+  if (!secured(personal))
+    console.warn("could not secure the project list, projects not cleaned");
 }

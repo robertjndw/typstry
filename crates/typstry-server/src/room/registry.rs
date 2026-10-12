@@ -68,14 +68,14 @@ impl RoomRegistry {
     }
 
     /// The room's command queue, spawning (and loading) the actor if needed.
-    /// The caller must already have checked that the project exists. None
+    /// The caller must already have checked that the space exists. None
     /// once shutdown has started.
-    pub fn get(&self, project_id: &str) -> Option<mpsc::Sender<RoomCmd>> {
+    pub fn get(&self, space_id: &str) -> Option<mpsc::Sender<RoomCmd>> {
         let mut rooms = self.inner.rooms.lock().expect("room registry poisoned");
         if rooms.closed {
             return None;
         }
-        if let Some(entry) = rooms.map.get(project_id)
+        if let Some(entry) = rooms.map.get(space_id)
             && !entry.tx.is_closed()
         {
             return Some(entry.tx.clone());
@@ -83,28 +83,28 @@ impl RoomRegistry {
         let generation = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(ROOM_QUEUE);
         rooms.map.insert(
-            project_id.to_owned(),
+            space_id.to_owned(),
             RoomEntry {
                 tx: tx.clone(),
                 generation,
             },
         );
-        let actor = RoomActor::new(project_id.to_owned(), generation, self.inner.clone());
+        let actor = RoomActor::new(space_id.to_owned(), generation, self.inner.clone());
         self.inner.actors.spawn(actor.run(rx));
         Some(tx)
     }
 
-    /// Sends a join to the project's room and waits for its answer. A room
+    /// Sends a join to the space's room and waits for its answer. A room
     /// can unload between handing out its queue and reading the join, so a
     /// dropped queue or reply is retried once against a fresh actor.
     /// `cmd` builds the join around the reply channel.
     pub async fn join(
         &self,
-        project_id: &str,
+        space_id: &str,
         mut cmd: impl FnMut(oneshot::Sender<bool>) -> RoomCmd,
     ) -> JoinOutcome {
         for _ in 0..2 {
-            let Some(room) = self.get(project_id) else {
+            let Some(room) = self.get(space_id) else {
                 return JoinOutcome::Unavailable;
             };
             let (reply, joined) = oneshot::channel();
@@ -121,11 +121,11 @@ impl RoomRegistry {
     }
 
     /// The room's queue if it is loaded right now; never spawns an actor.
-    pub fn loaded(&self, project_id: &str) -> Option<mpsc::Sender<RoomCmd>> {
+    pub fn loaded(&self, space_id: &str) -> Option<mpsc::Sender<RoomCmd>> {
         let rooms = self.inner.rooms.lock().expect("room registry poisoned");
         rooms
             .map
-            .get(project_id)
+            .get(space_id)
             .filter(|entry| !entry.tx.is_closed())
             .map(|entry| entry.tx.clone())
     }
@@ -161,7 +161,7 @@ impl Inner {
     /// queue and `RoomRegistry::join` retries against a fresh actor.
     pub(super) fn remove_if_idle(
         &self,
-        project_id: &str,
+        space_id: &str,
         generation: u64,
         rx: &mpsc::Receiver<RoomCmd>,
     ) -> bool {
@@ -169,22 +169,22 @@ impl Inner {
         if !rx.is_empty() {
             return false;
         }
-        remove_generation(&mut rooms.map, project_id, generation);
+        remove_generation(&mut rooms.map, space_id, generation);
         true
     }
 
-    pub(super) fn remove(&self, project_id: &str, generation: u64) {
+    pub(super) fn remove(&self, space_id: &str, generation: u64) {
         let mut rooms = self.rooms.lock().expect("room registry poisoned");
-        remove_generation(&mut rooms.map, project_id, generation);
+        remove_generation(&mut rooms.map, space_id, generation);
     }
 }
 
 /// A newer actor may already have replaced this one; only remove our own.
-fn remove_generation(rooms: &mut HashMap<String, RoomEntry>, project_id: &str, generation: u64) {
+fn remove_generation(rooms: &mut HashMap<String, RoomEntry>, space_id: &str, generation: u64) {
     if rooms
-        .get(project_id)
+        .get(space_id)
         .is_some_and(|entry| entry.generation == generation)
     {
-        rooms.remove(project_id);
+        rooms.remove(space_id);
     }
 }

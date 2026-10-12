@@ -27,6 +27,15 @@ export function Recover() {
   const [error, setError] = useState<string | null>(null);
   // Offered only once the browser turned out to hold another identity.
   const [conflict, setConflict] = useState(false);
+  const [recovered, setRecovered] = useState<{
+    path: string;
+    projects: number;
+  } | null>(null);
+
+  function open(path: string) {
+    const url = new URL(path, window.location.origin);
+    void navigate({ pathname: url.pathname, hash: url.hash });
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -34,14 +43,15 @@ export function Recover() {
     setBusy(true);
     setError(null);
     try {
-      const { path } = await recoverFromLink(await defaultBackend(), {
+      const result = await recoverFromLink(await defaultBackend(), {
         words,
         link,
         keepOthers,
         replace,
       });
-      const url = new URL(path, window.location.origin);
-      void navigate({ pathname: url.pathname, hash: url.hash });
+      // Only worth a stop when the rest of the list came back too.
+      if (result.projects > 0) setRecovered(result);
+      else open(result.path);
     } catch (err) {
       if (!(err instanceof RecoveryError)) console.error(err);
       if (err instanceof IdentityConflictError) setConflict(true);
@@ -63,48 +73,63 @@ export function Recover() {
           the project as you.
         </p>
       </div>
-      <form onSubmit={submit} className="flex flex-col gap-3">
-        <Input
-          aria-label="Recovery words"
-          placeholder="The 17 words"
-          autoComplete="off"
-          autoCapitalize="none"
-          spellCheck={false}
-          value={words}
-          onChange={(e) => setWords(e.target.value)}
-          className="h-9 font-mono"
-        />
-        <Input
-          aria-label="Project link"
-          placeholder="https://…/p/…#…"
-          autoComplete="off"
-          spellCheck={false}
-          value={link}
-          onChange={(e) => setLink(e.target.value)}
-          className="h-9"
-        />
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={keepOthers}
-            onChange={(e) => setKeepOthers(e.target.checked)}
+      {recovered ? (
+        <div className="flex flex-col gap-3">
+          <p role="status" className="text-sm">
+            You are back.{" "}
+            {recovered.projects === 1
+              ? "1 project came back with its owner key."
+              : `${recovered.projects} projects came back with their owner keys.`}
+          </p>
+          <Button onClick={() => open(recovered.path)}>Open project</Button>
+        </div>
+      ) : (
+        <form onSubmit={submit} className="flex flex-col gap-3">
+          <Input
+            aria-label="Recovery words"
+            placeholder="The 17 words"
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            value={words}
+            onChange={(e) => setWords(e.target.value)}
+            className="h-9 font-mono"
           />
-          Keep my other devices
-        </label>
-        {conflict && (
+          <Input
+            aria-label="Project link"
+            placeholder="https://…/p/…#…"
+            autoComplete="off"
+            spellCheck={false}
+            value={link}
+            onChange={(e) => setLink(e.target.value)}
+            className="h-9"
+          />
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
-              checked={replace}
-              onChange={(e) => setReplace(e.target.checked)}
+              checked={keepOthers}
+              onChange={(e) => setKeepOthers(e.target.checked)}
             />
-            Replace the identity this browser already has
+            Keep my other devices
           </label>
-        )}
-        <Button type="submit" disabled={busy || !words.trim() || !link.trim()}>
-          Recover
-        </Button>
-      </form>
+          {conflict && (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={replace}
+                onChange={(e) => setReplace(e.target.checked)}
+              />
+              Replace the identity this browser already has
+            </label>
+          )}
+          <Button
+            type="submit"
+            disabled={busy || !words.trim() || !link.trim()}
+          >
+            Recover
+          </Button>
+        </form>
+      )}
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}

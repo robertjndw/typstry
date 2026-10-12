@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use typstry_wire::crypto::LinkSecret;
 use typstry_wire::identity::PersonId;
-use typstry_wire::mls::{LeafKeys, MlsError, OwnerSecrets, ProjectGroup};
+use typstry_wire::mls::{LeafKeys, MlsError, OwnerSecrets, SpaceGroup};
 
-use crate::api::Permission;
+use crate::api::{Permission, ShareInfo};
 use crate::git::GitMark;
 use crate::hash::{BlobHash, Digest};
 use crate::link::ShareLink;
@@ -47,6 +47,21 @@ pub fn merge_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> 
     let mut keys = read_owner_keys(path);
     if keys.merge(held) {
         atomic_write(path, &keys.encode(), true)?;
+    }
+    Ok(())
+}
+
+/// Like [`merge_owner_keys`], but `held` only fills room behind what the
+/// store has ([`OwnerSecrets::extend_older`]). For keys from a place anyone
+/// who can write it controls, like the directory: they must not push out a
+/// key this machine already holds.
+pub fn fill_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> {
+    let mut keys = read_owner_keys(path);
+    let before = keys.encode();
+    keys.extend_older(held);
+    let after = keys.encode();
+    if after != before {
+        atomic_write(path, &after, true)?;
     }
     Ok(())
 }
@@ -122,6 +137,31 @@ pub struct Config {
 pub struct DamagedPin;
 
 impl Config {
+    /// The config of a space this device just created or joined at `link`,
+    /// with the group's owner pinned if it already has one.
+    pub fn new(
+        link: &ShareLink,
+        share: &ShareInfo,
+        name: Option<&str>,
+        group: Option<&SpaceGroup>,
+    ) -> Self {
+        let mut config = Self {
+            server: link.origin.clone(),
+            project_id: share.space_id.clone(),
+            token: link.token.clone(),
+            key: link.key.clone(),
+            permission: share.permission,
+            view_token: share.view_token.clone(),
+            name: name.map(str::to_owned),
+            branch: None,
+            owner_person: None,
+        };
+        if let Some(owner) = group.and_then(|g| g.owner_person()) {
+            config.pin_owner(&owner);
+        }
+        config
+    }
+
     /// `None` only when nothing was pinned yet. A value that cannot be
     /// decoded is an error: reading it as "no pin" would let the next join
     /// accept, and re-pin, whatever owner the server names.
@@ -303,9 +343,26 @@ impl StateDir {
             bail!("{} is already linked to a typstry project", root.display());
         }
         create_private_dir(&dir)?;
-        let state = Self::lock(root.to_path_buf(), dir)?;
+        let state = Self::lock(root.to_path_buf(), dir, LOCK_GRACE)?;
         state.ignore_in_git()?;
         Ok(state)
+    }
+
+    /// [`Self::open_headless_waiting`] with the usual grace period.
+    #[cfg(test)]
+    pub fn open_headless(dir: &Path) -> anyhow::Result<Self> {
+        Self::open_headless_waiting(dir, LOCK_GRACE)
+    }
+
+    /// Opens the state of a space that has no folder, in `dir` itself
+    /// (created if missing), waiting up to `wait` for whoever holds the
+    /// lock, since a sync pass may hold it for a while. There are no synced
+    /// files, so no `.gitignore` either; `dir` is not meant to sit inside a
+    /// repo. [`Self::root`] is `dir` too, which is only a place to run
+    /// `git config` from.
+    pub fn open_headless_waiting(dir: &Path, wait: Duration) -> anyhow::Result<Self> {
+        create_private_dirs(dir, true)?;
+        Self::lock(dir.to_path_buf(), dir.to_path_buf(), wait)
     }
 
     /// Finds the project `start` is in, walking up like git does, so
@@ -315,7 +372,7 @@ impl StateDir {
             .canonicalize()
             .with_context(|| format!("cannot open {}", start.display()))?;
         if let Some(dir) = Self::find_root(&start) {
-            let state = Self::lock(dir.to_path_buf(), dir.join(STATE_DIR))?;
+            let state = Self::lock(dir.to_path_buf(), dir.join(STATE_DIR), LOCK_GRACE)?;
             // Folders linked before the file existed get it too.
             if !state.dir.join(GITIGNORE).exists() {
                 state.ignore_in_git()?;
@@ -351,7 +408,7 @@ impl StateDir {
         }
     }
 
-    fn lock(root: PathBuf, dir: PathBuf) -> anyhow::Result<Self> {
+    fn lock(root: PathBuf, dir: PathBuf, grace: Duration) -> anyhow::Result<Self> {
         let path = dir.join(LOCK);
         let file = OpenOptions::new()
             .create(true)
@@ -363,7 +420,7 @@ impl StateDir {
         // copy of it until that child execs, so a lock released a moment ago
         // can still look taken. A short grace period hides that; a real
         // second run still fails fast.
-        let deadline = Instant::now() + LOCK_GRACE;
+        let deadline = Instant::now() + grace;
         loop {
             match file.try_lock() {
                 Ok(()) => break,
@@ -426,6 +483,29 @@ impl StateDir {
         &self.dir
     }
 
+    /// The config of the headless space in `dir`, if it has one, read
+    /// without the lock: configs are only ever replaced atomically.
+    pub fn peek_headless_config(dir: &Path) -> Option<Config> {
+        read_config(&dir.join(CONFIG)).ok()
+    }
+
+    /// Forgets the group seat, its device key and the owner keys, for a
+    /// space whose binding is replaced by another one: they belong to the
+    /// old space and would only confuse the new one.
+    pub fn clear_group(&self) -> anyhow::Result<()> {
+        for name in [MLS, DEVICE, OWNER] {
+            remove_if_exists(&self.dir.join(name))?;
+        }
+        Ok(())
+    }
+
+    /// Undoes the binding of a headless dir to its space, for a device the
+    /// space removed. The doc stays: the dir is a plain local one again.
+    pub fn clear_binding(&self) -> anyhow::Result<()> {
+        self.clear_group()?;
+        remove_if_exists(&self.dir.join(CONFIG))
+    }
+
     pub fn load_config(&self) -> anyhow::Result<Config> {
         read_config(&self.dir.join(CONFIG))
     }
@@ -439,14 +519,14 @@ impl StateDir {
     /// the next connect join again with a fresh state; the second field
     /// says what was dropped. One from a newer typstry is an error, since
     /// joining again would replace state that version can still use.
-    pub fn load_mls(&self) -> anyhow::Result<(Option<ProjectGroup>, Option<String>)> {
+    pub fn load_mls(&self) -> anyhow::Result<(Option<SpaceGroup>, Option<String>)> {
         let path = self.dir.join(MLS);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
-        match ProjectGroup::import_state(&bytes) {
+        match SpaceGroup::import_state(&bytes) {
             Ok(group) => Ok((Some(group), None)),
             Err(err @ MlsError::NewerState(_)) => {
                 Err(err).with_context(|| format!("reading {}", path.display()))
@@ -463,7 +543,7 @@ impl StateDir {
 
     /// Saves the device and the owner key first: if the state write is
     /// interrupted, both survive for the rejoin.
-    pub fn save_mls(&self, group: &ProjectGroup) -> anyhow::Result<()> {
+    pub fn save_mls(&self, group: &SpaceGroup) -> anyhow::Result<()> {
         self.save_device(group.device())?;
         if !group.owner_secrets().is_empty() {
             merge_owner_keys(&self.dir.join(OWNER), group.owner_secrets())?;
@@ -857,7 +937,14 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result
 /// The state holds the project key, so nobody else on the machine gets to
 /// read it.
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    create_private_dirs(dir, false)
+}
+
+/// [`create_private_dir`], with the missing parents too when `recursive`.
+/// An existing `dir` is then fine as well.
+fn create_private_dirs(dir: &Path, recursive: bool) -> anyhow::Result<()> {
     let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder
@@ -935,6 +1022,27 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn filled_owner_keys_never_push_out_a_held_one() {
+        use typstry_wire::mls::{Origin, OwnerSecret};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.bin");
+        let mine = OwnerSecret::generate();
+        let held: OwnerSecrets = [(mine.clone(), Origin::Received)].into_iter().collect();
+        merge_owner_keys(&path, &held).unwrap();
+        let planted: OwnerSecrets = (0..OwnerSecrets::KEEP * 2)
+            .map(|_| (OwnerSecret::generate(), Origin::Received))
+            .collect();
+        fill_owner_keys(&path, &planted).unwrap();
+        let stored = read_owner_keys(&path);
+        assert_eq!(stored.iter().next(), Some(&mine));
+        assert_eq!(stored.iter().count(), OwnerSecrets::KEEP);
+        // Nothing changes the second time.
+        let bytes = fs::read(&path).unwrap();
+        fill_owner_keys(&path, &planted).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
     fn owner_keys_keep_every_secret_a_group_held() {
         use typstry_wire::mls::{Origin, OwnerSecret};
         let dir = tempfile::tempdir().unwrap();
@@ -971,12 +1079,12 @@ pub(crate) mod tests {
         let graph = PersonGraph::genesis(&device);
         let me = LocalIdentity { device, graph };
         let link = LinkSecret::generate_edit();
-        let (group, init) = ProjectGroup::create(&link, b"me", &me).unwrap();
+        let (group, init) = SpaceGroup::create(&link, b"me", &me).unwrap();
         let real = group.owner_secret().unwrap().clone();
         // A server that names a key of its own making when the folder joins
         // again: the real one is what may be left nowhere else.
         let forged = OwnerSecret::generate().public();
-        let (joined, _) = ProjectGroup::join_external_as(
+        let (joined, _) = SpaceGroup::join_external_as(
             group.device().duplicate(),
             &link,
             Bootstrap {
@@ -1011,6 +1119,49 @@ pub(crate) mod tests {
         fs::create_dir_all(&sub).unwrap();
         let found = StateDir::discover(&sub).unwrap();
         assert_eq!(found.root(), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn headless_state_round_trips_in_any_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spaces/abc");
+        let state = StateDir::open_headless(&dir).unwrap();
+        assert_eq!(state.root(), dir);
+        assert!(!dir.join(GITIGNORE).exists());
+        assert!(state.load_mls().unwrap().0.is_none());
+
+        state.save_config(&test_config()).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "hi").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let err = StateDir::open_headless(&dir).unwrap_err();
+        assert!(err.to_string().contains("another typstry command"), "{err}");
+        drop(state);
+
+        let state = StateDir::open_headless(&dir).unwrap();
+        assert_eq!(state.load_config().unwrap().project_id, "p");
+        assert_eq!(state.load_doc().unwrap().0.get_text("t").to_string(), "hi");
+    }
+
+    #[test]
+    fn clearing_the_binding_keeps_the_doc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spaces/abc");
+        let state = StateDir::open_headless(&dir).unwrap();
+        state.save_config(&test_config()).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "hi").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        fs::write(dir.join(OWNER), b"x").unwrap();
+
+        state.clear_binding().unwrap();
+        assert!(StateDir::peek_headless_config(&dir).is_none());
+        assert!(!dir.join(OWNER).exists());
+        assert_eq!(state.load_doc().unwrap().0.get_text("t").to_string(), "hi");
+        // Nothing left to clear is not an error.
+        state.clear_binding().unwrap();
     }
 
     pub(crate) fn test_config() -> Config {

@@ -32,6 +32,8 @@ pub enum Action {
         /// A device's number from `typstry members` or its name, or a
         /// person's fingerprint (the start is enough) to remove all of
         /// their devices.
+        // Fingerprints are base64url, so one starts with '-' now and then.
+        #[arg(allow_hyphen_values = true)]
         member: String,
     },
 }

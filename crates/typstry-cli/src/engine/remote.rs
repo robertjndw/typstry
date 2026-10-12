@@ -14,7 +14,7 @@ use crate::client::{Client, Event, Joined};
 use crate::link::ws_url;
 
 use super::membership::NO_KEYS;
-use super::{RemoteEvent, Session, SyncError};
+use super::{RemoteEvent, SpaceCore, SyncError};
 
 /// Same as the adaptor's `CONTAINER_BUDGET`: one container per send stays
 /// well under the server's limit for a reassembled update.
@@ -52,7 +52,7 @@ pub(super) struct Conn {
     mismatched_key: Option<String>,
     decrypted_any: bool,
     /// A record came from a key generation newer than ours, so the keyring
-    /// has to be fetched again, see [`Session::next_remote`].
+    /// has to be fetched again, see [`SpaceCore::next_remote`].
     stale_keys: bool,
 }
 
@@ -95,7 +95,7 @@ impl Conn {
         }
     }
 
-    /// See [`Session::caught_up`]; `have` is the doc's oplog version.
+    /// See [`SpaceCore::caught_up`]; `have` is the doc's oplog version.
     fn caught_up(&self, have: &VersionVector) -> bool {
         if covers(have, &self.target) {
             return true;
@@ -268,12 +268,20 @@ impl Conn {
     }
 }
 
-impl Session {
+impl SpaceCore {
     /// Connects and catches up: resolves the link (refreshing the cached
     /// permission and view token), joins, imports the backfill until the
     /// doc covers what the server had, then sends ops the server lacks,
     /// e.g. from an earlier run that went offline.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let result = self.connect_inner().await;
+        if let Err(err) = &result {
+            self.note_fatal(err);
+        }
+        result
+    }
+
+    async fn connect_inner(&mut self) -> anyhow::Result<()> {
         self.disconnect().await;
         // Before anything else, and with the token we hold even if a
         // rotation retired it: the commit log is how a folder that was
@@ -299,9 +307,9 @@ impl Session {
         if share.retired {
             return Err(SyncError::LinkReplaced.into());
         }
-        if share.project_id != self.config.project_id {
+        if share.space_id != self.config.project_id {
             return Err(SyncError::WrongProject {
-                now: share.project_id,
+                now: share.space_id,
                 linked: self.config.project_id.clone(),
             }
             .into());
@@ -353,10 +361,13 @@ impl Session {
             }
             .into());
         }
+        // Before anything of ours goes out: a link that opens another kind
+        // of space (a project, say) must not get this doc's ops.
+        (self.kind.ensure)(&self.doc)?;
         if self.can_write() {
             // Only from here on does the doc hold the whole project, which
             // migrating needs. The result goes out with the push below.
-            typstry_doc::migrate(&self.doc).context("migrating the project")?;
+            (self.kind.migrate)(&self.doc).context("migrating the project")?;
             self.push_local().await?;
             if removed_devices {
                 // Same as after any other rotation, so the project does not
@@ -507,7 +518,7 @@ impl Session {
         }
         // A newer client may migrate the project while we sync. Fatal, so
         // a running sync stops instead of writing into the new layout.
-        typstry_doc::ensure_supported(&self.doc).map_err(SyncError::from)?;
+        (self.kind.ensure)(&self.doc)?;
         Ok(self.doc.oplog_vv() != before)
     }
 

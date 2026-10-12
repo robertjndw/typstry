@@ -5,31 +5,36 @@ use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
+use typstry_doc::directory::State;
 use typstry_wire::crypto::PublicKey;
 use typstry_wire::identity::{
     DeviceState, PersonGraph, PersonId, device_fingerprint, person_fingerprint,
 };
 use typstry_wire::mls::LocalIdentity;
 use typstry_wire::pairing::{
-    Code, Event, Grant, GrantedProject, PairError, Pairing, Role, fit_device_name,
+    Code, Event, Grant, GrantedSpace, PairError, Pairing, Role, fit_device_name,
 };
 use typstry_wire::relay::{CHANNEL_TTL_SECS, close_reason};
 
 use super::Ctx;
 use super::init::confirm;
+use super::list::print_catalog;
 use crate::api::Api;
 use crate::client::{PING_INTERVAL, Socket, open_socket};
+use crate::directory::list_all;
 use crate::link::{ShareLink, relay_url};
+use crate::space::{ensure_space, join_space, sync_server};
 use crate::state::StateDir;
 use crate::user::{
-    AvailableProject, KnownProject, catalog, load_identity, load_or_create_device, merge_graph,
-    projects, remember_available, save_paired_graph, set_device_label,
+    KnownProject, catalog, load_identity, load_or_create_device, merge_graph, owner_keys, projects,
+    save_paired_graph, set_device_label,
 };
 
 /// Pair this device with another one of yours.
 ///
-/// Pairing makes two devices the same person in every project they share,
-/// and hands the new device the list of your projects. Each device keeps
+/// Pairing makes two devices the same person in every project they share.
+/// The new device gets your projects, and keeps getting the ones you add
+/// later, through your personal space on the server. Each device keeps
 /// its own key; the existing one vouches for the new one in your device
 /// graph (see `typstry devices`). Run it without arguments on the device
 /// that is already you: it prints a short code. Then enter the code on the
@@ -48,10 +53,11 @@ pub struct Args {
     #[arg(long, value_name = "URL", env = "TYPSTRY_SERVER")]
     pub server: Option<String>,
     /// Join as a new device even though this one is already a person. It
-    /// switches to the other person; its own graph is discarded, and the
-    /// folders here join their projects again as the other person on their
-    /// next sync. Entering a code on a machine that only became a person by
-    /// cloning asks about this by itself.
+    /// switches to the other person; its own graph is discarded, its project
+    /// list is merged into the other person's, and the folders here join
+    /// their projects again as the other person on their next sync.
+    /// Entering a code on a machine that only became a person by cloning
+    /// asks about this by itself.
     #[arg(long)]
     pub replace: bool,
     /// Approve the other device without asking.
@@ -143,6 +149,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         pair(
             &mut ws,
             &meeting.code,
+            &meeting.origin,
             identity.as_mut(),
             &device_name,
             args.yes,
@@ -152,7 +159,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let _ = ws.close(None).await;
     match outcome {
         Ok(Ok(Outcome::Approved)) => Ok(()),
-        Ok(Ok(Outcome::Granted(grant))) => joined(grant, replace, old_person),
+        Ok(Ok(Outcome::Granted(grant))) => {
+            joined(grant, &meeting.origin, replace, old_person).await
+        }
         Ok(Err(err)) => Err(err),
         Err(_) => {
             bail!("The code expired before the pairing finished. Start over with a new code.")
@@ -170,6 +179,7 @@ enum Outcome {
 async fn pair(
     ws: &mut Socket,
     code: &Code,
+    origin: &str,
     mut identity: Option<&mut LocalIdentity>,
     device_name: &str,
     yes: bool,
@@ -239,12 +249,14 @@ async fn pair(
                     send(ws, pairing.reject().map_err(explain)?).await?;
                     bail!("Declined. {new_name} was not added.");
                 }
+                // Before the device is added, so a failure leaves nothing behind.
+                let space = personal_space(origin).await?;
                 let graph = add_device(identity, &device_pub, &new_name)?;
-                let grant = granted_projects(Grant::new(device_name.to_owned(), graph.encode()));
-                let shared = grant.projects.len();
+                let grant = Grant::new(device_name.to_owned(), graph.encode(), space);
                 send(ws, pairing.approve(&grant).map_err(explain)?).await?;
                 println!(
-                    "Paired. {new_name} ({tag}) is now one of your devices and received {shared} project(s)."
+                    "Paired. {new_name} ({tag}) is now one of your devices and gets your projects, \
+                     including the ones you add later."
                 );
                 return Ok(Outcome::Approved);
             }
@@ -305,7 +317,12 @@ async fn ask(
 
 /// What the new device does with a grant. `old_person` is the person this
 /// machine was before, if any.
-fn joined(grant: Grant, replace: bool, old_person: Option<PersonId>) -> anyhow::Result<()> {
+async fn joined(
+    grant: Grant,
+    origin: &str,
+    replace: bool,
+    old_person: Option<PersonId>,
+) -> anyhow::Result<()> {
     let graph = PersonGraph::decode(&grant.graph)
         .map_err(|err| anyhow::anyhow!("the received device graph is unusable: {err}"))?;
     let device = load_or_create_device()?;
@@ -338,17 +355,32 @@ fn joined(grant: Grant, replace: bool, old_person: Option<PersonId>) -> anyhow::
             );
         }
     }
-    if grant.projects.is_empty() {
-        println!("The other device has no projects to hand over.");
-        return Ok(());
+    // The directory is what carries the projects, so they arrive with the
+    // first pass.
+    join_space(origin, &grant.space).await.context(
+        "paired, but this device could not join your personal space, so your projects will not sync",
+    )?;
+    sync_server(origin).await;
+    if catalog()?.is_empty() {
+        println!("The other device has no projects yet.");
+    } else {
+        println!("Your projects (copy one with `typstry clone <number>`):");
+        print_catalog(false)?;
     }
-    let handed: Vec<AvailableProject> = grant.projects.into_iter().map(Into::into).collect();
-    remember_available(&handed)?;
-    println!(
-        "Received {} project(s). See them with `typstry list`, copy one with `typstry clone <number>`.",
-        handed.len()
-    );
     Ok(())
+}
+
+/// The personal space to hand the new device, created if this person has
+/// none yet and brought up to date first, so the new device finds the
+/// directory on the server. Pairing runs through the server, so a failure
+/// here is a real problem and fails the approval.
+async fn personal_space(origin: &str) -> anyhow::Result<GrantedSpace> {
+    let binding = ensure_space(origin).await.context(
+        "could not set up your personal space, which carries your projects to the new device",
+    )?;
+    sync_server(origin).await;
+    GrantedSpace::new(binding.token, binding.secret, binding.owner_secrets)
+        .map_err(|err| anyhow::anyhow!("could not hand over your personal space: {err}"))
 }
 
 /// Refuses `--replace` when it would leave a project without a way to
@@ -401,10 +433,18 @@ fn local_folders() -> anyhow::Result<Vec<String>> {
 
 /// Whether this machine's person is one it most likely became by
 /// accident, by cloning before pairing: this device is the only one the
-/// graph ever had, and it owns no project here. Leaving such a person for
-/// another one loses nothing.
+/// graph ever had, and it owns no project, in a folder here or in its
+/// directory. Leaving such a person for another one loses nothing, and its
+/// directory merges into the other person's.
 fn is_disposable(graph: &PersonGraph, own: &PublicKey) -> anyhow::Result<bool> {
-    Ok(graph.only_ever_had(own) && owned_folders(graph)?.is_empty())
+    Ok(graph.only_ever_had(own) && owned_folders(graph)?.is_empty() && !owns_listed()?)
+}
+
+/// Whether this machine holds the owner key of a project its directory lists.
+fn owns_listed() -> anyhow::Result<bool> {
+    Ok(list_all()?.iter().any(|(server, entry)| {
+        entry.state != State::Forgotten && !owner_keys(server, &entry.project_id).is_empty()
+    }))
 }
 
 /// Asks whether a machine that [`is_disposable`] should join the person of
@@ -428,22 +468,6 @@ fn offer_switch(yes: bool) -> anyhow::Result<bool> {
         "Does the device showing the code already belong to you, so this machine should join \
          it? Its folders switch over on their next sync. (No: add that device to this machine.)",
     )
-}
-
-/// `grant` with what the holder shares: the folders it still has.
-fn granted_projects(mut grant: Grant) -> Grant {
-    for known in projects().unwrap_or_default() {
-        if !known.dir.is_dir() {
-            continue;
-        }
-        let title = known.display_title();
-        if let Some(project) = GrantedProject::new(&title, known.link)
-            && !grant.push(project)
-        {
-            break;
-        }
-    }
-    grant
 }
 
 /// The server to pair through: `--server`, the origin of a link, the

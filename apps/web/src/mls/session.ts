@@ -7,7 +7,7 @@
 // before sending it so the log can settle it when the reply is lost.
 //
 // Doc sync never waits for any of this. Until the join completes, records
-// are signed by a throwaway device key (see ProjectCrypto), and a stalled
+// are signed by a throwaway device key (see SpaceCrypto), and a stalled
 // group only costs rotations.
 //
 // Several tabs of a project share one group state in IndexedDB. Every
@@ -20,9 +20,11 @@ import { sameBytes, toHex } from "@/crypto/bytes";
 import {
   LeafKeys,
   LinkSecret,
-  ProjectGroup,
+  SpaceGroup,
   mergeOwnerSecrets,
+  withOwnerSecrets,
   type DocKeys,
+  type PersonSpaceBinding,
   type Outcome,
   type PresenceKey,
   type Rotation,
@@ -37,6 +39,8 @@ import {
   type MlsRecord,
   type StoredRotation,
 } from "@/persist/local-doc-store";
+import { loadBinding } from "@/directory/binding";
+import { directoryOwnerSecrets, recordOwnerSecret } from "@/directory/record";
 import { encodeProfile, type Identity } from "@/presence/identity";
 import type { MlsBootstrap } from "@/sync/api";
 
@@ -85,7 +89,7 @@ export interface MlsSnapshot {
   error: string | null;
 }
 
-/** The group's keys as of one epoch, ready to hand to `ProjectCrypto`. */
+/** The group's keys as of one epoch, ready to hand to `SpaceCrypto`. */
 export interface GroupKeys {
   docKeys: DocKeys;
   signer: Signer;
@@ -102,7 +106,7 @@ export type DsConnection = Pick<
 >;
 
 export interface MlsSessionOptions {
-  projectId: string;
+  spaceId: string;
   backend: Pick<DocBackend, "loadMls" | "saveMls">;
   fetchBootstrap: (token: string) => Promise<MlsBootstrap | null>;
   /** The profile to put in this device's leaf, read when one is needed. */
@@ -117,6 +121,12 @@ export interface MlsSessionOptions {
    * Needed with `localIdentity` to keep the graph in step with the group.
    */
   mergeGraph?: (graph: Uint8Array) => Promise<Uint8Array>;
+  /**
+   * The personal space link the leaf carries, sealed to the recovery keys.
+   * Read whenever a leaf is written, so a binding made or rotated later is
+   * picked up. Defaults to this browser's directory binding.
+   */
+  personSpace?: () => PersonSpaceBinding | undefined;
   /**
    * The links moved on; keep them durably, they are the only way back in.
    * For a rotation this device made it is called before the new group state
@@ -204,7 +214,7 @@ const pageLock: Locker = (name, fn) => {
   return run;
 };
 
-function defaultLocker(): Locker {
+export function defaultLocker(): Locker {
   if (typeof navigator !== "undefined" && navigator.locks) {
     return (name, fn) => navigator.locks.request(name, fn);
   }
@@ -245,7 +255,7 @@ function sameRoster(
   );
 }
 
-function deviceOf(group: ProjectGroup): Uint8Array {
+function deviceOf(group: SpaceGroup): Uint8Array {
   const device = group.leafKeys();
   try {
     return device.export();
@@ -258,9 +268,27 @@ export function emptyRecord(): MlsRecord {
   return { state: null, device: null, removed: false, rotation: null };
 }
 
+/**
+ * Adds `ownerSecrets` (from a recovery or a pairing grant) to the space's
+ * group record, where the join that follows picks them up: with them the
+ * device can remove lost devices and replace the links they hold. What the
+ * record kept already stays.
+ */
+export async function keepOwnerKey(
+  backend: Pick<DocBackend, "loadMls" | "saveMls">,
+  spaceId: string,
+  ownerSecrets: Uint8Array,
+): Promise<void> {
+  const record = await backend.loadMls(spaceId);
+  await backend.saveMls(spaceId, {
+    ...(record ?? emptyRecord()),
+    ownerSecrets: mergeOwnerSecrets(record?.ownerSecrets, ownerSecrets),
+  });
+}
+
 /** What a locked section works on: the stored group and its record. */
 interface Tx {
-  group: ProjectGroup | null;
+  group: SpaceGroup | null;
   record: MlsRecord;
   /**
    * Stores the group's state and `patch`. A commit still waiting for the
@@ -292,7 +320,7 @@ export class MlsSession {
   private token = "";
   private link = "";
   /** This tab's reading of the stored group, for rendering. */
-  private group: ProjectGroup | null = null;
+  private group: SpaceGroup | null = null;
   private record: MlsRecord = emptyRecord();
   private snapshot: MlsSnapshot = IDLE;
   private readonly listeners = new Set<() => void>();
@@ -402,6 +430,7 @@ export class MlsSession {
     }
     this.running = true;
     this.openChannel();
+    await this.takeDirectoryKeys();
     await this.loadLocal();
     if (this.running) this.openSocket();
   }
@@ -478,7 +507,7 @@ export class MlsSession {
   // --- Reading the stored group ---
 
   private openChannel(): void {
-    const name = `typstry:mls:${this.opts.projectId}`;
+    const name = `typstry:mls:${this.opts.spaceId}`;
     const channel =
       this.opts.createChannel?.(name) ??
       (typeof BroadcastChannel === "undefined"
@@ -492,14 +521,14 @@ export class MlsSession {
 
   private async readStored(): Promise<{
     record: MlsRecord;
-    group: ProjectGroup | null;
+    group: SpaceGroup | null;
   }> {
     const record =
-      (await this.opts.backend.loadMls(this.opts.projectId)) ?? emptyRecord();
-    let group: ProjectGroup | null = null;
+      (await this.opts.backend.loadMls(this.opts.spaceId)) ?? emptyRecord();
+    let group: SpaceGroup | null = null;
     if (record.state && !record.removed) {
       try {
-        group = ProjectGroup.importState(record.state);
+        group = SpaceGroup.importState(record.state);
       } catch (error) {
         // Unreadable state is a lost group: the device is still ours, so
         // joining again replaces its old leaf. A newer build's state is
@@ -509,6 +538,46 @@ export class MlsSession {
       }
     }
     return { record, group };
+  }
+
+  /**
+   * Owner keys of this project that another device of the person put in the
+   * directory, kept in the record before anything reads it: a project this
+   * device never opened can then be joined and its links rotated. A group
+   * already joined gets them too, behind the key it holds, since joining is
+   * the only other way keys reach a group.
+   */
+  private async takeDirectoryKeys(): Promise<void> {
+    const { spaceId, backend } = this.opts;
+    try {
+      await this.lock(`typstry:mls:${spaceId}`, async () => {
+        const record = await backend.loadMls(spaceId);
+        const secrets = await directoryOwnerSecrets(spaceId);
+        if (secrets.length === 0) return;
+        const merged = withOwnerSecrets(record?.ownerSecrets, secrets);
+        let state = record?.state;
+        if (record?.state && !record.removed) {
+          const group = SpaceGroup.importState(record.state);
+          try {
+            group.keepOwnerSecrets(withOwnerSecrets(undefined, secrets));
+            state = group.exportState();
+          } finally {
+            group.free();
+          }
+        }
+        const same = (a?: Uint8Array | null, b?: Uint8Array | null) =>
+          sameBytes(a ?? new Uint8Array(), b ?? new Uint8Array());
+        if (same(merged, record?.ownerSecrets) && same(state, record?.state))
+          return;
+        await backend.saveMls(spaceId, {
+          ...(record ?? emptyRecord()),
+          ownerSecrets: merged,
+          state: state ?? null,
+        });
+      });
+    } catch (error) {
+      console.warn("could not take owner keys from the directory", error);
+    }
   }
 
   private async loadLocal(): Promise<void> {
@@ -546,7 +615,7 @@ export class MlsSession {
   // --- State ---
 
   /** Takes `group` (a fresh import, or the result of an operation) as the current one. */
-  private adopt(group: ProjectGroup | null, record: MlsRecord): void {
+  private adopt(group: SpaceGroup | null, record: MlsRecord): void {
     if (this.group && this.group !== group) this.group.free();
     this.group = group;
     this.record = record;
@@ -609,7 +678,7 @@ export class MlsSession {
    * changed: the tree moves with the epoch, and which identities open
    * depends on the keyring, which can arrive within an epoch.
    */
-  private rosterAt(group: ProjectGroup): RosterMember[] {
+  private rosterAt(group: SpaceGroup): RosterMember[] {
     const key = `${group.incarnation}:${group.epoch}:${group.needsKeyring()}`;
     if (this.roster?.key !== key)
       this.roster = { key, members: rosterOf(group.members()) };
@@ -664,6 +733,16 @@ export class MlsSession {
     return run;
   }
 
+  /**
+   * Puts the owner key the server names into the directory, if this device
+   * holds its secret. Only that one: the record keeps older keys for its own
+   * sake, but spreading them would let a stale key be planted again after
+   * pruning.
+   */
+  private async recordCurrentOwnerKey(group: SpaceGroup | null): Promise<void> {
+    await recordOwnerSecret(this.opts.spaceId, group?.ownerSecret());
+  }
+
   private background(task: () => Promise<void>): void {
     this.enqueue(task).catch((error: unknown) => this.report(error, true));
   }
@@ -674,8 +753,8 @@ export class MlsSession {
    * tells the other tabs.
    */
   private async locked<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-    const { projectId, backend } = this.opts;
-    return this.lock(`typstry:mls:${projectId}`, async () => {
+    const { spaceId, backend } = this.opts;
+    return this.lock(`typstry:mls:${spaceId}`, async () => {
       const stored = await this.readStored();
       let changed = false;
       const tx: Tx = {
@@ -697,7 +776,8 @@ export class MlsSession {
             // The device never changes once joined, a reset included.
             device: record.device ?? (group ? deviceOf(group) : null),
           };
-          await backend.saveMls(projectId, tx.record);
+          await backend.saveMls(spaceId, tx.record);
+          await this.recordCurrentOwnerKey(group);
           changed = true;
         },
       };
@@ -840,7 +920,7 @@ export class MlsSession {
    * An edit link opened on a device that holds a viewer's group: the same
    * device joins again, this time as an editor.
    */
-  private wantsUpgrade(group: ProjectGroup): boolean {
+  private wantsUpgrade(group: SpaceGroup): boolean {
     let link: LinkSecret | null = null;
     let held: LinkSecret | null = null;
     try {
@@ -1014,6 +1094,20 @@ export class MlsSession {
     this.syncIdentity().catch((error: unknown) => this.report(error));
   }
 
+  private isPersonalSpace(): boolean {
+    return loadBinding()?.spaceId === this.opts.spaceId;
+  }
+
+  private personSpace(): PersonSpaceBinding | undefined {
+    const binding = loadBinding();
+    const pointer = this.opts.personSpace
+      ? this.opts.personSpace()
+      : binding && { token: binding.token, secret: binding.secret };
+    // The personal space's own leaves must not point at it: that space is
+    // the one a recovery key is supposed to find from the outside.
+    return pointer && !this.isPersonalSpace() ? pointer : undefined;
+  }
+
   /**
    * Brings this device's identity in line with its person: merges what the
    * group knows of the person's graph into the one stored here, puts what
@@ -1036,7 +1130,7 @@ export class MlsSession {
     if (!localIdentity || !mergeGraph || !this.group?.isActive) return result;
     let { graph } = await localIdentity();
     if (!this.group?.isActive) return result;
-    let step = this.group.identityStep(graph);
+    let step = this.group.identityStep(graph, this.personSpace());
     // `merged` is only set while the group knows something the stored graph
     // lacks, so this storage write does not repeat on every settle.
     if (step.merged) graph = await mergeGraph(step.merged);
@@ -1066,12 +1160,16 @@ export class MlsSession {
     // that leaf.
     if (step.needsRefresh || step.shareOwnerKey) {
       await this.commit((g) =>
-        g.selfUpdate(encodeProfile(this.opts.identity()), graph),
+        g.selfUpdate(
+          encodeProfile(this.opts.identity()),
+          graph,
+          this.personSpace(),
+        ),
       );
       // The refresh put our revokes into the tree, which can make more
       // leaves read as revoked.
       if (!this.group?.isActive) return result;
-      step = this.group.identityStep(graph);
+      step = this.group.identityStep(graph, this.personSpace());
     }
     // Only filled for a holder of the owner key: anyone else leaves the
     // removal to an owner device, which reads the revoke from our leaf.
@@ -1162,7 +1260,7 @@ export class MlsSession {
         // Stored before the join so a refused attempt or a crash keeps the
         // identity for the next one.
         tx.record = { ...tx.record, device: device.export() };
-        await this.opts.backend.saveMls(this.opts.projectId, tx.record);
+        await this.opts.backend.saveMls(this.opts.spaceId, tx.record);
       }
       const link = LinkSecret.parse(this.link);
       const profile = encodeProfile(this.opts.identity());
@@ -1197,7 +1295,7 @@ export class MlsSession {
           ] as const;
           joined = tx.group
             ? tx.group.rejoinAs(...args)
-            : ProjectGroup.joinExternalAs(...args);
+            : SpaceGroup.joinExternalAs(...args);
         } catch (error) {
           // The sealed parts only open with the project's keys, so this
           // is where a truncated or wrong link shows.
@@ -1335,7 +1433,7 @@ export class MlsSession {
         // devices of this person learn it.
         const graph = (await this.opts.localIdentity?.())?.graph;
         await this.commit((group) =>
-          group.selfUpdate(encodeProfile(want), graph),
+          group.selfUpdate(encodeProfile(want), graph, this.personSpace()),
         );
       } else {
         await this.enqueue(() => this.locked((tx) => this.join(tx)));
@@ -1347,7 +1445,7 @@ export class MlsSession {
   }
 
   private async commit(
-    build: (group: ProjectGroup) => Unsent<SubmitMessage>,
+    build: (group: SpaceGroup) => Unsent<SubmitMessage>,
   ): Promise<void> {
     const jitter = this.opts.jitter ?? defaultJitter;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
@@ -1396,7 +1494,7 @@ export class MlsSession {
    */
   private async commitIn(
     tx: Tx,
-    build: (group: ProjectGroup) => Unsent<SubmitMessage>,
+    build: (group: SpaceGroup) => Unsent<SubmitMessage>,
   ): Promise<CommitResult> {
     const group = tx.group;
     const ds = this.ds;

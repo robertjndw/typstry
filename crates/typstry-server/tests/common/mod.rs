@@ -64,16 +64,16 @@ pub async fn json(res: Response) -> Value {
     serde_json::from_slice(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap()
 }
 
-pub async fn create_project(app: Router) -> Created {
+pub async fn create_space(app: Router) -> Created {
     let res = app
-        .oneshot(Request::post("/api/projects").body(Body::empty()).unwrap())
+        .oneshot(Request::post("/api/spaces").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     let body = json(res).await;
     let field = |key: &str| body[key].as_str().unwrap().to_owned();
     Created {
-        id: field("projectId"),
+        id: field("spaceId"),
         edit: field("editToken"),
         view: field("viewToken"),
     }

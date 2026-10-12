@@ -20,9 +20,9 @@ function text(doc: LoroDoc) {
   return doc.getText("t").toString();
 }
 
-async function reopen(backend: DocBackend, projectId = "p1") {
+async function reopen(backend: DocBackend, spaceId = "p1") {
   const doc = new LoroDoc();
-  const found = await new LocalDocStore(projectId, doc, backend).load();
+  const found = await new LocalDocStore(spaceId, doc, backend).load();
   return { doc, found };
 }
 

@@ -2,7 +2,9 @@
 
 use loro::{LoroDoc, LoroError, LoroResult, LoroText, LoroValue, TreeID, TreeParentId};
 
-use crate::{FileKind, SCHEMA_VERSION, configure, is_string, meta, node, root, schema_version};
+use crate::{
+    FileKind, SCHEMA_VERSION, configure, is_string, kind, meta, node, root, schema_version,
+};
 
 pub const DEFAULT_MAIN_FILE: &str = "main.typ";
 
@@ -51,6 +53,7 @@ fn seed(doc: &LoroDoc, title: &str, starter: bool) -> LoroResult<()> {
 
     // JS numbers are stored as doubles, so write a double to produce the
     // exact same value a browser-seeded project would have.
+    meta_map.insert(meta::KIND, kind::PROJECT)?;
     meta_map.insert(meta::SCHEMA, SCHEMA_VERSION as f64)?;
     meta_map.insert(meta::TITLE, title)?;
     doc.set_next_commit_message("init project");

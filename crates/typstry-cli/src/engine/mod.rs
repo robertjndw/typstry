@@ -17,20 +17,18 @@ mod assets;
 mod membership;
 mod reconcile;
 mod remote;
+mod space;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Context;
-use loro::{ExportMode, LoroDoc, VersionVector};
+use loro::LoroDoc;
 use loro_protocol::UpdateStatusCode;
 use typstry_doc::apply::ApplyReport;
-use typstry_doc::configure;
 use typstry_doc::materialize::FileContent;
 use typstry_doc::peers::{PALETTE, normalize_peer_name, set_peer};
-use typstry_wire::crypto::LinkSecret;
-use typstry_wire::mls::{LocalIdentity, ProjectGroup};
+use typstry_wire::mls::SpaceGroup;
 
 use crate::api::{Api, ShareInfo};
 use crate::git::Repo;
@@ -39,11 +37,7 @@ use crate::state::{Base, Config, StateDir};
 use crate::worktree::{Skipped, Worktree};
 
 use self::reconcile::BaseFiles;
-use self::remote::Conn;
-
-/// The log of updates next to the cached snapshot is folded into a new
-/// snapshot once it outgrows the snapshot, or this, whichever is larger.
-const COMPACT_LOG_BYTES: u64 = 1024 * 1024;
+pub use self::space::{DocKind, SpaceCore};
 
 /// How this run shows up in the history panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,56 +195,35 @@ pub enum Reconciled {
     Held(BTreeSet<String>),
 }
 
-/// An open project folder.
+/// An open project folder: the space plus the worktree it is synced with.
 pub struct Session {
-    state: StateDir,
-    pub config: Config,
+    core: SpaceCore,
     base: Base,
-    doc: LoroDoc,
-    /// The folder's seat in the project's group. It holds the doc keys and
-    /// the key that signs records. None until the first connect has joined
-    /// the group.
-    group: Option<ProjectGroup>,
     worktree: Worktree,
-    api: Api,
-    /// What the link resolved to a moment ago, for the next connect.
-    resolved: Option<ShareInfo>,
-    identity: Identity,
-    /// This device's key and person graph, read once per run and replaced
-    /// by what each save of the graph hands back. None while the machine is
-    /// not a person yet, or its files could not be read; whoever needs one
-    /// then reads them again and gets the error.
-    local: Option<LocalIdentity>,
-    conn: Option<Conn>,
-    /// One warning about undecryptable records is enough per run.
-    warned_unreadable: bool,
-    /// Problems the connection ran into that did not stop it. The session
-    /// never prints: a running sync may be working for another command,
-    /// whose terminal they belong in. See [`Self::take_warnings`].
-    warnings: Vec<String>,
-    /// The server refused a compaction snapshot; it would refuse the next
-    /// one for the same reason.
-    compaction_refused: bool,
     /// The repo the folder is in, once found. A miss is looked up again
     /// next time, so a `git init` while sync runs is noticed.
     repo: Option<Repo>,
     /// The base files as of the last time they were needed.
     base_files: std::sync::Mutex<Option<BaseFiles>>,
-    /// What is on disk in `.typstry/`, as far as this run knows. Exporting
-    /// a snapshot costs as much as the doc is big, so an unchanged doc is
-    /// not written again, and a changed one only gets the new ops appended
-    /// to the log next to the snapshot until that log grows too long.
-    saved_vv: Option<VersionVector>,
     saved_base: Option<Base>,
-    snapshot_bytes: u64,
-    log_bytes: u64,
-    /// An append failed and may have left a torn entry behind, after which
-    /// further entries would never be read.
-    log_broken: bool,
     /// Runs right before a file is written, for tests that need to change
     /// it at exactly that moment.
     #[doc(hidden)]
     pub before_write: Option<WriteHook>,
+}
+
+impl std::ops::Deref for Session {
+    type Target = SpaceCore;
+
+    fn deref(&self) -> &SpaceCore {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for Session {
+    fn deref_mut(&mut self) -> &mut SpaceCore {
+        &mut self.core
+    }
 }
 
 /// Why syncing stopped. Losing the connection is worth trying again; the
@@ -302,6 +275,12 @@ pub enum SyncError {
     UnknownLink,
     #[error(transparent)]
     SchemaTooNew(#[from] typstry_doc::SchemaTooNew),
+    /// The link opened a doc that is not a project.
+    #[error(transparent)]
+    ForeignKind(#[from] typstry_doc::ForeignKind),
+    /// The link opened a doc that is not the directory it should be.
+    #[error(transparent)]
+    Directory(#[from] typstry_doc::directory::Unsupported),
     /// The server answered 426: it no longer serves this protocol version.
     #[error("this typstry is too old for the server at {server}; upgrade typstry")]
     ProtocolTooOld { server: String },
@@ -355,19 +334,10 @@ impl Session {
 
     fn open_inner(start: &Path, name: Option<&str>, api: Option<Api>) -> anyhow::Result<Self> {
         let state = StateDir::discover(start)?;
-        let config = state.load_config()?;
         let base = state.load_base()?;
-        let (doc, note) = state.load_doc()?;
-        // Checked here so read-only commands refuse too: they would
-        // misread a layout this build does not know.
-        typstry_doc::ensure_supported(&doc).map_err(SyncError::from)?;
-        let (group, group_note) = state.load_mls()?;
-        let mut session = Self::assemble(state, config, base, doc, group, name, api)?;
-        session.warnings.extend(note);
-        session.warnings.extend(group_note);
-        session.saved_vv = Some(session.doc.oplog_vv());
+        let core = SpaceCore::open(state, DocKind::PROJECT, name, api)?;
+        let mut session = Self::wrap(core, base);
         session.saved_base = Some(session.base.clone());
-        (session.snapshot_bytes, session.log_bytes) = session.state.doc_sizes();
         Ok(session)
     }
 
@@ -380,7 +350,7 @@ impl Session {
         root: &Path,
         link: &ShareLink,
         share: &ShareInfo,
-        group: Option<ProjectGroup>,
+        group: Option<SpaceGroup>,
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
         Self::create_with_api(root, link, share, Api::new(&link.origin)?, group, name)
@@ -392,115 +362,42 @@ impl Session {
         link: &ShareLink,
         share: &ShareInfo,
         api: Api,
-        group: Option<ProjectGroup>,
+        group: Option<SpaceGroup>,
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
         let state = StateDir::create(root)?;
-        let mut config = Config {
-            server: link.origin.clone(),
-            project_id: share.project_id.clone(),
-            token: link.token.clone(),
-            key: link.key.clone(),
-            permission: share.permission,
-            view_token: share.view_token.clone(),
-            name: name.map(str::to_owned),
-            branch: None,
-            owner_person: None,
-        };
-        if let Some(owner) = group.as_ref().and_then(|g| g.owner_person()) {
-            config.pin_owner(&owner);
-        }
+        let config = Config::new(link, share, name, group.as_ref());
         state.save_config(&config)?;
         if let Some(group) = &group {
             state.save_mls(group)?;
         }
-        let mut session = Self::assemble(
+        let mut core = SpaceCore::assemble(
             state,
             config,
-            Base::default(),
+            DocKind::PROJECT,
             LoroDoc::new(),
             group,
             name,
             Some(api),
         )?;
-        session.resolved = Some(share.clone());
-        Ok(session)
+        core.resolved = Some(share.clone());
+        Ok(Self::wrap(core, Base::default()))
     }
 
-    fn assemble(
-        state: StateDir,
-        config: Config,
-        base: Base,
-        doc: LoroDoc,
-        group: Option<ProjectGroup>,
-        name: Option<&str>,
-        api: Option<Api>,
-    ) -> anyhow::Result<Self> {
-        LinkSecret::from_base64url(&config.key)
-            .context("reading the link secret in .typstry/config.json")?;
-        let api = match api {
-            Some(api) => api,
-            None => Api::new(&config.server)?,
-        };
-        // Best effort: a damaged graph only costs the person's profile here,
-        // and what needs the identity itself reads it again to report why.
-        let local = crate::user::load_identity().ok().flatten();
-        let identity = Identity::resolve(
-            name,
-            config.name.as_deref(),
-            local.as_ref().and_then(|l| l.graph.profile()),
-            state.root(),
-        );
-        // A fresh peer per run: two runs can never share one, which Loro
-        // requires, and nothing needs to be remembered between runs.
-        doc.set_peer_id(random_peer())?;
-        configure(&doc);
-        Ok(Self {
-            worktree: Worktree::new(state.root().to_path_buf()),
-            state,
-            config,
+    fn wrap(core: SpaceCore, base: Base) -> Self {
+        Self {
+            worktree: Worktree::new(core.state.root().to_path_buf()),
+            core,
             base,
-            doc,
-            group,
-            api,
-            resolved: None,
-            identity,
-            local,
-            conn: None,
-            warned_unreadable: false,
-            warnings: Vec::new(),
-            compaction_refused: false,
             repo: None,
             base_files: std::sync::Mutex::new(None),
-            saved_vv: None,
             saved_base: None,
-            snapshot_bytes: 0,
-            log_bytes: 0,
-            log_broken: false,
             before_write: None,
-        })
-    }
-
-    pub fn root(&self) -> &Path {
-        self.state.root()
-    }
-
-    pub fn state(&self) -> &StateDir {
-        &self.state
+        }
     }
 
     pub fn worktree(&self) -> &Worktree {
         &self.worktree
-    }
-
-    pub fn identity(&self) -> &Identity {
-        &self.identity
-    }
-
-    /// The local copy of the project. Edits made through it go out with
-    /// the next push, like any other local ops.
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
     }
 
     /// Unix milliseconds of the last successful sync, if any.
@@ -511,7 +408,7 @@ impl Session {
     /// Records that the folder matches the doc as it is now, for a caller
     /// that only changed what is not a file, like project metadata.
     pub fn set_base_to_doc(&mut self) {
-        self.base.frontiers = self.doc.oplog_frontiers();
+        self.base.frontiers = self.core.doc.oplog_frontiers();
     }
 
     /// Whether the doc holds remote changes the folder does not have yet:
@@ -525,23 +422,13 @@ impl Session {
         self.base.pins.keys().map(String::as_str)
     }
 
-    /// An edit token alone is not enough: other clients only accept
-    /// records signed with the key an edit secret carries.
-    pub fn can_write(&self) -> bool {
-        self.config.permission.can_write() && self.config.can_sign()
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.conn.is_some()
-    }
-
     /// Persists the doc and the base, each only if it changed since this
     /// run last saved it. The doc goes first: a base pointing at ops the
     /// cached doc lacks would be unusable.
     pub fn save(&mut self) -> anyhow::Result<()> {
-        self.save_doc()?;
+        self.core.save_doc()?;
         if self.saved_base.as_ref() != Some(&self.base) {
-            self.state.save_base(&self.base)?;
+            self.core.state.save_base(&self.base)?;
             self.saved_base = Some(self.base.clone());
         }
         Ok(())
@@ -550,66 +437,13 @@ impl Session {
     /// [`Self::save`], folding the log into a fresh snapshot, for the end
     /// of a long run.
     pub fn save_compacted(&mut self) -> anyhow::Result<()> {
-        if self.log_bytes > 0 || self.log_broken {
-            self.write_snapshot()?;
-        }
+        self.core.compact_doc()?;
         self.save()
-    }
-
-    fn save_doc(&mut self) -> anyhow::Result<()> {
-        // Only imports and commits move the oplog version, and nothing
-        // else ends up in the snapshot.
-        let vv = self.doc.oplog_vv();
-        let saved = match &self.saved_vv {
-            Some(saved) if *saved == vv => return Ok(()),
-            Some(saved)
-                if !self.log_broken
-                    && self.log_bytes <= self.snapshot_bytes.max(COMPACT_LOG_BYTES) =>
-            {
-                saved
-            }
-            _ => return self.write_snapshot(),
-        };
-        let update = self
-            .doc
-            .export(ExportMode::updates(saved))
-            .context("exporting the doc")?;
-        match self.state.append_doc(&update) {
-            Ok(bytes) => {
-                self.log_bytes += bytes;
-                self.saved_vv = Some(vv);
-                Ok(())
-            }
-            Err(err) => {
-                self.log_broken = true;
-                Err(err)
-            }
-        }
-    }
-
-    fn write_snapshot(&mut self) -> anyhow::Result<()> {
-        let vv = self.doc.oplog_vv();
-        self.snapshot_bytes = self.state.save_doc(&self.doc)?;
-        self.log_bytes = 0;
-        self.log_broken = false;
-        self.saved_vv = Some(vv);
-        Ok(())
     }
 
     /// The git repo the folder is in, if any.
     pub fn repo(&mut self) -> Option<&Repo> {
-        cached_repo(&mut self.repo, self.state.root())
-    }
-
-    pub fn save_config(&self) -> anyhow::Result<()> {
-        self.state.save_config(&self.config)
-    }
-
-    /// Warnings collected since the last call or reconcile, which hands
-    /// them out in [`Report::warnings`] instead. Each is meant to be
-    /// printed as `warning: ...`.
-    pub fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
+        cached_repo(&mut self.repo, self.core.state.root())
     }
 
     /// Whether git moved HEAD to another branch, or reset it, since the
@@ -619,7 +453,8 @@ impl Session {
         let Some(then) = &self.base.git else {
             return false;
         };
-        cached_repo(&mut self.repo, self.state.root()).is_some_and(|repo| repo.switched_since(then))
+        cached_repo(&mut self.repo, self.core.state.root())
+            .is_some_and(|repo| repo.switched_since(then))
     }
 }
 
@@ -649,7 +484,7 @@ pub fn set_peer_info(doc: &LoroDoc, identity: &Identity) -> anyhow::Result<()> {
 }
 
 /// Loro reserves `u64::MAX`; JS clients also only ever see ids below 2^63.
-fn random_peer() -> u64 {
+pub(crate) fn random_peer() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("OS random source unavailable");
     u64::from_le_bytes(bytes) >> 1
@@ -657,6 +492,8 @@ fn random_peer() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use typstry_wire::crypto::LinkSecret;
+
     use super::*;
 
     #[test]
@@ -693,6 +530,35 @@ mod tests {
             SyncError::fatal(&err),
             Some(SyncError::SchemaTooNew(_))
         ));
+    }
+
+    #[test]
+    fn a_space_opens_headless() {
+        let dir = tempfile::tempdir().unwrap();
+        let space = dir.path().join("spaces/x");
+        let state = StateDir::open_headless(&space).unwrap();
+        let config = Config {
+            key: LinkSecret::generate_edit().to_base64url().to_string(),
+            ..crate::state::tests::test_config()
+        };
+        state.save_config(&config).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "hi").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        drop(state);
+
+        let state = StateDir::open_headless(&space).unwrap();
+        let mut core = SpaceCore::open(state, DocKind::PROJECT, Some("Ada"), None).unwrap();
+        assert_eq!(core.doc().get_text("t").to_string(), "hi");
+        assert_eq!(core.identity().name, "Ada");
+        core.doc().get_text("t").insert(2, "!").unwrap();
+        core.doc().commit();
+        core.save_doc().unwrap();
+        drop(core);
+
+        let state = StateDir::open_headless(&space).unwrap();
+        assert_eq!(state.load_doc().unwrap().0.get_text("t").to_string(), "hi!");
     }
 
     #[test]

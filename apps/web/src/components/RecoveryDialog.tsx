@@ -12,20 +12,33 @@ import {
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { toError } from "@/lib/errors";
 import { createRecoveryKey } from "@/mls/recovery";
-import { cleanProjects } from "@/mls/revoke";
+import { cleanPersonalSpace, cleanProjects } from "@/mls/revoke";
 import { defaultBackend } from "@/persist/local-doc-store";
 
-async function createAndSpread(): Promise<string> {
+interface Created {
+  words: string;
+  /** Settles when the projects were brought up to date, whatever came of it. */
+  spread?: Promise<void>;
+}
+
+async function createAndSpread(): Promise<Created> {
   const backend = await defaultBackend();
   const words = await createRecoveryKey(backend);
   // A recovered device can only remove the lost ones with the owner key,
   // which it reads from the shares the owner's devices seal to the recovery
   // key. Those go in with a refresh of their leaf, so the projects are
   // opened for it now instead of whenever they next see a commit.
-  cleanProjects(backend).catch((error: unknown) =>
-    console.warn("could not bring the recovery key into the projects", error),
-  );
-  return words;
+  // The personal space first: its owner key is the one that gets the
+  // recovery key a share too.
+  // Nothing was revoked, so the links stay as they are.
+  const keep = { resetLinks: false };
+  const spread = cleanPersonalSpace(backend, undefined, keep)
+    .then(() => cleanProjects(backend, undefined, keep))
+    .then(() => undefined)
+    .catch((error: unknown) =>
+      console.warn("could not bring the recovery key into the projects", error),
+    );
+  return { words, spread };
 }
 
 /**
@@ -41,7 +54,7 @@ export function RecoveryDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Replaceable for tests. */
-  create?: () => Promise<string>;
+  create?: () => Promise<Created>;
 }) {
   const [words, setWords] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
@@ -50,6 +63,7 @@ export function RecoveryDialog({
     "Copying failed. Select the words and copy them manually.",
   );
   const [stored, setStored] = useState(false);
+  const [spreading, setSpreading] = useState(false);
 
   function close(next: boolean) {
     // Closing would lose the only copy of the words.
@@ -57,6 +71,7 @@ export function RecoveryDialog({
     if (!next) {
       setWords(null);
       setStored(false);
+      setSpreading(false);
       reset();
       setError(null);
     }
@@ -67,7 +82,13 @@ export function RecoveryDialog({
     setWorking(true);
     setError(null);
     try {
-      setWords(await create());
+      const created = await create();
+      setWords(created.words);
+      if (created.spread) {
+        setSpreading(true);
+        // The dialog may be gone by then; a stale update is harmless.
+        void created.spread.then(() => setSpreading(false));
+      }
     } catch (e) {
       console.error(e);
       setError(toError(e).message);
@@ -127,6 +148,11 @@ export function RecoveryDialog({
                 {copied ? <CheckIcon /> : <CopyIcon />}
               </Button>
             </div>
+            <p role="status" className="text-sm text-muted-foreground">
+              {spreading
+                ? "Updating your projects…"
+                : "Your projects are up to date."}
+            </p>
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"

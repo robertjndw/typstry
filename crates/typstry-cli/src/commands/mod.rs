@@ -161,24 +161,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dir: cli.cwd.unwrap_or_else(|| PathBuf::from(".")),
         name: cli.name,
     };
+    // Boxed so the largest command does not decide how much stack every
+    // command needs: debug builds on a 2 MiB test thread are close to it.
     match cli.command {
-        Command::Clone(args) => clone::run(&ctx, args).await,
-        Command::Status(args) => status::run(&ctx, args).await,
-        Command::Pull(args) => pull::run(&ctx, args).await,
-        Command::Push(args) => push::run(&ctx, args).await,
-        Command::Sync(args) => sync::run(&ctx, args).await,
+        Command::Clone(args) => Box::pin(clone::run(&ctx, args)).await,
+        Command::Status(args) => Box::pin(status::run(&ctx, args)).await,
+        Command::Pull(args) => Box::pin(pull::run(&ctx, args)).await,
+        Command::Push(args) => Box::pin(push::run(&ctx, args)).await,
+        Command::Sync(args) => Box::pin(sync::run(&ctx, args)).await,
         Command::Track(args) => track::run(&ctx, args),
-        Command::Init(args) => init::run(&ctx, args).await,
+        Command::Init(args) => Box::pin(init::run(&ctx, args)).await,
         Command::Link(args) => link::run(&ctx, args),
-        Command::Members(args) => members::run(&ctx, args).await,
-        Command::Share(args) => share::run(&ctx, args).await,
+        Command::Members(args) => Box::pin(members::run(&ctx, args)).await,
+        Command::Share(args) => Box::pin(share::run(&ctx, args)).await,
         Command::Open(args) => open::run(&ctx, args),
-        Command::Pair(args) => pair::run(&ctx, args).await,
-        Command::List(args) => list::run(args),
-        Command::Devices(args) => devices::run(&ctx, args).await,
-        Command::Info(args) => info::run(&ctx, args).await,
-        Command::Version(args) => version::run(&ctx, args).await,
-        Command::Export(args) => export::run(&ctx, args).await,
+        Command::Pair(args) => Box::pin(pair::run(&ctx, args)).await,
+        Command::List(args) => Box::pin(list::run(args)).await,
+        Command::Devices(args) => Box::pin(devices::run(&ctx, args)).await,
+        Command::Info(args) => Box::pin(info::run(&ctx, args)).await,
+        Command::Version(args) => Box::pin(version::run(&ctx, args)).await,
+        Command::Export(args) => Box::pin(export::run(&ctx, args)).await,
     }
 }
 

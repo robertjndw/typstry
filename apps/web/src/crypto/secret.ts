@@ -2,7 +2,7 @@
 // the recent list have to tell usable secrets from junk synchronously and
 // without loading the wasm, so this only looks at the shape. Whether a
 // secret really parses (the view key's public half is a valid point, say)
-// is the wasm's call when the project opens; project-crypto.test.ts keeps
+// is the wasm's call when the project opens; space-crypto.test.ts keeps
 // the two in agreement.
 import { fromBase64Url } from "./bytes";
 

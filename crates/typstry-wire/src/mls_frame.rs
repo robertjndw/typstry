@@ -15,30 +15,30 @@
 /// `ProtocolVersion` mls10, the only one RFC 9420 defines.
 const MLS10: u16 = 1;
 
-/// Group ids are `project_id || incarnation`, so anything near this size is
+/// Group ids are `space_id || incarnation`, so anything near this size is
 /// not ours. The cap is about refusing junk early, not about memory: the
 /// result borrows the input.
 pub const MAX_GROUP_ID: usize = 1024;
 
-/// Length of the random project id a group id starts with.
-pub const PROJECT_ID_LEN: usize = 16;
+/// Length of the random space id a group id starts with.
+pub const SPACE_ID_LEN: usize = 16;
 
-/// Exact length of a group id: the project id, then the incarnation as a
+/// Exact length of a group id: the space id, then the incarnation as a
 /// big-endian u32.
-pub const GROUP_ID_LEN: usize = PROJECT_ID_LEN + 4;
+pub const GROUP_ID_LEN: usize = SPACE_ID_LEN + 4;
 
-/// Builds the group id of a project's `incarnation`.
-pub fn group_id_of(project_id: &[u8; PROJECT_ID_LEN], incarnation: u32) -> Vec<u8> {
-    [&project_id[..], &incarnation.to_be_bytes()].concat()
+/// Builds the group id of a space's `incarnation`.
+pub fn group_id_of(space_id: &[u8; SPACE_ID_LEN], incarnation: u32) -> Vec<u8> {
+    [&space_id[..], &incarnation.to_be_bytes()].concat()
 }
 
-/// Splits a well-formed group id into its project id and incarnation.
+/// Splits a well-formed group id into its space id and incarnation.
 pub fn split_group_id(group_id: &[u8]) -> Option<(&[u8], u32)> {
     if group_id.len() != GROUP_ID_LEN {
         return None;
     }
-    let (project, incarnation) = group_id.split_at(PROJECT_ID_LEN);
-    Some((project, u32::from_be_bytes(incarnation.try_into().ok()?)))
+    let (space, incarnation) = group_id.split_at(SPACE_ID_LEN);
+    Some((space, u32::from_be_bytes(incarnation.try_into().ok()?)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,16 +273,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn group_ids_split_into_project_and_incarnation() {
-        let id = group_id_of(&[7; PROJECT_ID_LEN], 0x0102_0304);
+    fn group_ids_split_into_space_and_incarnation() {
+        let id = group_id_of(&[7; SPACE_ID_LEN], 0x0102_0304);
         assert_eq!(id.len(), GROUP_ID_LEN);
         assert_eq!(
             split_group_id(&id),
-            Some((&[7u8; PROJECT_ID_LEN][..], 0x0102_0304))
+            Some((&[7u8; SPACE_ID_LEN][..], 0x0102_0304))
         );
         assert_eq!(split_group_id(&id[1..]), None);
         assert_eq!(split_group_id(&[id.clone(), vec![0]].concat()), None);
-        assert_eq!(split_group_id(b"project-0"), None);
+        assert_eq!(split_group_id(b"space-0"), None);
     }
 
     fn header(wire_format: u16) -> Vec<u8> {

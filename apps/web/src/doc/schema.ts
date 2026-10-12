@@ -30,9 +30,21 @@ export const ROOT = {
 } as const;
 
 export const META = {
+  /** Which kind of doc this is, see DOC_KIND. */
+  kind: "kind",
   schema: "schema",
   title: "title",
   mainFile: "mainFile",
+} as const;
+
+/**
+ * Values of META.kind. A project link must never open a directory, nor the
+ * other way around. Absent on docs written before the marker existed, which
+ * are projects.
+ */
+export const DOC_KIND = {
+  project: "project",
+  directory: "directory",
 } as const;
 
 export const NODE = {
@@ -196,6 +208,7 @@ export function initProject(
     project.meta.set(META.mainFile, node.id);
   }
 
+  project.meta.set(META.kind, DOC_KIND.project);
   project.meta.set(META.schema, SCHEMA_VERSION);
   project.meta.set(META.title, opts.title);
   project.doc.commit({ message: "init project" });
@@ -208,6 +221,24 @@ export function initProject(
  */
 export function isSchemaTooNew(schema: number | null): boolean {
   return schema !== null && schema > SCHEMA_VERSION;
+}
+
+/**
+ * The doc is some other kind than a project, say a directory reached
+ * through a link meant for a project. A doc without a kind yet (still
+ * syncing, or from before the marker) passes. Mirrors ensure_supported in
+ * Rust.
+ */
+export function isForeignKind(target: LoroDoc | ProjectDoc): boolean {
+  const kind = docKind(target);
+  return kind !== null && kind !== DOC_KIND.project;
+}
+
+/** The doc's `meta.kind`, or null while it has none. */
+export function docKind(target: LoroDoc | ProjectDoc): string | null {
+  const doc = target instanceof ProjectDoc ? target.doc : target;
+  const kind = doc.getMap(ROOT.meta).get(META.kind);
+  return typeof kind === "string" ? kind : null;
 }
 
 /** One migration step: MIGRATIONS[i] brings a doc from schema i+1 to i+2. */

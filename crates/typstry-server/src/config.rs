@@ -103,7 +103,7 @@ impl Config {
         {
             config.limits.updates_per_sec = rate;
         }
-        // The app joins two rooms per project: the doc and presence.
+        // The app joins two rooms per space: the doc and presence.
         if let Some(rooms) = parse("TYPSTRY_MAX_ROOMS_PER_CONN", "a whole number of at least 2")
             .get_where(|&n| n >= 2)?
         {

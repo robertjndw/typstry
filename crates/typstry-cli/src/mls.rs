@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use typstry_wire::crypto::LinkSecret;
 use typstry_wire::ds::{ClientMessage, Permission, RefusalCode, ServerMessage};
 use typstry_wire::identity::PersonId;
-use typstry_wire::mls::{LeafKeys, LocalIdentity, MlsError, OwnerSecrets, ProjectGroup};
+use typstry_wire::mls::{LeafKeys, LocalIdentity, MlsError, OwnerSecrets, SpaceGroup};
 
 use crate::api::Api;
 use crate::client::{Socket, open_socket};
@@ -219,9 +219,9 @@ pub async fn create_group(
     project_id: &str,
     identity: &Identity,
     local: &LocalIdentity,
-) -> anyhow::Result<ProjectGroup> {
+) -> anyhow::Result<SpaceGroup> {
     let secret = LinkSecret::from_base64url(&link.key).context("reading the new link")?;
-    let (group, init) = ProjectGroup::create(&secret, &profile_bytes(identity), local)?;
+    let (group, init) = SpaceGroup::create(&secret, &profile_bytes(identity), local)?;
     // Before the server knows the key: if this run dies after the init
     // lands, the only copy must not die with it.
     user::remember_owner_keys(&link.origin, project_id, group.owner_secrets())?;
@@ -239,7 +239,7 @@ pub async fn create_group(
 /// old leaf if it had one. Retries when another member's commit wins the
 /// epoch. `previous` is the folder's old group state, if it has one, which
 /// the new group has to keep up with (see
-/// [`ProjectGroup::join_external_as`]). `owner_keys` are owner keys kept
+/// [`SpaceGroup::join_external_as`]). `owner_keys` are owner keys kept
 /// beside it; the one the server holds is carried into the new state.
 #[allow(clippy::too_many_arguments)]
 pub async fn join_group(
@@ -249,16 +249,16 @@ pub async fn join_group(
     identity: &Identity,
     local: &LocalIdentity,
     pinned_owner: Option<PersonId>,
-    previous: Option<&ProjectGroup>,
+    previous: Option<&SpaceGroup>,
     owner_keys: &OwnerSecrets,
-) -> anyhow::Result<ProjectGroup> {
+) -> anyhow::Result<SpaceGroup> {
     let secret = LinkSecret::from_base64url(&link.key).context("reading the link")?;
     let profile = profile_bytes(identity);
     for attempt in 1..=JOIN_ATTEMPTS {
         let boot = api.mls_bootstrap(&link.token).await?;
         // The same device every time: a lost race joined nothing, so no
         // leaf is left behind.
-        let (mut group, payload) = ProjectGroup::join_external_as(
+        let (mut group, payload) = SpaceGroup::join_external_as(
             device.duplicate(),
             &secret,
             boot.as_mls(),

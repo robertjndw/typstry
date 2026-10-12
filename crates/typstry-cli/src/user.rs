@@ -6,7 +6,7 @@
 //!
 //! It lives in `$TYPSTRY_CONFIG_DIR`, else the platform's config directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,15 +15,18 @@ use std::sync::OnceLock;
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use loro::LoroDoc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use typstry_wire::crypto::PublicKey;
 use typstry_wire::identity::{AdoptError, DeviceKey, DeviceState, PersonGraph, adopt};
 use typstry_wire::mls::{LocalIdentity, OwnerSecrets};
-use typstry_wire::pairing::GrantedProject;
 
 use crate::link::ShareLink;
-use crate::state::{atomic_write, create_private_dir, merge_owner_keys, read_owner_keys};
+use crate::state::{
+    atomic_write, create_private_dir, fill_owner_keys, merge_owner_keys, read_owner_keys,
+};
+use typstry_doc::directory::{self as doc_dir, Entry, State};
 
 const DEVICE_FILE: &str = "device.key";
 const GRAPH_FILE: &str = "person.graph";
@@ -32,8 +35,7 @@ const DEVICES_FILE: &str = "devices.json";
 const DEVICES_VERSION: u32 = 1;
 const PROJECTS_FILE: &str = "projects.json";
 const PROJECTS_VERSION: u32 = 1;
-const AVAILABLE_FILE: &str = "available.json";
-/// Guards both project lists. Never held while taking another lock, so it
+/// Guards the project list. Never held while taking another lock, so it
 /// cannot take part in a deadlock with `identity.lock`.
 const PROJECTS_LOCK: &str = "projects.lock";
 /// The owner keys of the projects this machine's folders own, one file per
@@ -63,23 +65,6 @@ impl KnownProject {
     }
 }
 
-/// A project another of the user's devices handed over that this device
-/// may not have a folder for yet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AvailableProject {
-    pub title: String,
-    pub link: String,
-}
-
-impl From<GrantedProject> for AvailableProject {
-    fn from(granted: GrantedProject) -> Self {
-        Self {
-            title: granted.title,
-            link: granted.link,
-        }
-    }
-}
-
 /// The shape of the user's JSON files: a format `version` next to the
 /// content.
 #[derive(Serialize, Deserialize)]
@@ -89,7 +74,7 @@ struct Versioned<T> {
     content: T,
 }
 
-/// `projects.json` and `available.json`.
+/// `projects.json`.
 #[derive(Serialize, Deserialize)]
 struct ProjectList<T> {
     projects: Vec<T>,
@@ -102,6 +87,13 @@ pub struct CatalogEntry {
     pub title: String,
     pub link: String,
     pub dir: Option<PathBuf>,
+    /// The project the directory files the link under, for ones only the
+    /// directory knows. Whoever acts on the entry checks it against what
+    /// the server says the link is for.
+    pub project_id: Option<String>,
+    /// Removed and gone projects stay listed so the person can see why
+    /// they cannot open them.
+    pub state: State,
 }
 
 static OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
@@ -433,70 +425,101 @@ fn remember_project_in(
     write_versioned(&path, PROJECTS_VERSION, ProjectList { projects })
 }
 
-/// Projects handed over by pairing. Like the project list, a damaged
-/// file reads as empty.
-pub fn available() -> anyhow::Result<Vec<AvailableProject>> {
-    Ok(read_available(&config_dir()?.join(AVAILABLE_FILE)))
+/// Every project this person has: those with a folder here first, then
+/// the ones only the directory knows, e.g. from another device. Projects
+/// the person dropped are left out unless a folder here has them.
+pub fn catalog() -> anyhow::Result<Vec<CatalogEntry>> {
+    catalog_with(false)
 }
 
-fn read_available(path: &Path) -> Vec<AvailableProject> {
-    read_versioned::<ProjectList<AvailableProject>>(path, PROJECTS_VERSION)
-        .map(|file| file.projects)
-        .unwrap_or_default()
+/// [`catalog`], with the projects the person dropped from their list too:
+/// dropping only hides a project, its links stay valid, so a cleanup that
+/// replaces links has to reach it as well.
+pub fn catalog_with_forgotten() -> anyhow::Result<Vec<CatalogEntry>> {
+    catalog_with(true)
 }
 
-/// Adds the projects a pairing handed over; ones already present (by
-/// token) are refreshed in place rather than duplicated.
-pub fn remember_available(handed: &[AvailableProject]) -> anyhow::Result<()> {
-    remember_available_in(&config_dir()?, handed)
+fn catalog_with(forgotten: bool) -> anyhow::Result<Vec<CatalogEntry>> {
+    catalog_in(&config_dir()?, forgotten)
 }
 
-fn remember_available_in(config: &Path, handed: &[AvailableProject]) -> anyhow::Result<()> {
-    let _lock = lock_in(config, PROJECTS_LOCK)?;
-    let path = config.join(AVAILABLE_FILE);
-    let mut projects = read_available(&path);
-    for new in handed {
-        let same = |p: &AvailableProject| same_project(&p.link, &new.link);
-        match projects.iter_mut().find(|p| same(p)) {
-            Some(known) => *known = new.clone(),
-            None => projects.push(new.clone()),
+fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry>> {
+    let snapshots = crate::directory::read_all_in(config)?;
+    let mut docs: HashMap<&str, &LoroDoc> = HashMap::new();
+    for s in &snapshots {
+        docs.entry(s.server.as_str()).or_insert(&s.doc);
+    }
+    // Taken out as folders claim them, so what is left keeps the
+    // directory's order for the folder-less part of the catalog.
+    let mut listed: Vec<Option<(&str, Entry)>> = snapshots
+        .iter()
+        .flat_map(|s| {
+            doc_dir::list(&s.doc, crate::directory::now())
+                .into_iter()
+                .map(|e| Some((s.server.as_str(), e)))
+        })
+        .collect();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for (i, item) in listed.iter().enumerate() {
+        if let Some((server, entry)) = item {
+            index
+                .entry(((*server).to_owned(), entry.project_id.clone()))
+                .or_insert(i);
         }
     }
-    write_versioned(&path, PROJECTS_VERSION, ProjectList { projects })
-}
-
-/// Every project this person has: those with a folder here first, then
-/// the ones only other devices have.
-pub fn catalog() -> anyhow::Result<Vec<CatalogEntry>> {
     let mut entries: Vec<CatalogEntry> = Vec::new();
-    for known in projects()? {
-        if !known.dir.is_dir() || entries.iter().any(|e| same_project(&e.link, &known.link)) {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for known in read_projects(&config.join(PROJECTS_FILE)) {
+        if !known.dir.is_dir() {
             continue;
         }
+        // The folder may hold an older link than the directory's best, so
+        // it is matched through the token rather than the entry's link.
+        let parsed = ShareLink::parse(&known.link).ok();
+        let project = parsed.as_ref().and_then(|link| {
+            let doc = docs.get(link.origin.as_str())?;
+            let id = doc_dir::project_of_token(doc, &link.token, crate::directory::now())?;
+            Some((link.origin.clone(), id))
+        });
+        let key = project
+            .clone()
+            .or_else(|| parsed.map(|l| (l.origin, l.token)))
+            .unwrap_or_else(|| (String::new(), known.link.clone()));
+        if !seen.insert(key) {
+            continue;
+        }
+        let entry = project
+            .and_then(|key| listed[*index.get(&key)?].take())
+            .map(|(_, e)| e);
+        let title = entry
+            .as_ref()
+            .and_then(|e| e.title.clone())
+            .or_else(|| known.title.clone())
+            .unwrap_or_else(|| known.display_title());
         entries.push(CatalogEntry {
-            title: known.display_title(),
+            title,
             link: known.link,
             dir: Some(known.dir),
+            project_id: None,
+            state: entry.map_or(State::Listed, |e| e.state),
         });
     }
-    for other in available()? {
-        if !entries.iter().any(|e| same_project(&e.link, &other.link)) {
-            entries.push(CatalogEntry {
-                title: other.title,
-                link: other.link,
-                dir: None,
-            });
+    for (server, entry) in listed.into_iter().flatten() {
+        if (entry.state == State::Forgotten && !forgotten)
+            || seen.contains(&(server.to_owned(), entry.project_id.clone()))
+        {
+            continue;
         }
+        let link = ShareLink::new(server, &entry.link.token, &entry.link.secret);
+        entries.push(CatalogEntry {
+            title: entry.title.unwrap_or_else(|| "Untitled".to_owned()),
+            link: link.to_string(),
+            dir: None,
+            project_id: Some(entry.project_id),
+            state: entry.state,
+        });
     }
     Ok(entries)
-}
-
-/// The same project, whatever link (edit or view) names it.
-fn same_project(a: &str, b: &str) -> bool {
-    match (ShareLink::parse(a), ShareLink::parse(b)) {
-        (Ok(a), Ok(b)) => a.origin == b.origin && a.token == b.token,
-        _ => a == b,
-    }
 }
 
 /// Where this machine keeps the owner key of the project `project_id` at
@@ -530,6 +553,26 @@ pub fn remember_owner_keys(
     project_id: &str,
     keys: &OwnerSecrets,
 ) -> anyhow::Result<()> {
+    store_owner_keys(server, project_id, keys, merge_owner_keys)
+}
+
+/// Like [`remember_owner_keys`], but `keys` only fill room behind what the
+/// machine already keeps. For keys that came from the directory, which a
+/// planted entry must not be able to use to push a real key out.
+pub fn remember_owner_keys_fill(
+    server: &str,
+    project_id: &str,
+    keys: &OwnerSecrets,
+) -> anyhow::Result<()> {
+    store_owner_keys(server, project_id, keys, fill_owner_keys)
+}
+
+fn store_owner_keys(
+    server: &str,
+    project_id: &str,
+    keys: &OwnerSecrets,
+    write: fn(&Path, &OwnerSecrets) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     if keys.is_empty() {
         return Ok(());
     }
@@ -539,13 +582,54 @@ pub fn remember_owner_keys(
     if !dir.is_dir() {
         create_private_dir(&dir)?;
     }
-    merge_owner_keys(&owner_key_path(&config, server, project_id), keys)
+    write(&owner_key_path(&config, server, project_id), keys)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use typstry_wire::identity::EntryKind;
+
+    #[test]
+    fn dropped_projects_are_listed_only_when_asked_for() {
+        use typstry_doc::directory::{self as doc_dir, NewLink};
+        let config = tempfile::tempdir().unwrap();
+        let server = "http://one.test";
+        let secret = typstry_wire::crypto::LinkSecret::generate_edit().to_base64url();
+        crate::directory::with_directory_in(config.path(), server, |doc| {
+            for (token, id) in [
+                ("aaaaaaaaaaaaaaaaaaaaaa", "kept"),
+                ("bbbbbbbbbbbbbbbbbbbbbb", "dropped"),
+            ] {
+                doc_dir::add_link(
+                    doc,
+                    &NewLink {
+                        token,
+                        project_id: id,
+                        secret: &secret,
+                        edit: true,
+                        added_at: crate::directory::now(),
+                        generation: None,
+                    },
+                )?;
+            }
+            doc_dir::set_status(
+                doc,
+                "dropped",
+                State::Forgotten,
+                crate::directory::now(),
+                None,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let shown = catalog_in(config.path(), false).unwrap();
+        assert_eq!(shown.len(), 1);
+        let all = catalog_in(config.path(), true).unwrap();
+        assert_eq!(all.len(), 2);
+        let dropped = all.iter().find(|e| e.state == State::Forgotten).unwrap();
+        assert_eq!(dropped.project_id.as_deref(), Some("dropped"));
+    }
 
     #[test]
     fn concurrent_remembers_keep_every_entry() {

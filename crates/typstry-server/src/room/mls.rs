@@ -1,9 +1,9 @@
-//! The delivery service half of a project's room: sequences MLS commits,
+//! The delivery service half of a space's room: sequences MLS commits,
 //! keeps the sealed GroupInfo and keyring, and relays commits to whoever is
 //! subscribed. It never looks inside an MLS message beyond the routing
 //! prefix `mls_frame::inspect` reads, so it needs no MLS and holds no key.
 //! The one signature it checks is the owner's on a rotation, against the
-//! public owner key the project's `Init` gave it (see
+//! public owner key the space's `Init` gave it (see
 //! [`typstry_wire::owner`]): a rotation swaps the tokens, and only the owner
 //! may lock anyone out.
 //!
@@ -23,7 +23,7 @@ use typstry_wire::owner::{OwnerKey, is_owner_key};
 
 use super::{ConnId, DsConfig, Outbound, Outbox};
 use crate::store::mls::{self, Head, PruneLimits, Reset, SubmitArgs, SubmitError, Submitted};
-use crate::store::projects::{self, DsAccess};
+use crate::store::spaces::{self, DsAccess};
 
 /// A commit backfill is queued under the outbox's backfill rules, which are
 /// keyed by room and CRDT. A delivery service socket carries no doc, so this
@@ -33,7 +33,7 @@ const BACKFILL_CRDT: CrdtType = CrdtType::Elo;
 /// What the room hands in with every command.
 pub(super) struct Ctx<'a> {
     pub db: &'a SqlitePool,
-    pub project_id: &'a str,
+    pub space_id: &'a str,
     pub config: &'a DsConfig,
     /// Tokens retired since the room loaded, with their rotation's epoch.
     /// A connection can resolve its token just before a rotation lands.
@@ -66,7 +66,7 @@ struct Submission {
 }
 
 pub(super) struct DsState {
-    /// The group without its blobs; None while the project has no group.
+    /// The group without its blobs; None while the space has no group.
     head: Option<Head>,
     peers: HashMap<ConnId, Peer>,
 }
@@ -80,9 +80,9 @@ fn frame(msg: &ServerMessage) -> Bytes {
 }
 
 impl DsState {
-    pub(super) async fn load(db: &SqlitePool, project_id: &str) -> sqlx::Result<Self> {
+    pub(super) async fn load(db: &SqlitePool, space_id: &str) -> sqlx::Result<Self> {
         Ok(Self {
-            head: mls::load_head(db, project_id).await?,
+            head: mls::load_head(db, space_id).await?,
             peers: HashMap::new(),
         })
     }
@@ -98,10 +98,10 @@ impl DsState {
     /// The cache can only be wrong after a failed write, whose outcome the
     /// database may or may not have kept.
     async fn refresh(&mut self, ctx: &Ctx<'_>) {
-        match mls::load_head(ctx.db, ctx.project_id).await {
+        match mls::load_head(ctx.db, ctx.space_id).await {
             Ok(head) => self.head = head,
             Err(err) => {
-                tracing::error!(project = %ctx.project_id, %err, "failed to reload group head");
+                tracing::error!(space = %ctx.space_id, %err, "failed to reload group head");
             }
         }
     }
@@ -128,10 +128,10 @@ impl DsState {
             (Some(&epoch), _) | (None, DsAccess::Retired { epoch }) => {
                 (Permission::Retired, Some(epoch))
             }
-            (None, DsAccess::Live(crate::store::projects::Permission::Write)) => {
+            (None, DsAccess::Live(crate::store::spaces::Permission::Write)) => {
                 (Permission::Write, None)
             }
-            (None, DsAccess::Live(crate::store::projects::Permission::Read)) => {
+            (None, DsAccess::Live(crate::store::spaces::Permission::Read)) => {
                 (Permission::Read, None)
             }
         };
@@ -364,7 +364,7 @@ impl DsState {
             envelope: s.envelope.as_deref(),
             rotate: s.rotate.as_ref(),
         };
-        match mls::submit(ctx.db, ctx.project_id, &args).await {
+        match mls::submit(ctx.db, ctx.space_id, &args).await {
             Ok(Submitted::Accepted { retired }) => {
                 if let Some(head) = &mut self.head {
                     head.epoch = s.epoch + 1;
@@ -403,15 +403,15 @@ impl DsState {
             Err(SubmitError::OwnerProof) => {
                 // Not a client bug: an editor or a removed owner device
                 // trying to swap the links, which is worth seeing in the log.
-                tracing::info!(project = %ctx.project_id, "rotation without the owner key refused");
+                tracing::info!(space = %ctx.space_id, "rotation without the owner key refused");
                 reply(RefusalCode::NotOwner)
             }
             Err(err @ (SubmitError::Rotate(_) | SubmitError::SameOwnerKey)) => {
-                tracing::debug!(project = %ctx.project_id, %err, "rotation refused");
+                tracing::debug!(space = %ctx.space_id, %err, "rotation refused");
                 reply(RefusalCode::Malformed)
             }
             Err(SubmitError::Db(err)) => {
-                tracing::error!(project = %ctx.project_id, %err, "failed to store commit");
+                tracing::error!(space = %ctx.space_id, %err, "failed to store commit");
                 self.refresh(ctx).await;
                 reply(RefusalCode::Internal)
             }
@@ -442,7 +442,7 @@ impl DsState {
         }
         match mls::init_group(
             ctx.db,
-            ctx.project_id,
+            ctx.space_id,
             &group_id,
             group_info,
             keyring,
@@ -463,7 +463,7 @@ impl DsState {
                 refuse(req, RefusalCode::GroupExists)
             }
             Err(err) => {
-                tracing::error!(project = %ctx.project_id, %err, "failed to create group");
+                tracing::error!(space = %ctx.space_id, %err, "failed to create group");
                 refuse(req, RefusalCode::Internal)
             }
         }
@@ -486,7 +486,7 @@ impl DsState {
         let Some(head) = &self.head else {
             return refuse(req, RefusalCode::NoGroup);
         };
-        // The new group is the same project one incarnation on. A group id
+        // The new group is the same space one incarnation on. A group id
         // that says otherwise would make clients disagree about where they
         // are.
         let well_formed = incarnation
@@ -494,16 +494,15 @@ impl DsState {
             .and_then(|next| u32::try_from(next).ok())
             .is_some_and(|next| {
                 let old = split_group_id(&head.group_id);
-                split_group_id(&group_id).is_some_and(|(project, got)| {
-                    got == next && old.is_some_and(|(p, _)| p == project)
-                })
+                split_group_id(&group_id)
+                    .is_some_and(|(space, got)| got == next && old.is_some_and(|(p, _)| p == space))
             });
         if !blobs_ok(ctx, group_info, keyring) || !well_formed {
             return refuse(req, RefusalCode::Malformed);
         }
         match mls::reset_group(
             ctx.db,
-            ctx.project_id,
+            ctx.space_id,
             incarnation,
             &group_id,
             group_info,
@@ -529,7 +528,7 @@ impl DsState {
                 refuse(req, RefusalCode::NoGroup)
             }
             Err(err) => {
-                tracing::error!(project = %ctx.project_id, %err, "failed to reset group");
+                tracing::error!(space = %ctx.space_id, %err, "failed to reset group");
                 self.refresh(ctx).await;
                 refuse(req, RefusalCode::Internal)
             }
@@ -562,11 +561,10 @@ async fn backfill(
     retired: Option<u64>,
 ) -> bool {
     let until = retired.unwrap_or(u64::MAX);
-    let commits = match mls::commits_since(ctx.db, ctx.project_id, incarnation, since, until).await
-    {
+    let commits = match mls::commits_since(ctx.db, ctx.space_id, incarnation, since, until).await {
         Ok(commits) => commits,
         Err(err) => {
-            tracing::error!(project = %ctx.project_id, %err, "failed to read commits");
+            tracing::error!(space = %ctx.space_id, %err, "failed to read commits");
             return false;
         }
     };
@@ -576,7 +574,7 @@ async fn backfill(
     if commits.is_empty() {
         return true;
     }
-    let Some(queue) = outbox.start_backfill(ctx.project_id, BACKFILL_CRDT) else {
+    let Some(queue) = outbox.start_backfill(ctx.space_id, BACKFILL_CRDT) else {
         return false;
     };
     commits.into_iter().all(|commit| {
@@ -591,7 +589,7 @@ async fn backfill(
 }
 
 async fn prune(ctx: &Ctx<'_>, incarnation: u64, head_epoch: u64) {
-    let cutoff = projects::now_secs()
+    let cutoff = spaces::now_secs()
         .saturating_sub(i64::try_from(ctx.config.commit_retention.as_secs()).unwrap_or(i64::MAX));
     let limits = PruneLimits {
         older_than: cutoff,
@@ -599,13 +597,13 @@ async fn prune(ctx: &Ctx<'_>, incarnation: u64, head_epoch: u64) {
         max_bytes: ctx.config.max_log_bytes,
     };
     if let Err(err) =
-        mls::prune_commits(ctx.db, ctx.project_id, incarnation, head_epoch, limits).await
+        mls::prune_commits(ctx.db, ctx.space_id, incarnation, head_epoch, limits).await
     {
-        tracing::warn!(project = %ctx.project_id, %err, "failed to prune commits");
+        tracing::warn!(space = %ctx.space_id, %err, "failed to prune commits");
     }
     // A retired token is only worth something while the rotation it reads
     // is still in the log.
-    if let Err(err) = projects::expire_retired(ctx.db, ctx.project_id, cutoff).await {
-        tracing::warn!(project = %ctx.project_id, %err, "failed to expire retired tokens");
+    if let Err(err) = spaces::expire_retired(ctx.db, ctx.space_id, cutoff).await {
+        tracing::warn!(space = %ctx.space_id, %err, "failed to expire retired tokens");
     }
 }

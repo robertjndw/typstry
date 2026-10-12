@@ -2,7 +2,7 @@ pub mod blobs;
 pub mod db;
 pub mod docs;
 pub mod mls;
-pub mod projects;
+pub mod spaces;
 
 /// SQLite integers are signed. Anything above i64::MAX cannot be an epoch
 /// of ours, so it saturates to a value that matches nothing.

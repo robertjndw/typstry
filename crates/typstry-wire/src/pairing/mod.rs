@@ -24,8 +24,9 @@ use zeroize::Zeroizing;
 pub use crate::words::WORDS;
 pub use code::{Code, CodeError};
 
-use crate::crypto::{KEY_LEN, PublicKey, SealKey};
+use crate::crypto::{KEY_LEN, LinkSecret, PublicKey, SealKey};
 use crate::identity::MAX_GRAPH_BYTES;
+use crate::owner::OwnerSecrets;
 use crate::relay::MAX_RELAY_MESSAGE;
 
 /// The PAKE identity, so a code cannot be replayed into another protocol.
@@ -46,17 +47,18 @@ const TAG_HELLO: u8 = 3;
 const TAG_GRANT: u8 = 4;
 const TAG_REJECT: u8 = 5;
 
-/// Limits that keep a grant well under [`MAX_RELAY_MESSAGE`]: a full graph
-/// and 100 * (100 + 400 + 8) come to about 59 KiB.
-pub const MAX_PROJECTS: usize = 100;
-pub const MAX_TITLE_LEN: usize = 100;
+/// Limits that keep a grant well under [`MAX_RELAY_MESSAGE`].
 pub const MAX_LINK_LEN: usize = 400;
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
+/// An encoded `OwnerSecrets` holds at most `2 * KEEP` secrets, well under this.
+pub const MAX_OWNER_SECRETS_LEN: usize = 4096;
 
 const _: () = assert!(
-    MAX_PROJECTS * (MAX_TITLE_LEN + MAX_LINK_LEN + 8)
-        + MAX_GRAPH_BYTES
+    MAX_GRAPH_BYTES
         + MAX_DEVICE_NAME_LEN
+        + crate::token::TOKEN_LEN
+        + MAX_LINK_LEN
+        + MAX_OWNER_SECRETS_LEN
         + 1024
         < MAX_RELAY_MESSAGE
 );
@@ -113,74 +115,88 @@ impl Role {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct GrantedProject {
-    pub title: String,
-    /// An edit link, so it is a secret.
-    pub link: String,
-}
-
 /// What the holder hands over: the person graph with the new device in it,
-/// the projects to open, and the name the holder's user gave the holder, so
-/// the new device can label the device that vouched for it.
+/// the person's personal space (whose directory lists the projects), and
+/// the name the holder's user gave the holder, so the new device can label
+/// the device that vouched for it.
 #[derive(Clone)]
 pub struct Grant {
     pub holder_name: String,
     /// An encoded `PersonGraph`.
     pub graph: Vec<u8>,
-    pub projects: Vec<GrantedProject>,
+    /// The person's personal space on the pairing server, so the new device
+    /// syncs the same directory.
+    pub space: GrantedSpace,
+}
+
+/// A personal space handed to the new device: its edit link and the owner
+/// secrets the holder keeps for it, which every device of the person needs
+/// to act as an owner.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrantedSpace {
+    pub token: String,
+    /// An edit secret in link form (base64url).
+    pub secret: Zeroizing<String>,
+    /// An encoded `OwnerSecrets`.
+    pub owner_secrets: Zeroizing<Vec<u8>>,
+}
+
+impl GrantedSpace {
+    /// A space fitted to the grant's rules, or `Malformed` when `token` is
+    /// not a token, `secret` is not an edit secret, or `owner_secrets` is
+    /// empty, too long or not an `OwnerSecrets` encoding.
+    pub fn new(token: String, secret: String, owner_secrets: Vec<u8>) -> Result<Self, PairError> {
+        let space = Self {
+            token,
+            secret: Zeroizing::new(secret),
+            owner_secrets: Zeroizing::new(owner_secrets),
+        };
+        space.check()?;
+        Ok(space)
+    }
+
+    fn check(&self) -> Result<(), PairError> {
+        let bad = |what: &str| PairError::Malformed(format!("space {what}"));
+        if !crate::token::looks_valid(&self.token) {
+            return Err(bad("token is not a token"));
+        }
+        if self.secret.len() > MAX_LINK_LEN {
+            return Err(bad("secret is too long"));
+        }
+        // Only an edit secret lets the new device write the directory.
+        match LinkSecret::from_base64url(&self.secret) {
+            Ok(secret) if secret.can_attest() => {}
+            _ => return Err(bad("secret is not an edit secret")),
+        }
+        if self.owner_secrets.is_empty() || self.owner_secrets.len() > MAX_OWNER_SECRETS_LEN {
+            return Err(bad("owner secrets have an invalid size"));
+        }
+        match OwnerSecrets::decode(&self.owner_secrets) {
+            Ok(set) if !set.is_empty() => Ok(()),
+            _ => Err(bad("owner secrets do not decode")),
+        }
+    }
+}
+
+impl std::fmt::Debug for GrantedSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrantedSpace").finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Grant")
-            .field("projects", &self.projects.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for GrantedProject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrantedProject")
-            .field("title", &self.title)
-            .finish_non_exhaustive()
-    }
-}
-
-impl GrantedProject {
-    /// A project fitted to the grant's limits: the title cut to
-    /// [`MAX_TITLE_LEN`] bytes on a character boundary, since a shorter
-    /// title is still the project. `None` for a link over [`MAX_LINK_LEN`],
-    /// which cut short would open nothing.
-    pub fn new(title: &str, link: String) -> Option<Self> {
-        (link.len() <= MAX_LINK_LEN).then(|| Self {
-            title: truncate(title, MAX_TITLE_LEN).to_owned(),
-            link,
-        })
+        f.debug_struct("Grant").finish_non_exhaustive()
     }
 }
 
 impl Grant {
-    /// A grant without projects yet; add them with [`Self::push`].
-    pub fn new(holder_name: String, graph: Vec<u8>) -> Self {
+    pub fn new(holder_name: String, graph: Vec<u8>, space: GrantedSpace) -> Self {
         Self {
             holder_name,
             graph,
-            projects: Vec::new(),
+            space,
         }
-    }
-
-    /// Adds `project` unless its link is in the grant already. False once
-    /// the grant holds [`MAX_PROJECTS`], with nothing added, so a caller
-    /// can stop there: a grant over the limit would be refused whole.
-    pub fn push(&mut self, project: GrantedProject) -> bool {
-        if self.projects.len() >= MAX_PROJECTS {
-            return false;
-        }
-        if !self.projects.iter().any(|p| p.link == project.link) {
-            self.projects.push(project);
-        }
-        true
     }
 
     fn check(&self) -> Result<(), PairError> {
@@ -188,18 +204,7 @@ impl Grant {
         if self.graph.len() > MAX_GRAPH_BYTES {
             return Err(PairError::Malformed("person graph is too large".into()));
         }
-        if self.projects.len() > MAX_PROJECTS {
-            return Err(PairError::Malformed(format!(
-                "more than {MAX_PROJECTS} projects"
-            )));
-        }
-        for p in &self.projects {
-            if p.title.len() > MAX_TITLE_LEN || p.link.len() > MAX_LINK_LEN {
-                return Err(PairError::Malformed(
-                    "project title or link too long".into(),
-                ));
-            }
-        }
+        self.space.check()?;
         Ok(())
     }
 
@@ -209,11 +214,9 @@ impl Grant {
         w.push_byte(GRANT_VERSION);
         w.push_var_bytes(&self.graph);
         w.push_var_string(&self.holder_name);
-        w.push_uleb128(self.projects.len() as u64);
-        for p in &self.projects {
-            w.push_var_string(&p.title);
-            w.push_var_string(&p.link);
-        }
+        w.push_var_string(&self.space.token);
+        w.push_var_string(&self.space.secret);
+        w.push_var_bytes(&self.space.owner_secrets);
         Ok(Zeroizing::new(w.finalize()))
     }
 
@@ -222,23 +225,18 @@ impl Grant {
         version(&mut r, GRANT_VERSION)?;
         let graph = r.read_var_bytes().map_err(PairError::Malformed)?.to_vec();
         let holder_name = r.read_var_string().map_err(PairError::Malformed)?;
-        let count = r.read_uleb128().map_err(PairError::Malformed)?;
-        // Each project takes at least two bytes, so a hostile count
-        // cannot make us allocate ahead of the data.
-        if count > MAX_PROJECTS as u64 || count * 2 > r.remaining() as u64 {
-            return Err(PairError::Malformed(format!("{count} projects do not fit")));
-        }
-        let mut projects = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let title = r.read_var_string().map_err(PairError::Malformed)?;
-            let link = r.read_var_string().map_err(PairError::Malformed)?;
-            projects.push(GrantedProject { title, link });
-        }
+        let space = GrantedSpace {
+            token: r.read_var_string().map_err(PairError::Malformed)?,
+            secret: Zeroizing::new(r.read_var_string().map_err(PairError::Malformed)?),
+            owner_secrets: Zeroizing::new(
+                r.read_var_bytes().map_err(PairError::Malformed)?.to_vec(),
+            ),
+        };
         done(&r)?;
         let grant = Self {
             holder_name,
             graph,
-            projects,
+            space,
         };
         grant.check()?;
         Ok(grant)

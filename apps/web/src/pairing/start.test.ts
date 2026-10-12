@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DeviceKey, PersonGraph } from "@/crypto/wasm";
 import { localIdentity, mergeOwnGraph } from "@/mls/identity";
 import { MemoryBackend } from "@/persist/local-doc-store";
-import { rememberProject } from "@/project/recent";
+import { seedProject } from "@/directory/test-utils";
 
 import { isDisposable, startShowing } from "./start";
 
@@ -18,7 +18,7 @@ describe("isDisposable", () => {
   it("is true for a person with only this device that owns nothing", async () => {
     const backend = new MemoryBackend();
     await localIdentity(backend);
-    rememberProject({ projectId: "p1", token: "t", title: "Shared" });
+    await seedProject("p1", 1, { title: "Shared" });
     expect(await isDisposable(backend)).toBe(true);
   });
 
@@ -38,7 +38,7 @@ describe("isDisposable", () => {
     const decoded = PersonGraph.decode(graph);
     const person = decoded.id();
     decoded.free();
-    rememberProject({ projectId: "p1", token: "t", title: "Mine" });
+    await seedProject("p1", 1, { title: "Mine" });
     await backend.saveMls("p1", {
       state: new Uint8Array([1]),
       device: null,

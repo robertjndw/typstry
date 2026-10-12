@@ -8,12 +8,14 @@
 pub mod api;
 pub mod client;
 pub mod commands;
+pub mod directory;
 pub mod engine;
 pub mod git;
 pub mod hash;
 pub mod link;
 pub mod mailbox;
 pub mod mls;
+pub mod space;
 pub mod state;
 pub mod user;
 pub mod watch;

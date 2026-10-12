@@ -44,7 +44,7 @@ describe("AssetCache", () => {
     expect(b).toBe(a);
     expect(fetch).toHaveBeenCalledOnce();
     expect(fetch.mock.calls[0]![0]).toBe(
-      `/api/p/tok/blobs/${encodeURIComponent(HASH)}`,
+      `/api/s/tok/blobs/${encodeURIComponent(HASH)}`,
     );
   });
 

@@ -18,7 +18,9 @@ import {
 } from "./paths";
 import {
   DEFAULT_MAIN_FILE,
+  DOC_KIND,
   initProject,
+  isForeignKind,
   isSchemaTooNew,
   META,
   migrate,
@@ -60,6 +62,22 @@ describe("initProject", () => {
     initProject(project.doc, { title: "Other" });
     expect(project.title).toBe("Thesis");
     expect(project.fs.getNodes()).toHaveLength(1);
+  });
+});
+
+describe("doc kind", () => {
+  it("marks a project and refuses another kind", () => {
+    const project = newProject(1);
+    expect(isForeignKind(project)).toBe(false);
+    initProject(project, { title: "T" });
+    expect(project.meta.get(META.kind)).toBe(DOC_KIND.project);
+    expect(isForeignKind(project)).toBe(false);
+    expect(isForeignKind(project.doc)).toBe(false);
+    project.meta.set(META.kind, DOC_KIND.directory);
+    expect(isForeignKind(project)).toBe(true);
+    expect(isForeignKind(project.doc)).toBe(true);
+    project.meta.set(META.kind, 5);
+    expect(isForeignKind(project)).toBe(false);
   });
 });
 

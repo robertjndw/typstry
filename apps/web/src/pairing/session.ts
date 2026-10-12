@@ -4,10 +4,9 @@
 import {
   Pairing,
   deviceFingerprint,
-  fitGrantProjects,
   relayCloseReasons,
   type PairingCode,
-  type PairingProject,
+  type PairingSpace,
 } from "@/crypto/wasm";
 import { toError } from "@/lib/errors";
 
@@ -34,15 +33,9 @@ export type PairState =
   | { status: "awaitingApproval"; deviceName: string; fingerprint: string }
   /** The holder's user said yes and the grant is being built and sent. */
   | { status: "approving"; deviceName: string; fingerprint: string }
-  | { status: "done"; projects: PairedProject[] }
+  | { status: "done" }
   | { status: "rejected" }
   | { status: "failed"; reason: PairFailure; detail?: string };
-
-/** What the done screen lists of a project; no secrets beyond the link. */
-export interface PairedProject {
-  title: string;
-  link: string;
-}
 
 /** The device asking to be added, as the holder's user sees it. */
 export interface PairingDevice {
@@ -54,7 +47,8 @@ export interface PairingDevice {
 export interface Grant {
   /** `PersonGraph.encode` bytes with the new device added. */
   graph: Uint8Array;
-  projects: PairingProject[];
+  /** The personal space that syncs the directory of projects. */
+  space: PairingSpace;
   /** How the new device labels the one that paired it. */
   holderName: string;
 }
@@ -67,12 +61,12 @@ export type PairRole =
    * the user approves. */
   | { kind: "holder"; grant: (device: PairingDevice) => Promise<Grant> }
   /** Wants to become a device of the person. `onGrant` stores what arrives
-   * and returns the projects that can be opened now. */
+   * the directory then brings the projects. */
   | {
       kind: "new";
       deviceName: string;
       devicePub: Uint8Array;
-      onGrant: (grant: Grant) => Promise<PairedProject[]>;
+      onGrant: (grant: Grant) => Promise<void>;
     };
 
 export interface PairSessionOptions {
@@ -183,12 +177,8 @@ export class PairSession {
     try {
       const grant = await this.holderRole().grant(requester);
       if (this.over) return;
-      this.send(pairing.approve(grant.graph, grant.projects, grant.holderName));
-      this.finish({
-        status: "done",
-        // What the grant really carried, which `approve` cut to fit.
-        projects: fitGrantProjects(grant.projects),
-      });
+      this.send(pairing.approve(grant.graph, grant.holderName, grant.space));
+      this.finish({ status: "done" });
     } catch (error) {
       if (this.over) return;
       this.fail(
@@ -249,7 +239,7 @@ export class PairSession {
           });
           break;
         case "granted":
-          await this.onGranted(event.graph, event.projects, event.holderName);
+          await this.onGranted(event.graph, event.holderName, event.space);
           break;
         case "rejected":
           this.finish({ status: "rejected" });
@@ -263,19 +253,15 @@ export class PairSession {
 
   private async onGranted(
     graph: Uint8Array,
-    projects: PairingProject[],
     holderName: string,
+    space: PairingSpace,
   ): Promise<void> {
     if (this.opts.role.kind !== "new") throw new Error("not the new device");
     // The holder closes right after the grant; the close is no failure.
     this.over = true;
     try {
-      const opened = await this.opts.role.onGrant({
-        graph,
-        projects,
-        holderName,
-      });
-      this.finish({ status: "done", projects: opened });
+      await this.opts.role.onGrant({ graph, holderName, space });
+      this.finish({ status: "done" });
     } catch (error) {
       this.fail(
         error instanceof GrantRefusedError ? "refused" : "protocol",

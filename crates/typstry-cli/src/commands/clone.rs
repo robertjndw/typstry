@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use typstry_doc::directory::State;
 use typstry_wire::identity::person_fingerprint;
 
 use super::init::absolute;
@@ -10,6 +11,7 @@ use crate::api::Api;
 use crate::engine::{Flush, Mode, Scope, Session};
 use crate::git::{self, Repo};
 use crate::link::ShareLink;
+use crate::space::{sync_bound, sync_server};
 use crate::state::{STATE_DIR, StateDir};
 
 /// Copy a project into a new folder and link the folder to it.
@@ -40,7 +42,7 @@ pub struct Args {
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let link = read_link(args.link.as_deref())?;
-    let link = ShareLink::parse(&resolve_listed(&link)?)?;
+    let link = ShareLink::parse(&resolve_listed(&link).await?)?;
     let explicit = args.dir.map(|dir| ctx.dir.join(dir));
     // Everything that can fail without the network fails before it.
     let parent = match &explicit {
@@ -91,7 +93,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     }
     let staging = match &explicit {
         Some(dir) => dir.clone(),
-        None => parent.join(format!(".typstry-clone-{}", share.project_id)),
+        None => parent.join(format!(".typstry-clone-{}", share.space_id)),
     };
     check_empty(&staging)?;
     let created = !staging.exists();
@@ -141,6 +143,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         repo.exclude_state_dir()?;
     }
     track_branch(&mut session, &mut out)?;
+    sync_server(&link.origin).await;
 
     println!(
         "Cloned {title:?} into {} ({} file(s){})",
@@ -201,11 +204,12 @@ fn read_link(arg: Option<&str>) -> anyhow::Result<String> {
 
 /// Turns a number or title from `typstry list` into that project's link;
 /// anything else is passed through as a link.
-fn resolve_listed(input: &str) -> anyhow::Result<String> {
+async fn resolve_listed(input: &str) -> anyhow::Result<String> {
     let input = input.trim();
     if input.contains('#') || input.contains("://") {
         return Ok(input.to_owned());
     }
+    sync_bound().await;
     let catalog = crate::user::catalog()?;
     let picked = match input.parse::<usize>() {
         Ok(n) => catalog.get(n.wrapping_sub(1)),
@@ -222,6 +226,15 @@ fn resolve_listed(input: &str) -> anyhow::Result<String> {
         }
     };
     match picked {
+        Some(entry) if entry.state != State::Listed => bail!(
+            "{:?} is not available any more ({}); see `typstry list`",
+            entry.title,
+            if entry.state == State::Removed {
+                "you were removed from it"
+            } else {
+                "the server no longer knows it"
+            }
+        ),
         Some(entry) => Ok(entry.link.clone()),
         None => bail!("{input:?} is neither a link nor a project in `typstry list`"),
     }

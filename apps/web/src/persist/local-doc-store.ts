@@ -27,7 +27,7 @@ function blobsOf(stored: StoredDoc): Uint8Array[] {
  * outdated state) comes back as itself instead of leaving a ghost leaf.
  */
 export interface MlsRecord {
-  /** `ProjectGroup.exportState()`; null while only the device exists. */
+  /** `SpaceGroup.exportState()`; null while only the device exists. */
   state: Uint8Array | null;
   /** `Device.export()`. */
   device: Uint8Array | null;
@@ -45,7 +45,7 @@ export interface MlsRecord {
    */
   ownerPerson?: Uint8Array;
   /**
-   * Every owner key secret the device held, as `ProjectGroup.ownerSecrets()`
+   * Every owner key secret the device held, as `SpaceGroup.ownerSecrets()`
    * bytes merged in with `mergeOwnerSecrets` on every save, kept beside the
    * state: one may be the only copy of the project's owner key, and a
    * device that has to rejoin (lost or unreadable state) brings them into
@@ -66,11 +66,11 @@ export interface StoredRotation {
 }
 
 export interface DocBackend {
-  load(projectId: string): Promise<StoredDoc>;
-  loadMls(projectId: string): Promise<MlsRecord | null>;
+  load(spaceId: string): Promise<StoredDoc>;
+  loadMls(spaceId: string): Promise<MlsRecord | null>;
   /** Callers serialize writers themselves (see mls/session.ts). */
-  saveMls(projectId: string, record: MlsRecord): Promise<void>;
-  append(projectId: string, update: Uint8Array): Promise<void>;
+  saveMls(spaceId: string, record: MlsRecord): Promise<void>;
+  append(spaceId: string, update: Uint8Array): Promise<void>;
   /**
    * Replaces everything stored for the project with the snapshot `build`
    * returns. `build` gets what is stored right then and runs inside the same
@@ -78,7 +78,7 @@ export interface DocBackend {
    * instead of being deleted unseen.
    */
   compact(
-    projectId: string,
+    spaceId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void>;
   /** The `DeviceKey.export` bytes of this browser, if it has made one. */
@@ -107,7 +107,7 @@ export interface DocBackend {
   /** Sets the names given, by hex device key, keeping the others. */
   saveLabels(labels: Record<string, string>): Promise<void>;
   /** Drops everything stored for the project. */
-  remove(projectId: string): Promise<void>;
+  remove(spaceId: string): Promise<void>;
 }
 
 const DB_NAME = "typstry";
@@ -119,7 +119,7 @@ const PERSON = "person";
 const DEVICE_ROW = "device";
 const GRAPH_ROW = "graph";
 const LABELS_ROW = "labels";
-const BY_PROJECT = "projectId";
+const BY_SPACE = "spaceId";
 
 function request<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -140,7 +140,7 @@ function done(tx: IDBTransaction): Promise<void> {
 }
 
 interface Row {
-  projectId: string;
+  spaceId: string;
   data: Uint8Array;
 }
 
@@ -153,7 +153,7 @@ function keyOf(row: PersonRow | undefined): Uint8Array | null {
   return row && "key" in row ? row.key : null;
 }
 
-type MlsRow = MlsRecord & { projectId: string };
+type MlsRow = MlsRecord & { spaceId: string };
 
 export class IndexedDbBackend implements DocBackend {
   private readonly db: IDBDatabase;
@@ -173,10 +173,10 @@ export class IndexedDbBackend implements DocBackend {
       const db = req.result;
       const oldVersion = event.oldVersion;
       if (oldVersion < 1) {
-        db.createObjectStore(SNAPSHOTS, { keyPath: "projectId" });
+        db.createObjectStore(SNAPSHOTS, { keyPath: "spaceId" });
         const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
-        updates.createIndex(BY_PROJECT, "projectId");
-        db.createObjectStore(MLS, { keyPath: "projectId" });
+        updates.createIndex(BY_SPACE, "spaceId");
+        db.createObjectStore(MLS, { keyPath: "spaceId" });
         db.createObjectStore(PERSON, { keyPath: "id" });
       }
     };
@@ -191,14 +191,14 @@ export class IndexedDbBackend implements DocBackend {
     return new IndexedDbBackend(db);
   }
 
-  async load(projectId: string): Promise<StoredDoc> {
+  async load(spaceId: string): Promise<StoredDoc> {
     const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readonly");
     const snapshot = request<Row | undefined>(
-      tx.objectStore(SNAPSHOTS).get(projectId),
+      tx.objectStore(SNAPSHOTS).get(spaceId),
     );
     // Auto-increment keys keep the index in append order.
     const updates = request<Row[]>(
-      tx.objectStore(UPDATES).index(BY_PROJECT).getAll(projectId),
+      tx.objectStore(UPDATES).index(BY_SPACE).getAll(spaceId),
     );
     const [snap, rows] = await Promise.all([snapshot, updates]);
     return {
@@ -207,20 +207,19 @@ export class IndexedDbBackend implements DocBackend {
     };
   }
 
-  async loadMls(projectId: string): Promise<MlsRecord | null> {
+  async loadMls(spaceId: string): Promise<MlsRecord | null> {
     const tx = this.db.transaction(MLS, "readonly");
     const row = await request<MlsRow | undefined>(
-      tx.objectStore(MLS).get(projectId),
+      tx.objectStore(MLS).get(spaceId),
     );
     if (!row) return null;
-    const { state, device, removed, rotation, ownerPerson, ownerSecrets } =
-      row;
+    const { state, device, removed, rotation, ownerPerson, ownerSecrets } = row;
     return { state, device, removed, rotation, ownerPerson, ownerSecrets };
   }
 
-  async saveMls(projectId: string, record: MlsRecord): Promise<void> {
+  async saveMls(spaceId: string, record: MlsRecord): Promise<void> {
     const tx = this.db.transaction(MLS, "readwrite");
-    tx.objectStore(MLS).put({ ...record, projectId } satisfies MlsRow);
+    tx.objectStore(MLS).put({ ...record, spaceId } satisfies MlsRow);
     await done(tx);
   }
 
@@ -300,29 +299,29 @@ export class IndexedDbBackend implements DocBackend {
     await committed;
   }
 
-  async append(projectId: string, update: Uint8Array): Promise<void> {
+  async append(spaceId: string, update: Uint8Array): Promise<void> {
     const tx = this.db.transaction(UPDATES, "readwrite");
     tx.objectStore(UPDATES).add({
-      projectId,
+      spaceId,
       data: update,
     } satisfies Row);
     await done(tx);
   }
 
   async compact(
-    projectId: string,
+    spaceId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void> {
     const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readwrite");
     const committed = done(tx);
     const snapshots = tx.objectStore(SNAPSHOTS);
-    const index = tx.objectStore(UPDATES).index(BY_PROJECT);
+    const index = tx.objectStore(UPDATES).index(BY_SPACE);
     // No other awaits in between: a transaction commits as soon as a task
     // ends without pending requests, and `build` must run while it is live.
     const [snap, rows, keys] = await Promise.all([
-      request<Row | undefined>(snapshots.get(projectId)),
-      request<Row[]>(index.getAll(projectId)),
-      request<IDBValidKey[]>(index.getAllKeys(projectId)),
+      request<Row | undefined>(snapshots.get(spaceId)),
+      request<Row[]>(index.getAll(spaceId)),
+      request<IDBValidKey[]>(index.getAllKeys(spaceId)),
     ]);
     let data: Uint8Array;
     try {
@@ -335,19 +334,19 @@ export class IndexedDbBackend implements DocBackend {
       await committed.catch(() => {});
       throw error;
     }
-    snapshots.put({ projectId, data } satisfies Row);
+    snapshots.put({ spaceId, data } satisfies Row);
     const updates = tx.objectStore(UPDATES);
     for (const key of keys) updates.delete(key);
     await committed;
   }
 
-  async remove(projectId: string): Promise<void> {
+  async remove(spaceId: string): Promise<void> {
     const tx = this.db.transaction([SNAPSHOTS, UPDATES, MLS], "readwrite");
     const committed = done(tx);
-    tx.objectStore(SNAPSHOTS).delete(projectId);
-    tx.objectStore(MLS).delete(projectId);
+    tx.objectStore(SNAPSHOTS).delete(spaceId);
+    tx.objectStore(MLS).delete(spaceId);
     const updates = tx.objectStore(UPDATES);
-    const keys = await request(updates.index(BY_PROJECT).getAllKeys(projectId));
+    const keys = await request(updates.index(BY_SPACE).getAllKeys(spaceId));
     for (const key of keys) updates.delete(key);
     await committed;
   }
@@ -361,26 +360,26 @@ export class MemoryBackend implements DocBackend {
   private graph: Uint8Array | null = null;
   private labels: Record<string, string> = {};
 
-  private entry(projectId: string): StoredDoc {
-    let entry = this.docs.get(projectId);
+  private entry(spaceId: string): StoredDoc {
+    let entry = this.docs.get(spaceId);
     if (!entry) {
       entry = { snapshot: null, updates: [] };
-      this.docs.set(projectId, entry);
+      this.docs.set(spaceId, entry);
     }
     return entry;
   }
 
-  async load(projectId: string): Promise<StoredDoc> {
-    const entry = this.entry(projectId);
+  async load(spaceId: string): Promise<StoredDoc> {
+    const entry = this.entry(spaceId);
     return { snapshot: entry.snapshot, updates: [...entry.updates] };
   }
 
-  async loadMls(projectId: string): Promise<MlsRecord | null> {
-    return this.groups.get(projectId) ?? null;
+  async loadMls(spaceId: string): Promise<MlsRecord | null> {
+    return this.groups.get(spaceId) ?? null;
   }
 
-  async saveMls(projectId: string, record: MlsRecord): Promise<void> {
-    this.groups.set(projectId, record);
+  async saveMls(spaceId: string, record: MlsRecord): Promise<void> {
+    this.groups.set(spaceId, record);
   }
 
   async loadDeviceKey(): Promise<Uint8Array | null> {
@@ -412,21 +411,21 @@ export class MemoryBackend implements DocBackend {
     this.labels = { ...this.labels, ...labels };
   }
 
-  async append(projectId: string, update: Uint8Array): Promise<void> {
-    this.entry(projectId).updates.push(update);
+  async append(spaceId: string, update: Uint8Array): Promise<void> {
+    this.entry(spaceId).updates.push(update);
   }
 
   async compact(
-    projectId: string,
+    spaceId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void> {
-    const snapshot = build(await this.load(projectId));
-    this.docs.set(projectId, { snapshot, updates: [] });
+    const snapshot = build(await this.load(spaceId));
+    this.docs.set(spaceId, { snapshot, updates: [] });
   }
 
-  async remove(projectId: string): Promise<void> {
-    this.docs.delete(projectId);
-    this.groups.delete(projectId);
+  async remove(spaceId: string): Promise<void> {
+    this.docs.delete(spaceId);
+    this.groups.delete(spaceId);
   }
 }
 
@@ -473,7 +472,7 @@ export interface LocalDocStoreOptions {
  * happens, and `stop()` to flush and let go.
  */
 export class LocalDocStore {
-  private readonly projectId: string;
+  private readonly spaceId: string;
   private readonly doc: LoroDoc;
   private readonly backend: DocBackend;
   private readonly flushDelayMs: number;
@@ -498,12 +497,12 @@ export class LocalDocStore {
   private stopListening: (() => void) | null = null;
 
   constructor(
-    projectId: string,
+    spaceId: string,
     doc: LoroDoc,
     backend: DocBackend,
     options: LocalDocStoreOptions = {},
   ) {
-    this.projectId = projectId;
+    this.spaceId = spaceId;
     this.doc = doc;
     this.backend = backend;
     this.flushDelayMs = options.flushDelayMs ?? 300;
@@ -514,7 +513,7 @@ export class LocalDocStore {
 
   /** Imports what is stored. Returns false when nothing was. */
   async load(): Promise<boolean> {
-    const stored = await this.backend.load(this.projectId);
+    const stored = await this.backend.load(this.spaceId);
     const blobs = blobsOf(stored);
     if (blobs.length > 0) this.doc.importBatch(blobs);
     this.persisted = this.doc.oplogVersion();
@@ -576,7 +575,7 @@ export class LocalDocStore {
     const version = this.doc.oplogVersion();
     if (version.compare(this.persisted) === 0) return;
     const update = this.doc.export({ mode: "update", from: this.persisted });
-    await this.backend.append(this.projectId, update);
+    await this.backend.append(this.spaceId, update);
     this.persisted = version;
     this.logBytes += update.length;
     const limit = Math.max(
@@ -589,7 +588,7 @@ export class LocalDocStore {
   private async compact(): Promise<void> {
     let version = this.persisted;
     let size = 0;
-    await this.backend.compact(this.projectId, (stored) => {
+    await this.backend.compact(this.spaceId, (stored) => {
       // Another tab may have stored ops this doc has never seen; importing
       // them is what keeps the new snapshot from dropping them. Most rows
       // are this tab's own or arrived here through sync too, and importing
