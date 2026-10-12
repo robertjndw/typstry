@@ -1,7 +1,7 @@
 # typstry
 
 [![CI](https://github.com/robertjndw/typstry/actions/workflows/ci.yml/badge.svg)](https://github.com/robertjndw/typstry/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A self-hostable, real-time collaborative editor for [Typst](https://typst.app), built on CRDTs and end-to-end encrypted.
 
@@ -16,8 +16,9 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
 - **Multi-file projects** - file tree, tabs, and uploads for images, fonts and data files. Images can also be pasted or dropped into the editor.
 - **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
-- **Sharing** - separate edit and view-only links, no accounts required.
-- **Export** - download the compiled PDF or the whole project as a ZIP.
+- **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so members can see who is in a project and its owner can remove a member, which also replaces the links.
+- **Your devices** - pair a phone, a laptop and the CLI with a short code to use them as one person. Your project list syncs between them, a lost device can be revoked from any other, and a recovery key brings everything back if all are lost.
+- **Import and export** - start a project from a ZIP or a folder, and download the compiled PDF or the whole project as a ZIP.
 - **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
 
 ## Quick start
@@ -28,7 +29,7 @@ The easiest way to run typstry is Docker Compose:
 docker compose up -d
 ```
 
-Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume. The first build compiles tinymist to wasm, so expect it to take several minutes.
+Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume. The first build compiles tinymist to wasm, so expect it to take several minutes. See [Self-hosting](docs/self-hosting.md) for configuration and backups.
 
 Or build and run the image directly:
 
@@ -39,134 +40,40 @@ docker run -d -p 8787:8787 -v typstry-data:/data typstry
 
 ## How it works
 
-```
-┌──────────────── browser ────────────────┐          ┌──────── typstry-server ────────┐
-│ CodeMirror ◄─► LoroDoc ◄─► IndexedDB    │  /ws     │ rooms (relay + compaction)     │
-│                  │                      │ ◄──────► │ SQLite: encrypted doc records  │
-│                  ├─► encrypt + sign     │  /api    │ blobs/: encrypted uploads      │
-│                  ├─► Typst worker ─► SVG│ ◄──────► │ static frontend                │
-│                  └─► tinymist worker    │          │                                │
-└─────────────────────────────────────────┘          └────────────────────────────────┘
-```
+Each project is a single [Loro](https://loro.dev) document holding the file tree, file contents and version list. Your browser (or the `typstry` CLI) encrypts every change before it leaves your machine. The server stores and forwards the encrypted changes without being able to read them.
 
-Each project is a single Loro document holding the file tree, file contents and version list. The browser and the `typstry` CLI encrypt every update before it leaves your machine and send it over WebSocket, and the server relays and persists those records without being able to read them. The server only sees project and share-link tokens, record headers and blob sizes.
+The key is in the share link, in the part after `#` that browsers never send to a server. Anyone with a link can read the project, so treat edit links like passwords. Only the person who created a project can remove members or replace the links, and a removed device cannot read anything written afterwards.
 
-Because the key is part of the share link, anyone with the link can read the project. Treat edit links like passwords.
+There are no accounts. Instead, every browser and CLI has its own device key, and you pair your devices with a short code so they act as one person and share your project list. A recovery key, 17 words to keep offline, gets you back in if you lose every device.
 
-An edit link carries a 32-byte secret. Two keys are derived from it with HKDF-SHA256: a read key and an Ed25519 signing key. A view link carries only the read key and the public key. Every message is encrypted with AES-256-GCM under a key derived from the read key and a fresh random salt, and every doc update is signed. Viewers can decrypt and verify, but other clients refuse updates they did not sign with the edit key, so a view link stays read-only even if the server is compromised. A compromised server can still withhold or roll back updates, and it serves the app's JavaScript.
+The [documentation](docs/README.md) explains all of this in more detail:
+
+- [Architecture](docs/architecture.md): the parts of typstry and what the server can see.
+- [Encryption](docs/encryption.md): share links, keys and generations.
+- [Members and owners](docs/members-and-owners.md): who is in a project and how removal works.
+- [Devices and accounts](docs/devices-and-accounts.md): pairing, your project list, lost devices and recovery keys.
+
+See [SECURITY.md](SECURITY.md) for what the encryption protects and its known limits.
 
 ## Working locally with git
 
-The `typstry` CLI links a folder to a project. It encrypts and decrypts on your machine like the browser does, so the server still only sees ciphertext.
-
-It isn't part of the Docker image. Install it from a checkout with [Rust](https://rustup.rs) 1.94 or newer:
+The `typstry` CLI links a folder to a project, so you can write in your own editor and keep the files in your own git repository. It encrypts on your machine like the browser does. Install it from a checkout with [Rust](https://rustup.rs) 1.94 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli
 ```
 
-typstry moves the current state of the files between people, live. Git keeps the snapshots you decide to commit. The CLI never commits for you (except the first commit of `clone --git`), so branches, rebase, hooks and remotes work as usual.
-
-Pick one way to get edits from your co-authors. If they use typstry, don't also `git pull` the same edits from a shared remote, or they arrive twice. Your git history can be your own, or one person can keep the shared repository for the group.
-
-### A normal day
-
 ```sh
-# Once, joining an existing project
 typstry clone 'https://typstry.example/p/<token>#<key>' thesis --git
-# Once, starting from a repository you already have
-cd thesis && typstry init --server https://typstry.example   # prints the links to share
-
-# Writing: keep sync running and use any editor
-typstry sync
-#   ↓ chapters/intro.typ
-#   ↑ chapters/method.typ
-
-# Checkpoints, in another terminal while sync runs.
-# Co-author edits show up as normal changes.
-git status
-git commit -am "method section draft"
-
-# A private draft: sync pauses while you are off the tracked branch
-git commit -am "before rewrite"
-git switch -c rewrite-results
-git commit -am "restructure results"
-git switch main                 # sync resumes and catches up
-git merge rewrite-results       # published to everyone as one edit
-
-# Backup and milestones
-git push
-typstry version save "sent to supervisor"
-git tag sent-to-supervisor
+cd thesis
+typstry sync   # keep running and edit with any editor
 ```
 
-Without the live mode, the same day is `typstry pull`, edit, then `typstry push`. `pull` leaves files that changed on both sides alone and lists them. `push` merges your changes with anything edited in the meantime and lists files changed on both sides so you can review them with `git diff`.
-
-### Commands
-
-| Command                         | What it does                                                                        |
-| ------------------------------- | ----------------------------------------------------------------------------------- |
-| `clone <link> [dir] [--git]`    | Copy a project into a new folder. `--git` also creates a repository and commits it  |
-| `init [dir]`                    | Turn a folder (for example an existing git repository) into a new project           |
-| `sync`                          | Keep the folder and the project in sync until Ctrl+C                                |
-| `status`, `pull`, `push`        | One-shot sync: show, receive or publish changes. While `sync` runs, it answers them |
-| `link`, `open`                  | Print the edit and view links, or open the project in the browser                   |
-| `info`                          | Project, permission, tracked branch and pending changes                             |
-| `version list`, `version save`  | Named versions (tags in the browser's history panel). Also work while `sync` runs   |
-| `export [--at <version>] <dir>` | Write the project, now or at a named version, to a plain folder                     |
-| `track <branch>`                | Change the git branch typstry syncs on (stop `sync` first)                          |
-
-Every command takes `-C <dir>` to run as if started in another folder, and `--name <name>` to set the author name shown in the project history (defaults to `git config user.name`). `typstry <command> --help` shows all options.
-
-| Variable          | Used for                                                        |
-| ----------------- | --------------------------------------------------------------- |
-| `TYPSTRY_LINK`    | The share link for `clone` when the argument is left out        |
-| `TYPSTRY_SERVER`  | The server for `init` when `--server` is left out               |
-| `TYPSTRY_BROWSER` | The program `open` starts instead of the system default browser |
-| `TYPSTRY_LOG`     | Log filter in `RUST_LOG` syntax, `warn` by default              |
-
-### Things to know
-
-- **The tracked branch.** typstry syncs on one git branch, the one checked out when the folder was first linked. On any other branch, or while git is merging or rebasing, `sync` pauses and `pull`/`push` refuse unless you pass `--force`.
-- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then publish by typing `push` in the sync terminal, running `typstry push --force`, or starting `sync` with `--publish`. Committing on the tracked branch before switching avoids this.
-- **Commands next to `sync`.** While `sync` runs, `status`, `info`, `version list`, `version save` and `push` in the same folder ask it instead of failing. `version save` and `push` publish what is on disk right away, so a version saved just after a save includes it. Both refuse while `sync` is paused, and need `--force` while it holds back changes after a branch switch, like the one-shot versions. `pull` only says that `sync` already pulls. `track` and `export` refuse to start until `sync` is stopped.
-- **The key lives in `.typstry/`.** That folder holds the link and a local cache. It ignores itself with its own `.gitignore` and is also added to `.git/info/exclude`. Never commit it. To keep the link out of your shell history, pass it on standard input (`pbpaste | typstry clone - thesis`) or in `TYPSTRY_LINK`.
-- **Ignored files.** `.gitignore` and an optional `.typstryignore` decide which files are synced, so build output such as PDFs stays local. git's own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`) and `.typstryignore` itself are not synced either; re-include one with a negated pattern in `.typstryignore`, such as `!.gitignore`. An ignored file is never written to the folder, and removing or editing it locally never changes the project. A file the project gets from someone else never replaces a local file that is not synced, or one whose name only differs in case on macOS and Windows.
-- **Editors.** Files can change on disk while you edit them. Let your editor reload changed files automatically (VS Code does this for files without unsaved changes).
+See [the CLI guide](docs/cli.md) for a typical day with git, all commands and the things to know.
 
 ## Configuration
 
-The server is configured through environment variables:
-
-| Variable                        | Default             | Description                                                                              |
-| ------------------------------- | ------------------- | ---------------------------------------------------------------------------------------- |
-| `TYPSTRY_ADDR`                  | `127.0.0.1:8787`    | Address to listen on (the Docker image uses `0.0.0.0:8787`).                             |
-| `TYPSTRY_DATA_DIR`              | `data`              | Directory for the SQLite database and uploaded blobs.                                    |
-| `TYPSTRY_WEB_DIST`              | `apps/web/dist`     | Built frontend to serve. Static serving is off if missing.                               |
-| `TYPSTRY_MAX_UPLOAD_BYTES`      | `26214400` (25 MiB) | Largest asset upload.                                                                    |
-| `TYPSTRY_ROOM_UNLOAD_SECS`      | `60`                | How long a project stays loaded after its last client left.                              |
-| `TYPSTRY_PRESENCE_TIMEOUT_SECS` | `30`                | How long a client's cursor stays visible without a refresh.                              |
-| `TYPSTRY_UPDATE_BURST`          | `200`               | Document records (and presence updates) one connection may send in a burst.              |
-| `TYPSTRY_UPDATES_PER_SEC`       | `50`                | Sustained records per second per connection, after the burst.                            |
-| `TYPSTRY_MAX_ROOMS_PER_CONN`    | `8`                 | Rooms one connection may join; a project takes two.                                      |
-| `TYPSTRY_OUTBOX_BYTES`          | `67108864` (64 MiB) | Live updates queued for a slow client before it is dropped. Does not limit the doc size. |
-| `RUST_LOG`                      | `info`              | Log filter, see [`tracing-subscriber`][env-filter].                                      |
-
-The container exposes `GET /healthz` for health checks.
-
-[env-filter]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
-
-### Backups
-
-The data directory contains `typstry.db` and a `blobs/` directory. Take a consistent copy of the database while the server is running with:
-
-```sh
-typstry-server backup /path/to/backup.db
-# or, with Docker Compose:
-docker compose exec typstry typstry-server backup /data/backup.db
-```
-
-Copy `blobs/` separately. Every record is written to the database as it arrives, so stopping the server does not lose edits.
+The server is configured through environment variables such as `TYPSTRY_ADDR` and `TYPSTRY_DATA_DIR`. [Self-hosting](docs/self-hosting.md) lists them all and explains backups.
 
 ## Development
 
@@ -175,17 +82,20 @@ Copy `blobs/` separately. Every record is written to the database as it arrives,
 - [Rust](https://rustup.rs) (stable, see `rust-toolchain.toml`; MSRV 1.94)
 - [Node.js](https://nodejs.org) 26 or newer
 - [pnpm](https://pnpm.io) 12 (`corepack enable` picks up the pinned version)
-- [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist for the browser
+- [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist and the crypto code for the browser
 
 ### Getting started
 
 ```sh
 pnpm install
 apps/web/scripts/build-tinymist.sh
+pnpm --filter web wasm
 pnpm dev
 ```
 
 The tinymist script builds the language server to wasm from a pinned commit into `apps/web/vendor/` (the npm package is only a stub). The first build takes a few minutes. Rerun it after the pinned commit changes.
+
+`pnpm --filter web wasm` builds `crates/typstry-wasm`, the encryption and MLS code the web app shares with the CLI, into `apps/web/vendor/typstry-wasm`. It takes about a minute. Rerun it after changing `typstry-wire` or `typstry-wasm`. Typecheck, tests and builds of the web app need both vendor directories.
 
 This starts the Vite dev server for the frontend and the Rust server on port 8787, with Vite proxying `/api` and `/ws` to it. Set `TYPSTRY_BACKEND` to point Vite at a server on a different address.
 
@@ -215,15 +125,19 @@ apps/web/              React + Vite frontend (editor, sync, encryption, Typst an
 crates/typstry-cli/    The typstry CLI: clone, sync, push and pull a project with a local folder
 crates/typstry-doc/    Shared Loro document schema, mirrored in apps/web/src/doc/schema.ts
 crates/typstry-server/ Axum server: WebSocket rooms, REST API, SQLite and blob storage
-crates/typstry-wire/   Encrypted record format and fragmentation, shared by the server and the CLI
+crates/typstry-wasm/   typstry-wire built to wasm for the web app
+crates/typstry-wire/   Record format, encryption, MLS groups, devices and pairing, shared by all of the above
+docs/                  Documentation
 ```
 
-The document schema exists on both sides. Changes to one must be reflected in the other, and incompatible layout changes bump `SCHEMA_VERSION`.
+The document schema exists on both sides. Changes to one must be reflected in the other, and incompatible layout changes bump `SCHEMA_VERSION`. [Compatibility](docs/compatibility.md) lists every versioned format and how to change one.
 
 ## Contributing
 
 Issues and pull requests are welcome. Before opening a PR, please make sure formatting, linting and tests pass locally (see [Common tasks](#common-tasks)). Commit messages follow [Conventional Commits](https://www.conventionalcommits.org).
 
+Please report security issues privately as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
-Licensed under the [MIT License](https://opensource.org/licenses/MIT).
+Licensed under the [MIT License](LICENSE).

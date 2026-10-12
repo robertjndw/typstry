@@ -1,7 +1,7 @@
 import { DownloadIcon, FileDownIcon, Loader2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { ownBuffer } from "@/crypto/project-key";
+import { ownBuffer } from "@/crypto/bytes";
 import {
   useDownload,
   useZipDownload,

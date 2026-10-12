@@ -7,12 +7,13 @@ import {
   PenLineIcon,
   Share2Icon,
   ShieldCheckIcon,
+  UserMinusIcon,
   UserXIcon,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { toast } from "sonner";
+import { useState } from "react";
 
+import { MembersSection } from "@/components/MembersSection";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -28,9 +29,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { ProjectKey } from "@/crypto/project-key";
+import { guard, type SpaceCrypto } from "@/crypto/space-crypto";
+import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { LinkSecret } from "@/crypto/wasm";
 import { cn } from "@/lib/utils";
-import { loadShareLinks, projectUrl } from "@/project/recent";
+import type { MlsSession } from "@/mls/session";
+import { projectUrl } from "@/project/recent";
+import { loadSpaceKey, loadShareLinks } from "@/space/space-links";
 import type { SharePermission } from "@/sync/api";
 
 export interface ShareDialogProps {
@@ -38,16 +43,42 @@ export interface ShareDialogProps {
   /** The token this page was opened with. */
   token: string;
   /** Its secrets are part of every link and never sent to the server. */
-  projectKey: ProjectKey;
+  crypto: SpaceCrypto;
   permission: SharePermission;
   /** From the share lookup; set for edit links, so any editor can pass on a view link. */
   viewToken?: string;
+  /** The project's member group; null while it is not known yet. */
+  mls: MlsSession | null;
+}
+
+/**
+ * The secrets to put in the links. After a rotation the stored key and the
+ * stored tokens are the new pair, while `crypto` can still be the one opened
+ * with the old link for a moment; mixing the two would show a link that does
+ * not open anything.
+ */
+function secretsOf(
+  stored: string | null,
+  crypto: SpaceCrypto,
+): { editSecret: string | null; viewSecret: string } {
+  try {
+    if (stored) {
+      const link = guard(() => LinkSecret.parse(stored));
+      return {
+        editSecret: link.canAttest() ? stored : null,
+        viewSecret: link.viewSecret(),
+      };
+    }
+  } catch {
+    // A key this build cannot read; the open project's own is all there is.
+  }
+  return { editSecret: crypto.editSecret, viewSecret: crypto.viewSecret };
 }
 
 const FACTS: { Icon: LucideIcon; text: string }[] = [
   {
     Icon: UserXIcon,
-    text: "There are no accounts. Whoever has a link has its access, so treat the edit link like a password.",
+    text: "There are no accounts. Anyone with a current link can join, so treat the edit link like a password.",
   },
   {
     Icon: KeyRoundIcon,
@@ -55,21 +86,29 @@ const FACTS: { Icon: LucideIcon; text: string }[] = [
   },
   {
     Icon: ShieldCheckIcon,
-    text: "Only the edit link can sign changes, so view links stay read-only even if the server were compromised.",
+    text: "Members are authenticated per device. Each one signs what it writes, and only the edit link can make a device an editor, so view links stay read-only even if the server were compromised.",
+  },
+  {
+    Icon: UserMinusIcon,
+    text: "Removing a member or resetting the links cuts off everything added afterwards, and the members who remain get the new links automatically. What someone already saw, they keep, and anyone who still has a current link can join again.",
   },
 ];
 
 export function ShareDialog({
   projectId,
   token,
-  projectKey,
+  crypto,
   permission,
   viewToken: resolvedViewToken,
+  mls,
 }: ShareDialogProps) {
   const [open, setOpen] = useState(false);
   // Read on open so links saved in another tab show up.
   const links = open ? loadShareLinks(projectId) : null;
-  const editSecret = projectKey.editSecret;
+  const { editSecret, viewSecret } = secretsOf(
+    open ? loadSpaceKey(projectId) : null,
+    crypto,
+  );
   const editToken =
     permission === "write" && editSecret
       ? (links?.editToken ?? token)
@@ -85,7 +124,7 @@ export function ShareDialog({
           Share
         </Button>
       </DialogTrigger>
-      <DialogContent className="gap-5 sm:max-w-md">
+      <DialogContent className="max-h-[calc(100svh-2rem)] gap-5 overflow-y-auto sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Share project</DialogTitle>
           <DialogDescription>
@@ -106,7 +145,7 @@ export function ShareDialog({
               label="Can view"
               hint="Anyone with this link can view"
               Icon={EyeIcon}
-              url={projectUrl(viewToken, projectKey.viewSecret)}
+              url={projectUrl(viewToken, viewSecret)}
             />
           ) : (
             <p className="text-xs text-muted-foreground">
@@ -115,6 +154,7 @@ export function ShareDialog({
             </p>
           )}
         </div>
+        <MembersSection mls={mls} />
         <details className="group rounded-lg border bg-muted/30 text-sm">
           <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg px-3 py-2 font-medium outline-none select-none focus-visible:ring-3 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
             <ChevronRightIcon className="size-4 text-muted-foreground transition-transform group-open:rotate-90" />
@@ -145,22 +185,10 @@ function LinkRow({
   Icon: LucideIcon;
   url: string;
 }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const { copied, copy } = useCopyToClipboard(
+    "Copying failed. Select the link and copy it manually.",
+  );
   const id = `share-${label.replace(/\s+/g, "-").toLowerCase()}`;
-
-  useEffect(() => () => clearTimeout(timer.current), []);
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      clearTimeout(timer.current);
-      timer.current = setTimeout(() => setCopied(false), 2000);
-    } catch {
-      toast.error("Copying failed. Select the link and copy it manually.");
-    }
-  }
 
   return (
     <div className="grid gap-1.5">
@@ -192,7 +220,7 @@ function LinkRow({
               size="icon"
               aria-label={`Copy ${label.toLowerCase()} link`}
               className={cn(copied && "text-success hover:text-success")}
-              onClick={copy}
+              onClick={() => void copy(url)}
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
             </Button>

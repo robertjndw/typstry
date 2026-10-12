@@ -1,5 +1,6 @@
 pub mod config;
 pub mod http;
+pub mod relay;
 pub mod room;
 pub mod state;
 pub mod store;

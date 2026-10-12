@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+dirs.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 ignore.workspace = true
@@ -32,12 +33,17 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 typstry-doc.workspace = true
-typstry-wire = { workspace = true, features = ["crypto"] }
+typstry-wire = { workspace = true, features = ["crypto", "mls"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true
 typstry-server.workspace = true
+# The compat fixture generator writes doc.json the way typstry-doc reads it.
+typstry-doc = { workspace = true, features = ["test-util"] }
+# The compat fixture generator seals with fixed salts and IVs.
+typstry-wire = { workspace = true, features = ["crypto", "test-util"] }
 
 [lints]
 workspace = true

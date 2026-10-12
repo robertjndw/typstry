@@ -4,6 +4,7 @@
 //! read and write the same containers.
 
 pub mod apply;
+pub mod directory;
 pub mod init;
 pub mod materialize;
 pub mod names;
@@ -20,7 +21,11 @@ use std::str::FromStr;
 
 use loro::{LoroDoc, LoroMap, LoroText, LoroValue, TreeID, ValueOrContainer};
 
-/// Bumped whenever the document layout changes incompatibly.
+/// Bumped whenever the document layout changes incompatibly, meaning an
+/// older client writing into the doc would corrupt it. Additive data older
+/// clients ignore (like `deletedVersions`) doesn't count. Docs are never
+/// rewritten wholesale, so readers have to keep handling every schema from
+/// 1 up. Must match `SCHEMA_VERSION` in schema.ts.
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// The doc's `meta.schema`, or None for a doc that was never initialized.
@@ -39,6 +44,98 @@ pub fn schema_version(doc: &LoroDoc) -> Option<i64> {
     }
 }
 
+/// The doc was written in a layout newer than this build understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "this project uses document layout {found}, but this typstry only supports up to {supported}; upgrade typstry"
+)]
+pub struct SchemaTooNew {
+    pub found: i64,
+    pub supported: i64,
+}
+
+/// The doc's `meta.kind`, or None while it is unset or not a string.
+pub fn doc_kind(doc: &LoroDoc) -> Option<String> {
+    string_value(doc.get_map(root::META).get(meta::KIND))
+}
+
+/// The doc is some other kind of space than a project, say a person's
+/// directory reached through a link that was meant for a project.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("this link does not open a project")]
+pub struct ForeignKind {
+    pub found: String,
+}
+
+/// Why a project doc must not be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error(transparent)]
+    TooNew(#[from] SchemaTooNew),
+    #[error(transparent)]
+    ForeignKind(#[from] ForeignKind),
+}
+
+/// Fails for a doc that is not a project, or whose `meta.schema` is newer
+/// than [`SCHEMA_VERSION`]. Anyone about to write into the doc must check
+/// this first: an older client editing a newer layout would corrupt it for
+/// everyone. A doc without a kind or schema yet (still syncing, or not
+/// initialized) passes.
+pub fn ensure_supported(doc: &LoroDoc) -> Result<(), Unsupported> {
+    if let Some(found) = doc_kind(doc)
+        && found != kind::PROJECT
+    {
+        return Err(ForeignKind { found }.into());
+    }
+    match schema_version(doc) {
+        Some(found) if found > SCHEMA_VERSION => Err(SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+/// One migration step: `MIGRATIONS[i]` brings a doc from schema `i + 1` to
+/// `i + 2`.
+type Migration = fn(&LoroDoc) -> loro::LoroResult<()>;
+
+/// Steps must be deterministic and idempotent: two peers can migrate the
+/// same doc at once and the CRDT merges both sets of ops, so a step has to
+/// write exactly what any other peer would, and do nothing on a doc that is
+/// already (partly) migrated. No random ids, timestamps or peer ids.
+/// Mirrors `MIGRATIONS` in schema.ts step by step.
+const MIGRATIONS: &[Migration] = &[];
+
+const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1);
+
+/// Brings an older doc up to [`SCHEMA_VERSION`] and returns whether it
+/// changed anything. Only for writers, and only once the doc has caught up
+/// with the server so the steps see the whole project. Docs without a
+/// schema (empty, or about to be seeded by their creator) and newer docs
+/// are left alone; call [`ensure_supported`] first for the latter.
+pub fn migrate(doc: &LoroDoc) -> loro::LoroResult<bool> {
+    let Some(from) = schema_version(doc) else {
+        return Ok(false);
+    };
+    if from >= SCHEMA_VERSION {
+        return Ok(false);
+    }
+    // Schemas start at 1, so anything smaller is garbage. Run every step.
+    let first = usize::try_from(from.max(1) - 1).unwrap_or(0);
+    for step in &MIGRATIONS[first..] {
+        step(doc)?;
+    }
+    // A double, like the browser writes, so concurrent migrations from
+    // both sides store the same value.
+    doc.get_map(root::META)
+        .insert(meta::SCHEMA, SCHEMA_VERSION as f64)?;
+    doc.set_next_commit_message("migrate schema");
+    doc.commit();
+    Ok(true)
+}
+
 /// Loro merges consecutive local commits into one change while they are at
 /// most this many seconds apart. Same value as the browser, see
 /// `CHANGE_MERGE_INTERVAL_S` in schema.ts for the reasoning.
@@ -49,6 +146,11 @@ pub const CHANGE_MERGE_INTERVAL_S: i64 = 30;
 /// this before its first commit.
 pub fn configure(doc: &LoroDoc) {
     doc.get_tree(root::FS).disable_fractional_index();
+    configure_commits(doc);
+}
+
+/// The part of [`configure`] every kind of doc shares.
+pub(crate) fn configure_commits(doc: &LoroDoc) {
     doc.set_record_timestamp(true);
     doc.set_change_merge_interval(CHANGE_MERGE_INTERVAL_S);
 }
@@ -137,8 +239,18 @@ pub mod peer {
     pub const COLOR: &str = "color";
 }
 
+/// Values of `meta.kind`. A project link must never open a directory, nor
+/// the other way around.
+pub mod kind {
+    pub const PROJECT: &str = "project";
+    pub const DIRECTORY: &str = "directory";
+}
+
 /// Keys inside the `meta` map.
 pub mod meta {
+    /// Which kind of doc this is, see [`super::kind`]. Absent on docs
+    /// written before the marker existed, which are projects.
+    pub const KIND: &str = "kind";
     pub const SCHEMA: &str = "schema";
     pub const TITLE: &str = "title";
     pub const MAIN_FILE: &str = "mainFile";
@@ -246,6 +358,67 @@ mod tests {
         assert_eq!(decoded, expected);
         let single: Frontiers = loro::ID::new(7, 3).into();
         assert_eq!(single.encode(), [1, 7, 6]);
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused() {
+        let doc = LoroDoc::new();
+        assert_eq!(ensure_supported(&doc), Ok(()));
+        let meta_map = doc.get_map(root::META);
+        meta_map
+            .insert(meta::SCHEMA, SCHEMA_VERSION as f64)
+            .unwrap();
+        assert_eq!(ensure_supported(&doc), Ok(()));
+        meta_map.insert(meta::SCHEMA, 2.0).unwrap();
+        let err = ensure_supported(&doc).unwrap_err();
+        assert_eq!(
+            err,
+            Unsupported::TooNew(SchemaTooNew {
+                found: 2,
+                supported: SCHEMA_VERSION
+            })
+        );
+        assert!(err.to_string().contains("upgrade typstry"), "{err}");
+    }
+
+    #[test]
+    fn a_foreign_kind_is_refused() {
+        let doc = LoroDoc::new();
+        let meta_map = doc.get_map(root::META);
+        meta_map.insert(meta::KIND, kind::PROJECT).unwrap();
+        assert_eq!(ensure_supported(&doc), Ok(()));
+        meta_map.insert(meta::KIND, kind::DIRECTORY).unwrap();
+        let err = ensure_supported(&doc).unwrap_err();
+        assert_eq!(
+            err,
+            Unsupported::ForeignKind(ForeignKind {
+                found: "directory".to_owned()
+            })
+        );
+        assert_eq!(err.to_string(), "this link does not open a project");
+    }
+
+    #[test]
+    fn init_marks_the_doc_as_a_project() {
+        let doc = LoroDoc::new();
+        init::init_project(&doc, "T").unwrap();
+        assert_eq!(doc_kind(&doc).as_deref(), Some(kind::PROJECT));
+        let bare = LoroDoc::new();
+        init::init_bare_project(&bare, "T").unwrap();
+        assert_eq!(doc_kind(&bare).as_deref(), Some(kind::PROJECT));
+    }
+
+    #[test]
+    fn migrate_leaves_a_current_doc_alone() {
+        let doc = LoroDoc::new();
+        assert!(!migrate(&doc).unwrap());
+        assert_eq!(schema_version(&doc), None);
+
+        init::init_project(&doc, "T").unwrap();
+        let before = doc.oplog_vv();
+        assert!(!migrate(&doc).unwrap());
+        assert_eq!(doc.oplog_vv(), before);
+        assert_eq!(schema_version(&doc), Some(SCHEMA_VERSION));
     }
 
     #[test]

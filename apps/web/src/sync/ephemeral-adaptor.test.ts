@@ -2,12 +2,9 @@
 import { EphemeralStore } from "loro-crdt";
 import { describe, expect, it, vi } from "vitest";
 
-import {
-  PRESENCE_CONTEXT,
-  generateEditSecret,
-  importProjectKey,
-  open,
-} from "@/crypto/project-key";
+import { SpaceCrypto } from "@/crypto/space-crypto";
+import { newProject } from "@/crypto/test-utils";
+import { DeviceKey, LinkSecret, PersonGraph, SpaceGroup } from "@/crypto/wasm";
 
 import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
 
@@ -15,10 +12,10 @@ function ctx() {
   return { send: vi.fn(), onJoinFailed: vi.fn(), onImportError: vi.fn() };
 }
 
-const key = await importProjectKey(generateEditSecret());
+const key = newProject().crypto;
 
 async function settle() {
-  // Sealing and opening go through WebCrypto, which resolves on a later task.
+  // Sends are queued behind each other, so they land on a later task.
   await new Promise((r) => setTimeout(r, 10));
 }
 
@@ -42,7 +39,7 @@ describe("EphemeralStoreAdaptor", () => {
     expect(c.send).toHaveBeenCalledTimes(2);
 
     const peer = new EphemeralStore(30_000);
-    peer.apply(await open(key, c.send.mock.calls[1]![0][0], PRESENCE_CONTEXT));
+    peer.apply(key.openPresence(c.send.mock.calls[1]![0][0])!);
     expect(peer.get("p:1")).toEqual({ name: "Ada" });
     store.destroy();
     peer.destroy();
@@ -71,7 +68,7 @@ describe("EphemeralStoreAdaptor", () => {
   });
 
   it("reports blobs that do not open with the key", async () => {
-    const other = await importProjectKey(generateEditSecret());
+    const other = newProject().crypto;
     const remote = new EphemeralStore(30_000);
     const remoteAdaptor = new EphemeralStoreAdaptor(remote, other);
     const rc = ctx();
@@ -88,6 +85,69 @@ describe("EphemeralStoreAdaptor", () => {
     expect(store.get("p:2")).toBeUndefined();
     expect(c.onImportError).toHaveBeenCalledTimes(2);
     remote.destroy();
+    store.destroy();
+  });
+
+  it("lets only records bind a peer, and drops presence posing as a bound one", async () => {
+    // Two members of one group, each with its own device key.
+    const link = LinkSecret.generateEdit();
+    const profile = new TextEncoder().encode("{}");
+    const seed = DeviceKey.generate().export();
+    const { group: a, message: init } = SpaceGroup.create(
+      link,
+      profile,
+      seed,
+      PersonGraph.genesis(seed).encode(),
+    );
+    const { group: b, message: submit } = SpaceGroup.joinExternal(
+      link,
+      init.groupInfo,
+      init.keyring,
+      init.ownerKey,
+      profile,
+    );
+    a.processCommit(submit.epoch, submit.commit);
+    b.confirmPending();
+    const memberOf = (group: SpaceGroup) => {
+      const crypto = new SpaceCrypto(link, group.docKeys(), group.signer());
+      crypto.setGroupKeys(group.docKeys(), group.signer(), group.presenceKey());
+      return crypto;
+    };
+    const victim = memberOf(a);
+    const attacker = memberOf(b);
+
+    const send = async (crypto: SpaceCrypto, entries: string[]) => {
+      const remote = new EphemeralStore(30_000);
+      const adaptor = new EphemeralStoreAdaptor(remote, crypto);
+      const rc = ctx();
+      adaptor.setCtx(rc);
+      for (const entry of entries) remote.set(entry, "posing");
+      await settle();
+      remote.destroy();
+      return rc.send.mock.calls.map((c) => c[0][0] as Uint8Array);
+    };
+    const store = new EphemeralStore(30_000);
+    const reader = new EphemeralStoreAdaptor(store, victim);
+    reader.setCtx(ctx());
+
+    // Before any record of peer 7, the claim is shown but binds nothing.
+    reader.applyUpdate(await send(attacker, ["p:7"]));
+    await settle();
+    expect(store.get("p:7")).toBe("posing");
+    expect(victim.signers.get("7")).toBeUndefined();
+
+    // Peer 7 proves itself with a signed record.
+    victim.decryptRecord(
+      victim.encryptDelta({ peer: "7", start: 0, end: 1 }, new Uint8Array([1])),
+    );
+    store.delete("p:7");
+
+    // The same claim from another device is dropped; a peer nobody has
+    // proven is let through.
+    reader.applyUpdate(await send(attacker, ["p:7", "p:8"]));
+    await settle();
+    expect(store.get("p:7")).toBeUndefined();
+    expect(store.get("p:8")).toBe("posing");
     store.destroy();
   });
 

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { newProject } from "@/crypto/test-utils";
 import { AssetCache, contentHash } from "@/typst/asset-cache";
 
 import { mimeOf } from "./file-types";
@@ -35,7 +35,7 @@ function fakeServer() {
 describe("projectAssets", () => {
   it("stores ciphertext and loads plaintext", async () => {
     const { blobs } = fakeServer();
-    const key = await importProjectKey(generateEditSecret());
+    const key = newProject().crypto;
     const assets = projectAssets("tok", key, {
       cache: new AssetCache({ caches: null }),
     });
@@ -48,17 +48,15 @@ describe("projectAssets", () => {
     expect(new TextDecoder().decode(stored)).not.toContain("private");
     expect(await assets.load(info.hash)).toEqual(content);
 
-    const stranger = projectAssets(
-      "tok",
-      await importProjectKey(generateEditSecret()),
-      { cache: new AssetCache({ caches: null }) },
-    );
+    const stranger = projectAssets("tok", newProject().crypto, {
+      cache: new AssetCache({ caches: null }),
+    });
     await expect(stranger.load(info.hash)).rejects.toThrow();
   });
 
   it("refuses files that would not fit once encrypted", async () => {
     const { fetch } = fakeServer();
-    const key = await importProjectKey(generateEditSecret());
+    const key = newProject().crypto;
     const assets = projectAssets("tok", key);
     const big = {
       name: "big.pdf",

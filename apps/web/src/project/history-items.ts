@@ -112,3 +112,46 @@ export function buildHistoryItems(
   });
   return items.reverse();
 }
+
+/** Finds the group member that signed what a peer wrote. */
+export type RosterLookup = (
+  peer: string,
+) => { name: string; color: string; signer: string } | null;
+
+export interface AuthorIdentity {
+  key: string;
+  name: string;
+  color: string;
+}
+
+const UNKNOWN = { name: "Unknown", color: "#71717a" };
+
+/**
+ * Who wrote what, for the avatars. A peer whose records the group's roster
+ * vouches for (`memberOfPeer`, from the signers of its decrypted records)
+ * is shown under the member's signed name; anyone else under the name the
+ * peer wrote into the doc, which is only a claim.
+ *
+ * Every page load is a new Loro peer, so one person shows up under several
+ * peer ids. A member collapses by its key, the rest by what they look like.
+ */
+export function authorIdentities(
+  project: ProjectDoc,
+  peers: PeerID[],
+  memberOfPeer?: RosterLookup,
+): AuthorIdentity[] {
+  const seen = new Map<string, AuthorIdentity>();
+  for (const peer of peers) {
+    const member = memberOfPeer?.(peer);
+    if (member) {
+      const key = `member:${member.signer}`;
+      if (!seen.has(key))
+        seen.set(key, { key, name: member.name, color: member.color });
+      continue;
+    }
+    const info = project.getPeer(peer) ?? UNKNOWN;
+    const key = `${info.name}\u0000${info.color}`;
+    if (!seen.has(key)) seen.set(key, { key, ...info });
+  }
+  return [...seen.values()];
+}

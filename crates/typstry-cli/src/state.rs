@@ -15,24 +15,95 @@ use loro::{Frontiers, LoroDoc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::LinkSecret;
+use typstry_wire::identity::PersonId;
+use typstry_wire::mls::{LeafKeys, MlsError, OwnerSecrets, SpaceGroup};
 
-use crate::api::Permission;
+use crate::api::{Permission, ShareInfo};
 use crate::git::GitMark;
 use crate::hash::{BlobHash, Digest};
 use crate::link::ShareLink;
 
 pub const STATE_DIR: &str = ".typstry";
+
+/// The owner keys a store holds, as `owner.bin` and the machine's
+/// per-project files keep them ([`OwnerSecrets::encode`]). A damaged file
+/// reads as empty, like a missing device: the group hands the key over
+/// again if another owner device holds it.
+pub fn read_owner_keys(path: &Path) -> OwnerSecrets {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Adds `held` to the store at `path`, writing only when that changed
+/// anything. Every secret goes in, not just the one the server last named:
+/// which key is current is only the server's word, and a server that names
+/// the wrong one must not get the right one left out of every copy. Nothing
+/// is ever replaced, so a folder that lags behind cannot push out what a
+/// newer one put there either (see [`OwnerSecrets::merge`]).
+pub fn merge_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> {
+    let mut keys = read_owner_keys(path);
+    if keys.merge(held) {
+        atomic_write(path, &keys.encode(), true)?;
+    }
+    Ok(())
+}
+
+/// Like [`merge_owner_keys`], but `held` only fills room behind what the
+/// store has ([`OwnerSecrets::extend_older`]). For keys from a place anyone
+/// who can write it controls, like the directory: they must not push out a
+/// key this machine already holds.
+pub fn fill_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> {
+    let mut keys = read_owner_keys(path);
+    let before = keys.encode();
+    keys.extend_older(held);
+    let after = keys.encode();
+    if after != before {
+        atomic_write(path, &after, true)?;
+    }
+    Ok(())
+}
 const CONFIG: &str = "config.json";
 const DOC: &str = "doc.bin";
 /// Updates since `doc.bin` was written, see [`StateDir::append_doc`].
 const DOC_LOG: &str = "doc.log";
 const BASE: &str = "base.json";
+/// The device's MLS group state: its signing key, the link and keyring it
+/// holds and the group tree. Versioned inside, see `MLS_STATE_VERSION`.
+const MLS: &str = "mls.bin";
+/// The device identity, apart from the group state: a damaged `mls.bin`
+/// then rejoins as the same device and replaces its leaf instead of
+/// leaving a ghost member behind.
+const DEVICE: &str = "device.bin";
+/// The project's owner keys this folder held last, kept apart from the group
+/// state for the same reason as the device: a damaged `mls.bin` would
+/// otherwise take the only copy with it, and no other device may be left to
+/// hand it over again. See [`merge_owner_keys`].
+const OWNER: &str = "owner.bin";
 const LOCK: &str = "lock";
 const BLOBS: &str = "blobs";
 const GITIGNORE: &str = ".gitignore";
 
 const LOCK_GRACE: Duration = Duration::from_millis(500);
+
+/// Format versions of `config.json` and `base.json`. Bump one when an
+/// older typstry would misread the file, and add the step that brings the
+/// previous version up to it to the matching `*_MIGRATIONS`. Files from
+/// before versions existed count as version 1.
+pub const CONFIG_VERSION: u32 = 1;
+pub const BASE_VERSION: u32 = 1;
+
+/// `CONFIG_MIGRATIONS[i]` turns a version `i + 1` config into version
+/// `i + 2`, on the raw JSON before it is parsed.
+const CONFIG_MIGRATIONS: &[Migration] = &[];
+const BASE_MIGRATIONS: &[Migration] = &[];
+
+type Migration = fn(&mut serde_json::Value);
+
+const _: () = assert!(CONFIG_MIGRATIONS.len() as u32 == CONFIG_VERSION - 1);
+const _: () = assert!(BASE_MIGRATIONS.len() as u32 == BASE_VERSION - 1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +112,8 @@ pub struct Config {
     pub server: String,
     pub project_id: String,
     pub token: String,
+    /// The link secret the way the share link carries it. It changes when
+    /// the project's links are rotated.
     pub key: String,
     pub permission: Permission,
     /// Learned from the server for edit links, so `link` can print both.
@@ -52,9 +125,60 @@ pub struct Config {
     /// The git branch typstry syncs on; see [`crate::git`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The person that owned the project when this folder first joined
+    /// (base64url person id). Every rejoin checks the group still names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_person: Option<String>,
 }
 
+/// The pinned owner in a config is present but not a person id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the recorded project owner is damaged")]
+pub struct DamagedPin;
+
 impl Config {
+    /// The config of a space this device just created or joined at `link`,
+    /// with the group's owner pinned if it already has one.
+    pub fn new(
+        link: &ShareLink,
+        share: &ShareInfo,
+        name: Option<&str>,
+        group: Option<&SpaceGroup>,
+    ) -> Self {
+        let mut config = Self {
+            server: link.origin.clone(),
+            project_id: share.space_id.clone(),
+            token: link.token.clone(),
+            key: link.key.clone(),
+            permission: share.permission,
+            view_token: share.view_token.clone(),
+            name: name.map(str::to_owned),
+            branch: None,
+            owner_person: None,
+        };
+        if let Some(owner) = group.and_then(|g| g.owner_person()) {
+            config.pin_owner(&owner);
+        }
+        config
+    }
+
+    /// `None` only when nothing was pinned yet. A value that cannot be
+    /// decoded is an error: reading it as "no pin" would let the next join
+    /// accept, and re-pin, whatever owner the server names.
+    pub fn pinned_owner(&self) -> Result<Option<PersonId>, DamagedPin> {
+        let Some(text) = self.owner_person.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| DamagedPin)?;
+        PersonId::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| DamagedPin)
+    }
+
+    pub fn pin_owner(&mut self, owner: &PersonId) {
+        self.owner_person = Some(URL_SAFE_NO_PAD.encode(owner));
+    }
+
     pub fn link(&self) -> ShareLink {
         ShareLink::new(&self.server, &self.token, &self.key)
     }
@@ -62,7 +186,7 @@ impl Config {
     /// Always built from the view secret: the edit secret in `key` must
     /// never end up in a link meant for viewers.
     pub fn view_link(&self) -> Option<ShareLink> {
-        let secret = ProjectKey::from_base64url(&self.key).ok()?.view_secret();
+        let secret = LinkSecret::from_base64url(&self.key).ok()?.view_secret();
         let token = match self.permission {
             Permission::Read => &self.token,
             Permission::Write => self.view_token.as_ref()?,
@@ -73,7 +197,7 @@ impl Config {
     /// Whether `key` is an edit secret, which writing takes on top of an
     /// edit token.
     pub fn can_sign(&self) -> bool {
-        ProjectKey::from_base64url(&self.key).is_ok_and(|key| key.can_sign())
+        LinkSecret::from_base64url(&self.key).is_ok_and(|key| key.can_attest())
     }
 }
 
@@ -219,9 +343,26 @@ impl StateDir {
             bail!("{} is already linked to a typstry project", root.display());
         }
         create_private_dir(&dir)?;
-        let state = Self::lock(root.to_path_buf(), dir)?;
+        let state = Self::lock(root.to_path_buf(), dir, LOCK_GRACE)?;
         state.ignore_in_git()?;
         Ok(state)
+    }
+
+    /// [`Self::open_headless_waiting`] with the usual grace period.
+    #[cfg(test)]
+    pub fn open_headless(dir: &Path) -> anyhow::Result<Self> {
+        Self::open_headless_waiting(dir, LOCK_GRACE)
+    }
+
+    /// Opens the state of a space that has no folder, in `dir` itself
+    /// (created if missing), waiting up to `wait` for whoever holds the
+    /// lock, since a sync pass may hold it for a while. There are no synced
+    /// files, so no `.gitignore` either; `dir` is not meant to sit inside a
+    /// repo. [`Self::root`] is `dir` too, which is only a place to run
+    /// `git config` from.
+    pub fn open_headless_waiting(dir: &Path, wait: Duration) -> anyhow::Result<Self> {
+        create_private_dirs(dir, true)?;
+        Self::lock(dir.to_path_buf(), dir.to_path_buf(), wait)
     }
 
     /// Finds the project `start` is in, walking up like git does, so
@@ -231,7 +372,7 @@ impl StateDir {
             .canonicalize()
             .with_context(|| format!("cannot open {}", start.display()))?;
         if let Some(dir) = Self::find_root(&start) {
-            let state = Self::lock(dir.to_path_buf(), dir.join(STATE_DIR))?;
+            let state = Self::lock(dir.to_path_buf(), dir.join(STATE_DIR), LOCK_GRACE)?;
             // Folders linked before the file existed get it too.
             if !state.dir.join(GITIGNORE).exists() {
                 state.ignore_in_git()?;
@@ -259,7 +400,7 @@ impl StateDir {
             .canonicalize()
             .with_context(|| format!("cannot open {}", start.display()))?;
         match Self::find_root(&start) {
-            Some(dir) => read_json(&dir.join(STATE_DIR).join(CONFIG)),
+            Some(dir) => read_config(&dir.join(STATE_DIR).join(CONFIG)),
             None => bail!(
                 "{} is not inside a typstry project (no {STATE_DIR}/ found)",
                 start.display()
@@ -267,7 +408,7 @@ impl StateDir {
         }
     }
 
-    fn lock(root: PathBuf, dir: PathBuf) -> anyhow::Result<Self> {
+    fn lock(root: PathBuf, dir: PathBuf, grace: Duration) -> anyhow::Result<Self> {
         let path = dir.join(LOCK);
         let file = OpenOptions::new()
             .create(true)
@@ -279,7 +420,7 @@ impl StateDir {
         // copy of it until that child execs, so a lock released a moment ago
         // can still look taken. A short grace period hides that; a real
         // second run still fails fast.
-        let deadline = Instant::now() + LOCK_GRACE;
+        let deadline = Instant::now() + grace;
         loop {
             match file.try_lock() {
                 Ok(()) => break,
@@ -342,12 +483,89 @@ impl StateDir {
         &self.dir
     }
 
+    /// The config of the headless space in `dir`, if it has one, read
+    /// without the lock: configs are only ever replaced atomically.
+    pub fn peek_headless_config(dir: &Path) -> Option<Config> {
+        read_config(&dir.join(CONFIG)).ok()
+    }
+
+    /// Forgets the group seat, its device key and the owner keys, for a
+    /// space whose binding is replaced by another one: they belong to the
+    /// old space and would only confuse the new one.
+    pub fn clear_group(&self) -> anyhow::Result<()> {
+        for name in [MLS, DEVICE, OWNER] {
+            remove_if_exists(&self.dir.join(name))?;
+        }
+        Ok(())
+    }
+
+    /// Undoes the binding of a headless dir to its space, for a device the
+    /// space removed. The doc stays: the dir is a plain local one again.
+    pub fn clear_binding(&self) -> anyhow::Result<()> {
+        self.clear_group()?;
+        remove_if_exists(&self.dir.join(CONFIG))
+    }
+
     pub fn load_config(&self) -> anyhow::Result<Config> {
-        read_json(&self.dir.join(CONFIG))
+        read_config(&self.dir.join(CONFIG))
     }
 
     pub fn save_config(&self, config: &Config) -> anyhow::Result<()> {
-        write_json(&self.dir.join(CONFIG), config)
+        write_versioned(&self.dir.join(CONFIG), config, CONFIG_VERSION)
+    }
+
+    /// The saved group state. A file that cannot be used (damaged, or a
+    /// join that never reached the server) reads as missing, which makes
+    /// the next connect join again with a fresh state; the second field
+    /// says what was dropped. One from a newer typstry is an error, since
+    /// joining again would replace state that version can still use.
+    pub fn load_mls(&self) -> anyhow::Result<(Option<SpaceGroup>, Option<String>)> {
+        let path = self.dir.join(MLS);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        match SpaceGroup::import_state(&bytes) {
+            Ok(group) => Ok((Some(group), None)),
+            Err(err @ MlsError::NewerState(_)) => {
+                Err(err).with_context(|| format!("reading {}", path.display()))
+            }
+            Err(err) => Ok((
+                None,
+                Some(format!(
+                    "ignoring {} ({err}); this folder joins the project's group again",
+                    path.display()
+                )),
+            )),
+        }
+    }
+
+    /// Saves the device and the owner key first: if the state write is
+    /// interrupted, both survive for the rejoin.
+    pub fn save_mls(&self, group: &SpaceGroup) -> anyhow::Result<()> {
+        self.save_device(group.device())?;
+        if !group.owner_secrets().is_empty() {
+            merge_owner_keys(&self.dir.join(OWNER), group.owner_secrets())?;
+        }
+        atomic_write(&self.dir.join(MLS), &group.export_state(), true)
+    }
+
+    /// The owner keys this folder held, newest first.
+    pub fn load_owner_keys(&self) -> OwnerSecrets {
+        read_owner_keys(&self.dir.join(OWNER))
+    }
+
+    pub fn save_device(&self, device: &LeafKeys) -> anyhow::Result<()> {
+        atomic_write(&self.dir.join(DEVICE), &device.export(), true)
+    }
+
+    /// The identity this folder joined with, if one was saved and is
+    /// readable. A damaged file reads as missing: a new identity only
+    /// costs a ghost leaf, where failing would block the folder.
+    pub fn load_device(&self) -> Option<LeafKeys> {
+        let bytes = fs::read(self.dir.join(DEVICE)).ok()?;
+        LeafKeys::import(&bytes).ok()
     }
 
     pub fn load_base(&self) -> anyhow::Result<Base> {
@@ -355,28 +573,51 @@ impl StateDir {
         if !path.exists() {
             return Ok(Base::default());
         }
-        read_json(&path)
+        read_versioned(&path, BASE_VERSION, BASE_MIGRATIONS)
     }
 
     pub fn save_base(&self, base: &Base) -> anyhow::Result<()> {
-        write_json(&self.dir.join(BASE), base)
+        write_versioned(&self.dir.join(BASE), base, BASE_VERSION)
     }
 
-    /// The cached doc, or an empty one before the first sync. A log entry
-    /// that a crash cut off is dropped from the file, so the next append
-    /// does not land behind it. A damaged entry with more after it is an
-    /// error instead, see [`log_entries`].
-    pub fn load_doc(&self) -> anyhow::Result<LoroDoc> {
+    /// The cached doc, or an empty one before the first sync, plus a
+    /// warning when it had to drop the log. A log entry that a crash cut
+    /// off is dropped from the file, so the next append does not land
+    /// behind it. A damaged entry with more after it is an error instead,
+    /// see [`log_entries`].
+    ///
+    /// A log from before the preamble is folded into a fresh snapshot right
+    /// away, so nothing gets appended to it. One from a newer typstry is
+    /// dropped. It is only a cache over `doc.bin`, and what of it reached
+    /// the server comes back on the next connect. `base.json` stays, it
+    /// describes the folder.
+    pub fn load_doc(&self) -> anyhow::Result<(LoroDoc, Option<String>)> {
         let (doc, log) = read_doc_and_log(&self.dir)?;
-        if log.torn {
-            let path = self.dir.join(DOC_LOG);
-            OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .and_then(|file| file.set_len(log.valid))
-                .with_context(|| format!("repairing {}", path.display()))?;
+        let path = self.dir.join(DOC_LOG);
+        match log.format {
+            LogFormat::Current if log.torn => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_len(log.valid))
+                    .with_context(|| format!("repairing {}", path.display()))?;
+            }
+            LogFormat::Current | LogFormat::Missing => {}
+            LogFormat::Legacy => {
+                self.save_doc(&doc)?;
+            }
+            LogFormat::Unknown(version) => {
+                remove_if_exists(&path)?;
+                return Ok((
+                    doc,
+                    Some(format!(
+                        "dropped {} (format {version}, written by a newer typstry); changes in it that reached the server come back on the next sync",
+                        path.display()
+                    )),
+                ));
+            }
         }
-        Ok(doc)
+        Ok((doc, None))
     }
 
     /// Sizes in bytes of the snapshot and of the log on top of it.
@@ -415,7 +656,12 @@ impl StateDir {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         let before = file.metadata()?.len();
-        let frame = log_frame(update);
+        let mut frame = log_frame(update);
+        // In one write with the first entry, so a crash cannot leave a log
+        // that has entries but no preamble.
+        if before == 0 {
+            frame.splice(0..0, log_preamble());
+        }
         let result = file.write_all(&frame).and_then(|()| file.sync_data());
         if let Err(err) = result {
             let _ = file.set_len(before);
@@ -458,10 +704,62 @@ impl StateDir {
 /// What reading the log found.
 #[derive(Debug, Default)]
 struct LogRead {
-    /// Bytes of whole, intact entries from the start.
+    format: LogFormat,
+    /// Bytes of the preamble and whole, intact entries from the start.
     valid: u64,
     /// Something follows them: an entry cut off by a crash.
     torn: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    /// No log, or an empty one.
+    #[default]
+    Missing,
+    /// [`LOG_FORMAT`], or a preamble a crash cut off, whose entries
+    /// then start at 0.
+    Current,
+    /// Entries without a preamble, as typstry wrote them before it had one.
+    /// The entries themselves are framed the same way.
+    Legacy,
+    /// A preamble with another version, from a newer typstry.
+    Unknown(u32),
+}
+
+/// The log starts with this and [`LOG_FORMAT`] (u32 LE), so a typstry
+/// that changes how entries are framed can tell its logs from older ones.
+/// A preambleless log can never start with it: its first four bytes would
+/// be a length, and the next four would have to be its complement.
+const LOG_MAGIC: &[u8; 8] = b"TYPSTRYL";
+/// Format of `doc.log`, written into its preamble. Bump it when entries are
+/// framed differently, so an older typstry drops the log instead of
+/// misreading it.
+pub const LOG_FORMAT: u32 = 1;
+const LOG_PREAMBLE: usize = LOG_MAGIC.len() + 4;
+
+fn log_preamble() -> [u8; LOG_PREAMBLE] {
+    let mut preamble = [0; LOG_PREAMBLE];
+    preamble[..LOG_MAGIC.len()].copy_from_slice(LOG_MAGIC);
+    preamble[LOG_MAGIC.len()..].copy_from_slice(&LOG_FORMAT.to_le_bytes());
+    preamble
+}
+
+/// The format of `log` and where its entries start.
+fn log_format(log: &[u8]) -> (LogFormat, usize) {
+    if log.is_empty() {
+        return (LogFormat::Missing, 0);
+    }
+    let magic = &log[..log.len().min(LOG_MAGIC.len())];
+    if magic != &LOG_MAGIC[..magic.len()] {
+        return (LogFormat::Legacy, 0);
+    }
+    let Some(version) = log.get(LOG_MAGIC.len()..LOG_PREAMBLE) else {
+        return (LogFormat::Current, 0);
+    };
+    match u32::from_le_bytes(version.try_into().expect("4 bytes")) {
+        LOG_FORMAT => (LogFormat::Current, LOG_PREAMBLE),
+        other => (LogFormat::Unknown(other), LOG_PREAMBLE),
+    }
 }
 
 /// Each log entry: the update's length (u32 LE), its bitwise complement,
@@ -489,12 +787,13 @@ fn log_frame(update: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// The intact entries at the start of `log`. Only the last append can be
-/// torn, since each one is synced before the next, so the first damaged
-/// entry is taken for a torn one only when no intact entry follows it.
+/// The intact entries at the start of `log`, and how many bytes they take.
+/// Only the last append can be torn, since each one is synced before the
+/// next, so the first damaged entry is taken for a torn one only when no
+/// intact entry follows it.
 /// Otherwise cutting there would lose entries that were synced; that is
 /// `Err` with its offset, for someone to look at.
-fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
+fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, usize), usize> {
     let mut entries = Vec::new();
     let mut at = 0;
     while at < log.len() {
@@ -507,11 +806,7 @@ fn log_entries(log: &[u8]) -> Result<(Vec<&[u8]>, LogRead), usize> {
         entries.push(body);
         at += LOG_HEADER + body.len();
     }
-    let read = LogRead {
-        valid: at as u64,
-        torn: at < log.len(),
-    };
-    Ok((entries, read))
+    Ok((entries, at))
 }
 
 /// The update of the intact entry starting at `at`, if there is one.
@@ -551,24 +846,86 @@ fn read_doc_and_log(dir: &Path) -> anyhow::Result<(LoroDoc, LogRead)> {
     let path = dir.join(DOC_LOG);
     let mut read = LogRead::default();
     if let Some(log) = read_optional(&path)? {
-        let (entries, found) = log_entries(&log).map_err(|at| {
+        let (format, start) = log_format(&log);
+        match format {
+            LogFormat::Unknown(_) => return Ok((doc, LogRead { format, ..read })),
+            // The first append was cut off inside the preamble, before
+            // any entry made it.
+            LogFormat::Current if start == 0 => {
+                let read = LogRead {
+                    format,
+                    valid: 0,
+                    torn: true,
+                };
+                return Ok((doc, read));
+            }
+            _ => {}
+        }
+        let (entries, intact) = log_entries(&log[start..]).map_err(|at| {
             anyhow::anyhow!(
-                "{} is corrupt: the entry at byte {at} is damaged and more follow it",
-                path.display()
+                "{} is corrupt: the entry at byte {} is damaged and more follow it",
+                path.display(),
+                start + at
             )
         })?;
         if !entries.is_empty() {
             doc.import_batch(&entries.iter().map(|e| e.to_vec()).collect::<Vec<_>>())
                 .with_context(|| format!("{} is corrupt", path.display()))?;
         }
-        read = found;
+        let valid = start + intact;
+        read = LogRead {
+            format,
+            valid: valid as u64,
+            torn: valid < log.len(),
+        };
     }
     Ok((doc, read))
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+fn read_config(path: &Path) -> anyhow::Result<Config> {
+    read_versioned(path, CONFIG_VERSION, CONFIG_MIGRATIONS)
+}
+
+/// Reads a JSON file that carries a format `version`, migrating an older
+/// one up to `current` first. A newer one is refused, since saving it
+/// again would drop the fields this build does not know.
+fn read_versioned<T: DeserializeOwned>(
+    path: &Path,
+    current: u32,
+    migrations: &[Migration],
+) -> anyhow::Result<T> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("{} is malformed", path.display()))
+    let malformed = || format!("{} is malformed", path.display());
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).with_context(malformed)?;
+    let version = match value.get("version") {
+        // Files from before versions existed.
+        None => 1,
+        Some(v) => v
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v >= 1)
+            .with_context(|| format!("{}: version {v} is not valid", malformed()))?,
+    };
+    if version > current {
+        bail!(
+            "{} was written by a newer typstry (format {version}, this one reads up to {current}); upgrade typstry",
+            path.display()
+        );
+    }
+    for step in &migrations[version as usize - 1..] {
+        step(&mut value);
+    }
+    serde_json::from_value(value).with_context(malformed)
+}
+
+/// Writes `value` with `version` set to `current`. Only the file has a
+/// version; the structs don't carry one.
+fn write_versioned<T: Serialize>(path: &Path, value: &T, current: u32) -> anyhow::Result<()> {
+    let mut value = serde_json::to_value(value)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("version".to_owned(), current.into());
+    }
+    write_json(path, &value)
 }
 
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
@@ -580,7 +937,14 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result
 /// The state holds the project key, so nobody else on the machine gets to
 /// read it.
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    create_private_dirs(dir, false)
+}
+
+/// [`create_private_dir`], with the missing parents too when `recursive`.
+/// An existing `dir` is then fine as well.
+fn create_private_dirs(dir: &Path, recursive: bool) -> anyhow::Result<()> {
     let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder
@@ -654,25 +1018,100 @@ pub fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn filled_owner_keys_never_push_out_a_held_one() {
+        use typstry_wire::mls::{Origin, OwnerSecret};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.bin");
+        let mine = OwnerSecret::generate();
+        let held: OwnerSecrets = [(mine.clone(), Origin::Received)].into_iter().collect();
+        merge_owner_keys(&path, &held).unwrap();
+        let planted: OwnerSecrets = (0..OwnerSecrets::KEEP * 2)
+            .map(|_| (OwnerSecret::generate(), Origin::Received))
+            .collect();
+        fill_owner_keys(&path, &planted).unwrap();
+        let stored = read_owner_keys(&path);
+        assert_eq!(stored.iter().next(), Some(&mine));
+        assert_eq!(stored.iter().count(), OwnerSecrets::KEEP);
+        // Nothing changes the second time.
+        let bytes = fs::read(&path).unwrap();
+        fill_owner_keys(&path, &planted).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn owner_keys_keep_every_secret_a_group_held() {
+        use typstry_wire::mls::{Origin, OwnerSecret};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.bin");
+        let [old, current, newer] = [(); 3].map(|_| OwnerSecret::generate());
+        // A group whose server named `current` still holds the older one,
+        // and it is kept too.
+        let held: OwnerSecrets = [
+            (current.clone(), Origin::Received),
+            (old.clone(), Origin::Made),
+        ]
+        .into_iter()
+        .collect();
+        merge_owner_keys(&path, &held).unwrap();
+        // A folder that only knows a newer one adds it without dropping any.
+        let other: OwnerSecrets = [(newer.clone(), Origin::Made)].into_iter().collect();
+        merge_owner_keys(&path, &other).unwrap();
+        let stored = read_owner_keys(&path);
+        assert_eq!(stored.iter().collect::<Vec<_>>(), [&newer, &current, &old]);
+        // Nothing new, nothing written.
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        merge_owner_keys(&path, &held).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+
+        fs::write(&path, b"damaged").unwrap();
+        assert!(read_owner_keys(&path).is_empty());
+    }
+
+    #[test]
+    fn a_group_state_saves_the_owner_key_the_server_did_not_name() {
+        use typstry_wire::identity::{DeviceKey, PersonGraph};
+        use typstry_wire::mls::{Bootstrap, LocalIdentity, OwnerSecret};
+        let device = DeviceKey::generate();
+        let graph = PersonGraph::genesis(&device);
+        let me = LocalIdentity { device, graph };
+        let link = LinkSecret::generate_edit();
+        let (group, init) = SpaceGroup::create(&link, b"me", &me).unwrap();
+        let real = group.owner_secret().unwrap().clone();
+        // A server that names a key of its own making when the folder joins
+        // again: the real one is what may be left nowhere else.
+        let forged = OwnerSecret::generate().public();
+        let (joined, _) = SpaceGroup::join_external_as(
+            group.device().duplicate(),
+            &link,
+            Bootstrap {
+                group_info: &init.group_info,
+                keyring: &init.keyring,
+                owner_key: &forged,
+            },
+            b"me",
+            Some(&me),
+            group.owner_person(),
+            Some(&group),
+            &OwnerSecrets::default(),
+        )
+        .unwrap();
+        assert!(joined.owner_secret().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        state.save_mls(&joined).unwrap();
+        assert_eq!(state.load_owner_keys().find(&real.public()), Some(&real));
+    }
 
     #[test]
     fn lock_is_exclusive() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::create(dir.path()).unwrap();
-        state
-            .save_config(&Config {
-                server: "http://x".into(),
-                project_id: "p".into(),
-                token: "t".into(),
-                key: "k".into(),
-                permission: Permission::Write,
-                view_token: None,
-                name: None,
-                branch: None,
-            })
-            .unwrap();
+        state.save_config(&test_config()).unwrap();
         let err = StateDir::discover(dir.path()).unwrap_err();
         assert!(err.to_string().contains("another typstry command"), "{err}");
         drop(state);
@@ -680,6 +1119,184 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         let found = StateDir::discover(&sub).unwrap();
         assert_eq!(found.root(), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn headless_state_round_trips_in_any_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spaces/abc");
+        let state = StateDir::open_headless(&dir).unwrap();
+        assert_eq!(state.root(), dir);
+        assert!(!dir.join(GITIGNORE).exists());
+        assert!(state.load_mls().unwrap().0.is_none());
+
+        state.save_config(&test_config()).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "hi").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let err = StateDir::open_headless(&dir).unwrap_err();
+        assert!(err.to_string().contains("another typstry command"), "{err}");
+        drop(state);
+
+        let state = StateDir::open_headless(&dir).unwrap();
+        assert_eq!(state.load_config().unwrap().project_id, "p");
+        assert_eq!(state.load_doc().unwrap().0.get_text("t").to_string(), "hi");
+    }
+
+    #[test]
+    fn clearing_the_binding_keeps_the_doc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spaces/abc");
+        let state = StateDir::open_headless(&dir).unwrap();
+        state.save_config(&test_config()).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "hi").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        fs::write(dir.join(OWNER), b"x").unwrap();
+
+        state.clear_binding().unwrap();
+        assert!(StateDir::peek_headless_config(&dir).is_none());
+        assert!(!dir.join(OWNER).exists());
+        assert_eq!(state.load_doc().unwrap().0.get_text("t").to_string(), "hi");
+        // Nothing left to clear is not an error.
+        state.clear_binding().unwrap();
+    }
+
+    pub(crate) fn test_config() -> Config {
+        Config {
+            server: "http://x".into(),
+            project_id: "p".into(),
+            token: "t".into(),
+            key: "k".into(),
+            permission: Permission::Write,
+            view_token: None,
+            name: None,
+            branch: None,
+            owner_person: None,
+        }
+    }
+
+    #[test]
+    fn config_and_base_without_a_version_load_as_version_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        fs::write(
+            state.dir().join(CONFIG),
+            r#"{"server":"http://x","projectId":"p","token":"t","key":"k","permission":"write"}"#,
+        )
+        .unwrap();
+        fs::write(state.dir().join(BASE), r#"{"frontiers":""}"#).unwrap();
+        let config = state.load_config().unwrap();
+        assert_eq!(config.project_id, "p");
+        assert_eq!(state.load_base().unwrap(), Base::default());
+
+        state.save_config(&config).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.dir().join(CONFIG)).unwrap()).unwrap();
+        assert_eq!(saved["version"], CONFIG_VERSION);
+        state.save_base(&Base::default()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.dir().join(BASE)).unwrap()).unwrap();
+        assert_eq!(saved["version"], BASE_VERSION);
+    }
+
+    #[test]
+    fn newer_config_and_base_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let mut config = serde_json::to_value(test_config()).unwrap();
+        config["version"] = (CONFIG_VERSION + 1).into();
+        fs::write(state.dir().join(CONFIG), config.to_string()).unwrap();
+        let err = state.load_config().unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+        let err = StateDir::peek_config(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+
+        let base = format!(r#"{{"version":{},"frontiers":""}}"#, BASE_VERSION + 1);
+        fs::write(state.dir().join(BASE), base).unwrap();
+        let err = state.load_base().unwrap_err();
+        assert!(format!("{err:#}").contains("upgrade typstry"), "{err:#}");
+
+        fs::write(state.dir().join(BASE), r#"{"version":"x"}"#).unwrap();
+        let err = state.load_base().unwrap_err();
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+    }
+
+    #[test]
+    fn a_log_without_preamble_is_folded_into_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let doc = LoroDoc::new();
+        let text = doc.get_text("t");
+        text.insert(0, "snapshot").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let saved = doc.oplog_vv();
+        text.insert(text.len_unicode(), " logged").unwrap();
+        doc.commit();
+        // How typstry wrote the log before it had a preamble.
+        let update = doc.export(loro::ExportMode::updates(&saved)).unwrap();
+        let log = state.dir().join(DOC_LOG);
+        fs::write(&log, log_frame(&update)).unwrap();
+
+        assert_eq!(
+            read_doc(state.dir()).unwrap().get_text("t").to_string(),
+            "snapshot logged"
+        );
+        let (loaded, note) = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot logged");
+        assert_eq!(note, None);
+        assert!(!log.exists());
+        let loaded = state.load_doc().unwrap().0;
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot logged");
+    }
+
+    #[test]
+    fn a_log_from_a_newer_typstry_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        state.save_base(&Base::default()).unwrap();
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "snapshot").unwrap();
+        doc.commit();
+        state.save_doc(&doc).unwrap();
+        let log = state.dir().join(DOC_LOG);
+        let mut bytes = LOG_MAGIC.to_vec();
+        bytes.extend_from_slice(&(LOG_FORMAT + 1).to_le_bytes());
+        bytes.extend_from_slice(b"whatever comes next");
+        fs::write(&log, bytes).unwrap();
+
+        assert_eq!(
+            read_doc(state.dir()).unwrap().get_text("t").to_string(),
+            "snapshot"
+        );
+        let (loaded, note) = state.load_doc().unwrap();
+        assert_eq!(loaded.get_text("t").to_string(), "snapshot");
+        assert!(note.unwrap().contains("newer typstry"));
+        assert!(!log.exists());
+        assert!(state.dir().join(BASE).exists());
+    }
+
+    #[test]
+    fn a_preamble_cut_off_by_a_crash_reads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        let log = state.dir().join(DOC_LOG);
+        fs::write(&log, &log_preamble()[..5]).unwrap();
+        state.load_doc().unwrap();
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0);
+
+        let doc = LoroDoc::new();
+        doc.get_text("t").insert(0, "after").unwrap();
+        doc.commit();
+        state
+            .append_doc(&doc.export(loro::ExportMode::all_updates()).unwrap())
+            .unwrap();
+        assert!(fs::read(&log).unwrap().starts_with(LOG_MAGIC));
+        let loaded = state.load_doc().unwrap().0;
+        assert_eq!(loaded.get_text("t").to_string(), "after");
     }
 
     #[test]
@@ -719,7 +1336,7 @@ mod tests {
             state.append_doc(&update).unwrap();
             saved = doc.oplog_vv();
         }
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
 
         // A crash halfway through the next append.
@@ -732,18 +1349,18 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
         file.write_all(&frame[..frame.len() / 2]).unwrap();
         drop(file);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two");
         // Cut back to the whole entries, so the next one is readable.
         assert_eq!(fs::metadata(&log).unwrap().len(), whole);
         state.append_doc(&update).unwrap();
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
 
         // A snapshot covers the log and replaces it.
         state.save_doc(&doc).unwrap();
         assert!(!log.exists());
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "snapshot one two three");
     }
 
@@ -779,7 +1396,7 @@ mod tests {
         let log = state.dir().join(DOC_LOG);
         // Garbage in the last entry's body, as a crash can leave.
         flip_byte(&log, fs::metadata(&log).unwrap().len() - 1);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two");
         assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
@@ -820,7 +1437,7 @@ mod tests {
         let starts = three_entry_log(&state);
         let log = state.dir().join(DOC_LOG);
         flip_byte(&log, starts[2] + 3);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two");
         assert_eq!(fs::metadata(&log).unwrap().len(), starts[2]);
     }
@@ -835,7 +1452,7 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
         file.write_all(&[0; 64]).unwrap();
         drop(file);
-        let loaded = state.load_doc().unwrap();
+        let loaded = state.load_doc().unwrap().0;
         assert_eq!(loaded.get_text("t").to_string(), "one two three");
         assert_eq!(fs::metadata(&log).unwrap().len(), whole);
     }

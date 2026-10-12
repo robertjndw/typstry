@@ -19,13 +19,13 @@ use typstry_doc::init::starter_content;
 use typstry_doc::materialize::{FileContent, MaterializedFile, materialize};
 use typstry_doc::paths::build_path_index;
 use typstry_doc::{FileKind, node, root};
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::{DocKeys, Keyring, LinkSecret, LocalSigner};
 use typstry_wire::elo::encode_container;
 
 #[tokio::test]
 async fn clones_an_empty_project() {
     let server = Server::start().await;
-    let (edit, _) = server.create_project().await;
+    let (edit, _) = server.create_space().await;
     let work = tempfile::tempdir().unwrap();
     let dir = clone(&edit, work.path(), "empty").await;
     let entries: Vec<_> = fs::read_dir(&dir)
@@ -318,7 +318,7 @@ async fn writers_compact_the_server_log() {
         .await
         .unwrap();
     let work = tempfile::tempdir().unwrap();
-    let mut session = Session::create(work.path(), &link, &share, None).unwrap();
+    let mut session = Session::create(work.path(), &link, &share, None, None).unwrap();
     session.connect().await.unwrap();
     let text = session.doc().get_text("scratch");
     for i in 0..210 {
@@ -328,7 +328,7 @@ async fn writers_compact_the_server_log() {
     }
     session.disconnect().await;
 
-    let records = typstry_server::store::docs::record_count(&server.state.db, &share.project_id)
+    let records = typstry_server::store::docs::record_count(&server.state.db, &share.space_id)
         .await
         .unwrap();
     assert!(records < 20, "{records} records left after compaction");
@@ -427,7 +427,7 @@ async fn git_files_in_the_project_are_neither_written_nor_deleted() {
         .unwrap();
     // Uploaded in the browser, or pushed by an older CLI.
     let seed = tempfile::tempdir().unwrap();
-    let mut browser = Session::create(seed.path(), &link, &share, Some("Browser")).unwrap();
+    let mut browser = Session::create(seed.path(), &link, &share, None, Some("Browser")).unwrap();
     browser.connect().await.unwrap();
     let set = |extra: &[(&str, &str)], doc: &loro::LoroDoc| {
         let mut files: Vec<MaterializedFile> = materialize(doc)
@@ -610,7 +610,7 @@ async fn case_variants_from_another_file_system_are_kept() {
         .unwrap();
     // A co-author on a case-sensitive file system has both files.
     let seed = tempfile::tempdir().unwrap();
-    let mut other = Session::create(seed.path(), &link, &share, Some("Linux")).unwrap();
+    let mut other = Session::create(seed.path(), &link, &share, None, Some("Linux")).unwrap();
     other.connect().await.unwrap();
     let with = |extra: &[(&str, &str)], doc: &loro::LoroDoc| {
         let mut files: Vec<MaterializedFile> = materialize(doc)
@@ -739,7 +739,9 @@ async fn inject_foreign_record(link: &str) {
         .resolve_share(&link.token)
         .await
         .unwrap();
-    let key = ProjectKey::from_base64url(&ProjectKey::generate_raw()).unwrap();
+    let other = LinkSecret::generate_edit();
+    let keys = DocKeys::new(Keyring::new(&other));
+    let signer = LocalSigner::attested([9; 32], &other, 1);
     let doc = loro::LoroDoc::new();
     doc.set_peer_id(4242).unwrap();
     doc.get_text("foreign").insert(0, "x").unwrap();
@@ -750,8 +752,10 @@ async fn inject_foreign_record(link: &str) {
             4242, 0, end,
         )]))
         .unwrap();
-    let record = key.encrypt_delta(4242, 0, end as u64, &plaintext).unwrap();
-    let mut client = Client::connect(&ws_url(&link.origin).unwrap(), &share.project_id)
+    let record = keys
+        .encrypt_delta(&signer, 4242, 0, end as u64, &plaintext)
+        .unwrap();
+    let mut client = Client::connect(&ws_url(&link.origin).unwrap(), &share.space_id)
         .await
         .unwrap();
     client
@@ -783,7 +787,7 @@ async fn records_under_another_key_are_skipped() {
     typstry(&a, &["push"]).await.unwrap();
 
     // A project made entirely of such records means the link's key is wrong.
-    let (empty, _) = server.create_project().await;
+    let (empty, _) = server.create_space().await;
     inject_foreign_record(&empty).await;
     let err = typstry(work.path(), &["clone", &empty, "wrong"])
         .await
@@ -802,7 +806,7 @@ async fn a_refused_compaction_is_not_fatal() {
         .await
         .unwrap();
     let work = tempfile::tempdir().unwrap();
-    let mut session = Session::create(work.path(), &link, &share, None).unwrap();
+    let mut session = Session::create(work.path(), &link, &share, None, None).unwrap();
     session.connect().await.unwrap();
     // More than the server reassembles, so it refuses the snapshot.
     let text = session.doc().get_text("scratch");

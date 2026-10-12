@@ -2,13 +2,18 @@
 //! and an async `run`.
 
 pub mod clone;
+pub mod devices;
 pub mod export;
 pub mod info;
 pub mod init;
 pub mod link;
+pub mod list;
+pub mod members;
 pub mod open;
+pub mod pair;
 pub mod pull;
 pub mod push;
+pub mod share;
 pub mod status;
 pub mod sync;
 pub mod track;
@@ -63,7 +68,12 @@ pub enum Command {
     Track(track::Args),
     Init(init::Args),
     Link(link::Args),
+    Members(members::Args),
+    Share(share::Args),
     Open(open::Args),
+    Pair(pair::Args),
+    List(list::Args),
+    Devices(devices::Args),
     Info(info::Args),
     Version(version::Args),
     Export(export::Args),
@@ -151,19 +161,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dir: cli.cwd.unwrap_or_else(|| PathBuf::from(".")),
         name: cli.name,
     };
+    // Boxed so the largest command does not decide how much stack every
+    // command needs: debug builds on a 2 MiB test thread are close to it.
     match cli.command {
-        Command::Clone(args) => clone::run(&ctx, args).await,
-        Command::Status(args) => status::run(&ctx, args).await,
-        Command::Pull(args) => pull::run(&ctx, args).await,
-        Command::Push(args) => push::run(&ctx, args).await,
-        Command::Sync(args) => sync::run(&ctx, args).await,
+        Command::Clone(args) => Box::pin(clone::run(&ctx, args)).await,
+        Command::Status(args) => Box::pin(status::run(&ctx, args)).await,
+        Command::Pull(args) => Box::pin(pull::run(&ctx, args)).await,
+        Command::Push(args) => Box::pin(push::run(&ctx, args)).await,
+        Command::Sync(args) => Box::pin(sync::run(&ctx, args)).await,
         Command::Track(args) => track::run(&ctx, args),
-        Command::Init(args) => init::run(&ctx, args).await,
+        Command::Init(args) => Box::pin(init::run(&ctx, args)).await,
         Command::Link(args) => link::run(&ctx, args),
+        Command::Members(args) => Box::pin(members::run(&ctx, args)).await,
+        Command::Share(args) => Box::pin(share::run(&ctx, args)).await,
         Command::Open(args) => open::run(&ctx, args),
-        Command::Info(args) => info::run(&ctx, args).await,
-        Command::Version(args) => version::run(&ctx, args).await,
-        Command::Export(args) => export::run(&ctx, args).await,
+        Command::Pair(args) => Box::pin(pair::run(&ctx, args)).await,
+        Command::List(args) => Box::pin(list::run(args)).await,
+        Command::Devices(args) => Box::pin(devices::run(&ctx, args)).await,
+        Command::Info(args) => Box::pin(info::run(&ctx, args)).await,
+        Command::Version(args) => Box::pin(version::run(&ctx, args)).await,
+        Command::Export(args) => Box::pin(export::run(&ctx, args)).await,
     }
 }
 
@@ -296,6 +313,22 @@ impl Output {
 }
 
 /// Prints `label` and the paths under it, if there are any.
+/// Shortest fingerprint prefix taken as one, so a short device name is not
+/// mistaken for the start of a fingerprint.
+const MIN_PREFIX: usize = 4;
+
+/// The one item of `items`, None if there is none, and the error from
+/// `ambiguous` if there are several.
+fn unique<T>(
+    mut items: impl Iterator<Item = T>,
+    ambiguous: impl FnOnce() -> anyhow::Error,
+) -> anyhow::Result<Option<T>> {
+    match (items.next(), items.next()) {
+        (Some(_), Some(_)) => Err(ambiguous()),
+        (first, _) => Ok(first),
+    }
+}
+
 fn print_list(out: &mut Output, label: &str, items: impl IntoIterator<Item = String>) {
     let items: Vec<String> = items.into_iter().collect();
     if items.is_empty() {

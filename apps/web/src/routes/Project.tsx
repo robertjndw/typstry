@@ -5,30 +5,40 @@ import {
   RotateCwIcon,
   SearchXIcon,
   TriangleAlertIcon,
-  type LucideIcon,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
-import { Link, useLocation, useParams } from "react-router";
+import { useEffect, useState } from "react";
+import { Link, useLocation, useNavigate, useParams } from "react-router";
 
+import { AccountMenu } from "@/components/AccountMenu";
 import { ConnectionStatus } from "@/components/ConnectionStatus";
-import { IdentityControl } from "@/components/IdentityControl";
+import { Notice } from "@/components/Notice";
 import { ProjectWorkspace } from "@/components/ProjectWorkspace";
+import { RemovedNotice } from "@/components/RemovedNotice";
 import { ShareDialog } from "@/components/ShareDialog";
 import { WorkspaceSkeleton } from "@/components/WorkspaceSkeleton";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
-import { randomIdentity, useStoredIdentity } from "@/presence/identity";
+import { RosterProvider } from "@/mls/RosterProvider";
+import { provisionalIdentity, useStoredIdentity } from "@/presence/identity";
 import { PresenceProvider } from "@/presence/PresenceProvider";
 import { ProjectProvider } from "@/project/ProjectProvider";
 import { useProjectSession } from "@/project/useProjectSession";
 
+/** What the router carries across a rotation, see ProjectSessionView. */
+interface RouteState {
+  session?: string;
+}
+
 export function Project() {
   const { token = "" } = useParams();
-  const { hash } = useLocation();
+  const { hash, state } = useLocation();
   // Keyed so that a different token never reuses the previous project's doc.
+  // A rotation moves the same project to new tokens: the page then keeps its
+  // first token as the key, so the doc and the session survive the switch.
+  const sessionKey = (state as RouteState | null)?.session ?? token;
   return (
     <ProjectSessionView
-      key={token}
+      key={sessionKey}
+      sessionKey={sessionKey}
       token={token}
       linkKey={hash.length > 1 ? hash.slice(1) : null}
     />
@@ -36,19 +46,31 @@ export function Project() {
 }
 
 function ProjectSessionView({
+  sessionKey,
   token,
   linkKey,
 }: {
+  sessionKey: string;
   token: string;
   linkKey: string | null;
 }) {
-  const { state, status, project, ephemeral, syncNow } = useProjectSession(
-    token,
-    linkKey,
-  );
   const stored = useStoredIdentity();
-  const [provisional] = useState(() => randomIdentity());
+  const [provisional] = useState(() => provisionalIdentity());
   const identity = stored ?? provisional;
+  const { state, status, project, ephemeral, mls, following, syncNow } =
+    useProjectSession(token, linkKey, { identity });
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!following) return;
+    void navigate(
+      {
+        pathname: `/p/${encodeURIComponent(following.token)}`,
+        hash: following.link,
+      },
+      { replace: true, state: { session: sessionKey } satisfies RouteState },
+    );
+  }, [following, navigate, sessionKey]);
 
   switch (state.phase) {
     case "resolving":
@@ -115,6 +137,8 @@ function ProjectSessionView({
           created it opens it while online.
         </Notice>
       );
+    case "removed":
+      return <RemovedNotice actions={<StartPageButton />} />;
     case "error":
       return (
         <Notice
@@ -135,32 +159,39 @@ function ProjectSessionView({
         </Notice>
       );
     case "ready": {
-      const { share, assets, key, canWrite } = state;
+      const { share, assets, crypto, canWrite } = state;
       return (
         <div className="h-svh">
           <ProjectProvider doc={project} assets={assets} readOnly={!canWrite}>
-            <PresenceProvider ephemeral={ephemeral} identity={identity}>
-              <ProjectWorkspace
-                documentTitle
-                onSyncNow={syncNow}
-                status={<ConnectionStatus status={status} />}
-                share={
-                  <ShareDialog
-                    projectId={share.projectId}
-                    token={token}
-                    projectKey={key}
-                    permission={share.permission}
-                    viewToken={share.viewToken}
-                  />
-                }
-                identity={
-                  <IdentityControl
-                    identity={identity}
-                    firstVisit={stored === null}
-                  />
-                }
-              />
-            </PresenceProvider>
+            <RosterProvider mls={mls} signers={crypto.signers}>
+              <PresenceProvider
+                ephemeral={ephemeral}
+                identity={identity}
+                crypto={crypto}
+              >
+                <ProjectWorkspace
+                  documentTitle
+                  onSyncNow={syncNow}
+                  status={<ConnectionStatus status={status} />}
+                  share={
+                    <ShareDialog
+                      projectId={share.spaceId}
+                      token={token}
+                      crypto={crypto}
+                      permission={share.permission}
+                      viewToken={share.viewToken}
+                      mls={mls}
+                    />
+                  }
+                  identity={
+                    <AccountMenu
+                      identity={identity}
+                      firstVisit={stored === null}
+                    />
+                  }
+                />
+              </PresenceProvider>
+            </RosterProvider>
           </ProjectProvider>
         </div>
       );
@@ -173,45 +204,5 @@ function StartPageButton({ label = "Go to the start page" }) {
     <Button asChild variant="outline">
       <Link to="/">{label}</Link>
     </Button>
-  );
-}
-
-/** Full-page message for the states where there is no workspace to show. */
-function Notice({
-  icon: Icon,
-  tone = "muted",
-  title,
-  children,
-  actions,
-}: {
-  icon: LucideIcon;
-  tone?: "muted" | "destructive";
-  title: string;
-  children: ReactNode;
-  actions: ReactNode;
-}) {
-  return (
-    <main className="flex min-h-svh flex-col items-center justify-center p-6">
-      <div className="flex max-w-sm flex-col items-center gap-4 text-center">
-        <div
-          aria-hidden
-          className={cn(
-            "flex size-12 items-center justify-center rounded-full",
-            tone === "destructive"
-              ? "bg-destructive/10 text-destructive"
-              : "bg-muted text-muted-foreground",
-          )}
-        >
-          <Icon className="size-6" />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <h1 className="text-xl font-semibold">{title}</h1>
-          <p className="text-sm break-words text-muted-foreground">
-            {children}
-          </p>
-        </div>
-        <div className="flex flex-wrap justify-center gap-2">{actions}</div>
-      </div>
-    </main>
   );
 }

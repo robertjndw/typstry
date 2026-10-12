@@ -1,0 +1,22 @@
+{
+  "branch": "main",
+  "git": {
+    "branch": "main",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "reflog": 3
+  },
+  "lastSync": 1700000000005,
+  "mls": {
+    "devicePub": "8WDiRu1R8O2xICRkvfd0wR8fnoNcrkNKDQ03KueIHgY",
+    "epoch": 0,
+    "profile": "{\"name\":\"Ada\",\"color\":\"#3366cc\"}"
+  },
+  "name": "Ada",
+  "pins": {
+    "main.typ": "First draft"
+  },
+  "projectId": "compat-project-0",
+  "server": "https://typstry.example",
+  "token": "compatEditToken0",
+  "viewToken": "compatViewToken0"
+}

@@ -181,7 +181,7 @@ impl Session {
     /// Whether the doc holds ops past the base's frontiers, i.e. remote
     /// changes beyond what the folder was last synced to.
     pub fn doc_past_base(&self) -> bool {
-        self.base.frontiers != self.doc.oplog_frontiers()
+        self.base.frontiers != self.core.doc.oplog_frontiers()
     }
 
     /// Turns the files at the base's frontiers into the base files by
@@ -234,14 +234,14 @@ impl Session {
         if frontiers.is_empty() {
             return Ok(LoroDoc::new());
         }
-        self.doc.fork_at(frontiers).context(
+        self.core.doc.fork_at(frontiers).context(
             "the cached doc does not contain the last synced state; clone the project again",
         )
     }
 
     /// The files in the doc as it is now.
     pub fn remote_files(&self) -> Files {
-        to_map(materialize(&self.doc))
+        to_map(materialize(&self.core.doc))
     }
 
     /// Reads the local side: every file for [`Scope::Full`], else the
@@ -547,7 +547,7 @@ impl Session {
                     .filter(|path| !both.contains(path))
                     .cloned()
                     .collect();
-                let frontiers = self.doc.oplog_frontiers();
+                let frontiers = self.core.doc.oplog_frontiers();
                 let mut kept = self
                     .write_back(&plan, &remote, Some(&targets), &mut report)
                     .await?;
@@ -590,7 +590,7 @@ impl Session {
                 } else {
                     remote
                 };
-                let frontiers = self.doc.oplog_frontiers();
+                let frontiers = self.core.doc.oplog_frontiers();
                 if report.applied.changed && flush == Flush::Now {
                     self.push_local().await?;
                 }
@@ -617,7 +617,7 @@ impl Session {
         if flush == Flush::Now {
             self.save()?;
         }
-        report.warnings.append(&mut self.warnings);
+        report.warnings.append(&mut self.core.warnings);
         Ok(report)
     }
 
@@ -707,21 +707,24 @@ impl Session {
             } else {
                 // Ops continue our peer's counters only if the fork has all
                 // of them; otherwise it would reuse ids the doc already holds.
-                let peer = self.doc.peer_id();
+                let peer = self.core.doc.peer_id();
                 let ours = |vv: &VersionVector| vv.get(&peer).copied().unwrap_or(0);
-                if ours(&fork.oplog_vv()) != ours(&self.doc.oplog_vv()) {
-                    self.doc.set_peer_id(random_peer())?;
+                if ours(&fork.oplog_vv()) != ours(&self.core.doc.oplog_vv()) {
+                    self.core.doc.set_peer_id(random_peer())?;
                 }
-                fork.set_peer_id(self.doc.peer_id())?;
+                fork.set_peer_id(self.core.doc.peer_id())?;
             }
             configure(&fork);
             let applied = apply_changes(&fork, &changes, PUSH_MESSAGE)?;
             if applied.changed {
-                set_peer_info(&fork, &self.identity)?;
+                set_peer_info(&fork, &self.core.identity)?;
                 let updates = fork
-                    .export(ExportMode::updates(&self.doc.oplog_vv()))
+                    .export(ExportMode::updates(&self.core.doc.oplog_vv()))
                     .context("exporting local changes")?;
-                self.doc.import(&updates).context("merging local changes")?;
+                self.core
+                    .doc
+                    .import(&updates)
+                    .context("merging local changes")?;
                 let now = fork.oplog_frontiers();
                 if pinned {
                     for path in changes.keys() {

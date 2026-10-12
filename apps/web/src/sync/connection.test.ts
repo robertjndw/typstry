@@ -1,11 +1,12 @@
 // @vitest-environment node
 import { LoroDoc } from "loro-crdt";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { newProject } from "@/crypto/test-utils";
 
-import { connectProject, projectWsUrl, type SyncStatus } from "./connection";
+import { connectSpace, projectWsUrl, type SyncStatus } from "./connection";
+import { PROTOCOL_VERSION } from "./protocol";
 
-const key = await importProjectKey(generateEditSecret());
+const crypto = newProject().crypto;
 
 type StatusCb = (s: string) => void;
 
@@ -76,20 +77,20 @@ beforeEach(() => {
 describe("projectWsUrl", () => {
   it("follows the page protocol", () => {
     expect(projectWsUrl({ protocol: "https:", host: "a.b" })).toBe(
-      "wss://a.b/ws",
+      `wss://a.b/ws?protocol=${PROTOCOL_VERSION}`,
     );
     expect(projectWsUrl({ protocol: "http:", host: "localhost:5173" })).toBe(
-      "ws://localhost:5173/ws",
+      `ws://localhost:5173/ws?protocol=${PROTOCOL_VERSION}`,
     );
   });
 });
 
-describe("connectProject", () => {
+describe("connectSpace", () => {
   it("joins doc and presence rooms with the token as auth", () => {
-    const conn = connectProject({
-      projectId: "proj",
+    const conn = connectSpace({
+      spaceId: "proj",
       token: "tok",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       ephemeral: {} as never,
@@ -109,10 +110,10 @@ describe("connectProject", () => {
   });
 
   it("is connected only once the socket is open and the doc room joined", () => {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -143,10 +144,10 @@ describe("connectProject", () => {
   });
 
   it("gives up and rejects synced when the join fails", async () => {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "bad",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -161,10 +162,10 @@ describe("connectProject", () => {
   });
 
   it("close() stops the client and detaches adaptors", () => {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -181,12 +182,53 @@ describe("connectProject", () => {
   });
 });
 
+describe("an outdated page", () => {
+  function connect(outdated: boolean) {
+    const checkOutdated = vi.fn(() => Promise.resolve(outdated));
+    const onOutdated = vi.fn();
+    const conn = connectSpace({
+      spaceId: "p",
+      token: "t",
+      crypto,
+      canWrite: true,
+      doc: new LoroDoc(),
+      url: "ws://x/ws",
+      checkOutdated,
+      onOutdated,
+    });
+    return { conn, client: lastClient(), checkOutdated, onOutdated };
+  }
+
+  it("stops for good once the server says it is too old", async () => {
+    const { conn, client, checkOutdated, onOutdated } = connect(true);
+    client.setStatus("disconnected");
+    await vi.waitFor(() => expect(onOutdated).toHaveBeenCalledOnce());
+    expect(checkOutdated).toHaveBeenCalledOnce();
+    expect(conn.getStatus()).toBe("disconnected");
+    expect(fake.clients.at(-1)!.destroyed).toBe(true);
+  });
+
+  it("keeps retrying and rate-limits the check while still served", async () => {
+    const { conn, client, checkOutdated, onOutdated } = connect(false);
+    for (let i = 0; i < 3; i++) {
+      client.setStatus("disconnected");
+      client.setStatus("connecting");
+    }
+    await Promise.resolve();
+    // Repeated failures share one check.
+    expect(checkOutdated).toHaveBeenCalledOnce();
+    expect(onOutdated).not.toHaveBeenCalled();
+    expect(fake.clients.at(-1)!.destroyed).toBe(false);
+    conn.close();
+  });
+});
+
 describe("syncNow", () => {
   function connect() {
-    const conn = connectProject({
-      projectId: "p",
+    const conn = connectSpace({
+      spaceId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",

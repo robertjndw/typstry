@@ -24,7 +24,6 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tower::ServiceExt;
-use typstry_server::config::Config;
 use typstry_server::http::{AppState, router};
 use typstry_server::room::RoomConfig;
 use typstry_server::store::docs;
@@ -52,20 +51,7 @@ impl Server {
     }
 
     async fn start_with(data: &Path, config: RoomConfig, limits: ConnLimits) -> Self {
-        let pool = common::open_db(data).await;
-        let config = Config {
-            data_dir: data.to_owned(),
-            rooms: config,
-            limits,
-            ..Config::default()
-        };
-        let state = AppState::from_config(pool, &config);
-        let app = common::app(state.clone(), data);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let common::Served { addr, state, task } = common::serve(data, config, limits).await;
         Self { addr, state, task }
     }
 
@@ -74,9 +60,8 @@ impl Server {
         self.task.abort();
     }
 
-    async fn create_project(&self) -> (String, String, String) {
-        let created =
-            common::create_project(router(self.state.clone(), Path::new("no-dist"))).await;
+    async fn create_space(&self) -> (String, String, String) {
+        let created = common::create_space(router(self.state.clone(), Path::new("no-dist"))).await;
         (created.id, created.edit, created.view)
     }
 
@@ -345,10 +330,10 @@ fn coverage(pairs: &[(u64, i32)]) -> HashMap<u64, i32> {
 }
 
 #[tokio::test]
-async fn project_and_share_endpoints() {
+async fn space_and_share_endpoints() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (id, edit, view) = server.create_project().await;
+    let (id, edit, view) = server.create_space().await;
     assert_eq!(id.len(), 22);
     assert_ne!(edit, view);
 
@@ -366,7 +351,7 @@ async fn project_and_share_endpoints() {
         assert_eq!(res.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(res.into_body(), 1024).await.unwrap()).unwrap();
-        assert_eq!(body["projectId"], id);
+        assert_eq!(body["spaceId"], id);
         assert_eq!(body["permission"], expected);
         if expected == "write" {
             assert_eq!(body["viewToken"], view);
@@ -391,10 +376,10 @@ async fn project_and_share_endpoints() {
 }
 
 #[tokio::test]
-async fn new_project_has_an_empty_doc() {
+async fn new_space_has_an_empty_doc() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut c = server.connect().await;
     let joined = c.join_doc(&room, &edit, &[]).await;
@@ -421,7 +406,7 @@ async fn new_project_has_an_empty_doc() {
 async fn deltas_are_stored_and_relayed() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -455,7 +440,7 @@ async fn deltas_are_stored_and_relayed() {
 async fn rejoin_with_version_gets_only_missing_deltas() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let d1 = delta(1, 0, 3, b"a");
     let d2 = delta(2, 0, 2, b"b");
@@ -500,7 +485,7 @@ async fn rejoin_with_version_gets_only_missing_deltas() {
 async fn coverage_waits_for_gaps_and_duplicates_are_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -558,7 +543,7 @@ async fn coverage_waits_for_gaps_and_duplicates_are_dropped() {
 async fn snapshots_replace_covered_deltas() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -636,7 +621,7 @@ async fn snapshots_replace_covered_deltas() {
 async fn invalid_updates_are_rejected_whole() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -682,7 +667,7 @@ async fn invalid_updates_are_rejected_whole() {
 async fn view_token_cannot_write_the_doc() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, _, view) = server.create_project().await;
+    let (room, _, view) = server.create_space().await;
 
     let mut viewer = server.connect().await;
     assert_eq!(
@@ -716,8 +701,8 @@ async fn view_token_cannot_write_the_doc() {
 async fn join_rejects_bad_tokens_unknown_rooms_and_plain_loro() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
-    let (other_room, _, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
+    let (other_room, _, _) = server.create_space().await;
 
     let mut c = server.connect().await;
     for (room, token) in [
@@ -770,7 +755,7 @@ async fn state_survives_restart_and_unload() {
         ..RoomConfig::default()
     };
     let server = Server::start(dir.path(), config.clone()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_doc(&room, &edit, &[]).await;
@@ -825,7 +810,7 @@ async fn large_records_are_fragmented_and_packed() {
         ..ConnLimits::default()
     };
     let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -882,7 +867,7 @@ async fn a_backfill_larger_than_the_outbox_budget_still_loads() {
         ..ConnLimits::default()
     };
     let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_doc(&room, &edit, &[]).await;
@@ -915,7 +900,7 @@ async fn a_backfill_larger_than_the_outbox_budget_still_loads() {
 async fn presence_is_relayed_replayed_and_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, view) = server.create_project().await;
+    let (room, edit, view) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -986,7 +971,7 @@ async fn stale_presence_expires() {
         ..RoomConfig::default()
     };
     let server = Server::start(dir.path(), config).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_presence(&room, &edit).await;
@@ -1018,6 +1003,28 @@ async fn answers_text_ping() {
 }
 
 #[tokio::test]
+async fn silent_connection_is_closed_as_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let mut c = server.connect().await;
+    // The connection's 1 s fragment sweep must not keep pushing the idle
+    // deadline back. Paused time skips ahead instead of waiting 90 s.
+    tokio::time::pause();
+    let close = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match c.ws.next().await {
+                Some(Ok(Message::Close(frame))) => return frame,
+                Some(Ok(_)) => {}
+                other => panic!("socket ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a silent connection was never closed");
+    assert_eq!(close.unwrap().reason.as_str(), "idle_timeout");
+}
+
+#[tokio::test]
 async fn doc_updates_are_rate_limited_per_connection() {
     let dir = tempfile::tempdir().unwrap();
     let limits = ConnLimits {
@@ -1027,7 +1034,7 @@ async fn doc_updates_are_rate_limited_per_connection() {
         ..ConnLimits::default()
     };
     let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_doc(&room, &edit, &[]).await;
@@ -1070,8 +1077,8 @@ async fn rooms_per_connection_are_capped() {
         ..ConnLimits::default()
     };
     let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
-    let (room, edit, _) = server.create_project().await;
-    let (other, other_edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
+    let (other, other_edit, _) = server.create_space().await;
 
     let mut c = server.connect().await;
     c.join_doc(&room, &edit, &[]).await;
@@ -1096,7 +1103,7 @@ async fn rooms_per_connection_are_capped() {
 async fn a_batch_is_stored_whole_or_not_at_all() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -1151,7 +1158,7 @@ async fn many_records_in_one_message_are_relayed_unchanged() {
         ..ConnLimits::default()
     };
     let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     let mut b = server.connect().await;
@@ -1208,7 +1215,7 @@ async fn doc_updates_are_charged_per_record() {
         ..ConnLimits::default()
     };
     let server = Server::start_with(dir.path(), RoomConfig::default(), limits).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_doc(&room, &edit, &[]).await;
@@ -1232,7 +1239,7 @@ async fn doc_updates_are_charged_per_record() {
 async fn oversized_presence_is_refused_before_reassembly() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_presence(&room, &edit).await;
@@ -1252,7 +1259,7 @@ async fn oversized_presence_is_refused_before_reassembly() {
 async fn shutdown_closes_sockets_and_stops_rooms() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
-    let (room, edit, _) = server.create_project().await;
+    let (room, edit, _) = server.create_space().await;
 
     let mut a = server.connect().await;
     a.join_doc(&room, &edit, &[]).await;
