@@ -9,7 +9,7 @@ import {
   PREVIEWABLE_IMAGE,
 } from "@/assets/file-types";
 import { Button } from "@/components/ui/button";
-import { ownBuffer } from "@/crypto/project-key";
+import { ownBuffer } from "@/crypto/bytes";
 import { basename } from "@/doc/names";
 import { NODE } from "@/doc/schema";
 import { cn } from "@/lib/utils";

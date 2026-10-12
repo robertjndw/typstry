@@ -20,8 +20,40 @@ function blobsOf(stored: StoredDoc): Uint8Array[] {
     : stored.updates;
 }
 
+/**
+ * What this browser keeps of a project's MLS group. The device is stored
+ * apart from the group state so a device that has to rejoin (lost or
+ * outdated state) comes back as itself instead of leaving a ghost leaf.
+ */
+export interface MlsRecord {
+  /** `ProjectGroup.exportState()`; null while only the device exists. */
+  state: Uint8Array | null;
+  /** `Device.export()`. */
+  device: Uint8Array | null;
+  /** The group removed this device. Kept so a reload still says so. */
+  removed: boolean;
+  /**
+   * The links of the latest rotation this device went through, so a tab
+   * that missed it (asleep, or opened later) can still follow it.
+   */
+  rotation: StoredRotation | null;
+}
+
+export interface StoredRotation {
+  /** The secret to put in the URL fragment. */
+  link: string;
+  /** The token to open the project with: the edit token for editors. */
+  token: string;
+  /** The view token, for members who got the edit link. */
+  viewToken: string | null;
+  canEdit: boolean;
+}
+
 export interface DocBackend {
   load(projectId: string): Promise<StoredDoc>;
+  loadMls(projectId: string): Promise<MlsRecord | null>;
+  /** Callers serialize writers themselves (see mls/session.ts). */
+  saveMls(projectId: string, record: MlsRecord): Promise<void>;
   append(projectId: string, update: Uint8Array): Promise<void>;
   /**
    * Replaces everything stored for the project with the snapshot `build`
@@ -41,6 +73,7 @@ const DB_NAME = "typstry";
 const DB_VERSION = 1;
 const SNAPSHOTS = "snapshots";
 const UPDATES = "updates";
+const MLS = "mls";
 const BY_PROJECT = "projectId";
 
 function request<T>(req: IDBRequest<T>): Promise<T> {
@@ -66,6 +99,8 @@ interface Row {
   data: Uint8Array;
 }
 
+type MlsRow = MlsRecord & { projectId: string };
+
 export class IndexedDbBackend implements DocBackend {
   private readonly db: IDBDatabase;
 
@@ -87,6 +122,7 @@ export class IndexedDbBackend implements DocBackend {
         db.createObjectStore(SNAPSHOTS, { keyPath: "projectId" });
         const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
         updates.createIndex(BY_PROJECT, "projectId");
+        db.createObjectStore(MLS, { keyPath: "projectId" });
       }
     };
     // Fires while another tab still holds an older connection. Those tabs
@@ -114,6 +150,22 @@ export class IndexedDbBackend implements DocBackend {
       snapshot: snap?.data ?? null,
       updates: rows.map((row) => row.data),
     };
+  }
+
+  async loadMls(projectId: string): Promise<MlsRecord | null> {
+    const tx = this.db.transaction(MLS, "readonly");
+    const row = await request<MlsRow | undefined>(
+      tx.objectStore(MLS).get(projectId),
+    );
+    if (!row) return null;
+    const { state, device, removed, rotation } = row;
+    return { state, device, removed, rotation };
+  }
+
+  async saveMls(projectId: string, record: MlsRecord): Promise<void> {
+    const tx = this.db.transaction(MLS, "readwrite");
+    tx.objectStore(MLS).put({ ...record, projectId } satisfies MlsRow);
+    await done(tx);
   }
 
   async append(projectId: string, update: Uint8Array): Promise<void> {
@@ -158,9 +210,10 @@ export class IndexedDbBackend implements DocBackend {
   }
 
   async remove(projectId: string): Promise<void> {
-    const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readwrite");
+    const tx = this.db.transaction([SNAPSHOTS, UPDATES, MLS], "readwrite");
     const committed = done(tx);
     tx.objectStore(SNAPSHOTS).delete(projectId);
+    tx.objectStore(MLS).delete(projectId);
     const updates = tx.objectStore(UPDATES);
     const keys = await request(updates.index(BY_PROJECT).getAllKeys(projectId));
     for (const key of keys) updates.delete(key);
@@ -171,6 +224,7 @@ export class IndexedDbBackend implements DocBackend {
 /** For browsers without usable IndexedDB: survives navigation, not reloads. */
 export class MemoryBackend implements DocBackend {
   private readonly docs = new Map<string, StoredDoc>();
+  private readonly groups = new Map<string, MlsRecord>();
 
   private entry(projectId: string): StoredDoc {
     let entry = this.docs.get(projectId);
@@ -184,6 +238,14 @@ export class MemoryBackend implements DocBackend {
   async load(projectId: string): Promise<StoredDoc> {
     const entry = this.entry(projectId);
     return { snapshot: entry.snapshot, updates: [...entry.updates] };
+  }
+
+  async loadMls(projectId: string): Promise<MlsRecord | null> {
+    return this.groups.get(projectId) ?? null;
+  }
+
+  async saveMls(projectId: string, record: MlsRecord): Promise<void> {
+    this.groups.set(projectId, record);
   }
 
   async append(projectId: string, update: Uint8Array): Promise<void> {
@@ -200,6 +262,7 @@ export class MemoryBackend implements DocBackend {
 
   async remove(projectId: string): Promise<void> {
     this.docs.delete(projectId);
+    this.groups.delete(projectId);
   }
 }
 

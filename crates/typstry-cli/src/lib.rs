@@ -13,6 +13,7 @@ pub mod git;
 pub mod hash;
 pub mod link;
 pub mod mailbox;
+pub mod mls;
 pub mod state;
 pub mod watch;
 pub mod worktree;

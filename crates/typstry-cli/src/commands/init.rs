@@ -7,16 +7,17 @@ use anyhow::{Context, bail};
 use typstry_doc::init::{DEFAULT_MAIN_FILE, init_bare_project, set_main_file, starter_content};
 use typstry_doc::names::validate_path;
 use typstry_doc::paths::build_path_index;
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::LinkSecret;
 
 use super::{
     Ctx, Output, link::print_links, print_not_applied, print_report_warnings, print_warnings,
     track_branch,
 };
 use crate::api::{Api, Permission, ShareInfo};
-use crate::engine::{Flush, Mode, Scope, Session, set_peer_info};
+use crate::engine::{Flush, Identity, Mode, Scope, Session, set_peer_info};
 use crate::git::{self, Head, Repo};
 use crate::link::{ShareLink, ws_url};
+use crate::mls::create_group;
 use crate::state::{STATE_DIR, StateDir};
 use crate::worktree::{GIT_FILE_REASON, LocalFile, Skipped, Worktree, case_clashes};
 
@@ -372,18 +373,29 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
 async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Result<Session> {
     let api = Api::new(server)?;
     let created = api.create_project().await?;
-    let link = ShareLink::new(server, &created.edit_token, &ProjectKey::generate_raw());
+    let link = ShareLink::new(
+        server,
+        &created.edit_token,
+        &LinkSecret::generate_edit().to_base64url(),
+    );
     let share = ShareInfo {
         project_id: created.project_id,
         permission: Permission::Write,
         view_token: Some(created.view_token),
+        retired: false,
     };
+    // The project's group starts with this folder as its only member, before
+    // anything else is uploaded, so every record has an author the group
+    // vouches for.
+    let identity = Identity::resolve(ctx.name.as_deref(), None, root);
+    let group = create_group(&link, &identity).await?;
     // Before .typstry/ exists, so the key cannot slip into a commit even if
     // the rest fails halfway.
     if let Some((repo, _)) = &plan.repo {
         repo.exclude_state_dir()?;
     }
-    let mut session = Session::create_with_api(root, &link, &share, api, ctx.name.as_deref())?;
+    let mut session =
+        Session::create_with_api(root, &link, &share, api, Some(group), ctx.name.as_deref())?;
     session.connect().await?;
 
     // The seed and the files go out together after the assets, so nobody

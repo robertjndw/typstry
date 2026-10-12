@@ -1,7 +1,7 @@
 // HTTP helpers for the project endpoints served by crates/typstry-server.
 // Nothing sent here is readable by the server: project content only ever
 // travels encrypted, so these calls carry tokens and ciphertext alone.
-import { ownBuffer } from "@/crypto/project-key";
+import { fromBase64, ownBuffer } from "@/crypto/bytes";
 
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
 
@@ -18,6 +18,12 @@ export interface ShareInfo {
   permission: SharePermission;
   /** Only present for edit tokens; view tokens never learn the edit link. */
   viewToken?: string;
+  /**
+   * The token was replaced when the links rotated. It still names the
+   * project, but only the group's commit log can be read with it: that is
+   * how a member finds the new links.
+   */
+  retired?: boolean;
 }
 
 export class ApiError extends Error {
@@ -91,6 +97,56 @@ export async function resolveShare(
   return share;
 }
 
+/** What a newcomer needs to open a project and join its MLS group. */
+export interface MlsBootstrap {
+  incarnation: number;
+  /** The epoch the GroupInfo describes; it can trail the group's head. */
+  epoch: number;
+  /** Sealed under the link; opens only with it. */
+  groupInfo: Uint8Array;
+  /** Sealed under the link and signed by an editor. */
+  keyring: Uint8Array;
+}
+
+/**
+ * The sealed GroupInfo and keyring of a project. Null when the token is
+ * unknown or the project has no group, which only a project that was never
+ * opened by its creator can lack.
+ */
+export async function fetchMlsBootstrap(
+  token: string,
+  opts: ApiOptions = {},
+): Promise<MlsBootstrap | null> {
+  const res = await apiFetch(
+    `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/mls`,
+    { signal: opts.signal, cache: "no-store" },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok)
+    throw new ApiError(
+      res.status,
+      `fetching the keyring failed: ${res.status}`,
+    );
+  const body = (await res.json()) as Record<string, unknown>;
+  const groupInfo =
+    typeof body.groupInfo === "string" ? fromBase64(body.groupInfo) : null;
+  const keyring =
+    typeof body.keyring === "string" ? fromBase64(body.keyring) : null;
+  if (
+    !groupInfo ||
+    !keyring ||
+    typeof body.incarnation !== "number" ||
+    typeof body.epoch !== "number"
+  )
+    throw new ApiError(res.status, "the keyring response was malformed");
+  return {
+    incarnation: body.incarnation,
+    epoch: body.epoch,
+    groupInfo,
+    keyring,
+  };
+}
+
 /**
  * Checks an untrusted value (a response body, a cached copy) against the
  * `ShareInfo` shape, dropping fields of the wrong type.
@@ -104,6 +160,7 @@ export function parseShareInfo(value: unknown): ShareInfo | null {
     return null;
   const share: ShareInfo = { projectId: v.projectId, permission: v.permission };
   if (typeof v.viewToken === "string") share.viewToken = v.viewToken;
+  if (v.retired === true) share.retired = true;
   return share;
 }
 

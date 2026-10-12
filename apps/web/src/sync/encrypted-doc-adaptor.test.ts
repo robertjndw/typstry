@@ -10,29 +10,11 @@ import {
 } from "loro-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  generateEditSecret,
-  importProjectKey,
-  type ProjectKey,
-} from "@/crypto/project-key";
+import { ProjectCrypto } from "@/crypto/project-crypto";
+import { editorOf, newProject, viewerOf } from "@/crypto/test-utils";
+import { DocKeys } from "@/crypto/wasm";
 
 import { EncryptedDocAdaptor } from "./encrypted-doc-adaptor";
-
-const hooks = vi.hoisted(() => ({
-  /** Runs at the start of every delta encryption, while push() awaits it. */
-  onEncryptDelta: null as (() => void) | null,
-}));
-
-vi.mock("@/crypto/project-key", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/crypto/project-key")>();
-  return {
-    ...actual,
-    encryptDelta: (...args: Parameters<typeof actual.encryptDelta>) => {
-      hooks.onEncryptDelta?.();
-      return actual.encryptDelta(...args);
-    },
-  };
-});
 
 const decoder = new TextDecoder();
 
@@ -137,7 +119,7 @@ interface Client {
 const clients: Client[] = [];
 
 afterEach(() => {
-  hooks.onEncryptDelta = null;
+  vi.restoreAllMocks();
   for (const c of clients.splice(0)) c.adaptor.destroy();
 });
 
@@ -147,25 +129,29 @@ async function settle() {
 
 function makeClient(
   server: FakeServer,
-  key: ProjectKey,
+  crypto: ProjectCrypto,
   opts: {
     canWrite?: boolean;
     compactAfterDeltas?: number;
     compactIntervalMs?: number;
     pushDelayMs?: number;
     doc?: LoroDoc;
+    compactOnJoin?: boolean;
+    onUnknownGeneration?: (generation: number) => void;
   } = {},
 ): Client {
   const doc = opts.doc ?? new LoroDoc();
   const onDecryptError = vi.fn();
   const adaptor = new EncryptedDocAdaptor(doc, {
-    key,
+    crypto,
     canWrite: opts.canWrite ?? true,
     compactAfterDeltas: opts.compactAfterDeltas,
+    compactOnJoin: opts.compactOnJoin,
     compactIntervalMs: opts.compactIntervalMs ?? 0,
     pushDelayMs: opts.pushDelayMs ?? 0,
     retryMs: 10,
     onDecryptError,
+    onUnknownGeneration: opts.onUnknownGeneration,
   });
   const ctx = {
     send: vi.fn((updates: Uint8Array[]) => {
@@ -202,17 +188,17 @@ function write(doc: LoroDoc, text: string) {
   doc.commit();
 }
 
-const key = await importProjectKey(generateEditSecret());
+const project = newProject();
 
 describe("EncryptedDocAdaptor", () => {
   it("syncs through a server that only ever sees ciphertext", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key);
+    const a = makeClient(server, project.crypto);
     write(a.doc, "top secret thesis");
     await a.join();
     await settle();
 
-    const b = makeClient(server, key);
+    const b = makeClient(server, project.crypto);
     await b.join();
     await b.adaptor.waitForReachingServerVersion();
     expect(b.doc.getText("t").toString()).toBe("top secret thesis");
@@ -231,18 +217,18 @@ describe("EncryptedDocAdaptor", () => {
 
   it("uploads edits made before joining", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key);
+    const a = makeClient(server, project.crypto);
     await a.join();
     await a.adaptor.waitForReachingServerVersion();
 
     const offline = new LoroDoc();
     offline.import(a.doc.export({ mode: "snapshot" }));
     write(offline, "written on a train");
-    const back = makeClient(server, key, { doc: offline });
+    const back = makeClient(server, project.crypto, { doc: offline });
     await back.join();
     await settle();
 
-    const fresh = makeClient(server, key);
+    const fresh = makeClient(server, project.crypto);
     await fresh.join();
     await fresh.adaptor.waitForReachingServerVersion();
     expect(fresh.doc.getText("t").toString()).toBe("written on a train");
@@ -250,13 +236,12 @@ describe("EncryptedDocAdaptor", () => {
 
   it("reports data sealed with another key and never syncs", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key);
+    const a = makeClient(server, project.crypto);
     write(a.doc, "hello");
     await a.join();
     await settle();
 
-    const other = await importProjectKey(generateEditSecret());
-    const c = makeClient(server, other);
+    const c = makeClient(server, newProject().crypto);
     const synced = vi.fn();
     void c.adaptor.waitForReachingServerVersion().then(synced);
     await c.join();
@@ -268,7 +253,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("compacts the server log with a snapshot once it grows", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key);
+    const a = makeClient(server, project.crypto);
     await a.join();
     for (let i = 0; i < 5; i++) {
       write(a.doc, `${i}`);
@@ -276,7 +261,7 @@ describe("EncryptedDocAdaptor", () => {
     }
     expect(server.deltas.length).toBeGreaterThanOrEqual(5);
 
-    const b = makeClient(server, key, { compactAfterDeltas: 3 });
+    const b = makeClient(server, project.crypto, { compactAfterDeltas: 3 });
     await b.join();
     // Verifying the backfill and signing the snapshot takes a few crypto
     // round trips, more than a fixed settle reliably covers.
@@ -285,7 +270,7 @@ describe("EncryptedDocAdaptor", () => {
       expect(server.deltas).toHaveLength(0);
     });
 
-    const fresh = makeClient(server, key);
+    const fresh = makeClient(server, project.crypto);
     await fresh.join();
     await fresh.adaptor.waitForReachingServerVersion();
     expect(fresh.doc.getText("t").toString()).toBe("01234");
@@ -293,7 +278,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("keeps compacting as its own sends grow the log", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key, { compactAfterDeltas: 3 });
+    const a = makeClient(server, project.crypto, { compactAfterDeltas: 3 });
     await a.join();
     await a.adaptor.waitForReachingServerVersion();
     for (let i = 0; i < 7; i++) {
@@ -313,7 +298,7 @@ describe("EncryptedDocAdaptor", () => {
     );
     expect(snapshots.length).toBeGreaterThanOrEqual(2);
 
-    const fresh = makeClient(server, key);
+    const fresh = makeClient(server, project.crypto);
     await fresh.join();
     await fresh.adaptor.waitForReachingServerVersion();
     expect(fresh.doc.getText("t").toString()).toBe("0123456");
@@ -321,7 +306,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("waits between compactions while connected", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key, {
+    const a = makeClient(server, project.crypto, {
       compactAfterDeltas: 3,
       compactIntervalMs: 60_000,
     });
@@ -343,22 +328,24 @@ describe("EncryptedDocAdaptor", () => {
 
   it("never snapshots ops that did not go out as deltas", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key, {
+    const a = makeClient(server, project.crypto, {
       compactAfterDeltas: 1,
       pushDelayMs: 60_000,
     });
-    const b = makeClient(server, key);
+    const b = makeClient(server, project.crypto);
     await a.join();
     await b.join();
     await b.adaptor.waitForReachingServerVersion();
 
-    // The first two encryptions each see a new commit land while they run:
+    // The first two encryptions each see a new commit land as they start:
     // the second one belongs to the push right before the snapshot.
     let calls = 0;
-    hooks.onEncryptDelta = () => {
+    const encrypt = project.crypto.encryptDelta.bind(project.crypto);
+    vi.spyOn(project.crypto, "encryptDelta").mockImplementation((...args) => {
       calls++;
       if (calls <= 2) write(a.doc, `${calls + 1}`);
-    };
+      return encrypt(...args);
+    });
     write(a.doc, "1");
     await a.adaptor.flush();
     await vi.waitFor(() => expect(server.snapshot).not.toBeNull());
@@ -373,7 +360,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("counts a push still encrypting as pending", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key, { pushDelayMs: 0 });
+    const a = makeClient(server, project.crypto, { pushDelayMs: 0 });
     await a.join();
     await a.adaptor.waitForReachingServerVersion();
     write(a.doc, "queued");
@@ -386,7 +373,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("gathers quick commits into one record", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key, { pushDelayMs: 30 });
+    const a = makeClient(server, project.crypto, { pushDelayMs: 30 });
     await a.join();
     await a.adaptor.waitForReachingServerVersion();
     for (const ch of "typing") write(a.doc, ch);
@@ -397,7 +384,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("sends pending commits right away on flush", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key, { pushDelayMs: 60_000 });
+    const a = makeClient(server, project.crypto, { pushDelayMs: 60_000 });
     await a.join();
     write(a.doc, "before closing");
     expect(a.adaptor.hasPendingPush).toBe(true);
@@ -408,7 +395,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("resends spans the server refused for a passing reason", async () => {
     const server = new FakeServer();
-    const a = makeClient(server, key);
+    const a = makeClient(server, project.crypto);
     await a.join();
     const receive = vi.spyOn(server, "receive");
     // Make the first send look refused: it never reaches the fake, and the
@@ -425,10 +412,63 @@ describe("EncryptedDocAdaptor", () => {
 
   it("never sends from a view link", async () => {
     const server = new FakeServer();
-    const viewer = makeClient(server, key, { canWrite: false });
+    const viewer = makeClient(server, viewerOf(project), { canWrite: false });
     write(viewer.doc, "local only");
     await viewer.join();
     await settle();
     expect(viewer.ctx.send).not.toHaveBeenCalled();
+  });
+
+  it("uploads exactly one snapshot right after joining when asked to", async () => {
+    const snapshotsIn = (server: FakeServer) =>
+      server.received.filter((c) =>
+        decodeEloContainer(c).some(
+          (r) => parseEloRecordHeader(r).header.kind === EloRecordKind.Snapshot,
+        ),
+      ).length;
+
+    // After a rotation the new connection says so, whatever the log length.
+    const server = new FakeServer();
+    const a = makeClient(server, project.crypto, {
+      compactAfterDeltas: 1000,
+      compactOnJoin: true,
+    });
+    write(a.doc, "history");
+    await a.join();
+    await a.adaptor.waitForReachingServerVersion();
+    await vi.waitFor(() => expect(snapshotsIn(server)).toBe(1));
+    await settle();
+    expect(snapshotsIn(server)).toBe(1);
+
+    // Otherwise a short log is left alone.
+    const quiet = new FakeServer();
+    const b = makeClient(quiet, project.crypto, { compactAfterDeltas: 1000 });
+    write(b.doc, "history");
+    await b.join();
+    await b.adaptor.waitForReachingServerVersion();
+    await settle();
+    expect(snapshotsIn(quiet)).toBe(0);
+  });
+
+  it("reports a record from a newer generation without calling it a decrypt error", async () => {
+    const server = new FakeServer();
+    const rotated = new ProjectCrypto(
+      project.link,
+      new DocKeys(project.keyring.next(project.link)),
+    );
+    const a = makeClient(server, rotated);
+    write(a.doc, "rotated");
+    await a.join();
+    await settle();
+
+    const unknown = vi.fn();
+    const b = makeClient(server, editorOf(project), {
+      onUnknownGeneration: unknown,
+    });
+    await b.join();
+    await settle();
+    expect(unknown).toHaveBeenCalledWith(2);
+    expect(b.onDecryptError).not.toHaveBeenCalled();
+    expect(b.doc.getText("t").toString()).toBe("");
   });
 });

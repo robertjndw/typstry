@@ -37,9 +37,11 @@ use typstry_doc::testing::file_json;
 use typstry_doc::versions::{named_versions, save_version};
 use typstry_doc::{SCHEMA_VERSION, root, text_content};
 use typstry_wire::crypto::{
-    BLOB_CONTEXT, PRESENCE_CONTEXT, ProjectKey, RECORD_VERSION, SEAL_VERSION, SECRET_EDIT_V1,
-    SECRET_VIEW_V1,
+    BLOB_CONTEXT, DocKeys, KEYRING_VERSION, Keyring, LinkSecret, LocalSigner, PROFILE_CONTEXT,
+    PresenceKey, RECORD_VERSION, RecordSigner, SEAL_VERSION, SECRET_EDIT_V1, SECRET_VIEW_V1,
 };
+use typstry_wire::ds::DS_VERSION;
+use typstry_wire::mls::{MLS_STATE_VERSION, ProjectGroup, Role};
 use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 
 #[path = "../../../fixtures/compat/support.rs"]
@@ -131,6 +133,29 @@ fn cli_reads_every_compat_fixture() {
         let git: GitMark = serde_json::from_value(expected["git"].clone()).unwrap();
         assert_eq!(base.git, Some(git), "v{n}");
 
+        // The saved group has to load, and still be the member it was.
+        let (group, warning) = state.load_mls().unwrap();
+        assert_eq!(warning, None, "v{n}");
+        let group = group.unwrap_or_else(|| panic!("v{n}: mls.bin did not load"));
+        let mls = &expected["mls"];
+        assert_eq!(group.epoch(), mls["epoch"].as_u64().unwrap(), "v{n}");
+        assert!(group.is_active(), "v{n}");
+        assert_eq!(group.link().to_base64url().as_str(), crypto["editSecret"]);
+        assert_eq!(group.generation().unwrap(), 1, "v{n}");
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(group.device().signer_pub()),
+            mls["devicePub"],
+            "v{n}"
+        );
+        let members = group.members().unwrap();
+        assert_eq!(members.len(), 1, "v{n}");
+        assert_eq!(members[0].role, Role::Editor, "v{n}");
+        assert_eq!(
+            members[0].profile.as_deref(),
+            Some(mls["profile"].as_str().unwrap().as_bytes()),
+            "v{n}"
+        );
+
         // doc.bin plus every doc.log entry has to add up to the whole doc.
         // A log mistaken for a newer format would be dropped with a warning.
         let (doc, warning) = state.load_doc().unwrap();
@@ -151,6 +176,7 @@ fn cli_formats_have_a_compat_fixture() {
         ("config", CONFIG_VERSION),
         ("base", BASE_VERSION),
         ("docLog", LOG_FORMAT),
+        ("mlsState", u32::from(MLS_STATE_VERSION)),
     ] {
         let frozen = frozen[name].as_u64().unwrap();
         assert!(
@@ -187,14 +213,33 @@ fn edit_secret() -> String {
     b64(&bytes)
 }
 
+/// The generation 1 doc key. Fixed so the sealed data below is stable.
+fn doc_key() -> [u8; 32] {
+    std::array::from_fn(|i| 0xc0 + i as u8)
+}
+
+/// The fixture editor's device key. Real devices use their MLS leaf key;
+/// records only care that the key is attested and signs.
+const SIGNER_SEED: [u8; 32] = [0x5a; 32];
+const PRESENCE_EPOCH: u64 = 5;
+const PRESENCE_LEAF: u32 = 3;
+const PROFILE: &str = r##"{"name":"Ada","color":"#3366cc"}"##;
+
+fn presence_secret() -> [u8; 32] {
+    std::array::from_fn(|i| 0xd0 + i as u8)
+}
+
 fn text(content: &str) -> Option<FileContent> {
     Some(FileContent::Text(Arc::from(content)))
 }
 
 fn write_fixture(out: &Path) {
     let secret = edit_secret();
-    let key = ProjectKey::from_base64url(&secret).unwrap();
-    let blob = key.seal_with(BLOB_PLAINTEXT, BLOB_CONTEXT, &[5; 12], &[6; 16]);
+    let link = LinkSecret::from_base64url(&secret).unwrap();
+    let keyring = Keyring::new_with(&link, doc_key());
+    let keys = DocKeys::new(keyring.clone());
+    let signer = LocalSigner::attested(SIGNER_SEED, &link, 1);
+    let blob = keys.seal_with(BLOB_PLAINTEXT, BLOB_CONTEXT, &[5; 12], &[6; 16]);
     let blob_hash = BlobHash::of(&blob);
 
     let doc = LoroDoc::new();
@@ -271,7 +316,19 @@ fn write_fixture(out: &Path) {
     write_json(
         out,
         "crypto.json",
-        &crypto_json(&key, &secret, &doc, init_end, &snapshot, &blob),
+        &crypto_json(
+            &Crypto {
+                link: &link,
+                keyring: &keyring,
+                keys: &keys,
+                signer: &signer,
+            },
+            &secret,
+            &doc,
+            init_end,
+            &snapshot,
+            &blob,
+        ),
     );
     write_json(
         out,
@@ -280,6 +337,9 @@ fn write_fixture(out: &Path) {
             "schema": SCHEMA_VERSION,
             "seal": SEAL_VERSION,
             "record": RECORD_VERSION,
+            "keyring": KEYRING_VERSION,
+            "mlsState": MLS_STATE_VERSION,
+            "ds": DS_VERSION,
             "secretEdit": SECRET_EDIT_V1,
             "secretView": SECRET_VIEW_V1,
             "protocol": PROTOCOL_VERSION,
@@ -320,6 +380,10 @@ fn write_fixture(out: &Path) {
             git: Some(git.clone()),
         })
         .unwrap();
+    // A one-member group of this device, the way `typstry init` leaves it.
+    // Its keyring is a random one: nothing here reads data through it.
+    let (group, _) = ProjectGroup::create(&link, PROFILE.as_bytes()).unwrap();
+    state.save_mls(&group).unwrap();
     state
         .save_doc(&LoroDoc::from_snapshot(&cached).unwrap())
         .unwrap();
@@ -327,7 +391,7 @@ fn write_fixture(out: &Path) {
     state.append_doc(&second_log_entry).unwrap();
     let cli = out.join("cli");
     fs::create_dir(&cli).unwrap();
-    for name in ["config.json", "base.json", "doc.bin", "doc.log"] {
+    for name in ["config.json", "base.json", "doc.bin", "doc.log", "mls.bin"] {
         fs::copy(state.dir().join(name), cli.join(name)).unwrap();
     }
     write_json(
@@ -343,6 +407,11 @@ fn write_fixture(out: &Path) {
             "lastSync": 1_700_000_000_005_u64,
             "pins": { "main.typ": "First draft" },
             "git": git,
+            "mls": {
+                "epoch": group.epoch(),
+                "devicePub": b64(&group.device().signer_pub()),
+                "profile": PROFILE,
+            },
         }),
     );
 }
@@ -403,21 +472,43 @@ fn doc_json(doc: &LoroDoc, deleted_key: &str) -> Value {
     })
 }
 
+/// What the fixture's keys and device are, bundled for `crypto_json`.
+struct Crypto<'a> {
+    link: &'a LinkSecret,
+    keyring: &'a Keyring,
+    keys: &'a DocKeys,
+    signer: &'a LocalSigner,
+}
+
 fn crypto_json(
-    key: &ProjectKey,
+    crypto: &Crypto,
     secret: &str,
     doc: &LoroDoc,
     init_end: i32,
     snapshot: &[u8],
     blob: &[u8],
 ) -> Value {
+    let Crypto {
+        link,
+        keyring,
+        keys,
+        signer,
+    } = crypto;
     let delta_plain = doc
         .export(ExportMode::updates_in_range(vec![IdSpan::new(
             AUTHOR, 0, init_end,
         )]))
         .unwrap();
-    let delta = key
-        .encrypt_delta_with(AUTHOR, 0, init_end as u64, &delta_plain, &[1; 12], &[2; 16])
+    let delta = keys
+        .encrypt_delta_with(
+            *signer,
+            AUTHOR,
+            0,
+            init_end as u64,
+            &delta_plain,
+            &[1; 12],
+            &[2; 16],
+        )
         .unwrap();
     let mut vv: Vec<(u64, u64)> = doc
         .oplog_vv()
@@ -425,8 +516,8 @@ fn crypto_json(
         .map(|(peer, counter)| (*peer, *counter as u64))
         .collect();
     vv.sort();
-    let snapshot_record = key
-        .encrypt_snapshot_with(&vv, snapshot, &[3; 12], &[4; 16])
+    let snapshot_record = keys
+        .encrypt_snapshot_with(*signer, &vv, snapshot, &[3; 12], &[4; 16])
         .unwrap();
 
     let main = typstry_doc::main_file(doc).unwrap().to_string();
@@ -442,15 +533,40 @@ fn crypto_json(
     let store = EphemeralStore::new(30_000);
     store.set(&presence_key, state);
     let presence_plain = store.encode_all();
-    let presence = key.seal_with(&presence_plain, PRESENCE_CONTEXT, &[7; 12], &[8; 16]);
+    let presence = PresenceKey::new(PRESENCE_EPOCH, presence_secret()).seal_with(
+        *signer,
+        PRESENCE_LEAF,
+        &presence_plain,
+        &[7; 12],
+        &[8; 16],
+    );
 
-    let view_secret = key.view_secret().to_string();
+    let profile = keys.seal_with(PROFILE.as_bytes(), PROFILE_CONTEXT, &[9; 12], &[10; 16]);
+    let signed_keyring = keyring
+        .seal_signed_with(link, &[11; 12], &[12; 16])
+        .unwrap();
+    let signer_pub = signer.public_key();
+    let attestation = signer.attestation(1).unwrap();
+
+    let view_secret = link.view_secret().to_string();
     json!({
         "editSecret": secret,
         "viewSecret": view_secret,
-        "keyId": key.key_id(),
+        "fingerprint": link.fingerprint(),
         "editLink": ShareLink::new(SERVER, EDIT_TOKEN, secret).to_string(),
         "viewLink": ShareLink::new(SERVER, VIEW_TOKEN, &view_secret).to_string(),
+        "keyring": {
+            "generation": keyring.generation(),
+            "signed": b64(&signed_keyring),
+            "keyId": keys.key_id(),
+            "docKey": b64(&doc_key()),
+        },
+        "signer": {
+            "seed": b64(&SIGNER_SEED),
+            "publicKey": b64(&signer_pub),
+            "attestation": b64(&attestation),
+            "generation": 1,
+        },
         "delta": {
             "peer": AUTHOR.to_string(),
             "start": 0,
@@ -468,10 +584,17 @@ fn crypto_json(
             "sealed": b64(blob),
             "plaintext": b64(BLOB_PLAINTEXT),
         },
+        "profile": {
+            "sealed": b64(&profile),
+            "plaintext": PROFILE,
+        },
         "presence": {
             "sealed": b64(&presence),
             "plaintext": b64(&presence_plain),
-            "key": presence_key,
+            "epoch": PRESENCE_EPOCH,
+            "leaf": PRESENCE_LEAF,
+            "key": b64(&presence_secret()),
+            "storeKey": presence_key,
             "state": { "name": "Ada", "color": "#3366cc", "fileId": main },
         },
     })
@@ -515,14 +638,27 @@ When a format version goes up (see `versions.json` and
 `docs/compatibility.md`), add a new `v<N>` directory with the generator
 instead of touching this one.
 
-- `versions.json`: the format versions in force when this was written.
+The v1 set was written for the MLS format. An earlier draft of v1 (one
+project key, no groups) was dropped before any release, so nothing in the
+wild uses it.
+
+- `versions.json`: the format versions in force when this was written,
+  including `mlsState` (the saved group state) and `ds` (the delivery
+  service messages).
 - `doc.loro`, `doc.json`: a project snapshot (text files, an asset, peers,
   named versions, a deleted version) and what it has to read as.
-- `crypto.json`: edit and view secrets, share links, a delta and a snapshot
-  record (the snapshot's plaintext is `doc.loro`), a sealed blob (the asset
-  in the doc) and a sealed presence update, with their plaintexts.
+- `crypto.json`: the edit and view secrets and share links; the signed,
+  sealed keyring with its key id and generation 1 doc key; a fixed device
+  key with the editor attestation made for it; a delta and a snapshot
+  record signed by that device (the snapshot's plaintext is `doc.loro`); a
+  generation-tagged blob (the asset in the doc); a sealed profile; and a
+  presence update, with the raw presence key, epoch and leaf it was sealed
+  under (MLS derives that key per epoch, so it is stored here as is). All
+  with their plaintexts.
 - `cli/`: the CLI's `.typstry/` files (`config.json`, `base.json`,
-  `doc.bin`, `doc.log` with its header), `cli.json` what they hold.
+  `doc.bin`, `doc.log` with its header, `mls.bin` the saved group state),
+  `cli.json` what they hold. `mls.bin` comes from a real group, so its
+  keys are random and only its public facts are recorded.
 "
     )
 }

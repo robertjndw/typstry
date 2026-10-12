@@ -13,6 +13,7 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use typstry_cli::api::Api;
 use typstry_cli::commands::{self, Cli};
+use typstry_cli::engine::Identity;
 use typstry_cli::engine::Session;
 use typstry_cli::link::ShareLink;
 use typstry_cli::state::STATE_DIR;
@@ -20,7 +21,7 @@ use typstry_doc::init::init_project;
 use typstry_server::http::{AppState, router};
 use typstry_server::store::blobs::BlobStore;
 use typstry_server::store::db;
-use typstry_wire::crypto::ProjectKey;
+use typstry_wire::crypto::LinkSecret;
 
 /// A server on the test's runtime, stopped when dropped.
 pub struct Server {
@@ -204,12 +205,15 @@ pub fn cached_doc(dir: &Path) -> loro::LoroDoc {
 /// A new, empty project on the server at `origin`: `(edit, view)`.
 pub async fn create_project(origin: &str) -> (ShareLink, ShareLink) {
     let created = Api::new(origin).unwrap().create_project().await.unwrap();
-    let key = ProjectKey::generate_raw();
-    let view_key = ProjectKey::from_base64url(&key).unwrap().view_secret();
-    (
-        ShareLink::new(origin, &created.edit_token, &key),
-        ShareLink::new(origin, &created.view_token, &view_key),
-    )
+    let secret = LinkSecret::generate_edit();
+    let edit = ShareLink::new(origin, &created.edit_token, &secret.to_base64url());
+    let view = ShareLink::new(origin, &created.view_token, &secret.view_secret());
+    // The browser that creates a project starts its group; everyone else
+    // joins it. This one only stands in for that, it does not sync.
+    typstry_cli::mls::create_group(&edit, &Identity::new("Browser"))
+        .await
+        .unwrap();
+    (edit, view)
 }
 
 /// A connected session standing in for a browser.
@@ -219,7 +223,7 @@ pub async fn seeder(link: &ShareLink, dir: &Path) -> Session {
         .resolve_share(&link.token)
         .await
         .unwrap();
-    let mut session = Session::create(dir, link, &share, Some("Seeder")).unwrap();
+    let mut session = Session::create(dir, link, &share, None, Some("Seeder")).unwrap();
     session.connect().await.unwrap();
     session
 }

@@ -1,12 +1,12 @@
 // @vitest-environment node
 import { LoroDoc } from "loro-crdt";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { newProject } from "@/crypto/test-utils";
 
 import { connectProject, projectWsUrl, type SyncStatus } from "./connection";
 import { PROTOCOL_VERSION } from "./protocol";
 
-const key = await importProjectKey(generateEditSecret());
+const crypto = newProject().crypto;
 
 type StatusCb = (s: string) => void;
 
@@ -90,7 +90,7 @@ describe("connectProject", () => {
     const conn = connectProject({
       projectId: "proj",
       token: "tok",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       ephemeral: {} as never,
@@ -113,7 +113,7 @@ describe("connectProject", () => {
     const conn = connectProject({
       projectId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -147,7 +147,7 @@ describe("connectProject", () => {
     const conn = connectProject({
       projectId: "p",
       token: "bad",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -165,7 +165,7 @@ describe("connectProject", () => {
     const conn = connectProject({
       projectId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -189,7 +189,7 @@ describe("an outdated page", () => {
     const conn = connectProject({
       projectId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",
@@ -228,7 +228,7 @@ describe("syncNow", () => {
     const conn = connectProject({
       projectId: "p",
       token: "t",
-      key,
+      crypto,
       canWrite: true,
       doc: new LoroDoc(),
       url: "ws://x/ws",

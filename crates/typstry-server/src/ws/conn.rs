@@ -7,17 +7,17 @@
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use axum::extract::ws::WebSocket;
 use loro_protocol::{
     BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateStatusCode, try_decode,
 };
 use tokio::sync::mpsc;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::{MissedTickBehavior, interval};
 use typstry_wire::elo::container_len;
 use typstry_wire::fragment::Reassembler;
 
 use super::rate::TokenBucket;
+use super::{CLOSE_PROTOCOL_ERROR, IDLE_TIMEOUT, Socket};
 use crate::room::{ConnId, JoinOutcome, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
 use crate::state::AppState;
 use crate::store::projects::{self, Permission};
@@ -26,14 +26,6 @@ use crate::store::projects::{self, Permission};
 /// Only small frames ever reach this many; big ones hit the byte budget in
 /// [`super::ConnLimits::outbox_bytes`] first.
 const OUTBOX_FRAMES: usize = 512;
-
-/// The JS client pings every 30 s, so silence this long means a dead peer.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// Neither code is in the JS client's fatal list (1008, 1011, 4400-4499), so
-/// it reconnects and resyncs after either.
-const CLOSE_PROTOCOL_ERROR: u16 = 1002;
-const CLOSE_GOING_AWAY: u16 = 1001;
 
 struct Joined {
     crdt: CrdtType,
@@ -56,34 +48,7 @@ struct Conn {
 
 pub async fn run(socket: WebSocket, state: AppState) {
     let id = state.rooms.next_conn_id();
-    let (mut sink, mut stream) = socket.split();
-    let (outbox, mut rx) = Outbox::channel(
-        OUTBOX_FRAMES,
-        state.limits.outbox_bytes,
-        state.limits.max_rooms,
-    );
-    let overflow = outbox.overflow_signal();
-    let shutdown = state.shutdown.clone();
-
-    let mut writer = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            let (msg, last) = match frame {
-                Outbound::Binary(bytes) => (Message::Binary(bytes), false),
-                Outbound::Text(text) => (Message::Text(Utf8Bytes::from_static(text)), false),
-                Outbound::Close(code, reason) => (
-                    Message::Close(Some(CloseFrame {
-                        code,
-                        reason: Utf8Bytes::from_static(reason),
-                    })),
-                    true,
-                ),
-            };
-            if sink.send(msg).await.is_err() || last {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
+    let (mut socket, outbox) = Socket::open(socket, &state, OUTBOX_FRAMES);
 
     let limits = &state.limits;
     let bucket = TokenBucket::new(limits.update_burst, limits.updates_per_sec, Instant::now());
@@ -99,67 +64,38 @@ pub async fn run(socket: WebSocket, state: AppState) {
 
     let mut sweep = interval(Duration::from_secs(1));
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut overflowed = false;
     loop {
         tokio::select! {
-            next = timeout(IDLE_TIMEOUT, stream.next()) => match next {
-                Ok(Some(Ok(msg))) => {
-                    if !conn.on_message(msg).await {
+            next = socket.next(IDLE_TIMEOUT) => match next {
+                Some(bytes) => {
+                    if !conn.on_binary(&bytes).await {
                         break;
                     }
                 }
-                Ok(Some(Err(_)) | None) => break,
-                Err(_) => {
-                    conn.close(CLOSE_GOING_AWAY, "idle_timeout");
-                    break;
-                }
+                None => break,
             },
-            () = overflow.notified() => {
-                overflowed = true;
-                break;
-            }
-            () = shutdown.cancelled() => {
-                conn.close(CLOSE_GOING_AWAY, "server shutdown");
-                break;
-            }
             _ = sweep.tick() => conn.expire_fragments(),
         }
     }
 
     conn.leave_all().await;
     drop(conn);
-    if overflowed {
-        // The queue is full, so a close frame cannot be queued; dropping the
-        // socket is the only way to make the client reconnect promptly.
-        writer.abort();
-    } else if timeout(Duration::from_secs(2), &mut writer).await.is_err() {
-        writer.abort();
-    }
+    socket.finish().await;
     tracing::debug!(conn = id, "connection closed");
 }
 
 impl Conn {
     /// Returns false when the connection should close.
-    async fn on_message(&mut self, msg: Message) -> bool {
-        match msg {
-            Message::Text(text) => {
-                if text.as_str() == "ping" {
-                    self.outbox.push(Outbound::Text("pong"));
-                }
+    async fn on_binary(&mut self, bytes: &[u8]) -> bool {
+        match try_decode(bytes) {
+            Some(msg) => {
+                self.on_protocol(msg).await;
                 true
             }
-            Message::Binary(bytes) => match try_decode(&bytes) {
-                Some(msg) => {
-                    self.on_protocol(msg).await;
-                    true
-                }
-                None => {
-                    self.close(CLOSE_PROTOCOL_ERROR, "Protocol error");
-                    false
-                }
-            },
-            Message::Close(_) => false,
-            Message::Ping(_) | Message::Pong(_) => true,
+            None => {
+                self.close(CLOSE_PROTOCOL_ERROR, "Protocol error");
+                false
+            }
         }
     }
 
@@ -247,10 +183,8 @@ impl Conn {
             );
             return;
         }
-        let resolved = match std::str::from_utf8(&auth) {
-            Ok(token) => projects::resolve_token(&self.state.db, token).await,
-            Err(_) => Ok(None),
-        };
+        let token = std::str::from_utf8(&auth).unwrap_or_default();
+        let resolved = projects::resolve_token(&self.state.db, token).await;
         let permission = match resolved {
             Ok(Some((project_id, permission))) if project_id == room_id => permission,
             Ok(_) => {
@@ -283,6 +217,7 @@ impl Conn {
                 conn: self.id,
                 crdt,
                 permission,
+                token: token.to_owned(),
                 version: version.clone(),
                 outbox: self.outbox.clone(),
                 reply,

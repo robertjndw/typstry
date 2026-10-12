@@ -32,6 +32,21 @@ jobs:
       - name: Build tinymist
         if: steps.tinymist.outputs.cache-hit != 'true'
         run: apps/web/scripts/build-tinymist.sh
+      # The web app's crypto and MLS code is typstry-wire built to wasm, so the
+      # cache key covers the Rust sources it is built from.
+      - name: Restore typstry-wasm
+        id: typstry-wasm
+        uses: actions/cache@v6
+        with:
+          path: apps/web/vendor/typstry-wasm
+          key: typstry-wasm-${{ hashFiles('apps/web/scripts/build-wasm.sh', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/typstry-wire/**', 'crates/typstry-wasm/**') }}
+      - uses: taiki-e/install-action@v2
+        if: steps.typstry-wasm.outputs.cache-hit != 'true'
+        with:
+          tool: wasm-pack@0.15.0
+      - name: Build typstry-wasm
+        if: steps.typstry-wasm.outputs.cache-hit != 'true'
+        run: apps/web/scripts/build-wasm.sh
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test

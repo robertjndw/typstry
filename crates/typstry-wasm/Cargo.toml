@@ -1,0 +1,36 @@
+[package]
+name = "typstry-wasm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The encryption and MLS group of typstry-wire for the browser"
+
+[lib]
+# rlib so cargo test and clippy build it natively with the workspace.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+typstry-wire = { workspace = true, features = ["js"] }
+getrandom.workspace = true
+js-sys = "0.3"
+serde.workspace = true
+serde-wasm-bindgen = "0.6"
+serde_bytes = "0.11"
+wasm-bindgen = "0.2"
+
+# openmls_rust_crypto still pulls rand_core 0.6 and with it getrandom 0.2,
+# which has to be told to use the browser too.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[package.metadata.wasm-pack.profile.release]
+# Measured: wasm-opt makes the gzipped size worse here.
+wasm-opt = false
+
+[lints]
+workspace = true

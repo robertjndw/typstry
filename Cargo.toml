@@ -29,6 +29,14 @@ loro = "1.16.2"
 loro-protocol = "=0.3.0"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
+# openmls is 0.x and its group state format is not stable, so the whole
+# family is pinned exactly. They pull older aes-gcm, ed25519-dalek, sha2 and
+# getrandom alongside ours, which is accepted for now.
+openmls = "=0.9.1"
+openmls_basic_credential = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+openmls_traits = "=0.6.0"
+tls_codec = { version = "=0.5.0", features = ["derive"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 # Only ring is compiled in, so rustls never has to guess a crypto provider
 # and nothing needs the aws-lc C toolchain.

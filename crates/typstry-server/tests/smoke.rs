@@ -111,7 +111,15 @@ async fn migrations_create_schema_in_wal_mode() {
     .unwrap();
     assert_eq!(
         tables,
-        ["blobs", "doc_records", "project_blobs", "projects"]
+        [
+            "blobs",
+            "doc_records",
+            "mls_commits",
+            "mls_groups",
+            "project_blobs",
+            "projects",
+            "retired_tokens"
+        ]
     );
 
     let mode: String = sqlx::query_scalar("PRAGMA journal_mode")

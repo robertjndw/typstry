@@ -7,11 +7,16 @@ use loro::VersionVector;
 use loro_protocol::{BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateStatusCode};
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
+use typstry_wire::ds::ClientMessage;
 use typstry_wire::elo::{PeerId, Record, Version, encode_container, parse_container};
 
 use super::elo::{self, DocIndex};
+use super::mls::{Ctx, DsState, Rotation};
 use super::registry::Inner;
-use super::{ConnId, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd, update_frames};
+use super::{
+    CLOSE_LINK_ROTATED, CLOSE_LINK_ROTATED_REASON, ConnId, MAX_PRESENCE_BYTES, Outbound, Outbox,
+    RoomCmd, update_frames,
+};
 use crate::store::docs::{self, Write};
 use crate::store::projects::Permission;
 
@@ -35,6 +40,14 @@ pub(super) struct RoomActor {
     full_backfill: Option<Arc<[Bytes]>>,
     presence: HashMap<ConnId, Presence>,
     peers: HashMap<(ConnId, [u8; 4]), Outbox>,
+    /// The token each doc or presence peer joined with.
+    peer_tokens: HashMap<(ConnId, [u8; 4]), String>,
+    /// Tokens retired while this room was loaded, with the epoch of their
+    /// rotation. A join that resolved its token before the rotation must
+    /// not slip in after it.
+    retired_here: HashMap<String, u64>,
+    /// Loaded on the first delivery service command.
+    ds: Option<DsState>,
     last_seq: i64,
     empty_since: Option<Instant>,
 }
@@ -49,6 +62,9 @@ impl RoomActor {
             full_backfill: None,
             presence: HashMap::new(),
             peers: HashMap::new(),
+            peer_tokens: HashMap::new(),
+            retired_here: HashMap::new(),
+            ds: None,
             last_seq: 0,
             empty_since: Some(Instant::now()),
         }
@@ -120,13 +136,21 @@ impl RoomActor {
                 conn,
                 crdt,
                 permission,
+                token,
                 version,
                 outbox,
                 reply,
             } => {
-                let joined = self.join(conn, crdt, permission, &version, outbox);
+                let joined = self.join(conn, crdt, permission, token, &version, outbox);
                 let _ = reply.send(joined);
             }
+            // Updates reach the room after the connection decided to send
+            // them, so some come from peers the room has dropped since: ones
+            // a rotation closed (their link is retired), ones that
+            // overflowed, ones that left. Whoever is not a peer right now
+            // has no standing to write or to be relayed.
+            RoomCmd::Update { conn, crdt, .. }
+                if !self.peers.contains_key(&(conn, crdt.magic_bytes())) => {}
             RoomCmd::Update {
                 conn,
                 crdt,
@@ -138,6 +162,121 @@ impl RoomActor {
                 _ => self.ack(conn, crdt, batch_id, UpdateStatusCode::Unknown),
             },
             RoomCmd::Leave { conn, crdt } => self.drop_peer(conn, crdt),
+            RoomCmd::DsHello {
+                conn,
+                token,
+                access,
+                incarnation,
+                since_epoch,
+                outbox,
+                reply,
+            } => {
+                let joined = if self.ensure_ds().await
+                    && let Some(ds) = &mut self.ds
+                {
+                    let ctx = Ctx {
+                        db: &self.registry.db,
+                        project_id: &self.project_id,
+                        config: &self.registry.config.ds,
+                        retired_here: &self.retired_here,
+                    };
+                    let joined = ds
+                        .hello(
+                            &ctx,
+                            conn,
+                            token,
+                            access,
+                            (incarnation, since_epoch),
+                            outbox,
+                        )
+                        .await;
+                    // A refused hello sends no DsLeave later, so it must not
+                    // keep the room loaded.
+                    if joined {
+                        self.empty_since = None;
+                    }
+                    joined
+                } else {
+                    false
+                };
+                let _ = reply.send(joined);
+            }
+            RoomCmd::DsMessage { conn, msg } => self.ds_message(conn, msg).await,
+            RoomCmd::DsLeave { conn } => {
+                if let Some(ds) = &mut self.ds {
+                    ds.leave(conn);
+                }
+                self.note_idle();
+            }
+        }
+    }
+
+    /// Loads the group state on first use. False if the database failed.
+    async fn ensure_ds(&mut self) -> bool {
+        if self.ds.is_some() {
+            return true;
+        }
+        match DsState::load(&self.registry.db, &self.project_id).await {
+            Ok(ds) => {
+                self.ds = Some(ds);
+                true
+            }
+            Err(err) => {
+                tracing::error!(project = %self.project_id, %err, "failed to load group");
+                false
+            }
+        }
+    }
+
+    async fn ds_message(&mut self, conn: ConnId, msg: ClientMessage) {
+        let Some(ds) = &mut self.ds else { return };
+        let ctx = Ctx {
+            db: &self.registry.db,
+            project_id: &self.project_id,
+            config: &self.registry.config.ds,
+            retired_here: &self.retired_here,
+        };
+        let rotation = ds.message(&ctx, conn, msg).await;
+        self.note_idle();
+        if let Some(rotation) = rotation {
+            self.apply_rotation(rotation);
+        }
+    }
+
+    /// Closes the doc and presence connections that joined with a retired
+    /// token and remembers the tokens as retired. The delivery service
+    /// sessions were already told by the DS state, and stay open to read.
+    fn apply_rotation(&mut self, rotation: Rotation) {
+        let stale: Vec<(ConnId, [u8; 4])> = self
+            .peer_tokens
+            .iter()
+            .filter(|&(_, token)| rotation.tokens.contains(token))
+            .map(|(&key, _)| key)
+            .collect();
+        for token in rotation.tokens {
+            self.retired_here.insert(token, rotation.epoch);
+        }
+        for key in stale {
+            if let Some(outbox) = self.peers.get(&key) {
+                outbox.push(Outbound::Close(
+                    CLOSE_LINK_ROTATED,
+                    CLOSE_LINK_ROTATED_REASON,
+                ));
+            }
+            self.peers.remove(&key);
+            self.peer_tokens.remove(&key);
+            self.presence.remove(&key.0);
+        }
+        self.note_idle();
+    }
+
+    fn note_idle(&mut self) {
+        let ds_empty = self.ds.as_ref().is_none_or(DsState::is_empty);
+        if self.peers.is_empty() {
+            self.full_backfill = None;
+        }
+        if self.peers.is_empty() && ds_empty && self.empty_since.is_none() {
+            self.empty_since = Some(Instant::now());
         }
     }
 
@@ -146,9 +285,21 @@ impl RoomActor {
         conn: ConnId,
         crdt: CrdtType,
         permission: Permission,
+        token: String,
         version: &[u8],
         outbox: Outbox,
     ) -> bool {
+        if self.retired_here.contains_key(&token) {
+            outbox.push_message(&ProtocolMessage::JoinError {
+                crdt,
+                room_id: self.project_id.clone(),
+                code: JoinErrorCode::AuthFailed,
+                message: "auth_failed".into(),
+                receiver_version: None,
+                app_code: None,
+            });
+            return false;
+        }
         // Checked before the backfill is built, which for most versions
         // means copying the doc.
         let Some(backfill) = outbox.start_backfill(&self.project_id, crdt) else {
@@ -218,6 +369,7 @@ impl RoomActor {
             }
         }
         self.peers.insert((conn, crdt.magic_bytes()), outbox);
+        self.peer_tokens.insert((conn, crdt.magic_bytes()), token);
         self.empty_since = None;
         true
     }
@@ -423,13 +575,11 @@ impl RoomActor {
 
     fn drop_peer(&mut self, conn: ConnId, crdt: CrdtType) {
         self.peers.remove(&(conn, crdt.magic_bytes()));
+        self.peer_tokens.remove(&(conn, crdt.magic_bytes()));
         if crdt == CrdtType::LoroEphemeralStore {
             self.presence.remove(&conn);
         }
-        if self.peers.is_empty() {
-            self.empty_since = Some(Instant::now());
-            self.full_backfill = None;
-        }
+        self.note_idle();
     }
 }
 

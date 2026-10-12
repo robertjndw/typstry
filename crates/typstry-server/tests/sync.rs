@@ -24,7 +24,6 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tower::ServiceExt;
-use typstry_server::config::Config;
 use typstry_server::http::{AppState, router};
 use typstry_server::room::RoomConfig;
 use typstry_server::store::docs;
@@ -52,20 +51,7 @@ impl Server {
     }
 
     async fn start_with(data: &Path, config: RoomConfig, limits: ConnLimits) -> Self {
-        let pool = common::open_db(data).await;
-        let config = Config {
-            data_dir: data.to_owned(),
-            rooms: config,
-            limits,
-            ..Config::default()
-        };
-        let state = AppState::from_config(pool, &config);
-        let app = common::app(state.clone(), data);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let common::Served { addr, state, task } = common::serve(data, config, limits).await;
         Self { addr, state, task }
     }
 
@@ -1015,6 +1001,28 @@ async fn answers_text_ping() {
         .unwrap()
         .unwrap();
     assert_eq!(reply, Message::text("pong"));
+}
+
+#[tokio::test]
+async fn silent_connection_is_closed_as_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let mut c = server.connect().await;
+    // The connection's 1 s fragment sweep must not keep pushing the idle
+    // deadline back. Paused time skips ahead instead of waiting 90 s.
+    tokio::time::pause();
+    let close = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match c.ws.next().await {
+                Some(Ok(Message::Close(frame))) => return frame,
+                Some(Ok(_)) => {}
+                other => panic!("socket ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a silent connection was never closed");
+    assert_eq!(close.unwrap().reason.as_str(), "idle_timeout");
 }
 
 #[tokio::test]

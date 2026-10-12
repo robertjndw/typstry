@@ -3,7 +3,8 @@ import { LoroDoc } from "loro-crdt";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { toBase64 } from "@/crypto/bytes";
+import { newProject } from "@/crypto/test-utils";
 import { initProject } from "@/doc/schema";
 import { IDENTITY_KEY, resetIdentityCache } from "@/presence/identity";
 import {
@@ -16,8 +17,9 @@ import { routes } from "@/router";
 import type { ConnectOptions } from "@/sync/connection";
 
 const seed = initProject(new LoroDoc(), { title: "Server seeded" });
-const KEY = generateEditSecret();
-const VIEW_KEY = (await importProjectKey(KEY)).viewSecret;
+const keys = newProject();
+const KEY = keys.link.toBase64url();
+const VIEW_KEY = keys.link.viewSecret();
 
 const sync = vi.hoisted(() => ({
   connected: [] as ConnectOptions[],
@@ -47,8 +49,15 @@ function renderProject(
 ) {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () =>
-      Response.json({ projectId, permission }, { status: 200 }),
+    vi.fn(async (input: RequestInfo | URL) =>
+      String(input).endsWith("/mls")
+        ? Response.json({
+            incarnation: 0,
+            epoch: 0,
+            groupInfo: "",
+            keyring: toBase64(keys.signed),
+          })
+        : Response.json({ projectId, permission }, { status: 200 }),
     ),
   );
   const router = createMemoryRouter(routes, {
@@ -98,7 +107,7 @@ describe("project route", () => {
 
     const [opts] = sync.connected;
     expect(opts).toMatchObject({ projectId: "proj1", canWrite: true });
-    expect(opts!.key.editSecret).toBe(KEY);
+    expect(opts!.crypto.editSecret).toBe(KEY);
   });
 
   it("asks for the full link when the key is missing", async () => {

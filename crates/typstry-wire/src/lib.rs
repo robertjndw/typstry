@@ -1,14 +1,23 @@
 //! What typstry clients and the sync server put on the wire: `%ELO` record
 //! containers, update fragmentation and, behind the `crypto` feature, the
-//! end-to-end encryption the browser client uses.
+//! end-to-end encryption the clients use and, behind `mls`, the MLS group
+//! that authenticates and rotates it. `mls_frame` and `ds`, the delivery
+//! service side of MLS, and `token` need no crypto, so the server uses them
+//! too.
 //!
 //! Everything here must stay byte-compatible with the web client, which
 //! speaks the same protocol through the npm `loro-protocol` package.
 
+mod codec;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod ds;
 pub mod elo;
 pub mod fragment;
+#[cfg(feature = "mls")]
+pub mod mls;
+pub mod mls_frame;
+pub mod token;
 
 /// Version of the HTTP and WebSocket contract between clients and the
 /// server. Bump it when a client starts relying on a new endpoint or field,

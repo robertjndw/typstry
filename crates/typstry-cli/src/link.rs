@@ -5,7 +5,8 @@ use std::fmt;
 use std::fmt::Write as _;
 
 use anyhow::{Context, bail};
-use typstry_wire::crypto::{CryptoError, ProjectKey};
+use typstry_wire::crypto::{CryptoError, LinkSecret};
+use typstry_wire::ds::DS_PATH;
 use typstry_wire::{PROTOCOL_QUERY, PROTOCOL_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +14,7 @@ pub struct ShareLink {
     /// `http(s)://host[:port]`, plus any path the app is served under.
     pub origin: String,
     pub token: String,
-    /// base64url, exactly as it appears in the fragment.
+    /// The link secret, base64url exactly as it appears in the fragment.
     pub key: String,
 }
 
@@ -36,7 +37,7 @@ impl ShareLink {
         if base.is_empty() || token.is_empty() || token.contains('/') {
             bail!("not a project link: expected .../p/<token>#<key>");
         }
-        match ProjectKey::from_base64url(key) {
+        match LinkSecret::from_base64url(key) {
             Ok(_) => {}
             Err(err @ CryptoError::NewerVersion(_)) => bail!("the key in the link was {err}"),
             Err(err) => return Err(err).context("the key in the link is malformed"),
@@ -69,15 +70,24 @@ impl fmt::Display for ShareLink {
     }
 }
 
-/// The WebSocket endpoint that belongs to an http origin, with our
+/// The doc WebSocket endpoint that belongs to an http origin, with our
 /// protocol version, which the server checks before the upgrade.
 pub fn ws_url(origin: &str) -> anyhow::Result<String> {
+    socket_url(origin, "/ws")
+}
+
+/// The endpoint of the MLS delivery service.
+pub fn ds_url(origin: &str) -> anyhow::Result<String> {
+    socket_url(origin, DS_PATH)
+}
+
+fn socket_url(origin: &str, path: &str) -> anyhow::Result<String> {
     let origin = origin.trim_end_matches('/');
     let query = format!("{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
     if let Some(rest) = origin.strip_prefix("https://") {
-        Ok(format!("wss://{rest}/ws?{query}"))
+        Ok(format!("wss://{rest}{path}?{query}"))
     } else if let Some(rest) = origin.strip_prefix("http://") {
-        Ok(format!("ws://{rest}/ws?{query}"))
+        Ok(format!("ws://{rest}{path}?{query}"))
     } else {
         bail!("server origin {origin:?} is not an http(s) URL")
     }
@@ -119,7 +129,8 @@ fn percent_decode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const KEY: &str = "AQABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
+    // An edit secret: kind byte 1, then 32 key bytes.
+    const KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
 
     #[test]
     fn parses_share_links() {

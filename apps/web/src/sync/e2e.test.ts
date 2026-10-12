@@ -6,11 +6,8 @@
 import { EphemeralStore, LoroDoc } from "loro-crdt";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  generateEditSecret,
-  importProjectKey,
-  type ProjectKey,
-} from "@/crypto/project-key";
+import type { ProjectCrypto } from "@/crypto/project-crypto";
+import { newProject, viewerOf } from "@/crypto/test-utils";
 import { getText } from "@/doc/fs-ops";
 import { ProjectDoc, initProject, starterContent } from "@/doc/schema";
 
@@ -30,7 +27,7 @@ afterEach(() => {
 function connect(
   projectId: string,
   token: string,
-  key: ProjectKey,
+  crypto: ProjectCrypto,
   opts: {
     canWrite?: boolean;
     ephemeral?: EphemeralStore;
@@ -42,7 +39,7 @@ function connect(
   const conn = connectProject({
     projectId,
     token,
-    key,
+    crypto,
     canWrite: opts.canWrite ?? true,
     doc,
     ephemeral: opts.ephemeral,
@@ -56,10 +53,10 @@ function connect(
 /** What the creator's browser does: register, then seed the doc locally. */
 async function create(title: string) {
   const created = await createProject({ baseUrl });
-  const key = await importProjectKey(generateEditSecret());
+  const project = newProject();
   const seed = new LoroDoc();
   initProject(seed, { title });
-  return { ...created, key, seed };
+  return { ...created, project, key: project.crypto, seed };
 }
 
 function mainText(project: ProjectDoc) {
@@ -121,9 +118,14 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     });
 
     // A late joiner loads the persisted state.
-    const c = connect(created.projectId, created.viewToken, created.key, {
-      canWrite: false,
-    });
+    const c = connect(
+      created.projectId,
+      created.viewToken,
+      viewerOf(created.project),
+      {
+        canWrite: false,
+      },
+    );
     await c.conn.synced;
     await eventually(() => expect(c.doc.toJSON()).toEqual(a.doc.toJSON()));
   });
@@ -137,10 +139,15 @@ describe.skipIf(!enabled)("sync against a running server", () => {
       doc: created.seed,
     });
     await editor.conn.synced;
-    const viewer = connect(created.projectId, created.viewToken, created.key, {
-      ephemeral: viewerStore,
-      canWrite: false,
-    });
+    const viewer = connect(
+      created.projectId,
+      created.viewToken,
+      viewerOf(created.project),
+      {
+        ephemeral: viewerStore,
+        canWrite: false,
+      },
+    );
     await viewer.conn.synced;
     await eventually(() => expect(viewer.project.mainFile).not.toBeNull());
 
@@ -176,7 +183,7 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     await new Promise((r) => setTimeout(r, 200));
 
     const onDecryptError = vi.fn();
-    const wrongKey = await importProjectKey(generateEditSecret());
+    const wrongKey = newProject().crypto;
     const intruder = connect(created.projectId, created.viewToken, wrongKey, {
       canWrite: false,
       onDecryptError,

@@ -4,6 +4,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useRoster } from "@/mls/context";
 import { usePresenceSummary } from "@/presence/context";
 import { initials, type Identity } from "@/presence/identity";
 import { useProject } from "@/project/context";
@@ -12,9 +13,19 @@ const MAX_SHOWN = 5;
 
 /** Avatars of everybody else here; clicking one opens their file. */
 export function PresenceBar() {
-  const peers = usePresenceSummary();
+  const summary = usePresenceSummary();
+  const roster = useRoster();
   const { index, openFile } = useProject();
-  if (peers.length === 0) return null;
+  if (summary.length === 0) return null;
+
+  // A name the roster vouches for replaces the one the peer claims for
+  // itself: the claim is whatever its page sent, the roster entry is signed.
+  const peers = summary.map((peer) => {
+    const member = roster?.memberOfPeer(peer.peerId);
+    return member
+      ? { ...peer, name: member.name, color: member.color, verified: true }
+      : { ...peer, verified: false };
+  });
 
   const shown = peers.slice(0, MAX_SHOWN);
   const hidden = peers.slice(MAX_SHOWN);
@@ -45,7 +56,10 @@ export function PresenceBar() {
             </TooltipTrigger>
             <TooltipContent>
               {peer.name}
-              {path && <span className="opacity-70">in {path}</span>}
+              {peer.verified && (
+                <span className="opacity-70"> · verified member</span>
+              )}
+              {path && <span className="opacity-70"> · in {path}</span>}
             </TooltipContent>
           </Tooltip>
         );

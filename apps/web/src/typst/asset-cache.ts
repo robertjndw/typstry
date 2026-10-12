@@ -1,4 +1,4 @@
-import { ownBuffer } from "@/crypto/project-key";
+import { ownBuffer, toHex } from "@/crypto/bytes";
 import { apiFetch, ApiError, blobUrl } from "@/sync/api";
 
 import { BLOB_CACHE } from "./cache-names";
@@ -8,9 +8,7 @@ export async function contentHash(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(
     await crypto.subtle.digest("SHA-256", ownBuffer(bytes)),
   );
-  let hex = "";
-  for (const b of digest) hex += b.toString(16).padStart(2, "0");
-  return `sha256:${hex}`;
+  return `sha256:${toHex(digest)}`;
 }
 
 // Assets go up to 25 MB each, so a count bound alone could pin hundreds of

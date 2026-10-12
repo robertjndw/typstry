@@ -18,6 +18,8 @@ use loro_protocol::{
     parse_elo_record_header,
 };
 
+use crate::codec::plausible_count;
+
 pub const IV_LEN: usize = 12;
 
 pub type Iv = [u8; IV_LEN];
@@ -58,18 +60,6 @@ fn counter(value: u64) -> Result<u64, String> {
         return Err(format!("counter {value} does not fit a Loro counter"));
     }
     Ok(value)
-}
-
-/// Reads the leading uleb128 count and checks it against the bytes left.
-/// The library pre-allocates from that count, so a hostile one like 2^60
-/// would abort the process before any bounds check runs.
-fn plausible_count(reader: &mut BytesReader<'_>, min_entry_bytes: usize) -> Result<u64, String> {
-    let count = reader.read_uleb128()?;
-    let room = (reader.remaining() / min_entry_bytes) as u64;
-    if count > room {
-        return Err(format!("count {count} exceeds the remaining bytes"));
-    }
-    Ok(count)
 }
 
 impl<'a> SealedRecord<'a> {

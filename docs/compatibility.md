@@ -10,9 +10,12 @@ wholesale.
 | What                           | Constant                                        | Where                                                                                    | Bump when                                                                                                                             |
 | ------------------------------ | ----------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | Doc layout (`meta.schema`)     | `SCHEMA_VERSION`                                | `crates/typstry-doc/src/lib.rs`, `apps/web/src/doc/schema.ts`                            | An older client writing into the doc would corrupt it. Additive data older clients can ignore (like `deletedVersions`) needs no bump. |
-| Sealed blob / presence         | `SEAL_VERSION`                                  | `crates/typstry-wire/src/crypto.rs`, `apps/web/src/crypto/project-key.ts`                | The sealed layout or key derivation changes.                                                                                          |
+| Sealed blob / presence         | `SEAL_VERSION`                                  | `crates/typstry-wire/src/crypto.rs` (the web app runs the same code as wasm)             | The sealed layout or key derivation changes.                                                                                          |
 | Doc record ciphertext          | `RECORD_VERSION`                                | same                                                                                     | The record body, signature or key derivation changes.                                                                                 |
+| Keyring                        | `KEYRING_VERSION`                               | same                                                                                     | The keyring's plain layout changes. Readers refuse a newer one.                                                                       |
 | Secrets in links               | `SECRET_EDIT_V1`, `SECRET_VIEW_V1` (kind bytes) | same                                                                                     | Never bumped: a new secret format gets a new kind byte, and the old ones stay readable.                                               |
+| Saved MLS group state          | `MLS_STATE_VERSION` (first byte)                | `crates/typstry-wire/src/mls/storage.rs`; stored in `.typstry/mls.bin` and IndexedDB     | The saved layout changes, or the openmls pin below moves to a release that reads or writes group state differently.                   |
+| MLS delivery service messages  | `DS_VERSION` (in `hello` / `ready`)             | `crates/typstry-wire/src/ds.rs`                                                          | The `/ws/mls` message layout changes. Peers on a newer version are refused, not guessed at.                                           |
 | Client/server protocol         | `PROTOCOL_VERSION`                              | `crates/typstry-wire/src/lib.rs`, `apps/web/src/sync/protocol.ts`, served at `/api/info` | The HTTP or WebSocket contract changes (new endpoint or field clients rely on, changed response or message).                          |
 | Oldest client served           | `MIN_PROTOCOL_VERSION`                          | `crates/typstry-wire/src/lib.rs`                                                         | Only when older clients can no longer work correctly; everyone below it is told to upgrade or reload.                                 |
 | CLI mailbox                    | `mailbox::PROTOCOL`                             | `crates/typstry-cli/src/mailbox.rs`                                                      | An existing request or response changes meaning or shape. New requests need no bump.                                                  |
@@ -22,7 +25,27 @@ wholesale.
 | Browser caches                 | `BLOB_CACHE`, `FONT_CACHE` suffixes             | `apps/web/src/typst/cache-names.ts`                                                      | The cached payload changes. Old caches are pruned on boot.                                                                            |
 | Server database                | sqlx migrations                                 | `crates/typstry-server/migrations/`                                                      | Any schema change.                                                                                                                    |
 
-Keep the Rust and TypeScript copies of a constant equal.
+Keep the Rust and TypeScript copies of a constant equal. The crypto and
+MLS constants live in Rust only; the web app reads them from the wasm.
+
+## The openmls pin
+
+`openmls` is `=0.9.1` (with `openmls_basic_credential` and
+`openmls_rust_crypto` `=0.6.0`, `openmls_traits` `=0.6.0`) in the workspace
+`Cargo.toml`. It is 0.x and its group state is not a stable format, so the
+whole set is pinned exactly. Our saved state (`MLS_STATE_VERSION`) embeds
+what openmls stores, so a new openmls release needs one of two things in
+the same change as the bump:
+
+- an import step that reads state written by the old pin, bumping
+  `MLS_STATE_VERSION` if the saved layout changes, or
+- a fallback that drops state it cannot read, so the device joins its
+  groups again with an external commit (what `load_mls` does for a damaged
+  file). Rejoining loses the device's old leaf, so it shows up as a new
+  member.
+
+Also check that the wire format of commits and GroupInfo stayed
+compatible, since devices on the old and new pin share a group.
 
 ## Rules
 
@@ -40,9 +63,14 @@ Keep the Rust and TypeScript copies of a constant equal.
 
 ## Frozen fixtures
 
+Nothing was released before MLS, so v1 was regenerated for it (a single
+project key became link secret, keyring and group) rather than adding a
+v2. The directory is frozen from the first release on.
+
 `fixtures/compat/v<N>/` holds data as typstry wrote it at format version N:
-a project doc, encrypted records, blob and presence, secrets and share
-links, and the CLI's `.typstry/` files. Each directory is generated once
+a project doc, the signed keyring, encrypted records, blob, profile and
+presence, secrets and share links, and the CLI's `.typstry/` files
+(including the saved group state). Each directory is generated once
 and then never regenerated or edited. The `compat` tests in typstry-wire,
 typstry-doc, typstry-cli and `apps/web/src/compat.test.ts` read every
 `v<N>` with the current code.
