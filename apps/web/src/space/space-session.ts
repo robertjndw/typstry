@@ -125,9 +125,14 @@ export interface SpaceSessionOptions {
   onRefused?: () => void;
   /**
    * A rotation was made or learned here and its links are stored already;
-   * remember whatever else belongs to the space.
+   * remember whatever else belongs to the space. `replaced` is the token the
+   * session was on when the rotation happened.
    */
-  onRotated?: (rotation: StoredRotation, spaceId: string) => void;
+  onRotated?: (
+    rotation: StoredRotation,
+    spaceId: string,
+    replaced: string,
+  ) => void;
 }
 
 interface State {
@@ -436,7 +441,7 @@ export class SpaceSession {
       // back into the space, and nothing else holds them.
       onRotated: (rotation) => {
         storeRotation(spaceId, rotation);
-        this.opts.onRotated?.(rotation, spaceId);
+        this.opts.onRotated?.(rotation, spaceId, this.token);
         this.rotated = true;
         this.set({
           followed: { token: rotation.token, link: rotation.link },

@@ -1532,10 +1532,7 @@ mod tests {
         ));
         // A zero version byte is corruption, not a newer format.
         sealed[0] = 0;
-        assert!(matches!(
-            keys.open_blob(&sealed),
-            Err(CryptoError::Decrypt)
-        ));
+        assert!(matches!(keys.open_blob(&sealed), Err(CryptoError::Decrypt)));
 
         let record = keys.encrypt_delta(&editor(), 7, 0, 3, b"ops").unwrap();
         let parsed = SealedRecord::parse(&record).unwrap();

@@ -3,7 +3,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
   useSyncExternalStore,
 } from "react";
@@ -110,13 +109,6 @@ export function useProjectSession(
     () => loadIdentity() ?? provisionalIdentity(),
   );
   const identity = opts.identity ?? fallbackIdentity;
-  // The session outlives a rotation's switch to new tokens, so its callback
-  // reads the token the page is on now, not the one it was built with.
-  const currentToken = useRef(token);
-  useEffect(() => {
-    currentToken.current = token;
-  }, [token]);
-
   const [session] = useState(
     () =>
       new SpaceSession({
@@ -131,8 +123,8 @@ export function useProjectSession(
           return kind === null ? undefined : kind === DOC_KIND.project;
         },
         refusedMessage: NOT_A_PROJECT,
-        onRotated: (rotation, spaceId) =>
-          void recordRotation(spaceId, rotation, currentToken.current),
+        onRotated: (rotation, spaceId, replaced) =>
+          void recordRotation(spaceId, rotation, replaced),
       }),
   );
   const snap = useSyncExternalStore(session.subscribe, session.snapshot);
