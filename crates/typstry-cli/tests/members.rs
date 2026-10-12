@@ -5,7 +5,8 @@
 mod common;
 
 use common::{
-    Server, assert_private, binary, binary_with, clone, failed, read, stderr, stdout, temp, typstry,
+    Server, assert_private, binary, binary_with, clone, config_in, failed, read, run_as, stderr,
+    stdout, temp, typstry,
 };
 
 use std::fs;
@@ -18,7 +19,7 @@ use typstry_cli::link::ShareLink;
 use typstry_cli::mls::{Ds, Reply};
 use typstry_cli::state::{Config, STATE_DIR, StateDir};
 use typstry_doc::init::starter_content;
-use typstry_wire::mls::{ProjectGroup, SubmitPayload};
+use typstry_wire::mls::{SpaceGroup, SubmitPayload};
 
 fn config(dir: &Path) -> Config {
     StateDir::peek_config(dir).unwrap()
@@ -236,7 +237,7 @@ async fn resetting_the_links_invalidates_the_old_ones() {
 /// `send`, delivered to the server with the reply never seen.
 async fn interrupted_rotation(dir: &Path, send: bool) -> SubmitPayload {
     let path = dir.join(STATE_DIR).join("mls.bin");
-    let mut group = ProjectGroup::import_state(&fs::read(&path).unwrap()).unwrap();
+    let mut group = SpaceGroup::import_state(&fs::read(&path).unwrap()).unwrap();
     let payload = group.reset_links().unwrap();
     fs::write(&path, group.export_state().as_slice()).unwrap();
     if send {
@@ -371,7 +372,7 @@ async fn a_group_that_cannot_be_followed_does_not_stop_doc_sync() {
     // a starts the group over, so b has to join again; with a wrong key in
     // its config that join fails.
     let path = a.join(STATE_DIR).join("mls.bin");
-    let group = ProjectGroup::import_state(&fs::read(&path).unwrap()).unwrap();
+    let group = SpaceGroup::import_state(&fs::read(&path).unwrap()).unwrap();
     let (_next, reset) = group
         .reset(b"{\"name\":\"a\",\"color\":\"#000\"}", None)
         .unwrap();
@@ -705,7 +706,7 @@ async fn the_owner_key_survives_a_rejoin_after_the_log_was_pruned() {
     // Two joins later, the server keeps only the newest commit, so o can no
     // longer follow and has to join again.
     let state = |dir: &Path| {
-        ProjectGroup::import_state(&fs::read(dir.join(STATE_DIR).join("mls.bin")).unwrap()).unwrap()
+        SpaceGroup::import_state(&fs::read(dir.join(STATE_DIR).join("mls.bin")).unwrap()).unwrap()
     };
     let head = state(&f);
     assert_eq!(state(&o).epoch() + 2, head.epoch());
@@ -736,4 +737,39 @@ async fn the_owner_key_survives_a_rejoin_after_the_log_was_pruned() {
     stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
     typstry(&f, &["pull"]).await.unwrap();
     assert_eq!(config(&f).token, config(&o).token);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_the_person_was_removed_from_is_unavailable_in_the_list() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let owner_cfg = config_in(&work, "owner-cfg");
+    let member_cfg = config_in(&work, "member-cfg");
+    let a = init_as(&server, &work, "shared", &owner_cfg).await;
+    let edit = stdout(&run_as(&a, &owner_cfg, &["link", "--edit"]).await);
+    let b = clone_as(edit.trim(), &work, "b", &member_cfg).await;
+    let listed = stdout(&run_as(&work, &member_cfg, &["list"]).await);
+    assert!(!listed.contains("unavailable"), "{listed}");
+
+    let leaf = other_leaf(
+        &stdout(&run_as(&a, &owner_cfg, &["members"]).await),
+        "editor",
+    );
+    stdout(&run_as(&a, &owner_cfg, &["members", "remove", &leaf]).await);
+
+    // The removed folder finds out on its next sync, and the directory with it.
+    let pulled = run_as(&b, &member_cfg, &["pull"]).await;
+    assert!(
+        failed(&pulled).contains("you were removed"),
+        "{}",
+        failed(&pulled)
+    );
+    let listed = stdout(&run_as(&work, &member_cfg, &["list"]).await);
+    assert!(
+        listed.contains("unavailable: you were removed from this project"),
+        "{listed}"
+    );
+    // The owner is not affected.
+    let listed = stdout(&run_as(&work, &owner_cfg, &["list"]).await);
+    assert!(!listed.contains("unavailable"), "{listed}");
 }

@@ -1,8 +1,8 @@
 //! One WebSocket connection speaking Loro Protocol v1.
 //!
 //! A connection can join several rooms; for typstry that is `%ELO` (the
-//! encrypted doc) and `%EPH` (encrypted presence) of the same project.
-//! Room ids are project ids and the join auth is the share token as UTF-8.
+//! encrypted doc) and `%EPH` (encrypted presence) of the same space.
+//! Room ids are space ids and the join auth is the share token as UTF-8.
 
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use super::rate::TokenBucket;
 use super::{CLOSE_PROTOCOL_ERROR, IDLE_TIMEOUT, Socket};
 use crate::room::{ConnId, JoinOutcome, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
 use crate::state::AppState;
-use crate::store::projects::{self, Permission};
+use crate::store::spaces::{self, Permission};
 
 /// Frames buffered per connection before the client counts as too slow.
 /// Only small frames ever reach this many; big ones hit the byte budget in
@@ -184,9 +184,9 @@ impl Conn {
             return;
         }
         let token = std::str::from_utf8(&auth).unwrap_or_default();
-        let resolved = projects::resolve_token(&self.state.db, token).await;
+        let resolved = spaces::resolve_token(&self.state.db, token).await;
         let permission = match resolved {
-            Ok(Some((project_id, permission))) if project_id == room_id => permission,
+            Ok(Some((space_id, permission))) if space_id == room_id => permission,
             Ok(_) => {
                 // Unknown rooms and wrong tokens look the same on purpose.
                 self.join_error(crdt, &room_id, JoinErrorCode::AuthFailed, "auth_failed");

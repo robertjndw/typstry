@@ -66,7 +66,7 @@ test("a new device pairs with a code, gets the projects and is one person", asyn
     received.getByRole("link", { name: "Shared thesis" }),
   ).toBeVisible();
 
-  // The project is in the recent list and opens with the key it was given.
+  // The project is in the project list and opens with the key it was given.
   await other.goto("/");
   await other.getByRole("link", { name: /Shared thesis/ }).click();
   await expect(syncStatus(other)).toHaveText("Connected");
@@ -89,7 +89,7 @@ test("the paired device is the owner and can remove a member", async ({
   page,
   browser,
 }) => {
-  const projectUrl = await createProject(page, "Owned");
+  await createProject(page, "Owned");
   const editLink = await shareLink(page, "Can edit");
   await page.goto("/");
   const code = await showCode(page);
@@ -116,15 +116,9 @@ test("the paired device is the owner and can remove a member", async ({
   const list = dialog.getByRole("list", { name: "Members" });
   await expect(list.getByRole("listitem")).toHaveCount(2);
   await expect(list.getByRole("listitem").first()).toContainText("Owner");
-  // The owner key only reaches the new device from one that holds it, and
-  // the holder has not had the project open since the new device joined.
+  // The owner key came through the directory, so the first device does not
+  // have to be online to hand it over.
   const remove = dialog.getByRole("button", { name: "Remove Third Tester" });
-  await expect(
-    dialog.getByText(/does not have the project's owner key yet/),
-  ).toBeVisible();
-  await expect(remove).toBeDisabled();
-  await page.goto(projectUrl);
-  await expect(syncStatus(page)).toHaveText("Connected");
   await expect(remove).toBeEnabled();
   await remove.click();
   const confirm = other.getByRole("dialog", { name: "Remove Third Tester?" });

@@ -29,12 +29,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { guard, type ProjectCrypto } from "@/crypto/project-crypto";
+import { guard, type SpaceCrypto } from "@/crypto/space-crypto";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { LinkSecret } from "@/crypto/wasm";
 import { cn } from "@/lib/utils";
 import type { MlsSession } from "@/mls/session";
-import { loadProjectKey, loadShareLinks, projectUrl } from "@/project/recent";
+import { projectUrl } from "@/project/recent";
+import { loadSpaceKey, loadShareLinks } from "@/space/space-links";
 import type { SharePermission } from "@/sync/api";
 
 export interface ShareDialogProps {
@@ -42,7 +43,7 @@ export interface ShareDialogProps {
   /** The token this page was opened with. */
   token: string;
   /** Its secrets are part of every link and never sent to the server. */
-  crypto: ProjectCrypto;
+  crypto: SpaceCrypto;
   permission: SharePermission;
   /** From the share lookup; set for edit links, so any editor can pass on a view link. */
   viewToken?: string;
@@ -58,7 +59,7 @@ export interface ShareDialogProps {
  */
 function secretsOf(
   stored: string | null,
-  crypto: ProjectCrypto,
+  crypto: SpaceCrypto,
 ): { editSecret: string | null; viewSecret: string } {
   try {
     if (stored) {
@@ -105,7 +106,7 @@ export function ShareDialog({
   // Read on open so links saved in another tab show up.
   const links = open ? loadShareLinks(projectId) : null;
   const { editSecret, viewSecret } = secretsOf(
-    open ? loadProjectKey(projectId) : null,
+    open ? loadSpaceKey(projectId) : null,
     crypto,
   );
   const editToken =

@@ -60,8 +60,8 @@ export function Pair() {
           Add a device
         </h1>
         <p className="text-sm text-muted-foreground">
-          Pair this browser with another device of yours. It gets your projects
-          and edits them as you.
+          Pair this browser with another device of yours. It gets your projects,
+          including the ones you add later, and edits them as you.
         </p>
       </div>
       {state ? (

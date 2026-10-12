@@ -1,5 +1,5 @@
 import { mimeOf } from "@/assets/file-types";
-import { BLOB_OVERHEAD, type ProjectCrypto } from "@/crypto/project-crypto";
+import { BLOB_OVERHEAD, type SpaceCrypto } from "@/crypto/space-crypto";
 import type { AssetInfo } from "@/doc/schema";
 import { ApiError, MAX_UPLOAD_BYTES, uploadBlob } from "@/sync/api";
 import { AssetCache, contentHash } from "@/typst/asset-cache";
@@ -19,7 +19,7 @@ let sharedCache: AssetCache | null = null;
 
 export function projectAssets(
   token: string,
-  crypto: ProjectCrypto,
+  crypto: SpaceCrypto,
   opts: { cache?: AssetCache; baseUrl?: string } = {},
 ): ProjectAssets {
   const cache = opts.cache ?? (sharedCache ??= new AssetCache());

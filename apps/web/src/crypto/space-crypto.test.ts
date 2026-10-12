@@ -8,9 +8,9 @@ import {
   KeyMismatchError,
   NewerVersionError,
   NotEditorError,
-  ProjectCrypto,
+  SpaceCrypto,
   UnknownGenerationError,
-} from "./project-crypto";
+} from "./space-crypto";
 import { secretKind } from "./secret";
 import { editorOf, newProject, viewerOf } from "./test-utils";
 import * as wasm from "./wasm";
@@ -50,7 +50,7 @@ describe("secrets", () => {
   });
 });
 
-describe("ProjectCrypto", () => {
+describe("SpaceCrypto", () => {
   it("remembers which device signed what each peer wrote", () => {
     const project = newProject();
     const reader = viewerOf(project);
@@ -98,7 +98,7 @@ describe("ProjectCrypto", () => {
     const project = newProject();
     const stranger = newProject();
     // Same keys, but a signer attested by another project's link.
-    const forger = new ProjectCrypto(
+    const forger = new SpaceCrypto(
       project.link,
       new wasm.DocKeys(project.keyring),
       wasm.Signer.attested(stranger.link, 1),
@@ -113,11 +113,11 @@ describe("ProjectCrypto", () => {
     const record = project.crypto.encryptDelta(span, text("x"));
     expect(() => other.crypto.decryptRecord(record)).toThrow(KeyMismatchError);
     expect(() =>
-      ProjectCrypto.open(other.link.toBase64url(), project.signed),
+      SpaceCrypto.open(other.link.toBase64url(), project.signed),
     ).toThrow(BadSignatureError);
 
     const next = project.keyring.next(project.link);
-    const rotated = new ProjectCrypto(project.link, new wasm.DocKeys(next));
+    const rotated = new SpaceCrypto(project.link, new wasm.DocKeys(next));
     expect(() =>
       project.crypto.decryptRecord(rotated.encryptDelta(span, text("y"))),
     ).toThrow(UnknownGenerationError);
@@ -127,7 +127,7 @@ describe("ProjectCrypto", () => {
 
     const bytes = fromBase64Url(project.link.toBase64url())!;
     expect(() =>
-      ProjectCrypto.open(
+      SpaceCrypto.open(
         toBase64Url(Uint8Array.from([9, ...bytes.slice(1), 1])),
         project.signed,
       ),
@@ -154,7 +154,7 @@ describe("MLS group", () => {
     const link = wasm.LinkSecret.generateEdit();
     const device = wasm.DeviceKey.generate().export();
     const graph = wasm.PersonGraph.genesis(device).encode();
-    const { group, message: init } = wasm.ProjectGroup.create(
+    const { group, message: init } = wasm.SpaceGroup.create(
       link,
       profile,
       device,
@@ -166,7 +166,7 @@ describe("MLS group", () => {
     expect(group.members()[0]).toMatchObject({ role: "owner", isSelf: true });
 
     // The delivery service, reduced to storing what Init and Submit carry.
-    const { group: joiner, message: submit } = wasm.ProjectGroup.joinExternal(
+    const { group: joiner, message: submit } = wasm.SpaceGroup.joinExternal(
       link,
       init.groupInfo,
       init.keyring,
@@ -190,8 +190,8 @@ describe("MLS group", () => {
     );
     expect(result.type).toBe("removed");
 
-    // The signer and doc keys feed ProjectCrypto.
-    const crypto = new ProjectCrypto(
+    // The signer and doc keys feed SpaceCrypto.
+    const crypto = new SpaceCrypto(
       group.link(),
       group.docKeys(),
       group.signer(),
@@ -210,7 +210,7 @@ describe("MLS group", () => {
       text("x"),
     );
 
-    const restored = wasm.ProjectGroup.importState(group.exportState());
+    const restored = wasm.SpaceGroup.importState(group.exportState());
     expect(restored.epoch).toBe(group.epoch);
   });
 

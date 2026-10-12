@@ -2,14 +2,9 @@
 import { EphemeralStore } from "loro-crdt";
 import { describe, expect, it, vi } from "vitest";
 
-import { ProjectCrypto } from "@/crypto/project-crypto";
+import { SpaceCrypto } from "@/crypto/space-crypto";
 import { newProject } from "@/crypto/test-utils";
-import {
-  DeviceKey,
-  LinkSecret,
-  PersonGraph,
-  ProjectGroup,
-} from "@/crypto/wasm";
+import { DeviceKey, LinkSecret, PersonGraph, SpaceGroup } from "@/crypto/wasm";
 
 import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
 
@@ -98,13 +93,13 @@ describe("EphemeralStoreAdaptor", () => {
     const link = LinkSecret.generateEdit();
     const profile = new TextEncoder().encode("{}");
     const seed = DeviceKey.generate().export();
-    const { group: a, message: init } = ProjectGroup.create(
+    const { group: a, message: init } = SpaceGroup.create(
       link,
       profile,
       seed,
       PersonGraph.genesis(seed).encode(),
     );
-    const { group: b, message: submit } = ProjectGroup.joinExternal(
+    const { group: b, message: submit } = SpaceGroup.joinExternal(
       link,
       init.groupInfo,
       init.keyring,
@@ -113,15 +108,15 @@ describe("EphemeralStoreAdaptor", () => {
     );
     a.processCommit(submit.epoch, submit.commit);
     b.confirmPending();
-    const memberOf = (group: ProjectGroup) => {
-      const crypto = new ProjectCrypto(link, group.docKeys(), group.signer());
+    const memberOf = (group: SpaceGroup) => {
+      const crypto = new SpaceCrypto(link, group.docKeys(), group.signer());
       crypto.setGroupKeys(group.docKeys(), group.signer(), group.presenceKey());
       return crypto;
     };
     const victim = memberOf(a);
     const attacker = memberOf(b);
 
-    const send = async (crypto: ProjectCrypto, entries: string[]) => {
+    const send = async (crypto: SpaceCrypto, entries: string[]) => {
       const remote = new EphemeralStore(30_000);
       const adaptor = new EphemeralStoreAdaptor(remote, crypto);
       const rc = ctx();

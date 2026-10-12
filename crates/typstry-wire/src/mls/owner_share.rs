@@ -1,6 +1,6 @@
 //! The owner key shares a leaf carries in extension `0xff03`.
 //!
-//! The secret of the project's owner key (see [`crate::owner`]) lives only on
+//! The secret of the space's owner key (see [`crate::owner`]) lives only on
 //! the owner's devices. When one of them holds the current secret and sees
 //! another owner device in the tree without it, it puts an entry for that
 //! device into its own leaf: the secret, HPKE-sealed to the other leaf's
@@ -63,7 +63,7 @@ pub struct OwnerShares {
 }
 
 /// What a share is bound to besides its recipient: the group, and the leaf
-/// that carries it, so an entry copied into another leaf or project does
+/// that carries it, so an entry copied into another leaf or space does
 /// not open.
 #[derive(Debug, Clone, Copy)]
 pub struct ShareScope<'a> {
@@ -71,17 +71,19 @@ pub struct ShareScope<'a> {
     pub sender: &'a PublicKey,
 }
 
-fn info(
+/// `bound` is what the sealed value is pinned to: the owner key here, the
+/// binding tag for [`super::person_share`].
+pub(super) fn info(
     context: &[u8],
     scope: &ShareScope<'_>,
-    owner_key: &OwnerKey,
+    bound: &[u8],
     recipient: &PublicKey,
 ) -> Vec<u8> {
     [
         context,
         &(scope.group_id.len() as u32).to_be_bytes(),
         scope.group_id,
-        owner_key,
+        bound,
         scope.sender,
         recipient,
     ]
@@ -234,7 +236,7 @@ impl OwnerShares {
     }
 }
 
-fn read_list(r: &mut BytesReader<'_>) -> Result<Vec<ShareEntry>, String> {
+pub(super) fn read_list(r: &mut BytesReader<'_>) -> Result<Vec<ShareEntry>, String> {
     // A recipient key and two length bytes at the least.
     let count = plausible_count(r, KEY_LEN + 2)?;
     if count > MAX_SHARES as u64 {

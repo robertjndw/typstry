@@ -67,7 +67,7 @@ function AddDevice({
             <DialogDescription>
               {holder === false
                 ? "Pair this browser with a device that already has your projects. Show a code here, or enter the one shown there."
-                : "Show this code on the new device, or open the link there. The device you add becomes you: it gets your projects."}
+                : "Show this code on the new device, or open the link there. The device you add becomes you: it gets your projects, and the ones you add later."}
             </DialogDescription>
           </DialogHeader>
 

@@ -3,10 +3,9 @@
 //! itself (removing members, resetting the links).
 //!
 //! The doc never waits for the group beyond the catch-up in
-//! [`Session::connect`]: a stalled group only costs rotations, so it is a
+//! [`SpaceCore::connect`]: a stalled group only costs rotations, so it is a
 //! warning, not an error.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -15,16 +14,18 @@ use typstry_wire::crypto::{DocKeys, PublicKey};
 use typstry_wire::ds::{Permission as DsPermission, ServerMessage};
 use typstry_wire::identity::PersonId;
 use typstry_wire::mls::{
-    IdentityStep, LeafKeys, MemberInfo, MlsError, Outcome, ProjectGroup, Role, Rotation,
+    IdentityStep, LeafKeys, MemberInfo, MlsError, Outcome, Role, Rotation, SpaceGroup,
     SubmitPayload,
 };
 
 use crate::api::Permission;
+use crate::link::ShareLink;
 use crate::mls::{Ds, Reply, jitter, join_group, profile_bytes, refusal_text};
-use crate::state::Config;
-use crate::user;
+use crate::state::{Config, StateDir};
+use crate::{directory, user};
+use typstry_doc::directory::State;
 
-use super::{Session, SyncError};
+use super::{DocKind, SpaceCore, SyncError};
 
 pub(super) const NO_KEYS: &str =
     "this folder has no group keys; run `typstry pull` to join the project again";
@@ -50,7 +51,7 @@ const COMMIT_SILENCE: Duration = Duration::from_secs(8);
 
 enum Followed {
     /// Up to date. Holds the connection the last catch-up ended on when it
-    /// can still be used to submit a commit (see [`Session::follow`]).
+    /// can still be used to submit a commit (see [`SpaceCore::follow`]).
     Current(Option<Box<Ds>>),
     /// The folder has to join again: its state cannot follow the group any
     /// more, or its leaf names a person this machine has left.
@@ -61,7 +62,7 @@ fn current(ds: Option<Ds>) -> Followed {
     Followed::Current(ds.map(Box::new))
 }
 
-impl Session {
+impl SpaceCore {
     pub(super) fn doc_keys(&self) -> anyhow::Result<&DocKeys> {
         Ok(self.group.as_ref().context(NO_KEYS)?.doc_keys())
     }
@@ -73,10 +74,37 @@ impl Session {
     /// Works with a retired token, which is how a folder that was offline
     /// during a rotation finds out what happened.
     pub async fn follow_group(&mut self) -> anyhow::Result<()> {
-        if let Some(ds) = self.follow().await? {
-            ds.close().await;
+        let followed = self.follow().await;
+        match followed {
+            Ok(Some(ds)) => ds.close().await,
+            Ok(None) => {}
+            Err(err) => {
+                self.note_fatal(&err);
+                return Err(err);
+            }
         }
         Ok(())
+    }
+
+    /// Tells the directory when the project is lost for good: the person
+    /// was removed from it, or its link is gone or replaced. Every command
+    /// that talks to the server comes through [`Self::connect`] or
+    /// [`Self::follow_group`], so this is the one place that sees it.
+    pub(super) fn note_fatal(&mut self, err: &anyhow::Error) {
+        if !self.kind.listed {
+            return;
+        }
+        let state = match SyncError::fatal(err) {
+            Some(SyncError::Removed) => State::Removed,
+            Some(SyncError::UnknownLink | SyncError::LinkReplaced) => State::Gone,
+            _ => return,
+        };
+        if let Err(err) =
+            directory::record_status(&self.config.link(), &self.config.project_id, state)
+        {
+            self.warnings
+                .push(format!("could not update your project directory: {err:#}"));
+        }
     }
 
     /// [`Self::follow_group`], handing back the connection it ended on if
@@ -90,6 +118,7 @@ impl Session {
     }
 
     async fn follow_inner(&mut self) -> anyhow::Result<Option<Ds>> {
+        self.take_owner_keys();
         let mut rejoin = self.group.is_none();
         let mut switched = false;
         for _ in 0..RESYNCS {
@@ -124,6 +153,27 @@ impl Session {
         bail!("the project's group was reset again and again; try again later")
     }
 
+    /// Hands the group the owner keys this machine holds for the project,
+    /// the directory's included, so a folder that joined before a key
+    /// reached it can rotate without another owner device online to hand
+    /// it over. A view-only folder could never use them.
+    fn take_owner_keys(&mut self) {
+        if !self.config.can_sign() {
+            return;
+        }
+        let Some(group) = self.group.as_mut().filter(|g| g.is_active()) else {
+            return;
+        };
+        if group.owner_secret().is_some() {
+            return;
+        }
+        directory::import_owner_keys(&self.config.server, &self.config.project_id);
+        group.keep_owner_secrets(&user::owner_keys(
+            &self.config.server,
+            &self.config.project_id,
+        ));
+    }
+
     /// An external join. With a group on file the device stays the same, so
     /// the new leaf replaces the old one instead of joining it.
     async fn join_again(&mut self) -> anyhow::Result<()> {
@@ -149,6 +199,8 @@ impl Session {
         // folder could never use the machine's keys, so it does not get them.
         let mut owner_keys = self.state.load_owner_keys();
         if self.config.can_sign() {
+            // Keys of projects the person owns that this machine never opened.
+            directory::import_owner_keys(&self.config.server, &self.config.project_id);
             owner_keys.extend_older(&user::owner_keys(
                 &self.config.server,
                 &self.config.project_id,
@@ -232,12 +284,15 @@ impl Session {
                 {
                     Ok(Outcome::Advanced | Outcome::AlreadyApplied) => {}
                     Ok(Outcome::Rotated(rotation)) => {
-                        adopt(&mut self.config, &rotation);
-                        // Before the group state: a crash in between replays
-                        // the rotation, but losing the new link would lock the
-                        // folder out.
-                        self.state.save_config(&self.config)?;
-                        remember(self.state.root(), &self.config, &mut self.warnings);
+                        adopt_rotation(
+                            self.kind,
+                            &self.state,
+                            &mut self.config,
+                            &rotation,
+                            typstry_doc::title(&self.doc).as_deref(),
+                            group.generation().ok(),
+                            &mut self.warnings,
+                        )?;
                         self.resolved = None;
                         rotated = true;
                         hop = true;
@@ -342,6 +397,7 @@ impl Session {
             if !self.can_write() {
                 return Ok(current(ds));
             }
+            let space = self.person_space();
             let Some(local) = self.local.as_mut() else {
                 return Ok(current(ds));
             };
@@ -379,7 +435,11 @@ impl Session {
                 conn.close().await;
                 return Ok(Followed::Current(None));
             }
-            let payload = group.self_update(&profile_bytes(&self.identity), Some(&local.graph))?;
+            let payload = group.self_update(
+                &profile_bytes(&self.identity),
+                Some(&local.graph),
+                space.as_ref(),
+            )?;
             self.state.save_mls(group)?;
             let reply = conn.request(1, &payload.into_message(1)).await;
             conn.close().await;
@@ -414,14 +474,23 @@ impl Session {
 
     /// What this device has to do to keep its identity in the group in
     /// line with its person, judged on the graph as this run last saw it
-    /// (see [`ProjectGroup::identity_step`]). None while the machine is not
+    /// (see [`SpaceGroup::identity_step`]). None while the machine is not
     /// a person.
     pub fn identity_step(&self) -> anyhow::Result<Option<IdentityStep>> {
         let group = self.group.as_ref().context(NO_KEYS)?;
         let Some(local) = &self.local else {
             return Ok(None);
         };
-        Ok(Some(group.identity_step(&local.graph)?))
+        Ok(Some(group.identity_step(
+            &local.graph,
+            self.person_space().as_ref(),
+        )?))
+    }
+
+    /// The personal space pointer this leaf should carry, from the binding
+    /// of this project's server.
+    fn person_space(&self) -> Option<typstry_wire::mls::PersonSpace> {
+        crate::space::pointer_for(&self.config.server, &self.config.project_id)
     }
 
     /// Fails unless this device is the project owner's, as of the last
@@ -454,13 +523,19 @@ impl Session {
         let Some(group) = self.group.as_ref() else {
             return;
         };
-        if let Err(err) = user::remember_owner_keys(
-            &self.config.server,
-            &self.config.project_id,
-            group.owner_secrets(),
-        ) {
+        let (server, id) = (&self.config.server, &self.config.project_id);
+        if let Err(err) = user::remember_owner_keys(server, id, group.owner_secrets()) {
             self.warnings
                 .push(format!("could not keep the project's owner key: {err:#}"));
+        }
+        // Only the current key: which of the held ones is the server's is
+        // what the directory must not blur.
+        if let Some(current) = group.owner_secret()
+            && let Err(err) = directory::record_owner_keys(server, id, current)
+        {
+            self.warnings.push(format!(
+                "could not share the project's owner key with your other devices: {err:#}"
+            ));
         }
     }
 
@@ -477,14 +552,31 @@ impl Session {
         Ok(true)
     }
 
-    /// Records this folder in the user's project list, with the project's
-    /// current title. A failure is only a warning: the list is a
-    /// convenience for pairing, not part of the project.
+    /// Records this folder in the user's project list and directory, with
+    /// the project's current title. A failure is only a warning: the lists
+    /// are a convenience for pairing and `typstry list`, not part of the
+    /// project.
     pub fn remember_project(&mut self) {
+        if !self.kind.listed {
+            return;
+        }
         let title = typstry_doc::title(&self.doc);
-        if let Err(err) =
-            user::remember_project(self.state.root(), &self.config.link(), title.as_deref())
-        {
+        let link = self.config.link();
+        let generation = self.group.as_ref().and_then(|g| g.generation().ok());
+        let folder = user::remember_project(self.state.root(), &link, title.as_deref());
+        // The server named this project for the token; an entry that files
+        // it elsewhere would send other devices to the wrong place, but the
+        // token itself still works, so it moves instead of being retired.
+        let listed =
+            directory::record_open(&link, &self.config.project_id, title.as_deref(), generation);
+        if let Ok(true) = listed {
+            self.warnings.push(
+                "your project directory filed this project's link under another project; \
+                 it was moved to this one"
+                    .to_owned(),
+            );
+        }
+        for err in [folder.err(), listed.err()].into_iter().flatten() {
             self.warnings.push(format!(
                 "could not update the list of your projects: {err:#}"
             ));
@@ -498,7 +590,7 @@ impl Session {
 
     /// Removes the members whose device keys are `members` and rotates the
     /// links so what they hold stops working. The new links are in
-    /// [`Session::config`] afterwards.
+    /// [`SpaceCore::config`] afterwards.
     ///
     /// Members are named by key and looked up in the group as it is right
     /// before the commit: a leaf number seen earlier may belong to someone
@@ -615,7 +707,7 @@ impl Session {
     /// sends the saved commit again.
     async fn rotate(
         &mut self,
-        build: impl Fn(&mut ProjectGroup) -> anyhow::Result<SubmitPayload>,
+        build: impl Fn(&mut SpaceGroup) -> anyhow::Result<SubmitPayload>,
     ) -> anyhow::Result<()> {
         if !self.can_write() {
             bail!("only editors can do that, and this folder has a view-only link");
@@ -687,9 +779,15 @@ impl Session {
                         .confirm_pending()?
                         .context("the confirmed commit did not rotate the links")?;
                     debug_assert_eq!(rotation.tokens.edit.as_deref(), Some(&*rotate.edit_token));
-                    adopt(&mut self.config, &rotation);
-                    self.state.save_config(&self.config)?;
-                    remember(self.state.root(), &self.config, &mut self.warnings);
+                    adopt_rotation(
+                        self.kind,
+                        &self.state,
+                        &mut self.config,
+                        &rotation,
+                        typstry_doc::title(&self.doc).as_deref(),
+                        group.generation().ok(),
+                        &mut self.warnings,
+                    )?;
                     self.state.save_mls(group)?;
                     self.resolved = None;
                     self.keep_owner_key();
@@ -717,13 +815,44 @@ impl Session {
     }
 }
 
-/// Updates the stored link of the folder at `root` after a rotation.
-fn remember(root: &Path, config: &Config, warnings: &mut Vec<String>) {
-    if let Err(err) = user::remember_project(root, &config.link(), None) {
+/// Switches `config` to the links of a rotation and saves it, then updates
+/// the stored link of the folder at `root` and the directory: the new link
+/// in, the old one retired. Spaces the directory does not list have
+/// neither. Only saving the config can fail; the lists are warnings.
+fn adopt_rotation(
+    kind: DocKind,
+    state: &StateDir,
+    config: &mut Config,
+    rotation: &Rotation,
+    title: Option<&str>,
+    generation: Option<u32>,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let old_token = config.token.clone();
+    adopt(config, rotation);
+    // Before the group state, which the callers save next: a crash in
+    // between replays the rotation, but losing the new link would lock the
+    // folder out.
+    state.save_config(config)?;
+    if !kind.listed {
+        return Ok(());
+    }
+    let link: ShareLink = config.link();
+    // A headless project seat (see `devices revoke`) is its own root, not a
+    // folder the person could open, so it stays out of the folder list.
+    let folder = if state.root() == state.dir() {
+        Ok(())
+    } else {
+        user::remember_project(state.root(), &link, None)
+    };
+    let listed =
+        directory::record_rotation(&link, &config.project_id, title, generation, &old_token);
+    for err in [folder.err(), listed.err()].into_iter().flatten() {
         warnings.push(format!(
             "could not update the list of your projects: {err:#}"
         ));
     }
+    Ok(())
 }
 
 /// Switches `config` to the links of a rotation.

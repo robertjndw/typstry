@@ -1,14 +1,14 @@
-//! The MLS group state of projects: the commit log and the sealed
+//! The MLS group state of spaces: the commit log and the sealed
 //! GroupInfo and keyring newcomers bootstrap from.
 //!
 //! Epochs: the group is at `head_epoch`, and the commit submitted at epoch
 //! N is the one that moves it to N + 1. A commit is stored under the epoch
 //! it extends, so the log reads 0, 1, 2 ... and a client at epoch E needs
-//! the commits from E on. Only the project's room actor writes here, but
+//! the commits from E on. Only the space's room actor writes here, but
 //! the conditional updates below keep the invariants even without it.
 //!
 //! The owner key is the one thing here that the server checks rather than
-//! stores blindly: a rotation swaps the project's tokens, so it lands only
+//! stores blindly: a rotation swaps the space's tokens, so it lands only
 //! if it is signed with the owner key on record (see
 //! [`typstry_wire::owner`]).
 
@@ -16,7 +16,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use typstry_wire::ds::Rotate;
 use typstry_wire::owner::{OwnerKey, RotationClaim, verify_rotation};
 
-use super::projects::{self, RotateError, now_secs};
+use super::spaces::{self, RotateError, now_secs};
 use super::{sql, unsql};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,12 +52,12 @@ type CommitRow = (i64, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
 /// incarnation, head, group id, group info, keyring, owner key.
 type GroupRow = (i64, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
-pub async fn load_group(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<Group>> {
+pub async fn load_group(pool: &SqlitePool, space_id: &str) -> sqlx::Result<Option<Group>> {
     let row: Option<GroupRow> = sqlx::query_as(
         "SELECT incarnation, head_epoch, group_id, group_info, keyring, owner_key
-         FROM mls_groups WHERE project_id = ?",
+         FROM mls_groups WHERE space_id = ?",
     )
-    .bind(project_id)
+    .bind(space_id)
     .fetch_optional(pool)
     .await?;
     row.map(
@@ -82,11 +82,11 @@ fn owner_key_of(bytes: Vec<u8>) -> sqlx::Result<OwnerKey> {
     })
 }
 
-pub async fn load_head(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<Head>> {
+pub async fn load_head(pool: &SqlitePool, space_id: &str) -> sqlx::Result<Option<Head>> {
     let row: Option<(i64, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT incarnation, head_epoch, group_id FROM mls_groups WHERE project_id = ?",
+        "SELECT incarnation, head_epoch, group_id FROM mls_groups WHERE space_id = ?",
     )
-    .bind(project_id)
+    .bind(space_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(incarnation, epoch, group_id)| Head {
@@ -101,7 +101,7 @@ pub async fn load_head(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Opti
 /// of two racing creators only one wins.
 pub async fn init_group(
     pool: &SqlitePool,
-    project_id: &str,
+    space_id: &str,
     group_id: &[u8],
     group_info: &[u8],
     keyring: &[u8],
@@ -109,11 +109,11 @@ pub async fn init_group(
 ) -> sqlx::Result<bool> {
     let done = sqlx::query(
         "INSERT INTO mls_groups
-           (project_id, incarnation, head_epoch, group_id, group_info, keyring, owner_key)
+           (space_id, incarnation, head_epoch, group_id, group_info, keyring, owner_key)
          VALUES (?, 0, 0, ?, ?, ?, ?)
-         ON CONFLICT (project_id) DO NOTHING",
+         ON CONFLICT (space_id) DO NOTHING",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(group_id)
     .bind(group_info)
     .bind(keyring)
@@ -142,28 +142,28 @@ pub enum Append {
 ///
 /// The conditional update comes first so the transaction takes SQLite's
 /// write lock up front; reading first and upgrading later can fail
-/// instantly with a busy snapshot when another project writes in between.
+/// instantly with a busy snapshot when another space writes in between.
 pub async fn append_commit(
     conn: &mut SqliteConnection,
-    project_id: &str,
+    space_id: &str,
     args: &SubmitArgs<'_>,
 ) -> sqlx::Result<Append> {
     let moved = sqlx::query(
         "UPDATE mls_groups
          SET head_epoch = head_epoch + 1, group_info = ?, keyring = COALESCE(?, keyring)
-         WHERE project_id = ? AND incarnation = ? AND head_epoch = ?",
+         WHERE space_id = ? AND incarnation = ? AND head_epoch = ?",
     )
     .bind(args.group_info)
     .bind(args.keyring)
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(args.incarnation))
     .bind(sql(args.epoch))
     .execute(&mut *conn)
     .await?;
     if moved.rows_affected() == 0 {
         let row: Option<(i64, i64)> =
-            sqlx::query_as("SELECT incarnation, head_epoch FROM mls_groups WHERE project_id = ?")
-                .bind(project_id)
+            sqlx::query_as("SELECT incarnation, head_epoch FROM mls_groups WHERE space_id = ?")
+                .bind(space_id)
                 .fetch_optional(&mut *conn)
                 .await?;
         return Ok(match row {
@@ -174,10 +174,10 @@ pub async fn append_commit(
     }
     sqlx::query(
         "INSERT INTO mls_commits
-           (project_id, incarnation, epoch, data, envelope, owner_key, created_at)
+           (space_id, incarnation, epoch, data, envelope, owner_key, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(args.incarnation))
     .bind(sql(args.epoch))
     .bind(args.commit)
@@ -192,16 +192,16 @@ pub async fn append_commit(
 /// Commits that extended an epoch in `since..=until`, in order.
 pub async fn commits_since(
     pool: &SqlitePool,
-    project_id: &str,
+    space_id: &str,
     incarnation: u64,
     since: u64,
     until: u64,
 ) -> sqlx::Result<Vec<StoredCommit>> {
     let rows: Vec<CommitRow> = sqlx::query_as(
         "SELECT epoch, data, envelope, owner_key FROM mls_commits
-         WHERE project_id = ? AND incarnation = ? AND epoch >= ? AND epoch <= ? ORDER BY epoch",
+         WHERE space_id = ? AND incarnation = ? AND epoch >= ? AND epoch <= ? ORDER BY epoch",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(incarnation))
     .bind(sql(since))
     .bind(sql(until))
@@ -219,7 +219,7 @@ pub async fn commits_since(
         .collect()
 }
 
-/// What keeps a project's commit log from growing without bound. Anyone
+/// What keeps a space's commit log from growing without bound. Anyone
 /// with a view link can append external commits, so the log has to be
 /// bounded by what the server decides, not by what clients send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,7 +240,7 @@ pub struct PruneLimits {
 /// cleared the earlier ones.
 pub async fn prune_commits(
     pool: &SqlitePool,
-    project_id: &str,
+    space_id: &str,
     incarnation: u64,
     head_epoch: u64,
     limits: PruneLimits,
@@ -249,9 +249,9 @@ pub async fn prune_commits(
     let mut gone = 0;
     gone += sqlx::query(
         "DELETE FROM mls_commits
-         WHERE project_id = ?1 AND incarnation = ?2 AND epoch < ?3 - ?4",
+         WHERE space_id = ?1 AND incarnation = ?2 AND epoch < ?3 - ?4",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(incarnation))
     .bind(sql(head_epoch))
     .bind(sql(limits.keep_last))
@@ -260,9 +260,9 @@ pub async fn prune_commits(
     .rows_affected();
     gone += sqlx::query(
         "DELETE FROM mls_commits
-         WHERE project_id = ?1 AND incarnation = ?2 AND epoch < ?3 - 1 AND created_at < ?4",
+         WHERE space_id = ?1 AND incarnation = ?2 AND epoch < ?3 - 1 AND created_at < ?4",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(incarnation))
     .bind(sql(head_epoch))
     .bind(limits.older_than)
@@ -273,17 +273,17 @@ pub async fn prune_commits(
     // dropped is whatever no longer fits under the cap.
     gone += sqlx::query(
         "DELETE FROM mls_commits
-         WHERE project_id = ?1 AND incarnation = ?2 AND epoch < ?3 - 1
+         WHERE space_id = ?1 AND incarnation = ?2 AND epoch < ?3 - 1
            AND epoch IN (
              SELECT epoch FROM (
                SELECT epoch, SUM(LENGTH(data) + COALESCE(LENGTH(envelope), 0))
                         OVER (ORDER BY epoch DESC) AS total
                FROM mls_commits
-               WHERE project_id = ?1 AND incarnation = ?2
+               WHERE space_id = ?1 AND incarnation = ?2
              ) WHERE total > ?4
            )",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(incarnation))
     .bind(sql(head_epoch))
     .bind(sql(limits.max_bytes))
@@ -307,7 +307,7 @@ pub enum Reset {
 /// pick who signs the next rotation.
 pub async fn reset_group(
     pool: &SqlitePool,
-    project_id: &str,
+    space_id: &str,
     expected: u64,
     group_id: &[u8],
     group_info: &[u8],
@@ -317,29 +317,28 @@ pub async fn reset_group(
     let done = sqlx::query(
         "UPDATE mls_groups SET incarnation = incarnation + 1, head_epoch = 0, group_id = ?,
            group_info = ?, keyring = ?
-         WHERE project_id = ? AND incarnation = ?",
+         WHERE space_id = ? AND incarnation = ?",
     )
     .bind(group_id)
     .bind(group_info)
     .bind(keyring)
-    .bind(project_id)
+    .bind(space_id)
     .bind(sql(expected))
     .execute(&mut *tx)
     .await?;
     if done.rows_affected() == 0 {
-        let exists: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM mls_groups WHERE project_id = ?")
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM mls_groups WHERE space_id = ?")
+            .bind(space_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         return Ok(if exists.is_some() {
             Reset::WrongIncarnation
         } else {
             Reset::NoGroup
         });
     }
-    sqlx::query("DELETE FROM mls_commits WHERE project_id = ?")
-        .bind(project_id)
+    sqlx::query("DELETE FROM mls_commits WHERE space_id = ?")
+        .bind(space_id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -377,7 +376,7 @@ pub enum Submitted {
 pub enum SubmitError {
     #[error(transparent)]
     Rotate(RotateError),
-    /// The rotation is not signed with the project's owner key.
+    /// The rotation is not signed with the space's owner key.
     #[error("the rotation is not signed with the owner key")]
     OwnerProof,
     /// A rotation has to move the owner key on, or a removed owner device
@@ -389,7 +388,7 @@ pub enum SubmitError {
 }
 
 /// The commit, its GroupInfo and keyring, and the token swap of a rotation,
-/// in one transaction: any failure leaves the project exactly as it was.
+/// in one transaction: any failure leaves the space exactly as it was.
 ///
 /// A rotation's owner proof is checked after the epoch, so of two owner
 /// devices rotating at once the second hears `Conflict` and follows, rather
@@ -398,11 +397,11 @@ pub enum SubmitError {
 /// from changing underneath.
 pub async fn submit(
     pool: &SqlitePool,
-    project_id: &str,
+    space_id: &str,
     args: &SubmitArgs<'_>,
 ) -> Result<Submitted, SubmitError> {
     let mut tx = pool.begin().await?;
-    match append_commit(&mut tx, project_id, args).await? {
+    match append_commit(&mut tx, space_id, args).await? {
         Append::Appended => {}
         Append::Conflict { head } => return Ok(Submitted::Conflict { head }),
         Append::NoGroup => return Ok(Submitted::NoGroup),
@@ -410,11 +409,11 @@ pub async fn submit(
     }
     let retired = match &args.rotate {
         Some(rotate) => {
-            swap_owner_key(&mut tx, project_id, args, rotate).await?;
+            swap_owner_key(&mut tx, space_id, args, rotate).await?;
             Some(
-                projects::rotate_tokens(
+                spaces::rotate_tokens(
                     &mut tx,
-                    project_id,
+                    space_id,
                     &rotate.edit_token,
                     &rotate.view_token,
                     args.epoch,
@@ -436,13 +435,13 @@ pub async fn submit(
 /// the owner key on to the one it names.
 async fn swap_owner_key(
     conn: &mut SqliteConnection,
-    project_id: &str,
+    space_id: &str,
     args: &SubmitArgs<'_>,
     rotate: &Rotate,
 ) -> Result<(), SubmitError> {
     let (group_id, current): (Vec<u8>, Vec<u8>) =
-        sqlx::query_as("SELECT group_id, owner_key FROM mls_groups WHERE project_id = ?")
-            .bind(project_id)
+        sqlx::query_as("SELECT group_id, owner_key FROM mls_groups WHERE space_id = ?")
+            .bind(space_id)
             .fetch_one(&mut *conn)
             .await?;
     let current = owner_key_of(current)?;
@@ -464,9 +463,9 @@ async fn swap_owner_key(
         return Err(SubmitError::SameOwnerKey);
     }
     let swapped =
-        sqlx::query("UPDATE mls_groups SET owner_key = ? WHERE project_id = ? AND owner_key = ?")
+        sqlx::query("UPDATE mls_groups SET owner_key = ? WHERE space_id = ? AND owner_key = ?")
             .bind(rotate.next_owner_key.as_slice())
-            .bind(project_id)
+            .bind(space_id)
             .bind(current.as_slice())
             .execute(&mut *conn)
             .await?;

@@ -11,9 +11,12 @@
 //!   leaf key and the person graph that says whether that device counts,
 //!   sealed under the identity key. A leaf keeps its device for its whole
 //!   life; a commit copies the identity unchanged or extends the graph.
-//! - `0xff03` on a leaf: shares of the project's owner key for the owner's
+//! - `0xff03` on a leaf: shares of the space's owner key for the owner's
 //!   other devices and recovery keys, see [`super::owner_share`]. Only an
 //!   owner's leaf counts, and no rule of the policy depends on it.
+//! - `0xff04` on a leaf: the pointer to the person's personal space, sealed
+//!   to their recovery keys, see [`super::person_share`]. No rule of the
+//!   policy depends on it either.
 //! - `0xff10` in the GroupContext: the policy, i.e. the attestation public
 //!   key of every generation and the owner tag. The tag stands for the
 //!   owner's person (see [`crate::crypto::Keyring::owner_tag`]); an owner is
@@ -29,6 +32,7 @@ use loro_protocol::{BytesReader, BytesWriter};
 use openmls::prelude::*;
 
 use super::owner_share::OwnerShares;
+use super::person_share::PersonShares;
 use crate::codec::plausible_count;
 use crate::crypto::{Attestation, KEY_LEN, PublicKey, SIGNATURE_LEN};
 
@@ -36,6 +40,7 @@ pub const EXT_EDITOR: u16 = 0xff00;
 pub const EXT_PROFILE: u16 = 0xff01;
 pub const EXT_IDENTITY: u16 = 0xff02;
 pub const EXT_OWNER_SHARES: u16 = 0xff03;
+pub const EXT_PERSON_SHARES: u16 = 0xff04;
 pub const EXT_POLICY: u16 = 0xff10;
 
 /// X25519, AES-128-GCM, SHA-256, Ed25519: the suite every MLS client has to
@@ -46,7 +51,7 @@ const EDITOR_VERSION: u8 = 1;
 const POLICY_VERSION: u8 = 1;
 
 /// Upper bound for the policy's list. Each rotation adds 32 bytes, so this
-/// is far beyond what a project reaches and only keeps junk out.
+/// is far beyond what a space reaches and only keeps junk out.
 const MAX_POLICY_ENTRIES: usize = 4096;
 
 /// What an editor's leaf says about its holder.
@@ -92,7 +97,7 @@ pub struct Policy {
     /// length is the current generation. Leaves attested in an older
     /// generation stay valid, so every key has to stay.
     pub attest_pubs: Vec<PublicKey>,
-    /// The tag of the owner's person, fixed for the life of the project and
+    /// The tag of the owner's person, fixed for the life of the space and
     /// kept by every rotation and reset.
     pub owner_tag: [u8; KEY_LEN],
 }
@@ -190,6 +195,7 @@ pub fn capabilities() -> Capabilities {
             ExtensionType::Unknown(EXT_PROFILE),
             ExtensionType::Unknown(EXT_IDENTITY),
             ExtensionType::Unknown(EXT_OWNER_SHARES),
+            ExtensionType::Unknown(EXT_PERSON_SHARES),
             ExtensionType::Unknown(EXT_POLICY),
         ])
         .build()
@@ -198,14 +204,17 @@ pub fn capabilities() -> Capabilities {
 /// The extensions of a leaf: `editor` only for editors, `profile` already
 /// sealed. `sealed_identity` is the sealed leaf identity, for members that
 /// have a person, and `owner_shares` the encoded owner key shares of a
-/// device that holds the owner key.
+/// device that holds the owner key. `person_shares` is the encoded
+/// personal space pointer, for a device that has a binding and a recovery
+/// key to seal it to.
 pub fn leaf_extensions(
     editor: Option<&EditorInfo>,
     sealed_profile: Vec<u8>,
     sealed_identity: Option<Vec<u8>>,
     owner_shares: Option<Vec<u8>>,
+    person_shares: Option<Vec<u8>>,
 ) -> Result<Extensions<LeafNode>, String> {
-    let mut exts = Vec::with_capacity(4);
+    let mut exts = Vec::with_capacity(5);
     if let Some(editor) = editor {
         exts.push(unknown(EXT_EDITOR, editor.encode()));
     }
@@ -216,6 +225,9 @@ pub fn leaf_extensions(
     if let Some(shares) = owner_shares {
         exts.push(unknown(EXT_OWNER_SHARES, shares));
     }
+    if let Some(shares) = person_shares {
+        exts.push(unknown(EXT_PERSON_SHARES, shares));
+    }
     Extensions::from_vec(exts).map_err(|e| e.to_string())
 }
 
@@ -224,6 +236,7 @@ pub fn leaf_parameters(
     sealed_profile: Vec<u8>,
     sealed_identity: Option<Vec<u8>>,
     owner_shares: Option<Vec<u8>>,
+    person_shares: Option<Vec<u8>>,
 ) -> Result<LeafNodeParameters, String> {
     Ok(LeafNodeParameters::builder()
         .with_capabilities(capabilities())
@@ -232,6 +245,7 @@ pub fn leaf_parameters(
             sealed_profile,
             sealed_identity,
             owner_shares,
+            person_shares,
         )?)
         .build())
 }
@@ -282,6 +296,12 @@ pub fn read_leaf(leaf: &LeafNode) -> LeafInfo {
 pub fn read_owner_shares(leaf: &LeafNode) -> Option<OwnerShares> {
     let ext = leaf.extensions().unknown(EXT_OWNER_SHARES)?;
     OwnerShares::decode(&ext.0).ok()
+}
+
+/// A leaf's personal space shares, `None` also when they do not parse.
+pub fn read_person_shares(leaf: &LeafNode) -> Option<PersonShares> {
+    let ext = leaf.extensions().unknown(EXT_PERSON_SHARES)?;
+    PersonShares::decode(&ext.0).ok()
 }
 
 #[cfg(test)]

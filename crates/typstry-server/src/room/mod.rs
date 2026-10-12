@@ -1,4 +1,4 @@
-//! One actor per loaded project. The server cannot read project content:
+//! One actor per loaded space. The server cannot read space content:
 //! the doc room holds encrypted `%ELO` records it indexes by their plaintext
 //! headers, and the presence room relays opaque ciphertext blobs.
 
@@ -18,7 +18,7 @@ use typstry_wire::fragment::encode_update;
 
 use typstry_wire::ds::ClientMessage;
 
-use crate::store::projects::{DsAccess, Permission};
+use crate::store::spaces::{DsAccess, Permission};
 
 pub use registry::{JoinOutcome, RoomRegistry};
 
@@ -192,8 +192,8 @@ impl Outbox {
     /// queue a copy of the doc for every join, since backfill skips the
     /// budget. None, with overflow signalled, while an earlier backfill of
     /// the same room and CRDT is still queued, or `max_backfills` others
-    /// are. Keyed by room so that switching projects on one socket is not
-    /// held up by the previous project's backfill.
+    /// are. Keyed by room so that switching spaces on one socket is not
+    /// held up by the previous space's backfill.
     pub fn start_backfill(&self, room_id: &str, crdt: CrdtType) -> Option<Backfill> {
         let key = BackfillKey {
             room_id: room_id.to_owned(),
@@ -312,7 +312,7 @@ pub struct RoomConfig {
 /// Limits of the MLS delivery service.
 ///
 /// Anyone with a view link can append external commits, so each knob bounds
-/// what a project can make the server store. Clients pruned out of the log
+/// what a space can make the server store. Clients pruned out of the log
 /// rejoin from the stored GroupInfo, which is what a lost state costs
 /// anyway.
 #[derive(Debug, Clone)]
@@ -321,12 +321,12 @@ pub struct DsConfig {
     pub commit_retention: Duration,
     /// At most this many of the newest commits are kept, whatever their age.
     pub keep_last_commits: u64,
-    /// At most this many bytes of the newest commits are kept per project,
+    /// At most this many bytes of the newest commits are kept per space,
     /// except that the newest commit always is.
     pub max_log_bytes: u64,
     /// Cap on one commit. Real ones are about a kilobyte, growing with the
     /// log of the member count (a 60 member group's commits are 1 to 1.4
-    /// KiB) and by 32 bytes for every rotation the project went through
+    /// KiB) and by 32 bytes for every rotation the space went through
     /// (the policy travels in them), so 64 KiB leaves room for thousands of
     /// rotations and members. The ratchet tree is not in a commit, it is in
     /// the GroupInfo.

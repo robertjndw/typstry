@@ -10,13 +10,13 @@ import { LoroDoc, LoroText } from "loro-crdt";
 import { describe, expect, it } from "vitest";
 
 import { fromBase64Url } from "./crypto/bytes";
-import { ProjectCrypto } from "./crypto/project-crypto";
+import { SpaceCrypto } from "./crypto/space-crypto";
 import {
   DocKeys,
   dsVersion,
   Keyring,
   LinkSecret,
-  ProjectGroup,
+  SpaceGroup,
   recordVersion,
   sealVersion,
 } from "./crypto/wasm";
@@ -206,7 +206,7 @@ describe.each(compatDirs())("compat crypto v%i", (_n, dir) => {
 
     const signed = bytes(fixture.keyring.signed);
     for (const secret of [fixture.editSecret, fixture.viewSecret]) {
-      const crypto = ProjectCrypto.open(secret, signed);
+      const crypto = SpaceCrypto.open(secret, signed);
       expect(crypto.generation).toBe(fixture.keyring.generation);
       expect(
         new DocKeys(Keyring.openVerified(LinkSecret.parse(secret), signed))
@@ -243,7 +243,7 @@ describe.each(compatDirs())("compat crypto v%i", (_n, dir) => {
 
   it("loads the CLI's saved group state", () => {
     const cli = readJson<CliFixture>(dir, "cli.json");
-    const group = ProjectGroup.importState(
+    const group = SpaceGroup.importState(
       new Uint8Array(readFileSync(path.join(dir, "cli", "mls.bin"))),
     );
     expect(group.epoch).toBe(cli.mls.epoch);

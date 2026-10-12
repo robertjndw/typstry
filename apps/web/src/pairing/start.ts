@@ -7,7 +7,7 @@ import {
   loadWasm,
 } from "@/crypto/wasm";
 import { defaultBackend, type DocBackend } from "@/persist/local-doc-store";
-import { loadRecent } from "@/project/recent";
+import { directory } from "@/directory/store";
 
 import { applyGrant, holderGrant } from "./grant";
 import { allocateChannel, relaySocketUrl } from "./relay";
@@ -58,9 +58,12 @@ export async function isDisposable(backend?: DocBackend): Promise<boolean> {
     graph.free();
   }
   const owners = await Promise.all(
-    loadRecent().map(
-      async (recent) => (await store.loadMls(recent.projectId))?.ownerPerson,
-    ),
+    (await directory())
+      .list(Date.now())
+      .filter((entry) => entry.state !== "forgotten")
+      .map(
+        async (entry) => (await store.loadMls(entry.projectId))?.ownerPerson,
+      ),
   );
   return !owners.some((owner) => owner && sameBytes(owner, person));
 }

@@ -43,7 +43,7 @@ async fn the_api_refuses_outdated_clients() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
     let app = common::app(AppState::new(pool, BlobStore::new(dir.path())), dir.path());
-    let created = common::create_project(app.clone()).await;
+    let created = common::create_space(app.clone()).await;
     let share = format!("/api/share/{}", created.edit);
 
     let get = |version: Option<&str>| {

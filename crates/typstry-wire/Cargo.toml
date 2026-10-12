@@ -37,7 +37,7 @@ crypto = [
     "dep:thiserror",
     "dep:zeroize",
 ]
-# Checking that a rotation is signed with a project's owner key, which is all
+# Checking that a rotation is signed with a space's owner key, which is all
 # of the owner key the server needs. It verifies and never holds a secret.
 owner-proof = ["dep:ed25519-dalek", "dep:sha2"]
 # MLS group membership on top of the encryption. Clients only, like `crypto`.

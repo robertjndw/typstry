@@ -1,3 +1,6 @@
+use typstry_doc::directory::State;
+
+use crate::space::sync_bound;
 use crate::user::catalog;
 
 /// List your projects, including the ones other devices of yours have.
@@ -13,7 +16,14 @@ pub struct Args {
     pub missing: bool,
 }
 
-pub fn run(args: Args) -> anyhow::Result<()> {
+pub async fn run(args: Args) -> anyhow::Result<()> {
+    // Before reading, so projects the person's other devices added show up.
+    sync_bound().await;
+    print_catalog(args.missing)
+}
+
+/// Prints the projects as `typstry list` does, from what is on disk.
+pub fn print_catalog(missing: bool) -> anyhow::Result<()> {
     let entries = catalog()?;
     if entries.is_empty() {
         println!(
@@ -25,18 +35,34 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // thing with and without --missing.
     let mut shown = 0;
     for (i, entry) in entries.iter().enumerate() {
-        if args.missing && entry.dir.is_some() {
+        if missing && entry.dir.is_some() {
             continue;
         }
         shown += 1;
-        match &entry.dir {
-            Some(dir) => println!("{:>3}. {}\n       {}", i + 1, entry.title, dir.display()),
-            None => println!(
+        let why = match entry.state {
+            State::Removed => Some("you were removed from this project"),
+            State::Gone => Some("the server no longer knows this project"),
+            State::Listed | State::Forgotten => None,
+        };
+        match (&entry.dir, why) {
+            (Some(dir), None) => {
+                println!("{:>3}. {}\n       {}", i + 1, entry.title, dir.display())
+            }
+            (Some(dir), Some(why)) => println!(
+                "{:>3}. {}\n       {}\n       unavailable: {why}",
+                i + 1,
+                entry.title,
+                dir.display()
+            ),
+            (None, None) => println!(
                 "{:>3}. {}\n       not on this device: typstry clone {}",
                 i + 1,
                 entry.title,
                 i + 1
             ),
+            (None, Some(why)) => {
+                println!("{:>3}. {}\n       unavailable: {why}", i + 1, entry.title)
+            }
         }
     }
     if shown == 0 {

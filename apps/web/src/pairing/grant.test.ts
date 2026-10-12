@@ -1,18 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { toHex } from "@/crypto/bytes";
-import { DeviceKey, LinkSecret, PersonGraph } from "@/crypto/wasm";
+import { DeviceKey, PersonGraph, type PairingSpace } from "@/crypto/wasm";
 import { localDeviceKey, localIdentity } from "@/mls/identity";
 import { MemoryBackend } from "@/persist/local-doc-store";
-import {
-  loadProjectKey,
-  loadRecent,
-  rememberProject,
-  saveProjectKey,
-} from "@/project/recent";
 
 import { applyGrant, holderGrant } from "./grant";
 import { GrantRefusedError } from "./session";
+import { fakeEnsureSpace, someSpace } from "./test-utils";
+
+const mocks = vi.hoisted(() => ({ ensureSpace: vi.fn() }));
+vi.mock("@/directory/ensure-space", () => ({
+  ensureSpace: mocks.ensureSpace,
+}));
+vi.mock("@/directory/service", () => ({
+  refreshDirectoryService: vi.fn(async () => {}),
+}));
 
 function newDevice(): { name: string; pub: Uint8Array } {
   const key = DeviceKey.generate();
@@ -28,27 +31,16 @@ function stateOf(graph: Uint8Array, pub: Uint8Array): string {
   return state;
 }
 
-beforeEach(() => localStorage.clear());
-afterEach(() => vi.unstubAllGlobals());
+beforeEach(() => {
+  localStorage.clear();
+  mocks.ensureSpace.mockImplementation(fakeEnsureSpace);
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+  mocks.ensureSpace.mockReset();
+});
 
 describe("holderGrant", () => {
-  it("lists the recent projects it holds a key for", async () => {
-    const key = LinkSecret.generateEdit().toBase64url();
-    saveProjectKey("p1", key);
-    rememberProject({ projectId: "p1", token: "tok1", title: "Thesis" });
-    // No key stored: nothing to hand over.
-    rememberProject({ projectId: "p2", token: "tok2", title: "Lost" });
-
-    const grant = await holderGrant(
-      new MemoryBackend(),
-      newDevice(),
-      "https://t.test",
-    );
-    expect(grant.projects).toEqual([
-      { title: "Thesis", link: `https://t.test/p/tok1#${key}` },
-    ]);
-  });
-
   it("names itself by its stored label, else by the browser", async () => {
     const backend = new MemoryBackend();
     const { deviceSeed } = await localIdentity(backend);
@@ -56,11 +48,11 @@ describe("holderGrant", () => {
     const own = toHex(key.publicKey());
     key.free();
 
-    const guessed = await holderGrant(backend, newDevice(), "https://t.test");
+    const guessed = await holderGrant(backend, newDevice());
     expect(guessed.holderName).toMatch(/\S/);
 
     await backend.saveLabels({ [own]: "Studio Mac" });
-    const labeled = await holderGrant(backend, newDevice(), "https://t.test");
+    const labeled = await holderGrant(backend, newDevice());
     expect(labeled.holderName).toBe("Studio Mac");
   });
 
@@ -70,7 +62,7 @@ describe("holderGrant", () => {
     const { graph: before } = await localIdentity(backend);
     expect(stateOf(before, device.pub)).toBe("unknown");
 
-    const grant = await holderGrant(backend, device, "https://t.test");
+    const grant = await holderGrant(backend, device);
 
     expect(stateOf(grant.graph, device.pub)).toBe("valid");
     expect(await backend.loadGraph()).toEqual(grant.graph);
@@ -89,72 +81,64 @@ describe("holderGrant", () => {
     revoked.revoke(other.export(), DeviceKey.import(deviceSeed).publicKey());
     await backend.mergeGraph(revoked.encode(), (_, incoming) => incoming);
 
-    await expect(
-      holderGrant(backend, newDevice(), "https://t.test"),
-    ).rejects.toBeInstanceOf(GrantRefusedError);
+    await expect(holderGrant(backend, newDevice())).rejects.toBeInstanceOf(
+      GrantRefusedError,
+    );
   });
 
   it("does not add a device that is already valid", async () => {
     const backend = new MemoryBackend();
     const device = newDevice();
-    const first = await holderGrant(backend, device, "https://t.test");
-    const again = await holderGrant(backend, device, "https://t.test");
+    const first = await holderGrant(backend, device);
+    const again = await holderGrant(backend, device);
     expect(again.graph).toEqual(first.graph);
   });
 
   it("refuses a device that was removed from the account before", async () => {
     const backend = new MemoryBackend();
     const device = newDevice();
-    const { graph } = await holderGrant(backend, device, "https://t.test");
+    const { graph } = await holderGrant(backend, device);
     const { deviceSeed } = await localIdentity(backend);
     const revoked = PersonGraph.decode(graph);
     revoked.revoke(deviceSeed, device.pub);
     await backend.mergeGraph(revoked.encode(), (_, incoming) => incoming);
     revoked.free();
 
-    await expect(
-      holderGrant(backend, device, "https://t.test"),
-    ).rejects.toThrow(/cannot be added again/);
+    await expect(holderGrant(backend, device)).rejects.toThrow(
+      /cannot be added again/,
+    );
   });
 });
 
 describe("applyGrant", () => {
-  function stubShare(projectId: string) {
+  let space: PairingSpace;
+  beforeEach(async () => {
+    space = await someSpace(new MemoryBackend());
+    // The space is not looked up here; see grant-space.test.ts.
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        Response.json({ projectId, permission: "write" }, { status: 200 }),
-      ),
+      vi.fn(async () => new Response(null, { status: 404 })),
     );
-  }
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
 
   /** What a holder hands to the device with `backend`'s key. */
-  async function grantFor(backend: MemoryBackend, projects = [] as never[]) {
+  async function grantFor(backend: MemoryBackend) {
     const key = DeviceKey.import(await localDeviceKey(backend));
     const holderBackend = new MemoryBackend();
-    const { graph, holderName } = await holderGrant(holderBackend, {
+    const { graph, holderName, space } = await holderGrant(holderBackend, {
       name: "x",
       pub: key.publicKey(),
     });
     key.free();
-    return { graph, projects, holderName };
+    return { graph, holderName, space };
   }
 
-  it("stores the graph, the label and the projects", async () => {
-    stubShare("pid-1");
+  it("stores the graph and the label", async () => {
     const backend = new MemoryBackend();
-    const key = LinkSecret.generateEdit().toBase64url();
-    const { graph } = await grantFor(backend);
+    const { graph, space } = await grantFor(backend);
 
-    const opened = await applyGrant(
-      {
-        graph,
-        holderName: "Desk",
-        projects: [{ title: "Thesis", link: `https://t.test/p/tok#${key}` }],
-      },
-      backend,
-      "Phone",
-    );
+    await applyGrant({ graph, holderName: "Desk", space }, backend, "Phone");
 
     expect(await backend.loadGraph()).toEqual(graph);
     // The holder is labeled under the key that added this device.
@@ -162,18 +146,13 @@ describe("applyGrant", () => {
       "Desk",
       "Phone",
     ]);
-    expect(loadProjectKey("pid-1")).toBe(key);
-    expect(loadRecent()).toMatchObject([
-      { projectId: "pid-1", token: "tok", title: "Thesis" },
-    ]);
-    expect(opened).toEqual([{ title: "Thesis", link: "/p/tok" }]);
   });
 
   it("refuses a grant that does not include this device", async () => {
     const backend = new MemoryBackend();
     const { graph } = await localIdentity(new MemoryBackend());
     await expect(
-      applyGrant({ graph, projects: [], holderName: "Desk" }, backend, "Phone"),
+      applyGrant({ graph, holderName: "Desk", space }, backend, "Phone"),
     ).rejects.toBeInstanceOf(GrantRefusedError);
     expect(await backend.loadGraph()).toBeNull();
   });
@@ -194,7 +173,7 @@ describe("applyGrant", () => {
       const backend = new MemoryBackend();
       const { seed, pub } = pairingKey();
       const { graph, holderName } = await grantTo(pub);
-      await applyGrant({ graph, projects: [], holderName }, backend, "Phone", {
+      await applyGrant({ graph, holderName, space }, backend, "Phone", {
         deviceSeed: seed,
       });
       expect(await backend.loadDeviceKey()).toEqual(seed);
@@ -205,7 +184,7 @@ describe("applyGrant", () => {
       const { seed } = pairingKey();
       const { graph } = await grantTo(pairingKey().pub);
       await expect(
-        applyGrant({ graph, projects: [], holderName: "Desk" }, backend, "P", {
+        applyGrant({ graph, holderName: "Desk", space }, backend, "P", {
           deviceSeed: seed,
         }),
       ).rejects.toBeInstanceOf(GrantRefusedError);
@@ -219,7 +198,7 @@ describe("applyGrant", () => {
       const other = await localDeviceKey(backend);
       const { graph } = await grantTo(pub);
       await expect(
-        applyGrant({ graph, projects: [], holderName: "Desk" }, backend, "P", {
+        applyGrant({ graph, holderName: "Desk", space }, backend, "P", {
           deviceSeed: seed,
         }),
       ).rejects.toBeInstanceOf(GrantRefusedError);
@@ -233,7 +212,7 @@ describe("applyGrant", () => {
     await localIdentity(backend);
     const { graph } = await grantFor(backend);
     await expect(
-      applyGrant({ graph, projects: [], holderName: "Desk" }, backend, "Phone"),
+      applyGrant({ graph, holderName: "Desk", space }, backend, "Phone"),
     ).rejects.toBeInstanceOf(GrantRefusedError);
   });
 
@@ -241,12 +220,9 @@ describe("applyGrant", () => {
     const backend = new MemoryBackend();
     const { graph: own } = await localIdentity(backend);
     const { graph } = await grantFor(backend);
-    await applyGrant(
-      { graph, projects: [], holderName: "Desk" },
-      backend,
-      "Phone",
-      { replace: true },
-    );
+    await applyGrant({ graph, holderName: "Desk", space }, backend, "Phone", {
+      replace: true,
+    });
     expect(await backend.loadGraph()).toEqual(graph);
     expect(graph).not.toEqual(own);
   });
@@ -259,29 +235,8 @@ describe("applyGrant", () => {
     const graph = grown.encode();
     grown.free();
     await expect(
-      applyGrant({ graph, projects: [], holderName: "Desk" }, backend, "Phone"),
-    ).resolves.toEqual([]);
+      applyGrant({ graph, holderName: "Desk", space }, backend, "Phone"),
+    ).resolves.toBeUndefined();
     expect(await backend.loadGraph()).toEqual(graph);
-  });
-
-  it("leaves out a project the server does not know", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(null, { status: 404 })),
-    );
-    const backend = new MemoryBackend();
-    const key = LinkSecret.generateEdit().toBase64url();
-    const { graph } = await grantFor(backend);
-    const opened = await applyGrant(
-      {
-        graph,
-        holderName: "Desk",
-        projects: [{ title: "Gone", link: `https://t.test/p/tok#${key}` }],
-      },
-      backend,
-      "Phone",
-    );
-    expect(opened).toEqual([]);
-    expect(loadRecent()).toEqual([]);
   });
 });

@@ -1,12 +1,12 @@
-// HTTP helpers for the project endpoints served by crates/typstry-server.
-// Nothing sent here is readable by the server: project content only ever
+// HTTP helpers for the space endpoints served by crates/typstry-server.
+// Nothing sent here is readable by the server: a space's content only ever
 // travels encrypted, so these calls carry tokens and ciphertext alone.
 import { fromBase64, ownBuffer } from "@/crypto/bytes";
 
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
 
-export interface CreatedProject {
-  projectId: string;
+export interface CreatedSpace {
+  spaceId: string;
   editToken: string;
   viewToken: string;
 }
@@ -14,7 +14,7 @@ export interface CreatedProject {
 export type SharePermission = "write" | "read";
 
 export interface ShareInfo {
-  projectId: string;
+  spaceId: string;
   permission: SharePermission;
   /** Only present for edit tokens; view tokens never learn the edit link. */
   viewToken?: string;
@@ -64,19 +64,19 @@ export interface ApiOptions {
 }
 
 /**
- * Registers an empty project. The title and starter files are content, so
+ * Registers an empty space. The title and starter files are content, so
  * the creator seeds the doc locally and it reaches the server encrypted.
  */
-export async function createProject(
+export async function createSpace(
   opts: ApiOptions = {},
-): Promise<CreatedProject> {
-  const res = await apiFetch(`${opts.baseUrl ?? ""}/api/projects`, {
+): Promise<CreatedSpace> {
+  const res = await apiFetch(`${opts.baseUrl ?? ""}/api/spaces`, {
     method: "POST",
     signal: opts.signal,
   });
   if (!res.ok)
     throw new ApiError(res.status, `creating project failed: ${res.status}`);
-  return (await res.json()) as CreatedProject;
+  return (await res.json()) as CreatedSpace;
 }
 
 /** Looks up a share token. Returns null when the token is unknown. */
@@ -123,7 +123,7 @@ export async function fetchMlsBootstrap(
   opts: ApiOptions = {},
 ): Promise<MlsBootstrap | null> {
   const res = await apiFetch(
-    `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/mls`,
+    `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/mls`,
     { signal: opts.signal, cache: "no-store" },
   );
   if (res.status === 404) return null;
@@ -163,11 +163,11 @@ export async function fetchMlsBootstrap(
 export function parseShareInfo(value: unknown): ShareInfo | null {
   const v = value as Partial<ShareInfo> | null;
   if (
-    typeof v?.projectId !== "string" ||
+    typeof v?.spaceId !== "string" ||
     (v.permission !== "write" && v.permission !== "read")
   )
     return null;
-  const share: ShareInfo = { projectId: v.projectId, permission: v.permission };
+  const share: ShareInfo = { spaceId: v.spaceId, permission: v.permission };
   if (typeof v.viewToken === "string") share.viewToken = v.viewToken;
   if (v.retired === true) share.retired = true;
   return share;
@@ -194,7 +194,7 @@ export async function uploadBlob(
   opts: ApiOptions = {},
 ): Promise<StoredBlob> {
   const res = await apiFetch(
-    `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/assets`,
+    `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/assets`,
     {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
@@ -219,5 +219,5 @@ export function blobUrl(
   hash: string,
   opts: Pick<ApiOptions, "baseUrl"> = {},
 ): string {
-  return `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/blobs/${encodeURIComponent(hash)}`;
+  return `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/blobs/${encodeURIComponent(hash)}`;
 }

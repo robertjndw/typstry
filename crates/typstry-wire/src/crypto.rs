@@ -118,7 +118,7 @@ const RECORD_TRAILER: usize = KEY_LEN + 2 * SIGNATURE_LEN;
 /// The browser decodes secrets with `atob`, which ignores the unused low
 /// bits of the last character, so this does too. Otherwise a secret that
 /// works in the browser could be refused here.
-const BASE64URL: GeneralPurpose = GeneralPurpose::new(
+pub(crate) const BASE64URL: GeneralPurpose = GeneralPurpose::new(
     &URL_SAFE,
     GeneralPurposeConfig::new()
         .with_encode_padding(false)

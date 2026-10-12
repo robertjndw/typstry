@@ -1,4 +1,5 @@
 import { CheckIcon, Loader2Icon, TriangleAlertIcon } from "lucide-react";
+
 import { Link } from "react-router";
 
 import { Button } from "@/components/ui/button";
@@ -10,11 +11,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useDirectory } from "@/directory/store";
+import { useDirectorySync } from "@/directory/service";
 import {
   PairSession,
   type PairFailure,
   type PairState,
 } from "@/pairing/session";
+import { projectUrl } from "@/project/recent";
 import { RELOAD_MESSAGE } from "@/sync/protocol";
 
 const FAILURES: Record<PairFailure, string> = {
@@ -106,31 +110,53 @@ export function PairingStatus({
             <CheckIcon aria-hidden className="size-4" />
             {holder ? "Device added" : "This device is now yours"}
           </p>
-          {!holder &&
-            (state.projects.length > 0 ? (
-              <ul
-                aria-label="Projects received"
-                className="divide-y overflow-hidden rounded-lg border bg-card"
-              >
-                {state.projects.map((p) => (
-                  <li key={p.link}>
-                    <Link
-                      to={p.link}
-                      className="block truncate px-3 py-2.5 text-sm font-medium hover:bg-muted/60"
-                    >
-                      {p.title}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No projects came along.
-              </p>
-            ))}
+          {!holder && <ReceivedProjects />}
         </div>
       );
   }
+}
+
+/**
+ * The projects arrive through the personal space's first sync, so this
+ * waits for it instead of announcing an empty list too early.
+ */
+function ReceivedProjects() {
+  const sync = useDirectorySync();
+  const entries = useDirectory();
+  if (sync === "error")
+    return (
+      <p role="alert" className="text-sm text-destructive">
+        Your projects could not be synced to this device yet. They will keep
+        trying whenever you open Typstry.
+      </p>
+    );
+  if (sync !== "synced" || entries === null)
+    return <Progress>Syncing your projects…</Progress>;
+  const listed = entries.filter((e) => e.state === "listed");
+  if (listed.length === 0)
+    return (
+      <p className="text-sm text-muted-foreground">
+        The other device has no projects yet. New ones will show up here.
+      </p>
+    );
+  return (
+    <ul
+      aria-label="Projects received"
+      className="divide-y overflow-hidden rounded-lg border bg-card"
+    >
+      {listed.map((p) => (
+        <li key={p.projectId}>
+          <Link
+            // The key travels in the fragment; the token alone cannot open it.
+            to={projectUrl(p.link.token, p.link.secret, "")}
+            className="block truncate px-3 py-2.5 text-sm font-medium hover:bg-muted/60"
+          >
+            {p.title || "Untitled"}
+          </Link>
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 /** What the holder's approval dialog shows for this device, to compare. */

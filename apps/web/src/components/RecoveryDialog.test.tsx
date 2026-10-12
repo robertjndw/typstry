@@ -7,7 +7,7 @@ const WORDS = "one two three four";
 
 describe("RecoveryDialog", () => {
   it("creates nothing until asked, then shows the words once", async () => {
-    const create = vi.fn(async () => WORDS);
+    const create = vi.fn(async () => ({ words: WORDS }));
     const onOpenChange = vi.fn();
     render(<RecoveryDialog open onOpenChange={onOpenChange} create={create} />);
     expect(create).not.toHaveBeenCalled();
@@ -24,6 +24,7 @@ describe("RecoveryDialog", () => {
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Done" })).toBeDisabled();
 
+    expect(screen.getByRole("status")).toHaveTextContent("up to date");
     fireEvent.click(screen.getByLabelText("I have stored it"));
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
     expect(onOpenChange).toHaveBeenCalledWith(false);

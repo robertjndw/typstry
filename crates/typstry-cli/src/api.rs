@@ -54,18 +54,18 @@ impl Permission {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareInfo {
-    pub project_id: String,
+    pub space_id: String,
     pub permission: Permission,
     /// Only sent for edit tokens.
     pub view_token: Option<String>,
-    /// A rotation replaced the token. It still names the project, so the
+    /// A rotation replaced the token. It still names the space, so the
     /// folder can catch up through the delivery service and find the new
     /// links.
     #[serde(default)]
     pub retired: bool,
 }
 
-/// What a newcomer needs to join the project's group.
+/// What a newcomer needs to join the space's group.
 #[derive(Debug, Clone)]
 pub struct Bootstrap {
     pub incarnation: u64,
@@ -96,8 +96,8 @@ struct BootstrapBody {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreatedProject {
-    pub project_id: String,
+pub struct CreatedSpace {
+    pub space_id: String,
     pub edit_token: String,
     pub view_token: String,
 }
@@ -210,14 +210,14 @@ impl Api {
         url
     }
 
-    /// A URL in the project the share token grants access to.
-    fn project_url(&self, token: &str, tail: &str) -> String {
-        self.token_url("p", token, tail)
+    /// A URL in the space the share token grants access to.
+    fn space_url(&self, token: &str, tail: &str) -> String {
+        self.token_url("s", token, tail)
     }
 
-    /// Registers an empty project; its content arrives later, encrypted.
-    pub async fn create_project(&self) -> anyhow::Result<CreatedProject> {
-        let req = self.http.post(format!("{}/api/projects", self.origin));
+    /// Registers an empty space; its content arrives later, encrypted.
+    pub async fn create_space(&self) -> anyhow::Result<CreatedSpace> {
+        let req = self.http.post(format!("{}/api/spaces", self.origin));
         let res = self
             .send(req, || format!("cannot reach {}", self.origin))
             .await?;
@@ -273,7 +273,7 @@ impl Api {
     /// retired one gets a 404, since it must not reach the keys of the
     /// generation that replaced it.
     pub async fn mls_bootstrap(&self, token: &str) -> anyhow::Result<Bootstrap> {
-        let req = self.http.get(self.project_url(token, "mls"));
+        let req = self.http.get(self.space_url(token, "mls"));
         let res = self.send(req, || "fetching the group".to_owned()).await?;
         let status = res.status();
         if status == StatusCode::NOT_FOUND {
@@ -299,7 +299,7 @@ impl Api {
     }
 
     pub async fn get_blob(&self, token: &str, hash: &str) -> anyhow::Result<Vec<u8>> {
-        let url = self.project_url(token, &format!("blobs/{}", percent_encode(hash)));
+        let url = self.space_url(token, &format!("blobs/{}", percent_encode(hash)));
         let res = self
             .send(self.http.get(url), || format!("downloading {hash}"))
             .await?;
@@ -325,7 +325,7 @@ impl Api {
             READ_TIMEOUT + Duration::from_secs(sealed.len() as u64 / MIN_UPLOAD_BYTES_PER_SEC);
         let req = self
             .upload
-            .post(self.project_url(token, "assets"))
+            .post(self.space_url(token, "assets"))
             .timeout(deadline)
             .header("content-type", "application/octet-stream")
             .body(sealed);
@@ -476,8 +476,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_unknown_permission_from_the_server_asks_for_an_upgrade() {
         let (origin, _) = fake_server(
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 38\r\n\
-              connection: close\r\n\r\n{\"projectId\":\"p\",\"permission\":\"admin\"}",
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\
+              connection: close\r\n\r\n{\"spaceId\":\"p\",\"permission\":\"admin\"}",
         )
         .await;
         let err = Api::new(&origin)

@@ -1,26 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { toHex } from "@/crypto/bytes";
 import {
   DeviceKey,
   LinkSecret,
   PersonGraph,
-  ProjectGroup,
+  SpaceGroup,
   RecoveryKey,
   devicePublicKey,
   graphsInGroupInfo,
   mergeOwnerSecrets,
+  ownerPublicKeyOf,
+  ownerSecretList,
+  personSpacesForRecovery,
 } from "@/crypto/wasm";
 import {
   MemoryBackend,
   type DocBackend,
   type StoredRotation,
 } from "@/persist/local-doc-store";
+import { saveBinding } from "@/directory/binding";
+import { directory, resetDirectory } from "@/directory/store";
 import { encodeProfile, type Identity } from "@/presence/identity";
 
 import { FakeServer } from "./fake-server";
 import { localIdentity, mergeOwnGraph } from "./identity";
-import { keepOwnerKey, recoverDevice, recoveredOwnerKey } from "./recovery";
-import { MlsSession, type MlsSessionOptions } from "./session";
+import { recoverDevice, recoveredOwnerKey } from "./recovery";
+import { keepOwnerKey, MlsSession, type MlsSessionOptions } from "./session";
 
 const EDIT = "edit-1";
 const VIEW = "view-1";
@@ -75,7 +81,7 @@ function world({ recovery = false } = {}) {
       devicePublicKey(recoveryKey.deviceSeed),
       true,
     );
-  const { group, message } = ProjectGroup.create(
+  const { group, message } = SpaceGroup.create(
     link,
     encodeProfile({ name: "Alice", color }),
     aliceSeed,
@@ -99,7 +105,7 @@ function world({ recovery = false } = {}) {
     const errors: Error[] = [];
     const out = { identity: { name, color } } as Device;
     out.session = new MlsSession({
-      projectId: "p",
+      spaceId: "p",
       backend,
       fetchBootstrap: server.bootstrap,
       identity: () => out.identity,
@@ -491,7 +497,7 @@ describe("MlsSession", () => {
     server.onSubmit = async () => {
       const record = await alice.backend.loadMls("p");
       storedPending =
-        ProjectGroup.importState(record!.state!).pendingSubmit() !== undefined;
+        SpaceGroup.importState(record!.state!).pendingSubmit() !== undefined;
     };
     server.loseNextReply = { landed: true };
     const epoch = server.head;
@@ -523,7 +529,7 @@ describe("MlsSession", () => {
     expect(server.live.has(alice.rotations[0]!.token)).toBe(true);
     // The group carries on at the new epoch with nothing left waiting.
     const stored = await alice.backend.loadMls("p");
-    const group = ProjectGroup.importState(stored!.state!);
+    const group = SpaceGroup.importState(stored!.state!);
     expect(group.pendingSubmit()).toBeUndefined();
     expect(group.epoch).toBe(epoch + 1);
     sessions.forEach((s) => s.stop());
@@ -748,6 +754,80 @@ describe("MlsSession", () => {
     sessions.forEach((s) => s.stop());
   });
 
+  it("records each owner key in the directory while it is current", async () => {
+    const { creator, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    await alice.session.resetLinks();
+    const held = ownerSecretList(
+      (await alice.backend.loadMls("p"))!.ownerSecrets,
+    );
+    expect(held).toHaveLength(2);
+    // Each was the server's key when it was recorded; the newest leads, so
+    // a device taking them from the directory finds the current one first.
+    const keys = await vi.waitFor(async () => {
+      const found = (await directory()).ownerKeys("p", Date.now());
+      expect(found).toHaveLength(2);
+      return found.map((k) => k.publicKey);
+    });
+    expect(keys[0]).toBe(toHex(ownerPublicKeyOf(held[0]!)));
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("takes the owner keys of a project it never opened from the directory", async () => {
+    const { creator, device, editSecret, sessions } = world();
+    const alice = await creator();
+    const [secret] = ownerSecretList(
+      (await alice.backend.loadMls("p"))!.ownerSecrets,
+    );
+    alice.session.stop();
+    (await directory()).addOwnerKey("p", secret!, 100);
+
+    const other = device("Alice", { backend: new MemoryBackend() });
+    await other.session.start({ token: EDIT, link: editSecret });
+    const kept = ownerSecretList(
+      (await other.backend.loadMls("p"))!.ownerSecrets,
+    );
+    expect(kept).toEqual([secret]);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("hands directory owner keys to a group it already joined", async () => {
+    const { creator, device, editSecret, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    alice.session.stop();
+    const record = (await alice.backend.loadMls("p"))!;
+    const [secret] = ownerSecretList(record.ownerSecrets);
+    // The same person on a device that rejoined without the key, with
+    // nothing in the directory yet.
+    await resetDirectory();
+    await alice.backend.saveMls("p", {
+      ...record,
+      state: null,
+      ownerSecrets: undefined,
+    });
+    const joined = device("Alice", { backend: alice.backend });
+    await joined.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(joined.session.getSnapshot().canCommit).toBe(true),
+    );
+    expect(joined.session.getSnapshot().holdsOwnerKey).toBe(false);
+    joined.session.stop();
+
+    (await directory()).addOwnerKey("p", secret!, 100);
+    const again = device("Alice", { backend: alice.backend });
+    await again.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(again.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    sessions.forEach((s) => s.stop());
+  });
+
   it("keeps the real owner key when the server names another", async () => {
     const { creator, device, editSecret, server, sessions } = world();
     const alice = await creator();
@@ -760,7 +840,7 @@ describe("MlsSession", () => {
     // A key this device holds that the server does not name now, as one it
     // was told was current once would be.
     const seed = DeviceKey.generate().export();
-    const { group: other } = ProjectGroup.create(
+    const { group: other } = SpaceGroup.create(
       LinkSecret.generateEdit(),
       encodeProfile({ name: "Other", color }),
       seed,
@@ -818,7 +898,7 @@ describe("MlsSession", () => {
     expect(server.head).toBe(head);
     expect(alice.rotations).toEqual([]);
     expect(
-      ProjectGroup.importState((await alice.backend.loadMls("p"))!.state!)
+      SpaceGroup.importState((await alice.backend.loadMls("p"))!.state!)
         .hasPendingSubmit,
     ).toBe(false);
     sessions.forEach((s) => s.stop());
@@ -905,6 +985,75 @@ describe("MlsSession", () => {
     sessions.forEach((s) => s.stop());
   });
 
+  it("carries the personal space link for the recovery key, and follows a changed binding", async () => {
+    const { creator, editSecret, server, sessions, recoveryWords } = world({
+      recovery: true,
+    });
+    const space = (token: string) => ({
+      spaceId: "s",
+      token,
+      secret: LinkSecret.generateEdit().toBase64url(),
+    });
+    const first = space("t".repeat(22));
+    saveBinding(first);
+    const alice = await creator();
+    const link = LinkSecret.parse(editSecret);
+    const seed = RecoveryKey.fromWords(recoveryWords);
+    const read = async () => {
+      const boot = (await server.bootstrap(EDIT))!;
+      return personSpacesForRecovery(
+        link,
+        boot.groupInfo,
+        boot.keyring,
+        seed,
+      )[0];
+    };
+    await vi.waitFor(async () =>
+      expect(await read()).toEqual({
+        token: first.token,
+        secret: first.secret,
+      }),
+    );
+
+    // A rotated or newly made binding has to reach the leaf without any
+    // other reason to commit.
+    const second = space("u".repeat(22));
+    saveBinding(second);
+    await alice.session.syncIdentity();
+    expect(await read()).toEqual({
+      token: second.token,
+      secret: second.secret,
+    });
+    sessions.forEach((s) => s.stop());
+    localStorage.clear();
+  });
+
+  it("leaves the pointer out of the personal space's own leaf", async () => {
+    const { creator, editSecret, server, sessions, recoveryWords } = world({
+      recovery: true,
+    });
+    // The session's own space is the one the binding names.
+    saveBinding({
+      spaceId: "p",
+      token: "t".repeat(22),
+      secret: LinkSecret.generateEdit().toBase64url(),
+    });
+    const alice = await creator();
+    await alice.session.syncIdentity();
+    const link = LinkSecret.parse(editSecret);
+    const boot = (await server.bootstrap(EDIT))!;
+    expect(
+      personSpacesForRecovery(
+        link,
+        boot.groupInfo,
+        boot.keyring,
+        RecoveryKey.fromWords(recoveryWords),
+      ),
+    ).toEqual([]);
+    sessions.forEach((s) => s.stop());
+    localStorage.clear();
+  });
+
   it("removes by device key, and refuses a member who is gone", async () => {
     const { creator, join, server, sessions } = world();
     const alice = await creator();
@@ -941,7 +1090,7 @@ describe("MlsSession", () => {
     );
 
     const spy = vi
-      .spyOn(ProjectGroup.prototype, "processCommit")
+      .spyOn(SpaceGroup.prototype, "processCommit")
       .mockImplementation(() => {
         throw Object.assign(new Error("broken"), { kind: "Mls" });
       });

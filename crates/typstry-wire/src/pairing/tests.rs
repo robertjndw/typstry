@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use super::*;
+use crate::crypto::LinkSecret;
 use crate::identity::{DeviceKey, EntryKind, PersonGraph};
+use crate::owner::OwnerSecrets;
 use crate::relay::CHANNEL_MAX;
 
 const DEVICE_PUB: PublicKey = [5; 32];
@@ -11,20 +13,31 @@ fn code() -> Code {
 }
 
 fn grant() -> Grant {
-    Grant {
-        holder_name: "Desktop".into(),
-        graph: PersonGraph::genesis(&DeviceKey::import(&[7; 32]).unwrap()).encode(),
-        projects: vec![
-            GrantedProject {
-                title: "Thesis".into(),
-                link: "https://host/p/abc#secret".into(),
-            },
-            GrantedProject {
-                title: "Notes".into(),
-                link: "https://host/p/def#other".into(),
-            },
-        ],
+    Grant::new(
+        "Desktop".into(),
+        PersonGraph::genesis(&DeviceKey::import(&[7; 32]).unwrap()).encode(),
+        space(),
+    )
+}
+
+/// The most owner secrets a person's set can hold.
+fn full_owner_secrets() -> Vec<u8> {
+    use crate::owner::{Origin, OwnerSecret};
+    let mut set = OwnerSecrets::default();
+    for _ in 0..OwnerSecrets::KEEP {
+        set.add(OwnerSecret::generate(), Origin::Made);
+        set.add(OwnerSecret::generate(), Origin::Received);
     }
+    set.encode().to_vec()
+}
+
+fn space() -> GrantedSpace {
+    GrantedSpace::new(
+        crate::token::generate(),
+        LinkSecret::generate_edit().to_base64url().to_string(),
+        full_owner_secrets(),
+    )
+    .unwrap()
 }
 
 /// Runs the exchange up to the holder's approval question.
@@ -56,14 +69,15 @@ fn paired() -> (Pairing, Pairing) {
 #[test]
 fn full_exchange_hands_over_the_grant() {
     let (mut holder, mut new) = paired();
-    let sent = holder.approve(&grant()).unwrap();
+    let sent_grant = grant();
+    let sent = holder.approve(&sent_grant).unwrap();
     let Some(Event::Granted(got)) = new.handle(&sent).unwrap().event else {
         panic!("expected a grant");
     };
-    assert_eq!(got.graph, grant().graph);
+    assert_eq!(got.graph, sent_grant.graph);
     assert_eq!(got.holder_name, "Desktop");
     assert!(PersonGraph::decode(&got.graph).is_ok());
-    assert!(got.projects == grant().projects);
+    assert!(got.space == sent_grant.space);
     assert!(holder.is_over() && new.is_over());
     assert!(matches!(new.handle(&sent), Err(PairError::Finished)));
 }
@@ -179,13 +193,6 @@ fn grant_limits_hold() {
     g.graph = vec![0; MAX_GRAPH_BYTES + 1];
     assert!(g.encode().is_err());
     let mut g = grant();
-    g.projects = (0..=MAX_PROJECTS).map(|_| g.projects[0].clone()).collect();
-    assert!(g.encode().is_err());
-    let mut g = grant();
-    g.projects[0].link = "x".repeat(MAX_LINK_LEN + 1);
-    assert!(g.encode().is_err());
-
-    let mut g = grant();
     g.holder_name = "n".repeat(MAX_DEVICE_NAME_LEN + 1);
     assert!(g.encode().is_err());
     g.holder_name = String::new();
@@ -194,23 +201,13 @@ fn grant_limits_hold() {
     let full = Grant {
         holder_name: "n".repeat(MAX_DEVICE_NAME_LEN),
         graph: vec![1; MAX_GRAPH_BYTES],
-        projects: (0..MAX_PROJECTS)
-            .map(|_| GrantedProject {
-                title: "t".repeat(MAX_TITLE_LEN),
-                link: "l".repeat(MAX_LINK_LEN),
-            })
-            .collect(),
+        space: space(),
     };
+    assert!(full.space.owner_secrets.len() <= MAX_OWNER_SECRETS_LEN);
     let bytes = full.encode().unwrap();
     assert!(bytes.len() + 64 < MAX_RELAY_MESSAGE);
-    assert!(Grant::decode(&bytes).unwrap().projects.len() == MAX_PROJECTS);
-    // A count far past the data must not allocate or pass.
-    let mut w = BytesWriter::new();
-    w.push_byte(GRANT_VERSION);
-    w.push_var_bytes(&[0; 8]);
-    w.push_var_string("Desktop");
-    w.push_uleb128(u32::MAX as u64);
-    assert!(Grant::decode(&w.finalize()).is_err());
+    let got = Grant::decode(&bytes).unwrap();
+    assert!(got.space == full.space);
 }
 
 #[test]
@@ -242,27 +239,6 @@ fn device_names_are_fitted() {
     let fitted = fit_device_name(&odd).unwrap();
     assert_eq!(fitted.len(), MAX_DEVICE_NAME_LEN - 3);
     assert!(valid_device_name(&fitted));
-}
-
-#[test]
-fn granted_projects_are_fitted_on_the_sending_side() {
-    let title = format!("{}\u{e9}", "t".repeat(MAX_TITLE_LEN - 1));
-    let project = GrantedProject::new(&title, "https://host/p/a#k".into()).unwrap();
-    assert_eq!(project.title, "t".repeat(MAX_TITLE_LEN - 1));
-    assert!(GrantedProject::new("x", "l".repeat(MAX_LINK_LEN)).is_some());
-    assert!(GrantedProject::new("x", "l".repeat(MAX_LINK_LEN + 1)).is_none());
-
-    let mut g = Grant::new("Desktop".into(), grant().graph);
-    let project = |i: usize| GrantedProject::new("p", format!("https://host/p/{i}#k")).unwrap();
-    assert!(g.push(project(0)));
-    assert!(g.push(project(0)));
-    assert_eq!(g.projects.len(), 1);
-    let mut i = 1;
-    while g.push(project(i)) {
-        i += 1;
-    }
-    assert_eq!(g.projects.len(), MAX_PROJECTS);
-    assert!(g.encode().is_ok());
 }
 
 #[test]
@@ -304,11 +280,7 @@ fn a_grant_graph_extends_with_the_announced_device() {
             },
         )
         .unwrap();
-    let grant = Grant {
-        holder_name: "Desktop".into(),
-        graph: graph.encode(),
-        projects: Vec::new(),
-    };
+    let grant = Grant::new("Desktop".into(), graph.encode(), space());
     let got = Grant::decode(&grant.encode().unwrap()).unwrap();
     let got = PersonGraph::decode(&got.graph).unwrap();
     assert_eq!(got, graph);
@@ -316,7 +288,70 @@ fn a_grant_graph_extends_with_the_announced_device() {
 }
 
 #[test]
+fn a_space_roundtrips() {
+    let g = grant();
+    let got = Grant::decode(&g.encode().unwrap()).unwrap();
+    assert!(got.space == g.space);
+
+    let (mut holder, mut new) = paired();
+    let sent = holder.approve(&g).unwrap();
+    let Some(Event::Granted(got)) = new.handle(&sent).unwrap().event else {
+        panic!("expected a grant");
+    };
+    assert!(got.space == g.space);
+}
+
+#[test]
+fn a_grant_without_a_space_is_refused() {
+    // The space is the last field, so every shorter prefix lacks some of it.
+    let bytes = grant().encode().unwrap().to_vec();
+    for len in 0..bytes.len() {
+        assert!(Grant::decode(&bytes[..len]).is_err(), "prefix {len}");
+    }
+    let mut w = BytesWriter::new();
+    w.push_byte(GRANT_VERSION);
+    w.push_var_bytes(&grant().graph);
+    w.push_var_string("Desktop");
+    assert!(Grant::decode(&w.finalize()).is_err());
+}
+
+#[test]
+fn a_malformed_space_is_refused() {
+    let token = crate::token::generate();
+    let edit = LinkSecret::generate_edit().to_base64url().to_string();
+    let view = LinkSecret::generate_edit().view_secret().to_string();
+    let owners = full_owner_secrets();
+    let make = |t: &str, s: &str, o: &[u8]| GrantedSpace::new(t.into(), s.into(), o.to_vec());
+
+    assert!(make(&token, &edit, &owners).is_ok());
+    assert!(make("short", &edit, &owners).is_err());
+    assert!(make(&"!".repeat(crate::token::TOKEN_LEN), &edit, &owners).is_err());
+    assert!(make(&token, "", &owners).is_err());
+    assert!(make(&token, "not a secret", &owners).is_err());
+    assert!(make(&token, &view, &owners).is_err());
+    assert!(make(&token, &"A".repeat(MAX_LINK_LEN + 1), &owners).is_err());
+    assert!(make(&token, &edit, &[]).is_err());
+    assert!(make(&token, &edit, &[1, 0]).is_err());
+    assert!(make(&token, &edit, &[0xff; 20]).is_err());
+    assert!(make(&token, &edit, &vec![0; MAX_OWNER_SECRETS_LEN + 1]).is_err());
+
+    // The same goes for a grant built around fields set directly.
+    let mut g = grant();
+    g.space = GrantedSpace {
+        token,
+        secret: edit.into(),
+        owner_secrets: vec![0; MAX_OWNER_SECRETS_LEN + 1].into(),
+    };
+    assert!(g.encode().is_err());
+}
+
+#[test]
 fn debug_hides_secrets() {
+    let g = grant();
+    let secret = g.space.secret.to_string();
+    let token = g.space.token.clone();
+    let text = format!("{g:?} {:?}", g.space);
+    assert!(!text.contains(&secret) && !text.contains(&token), "{text}");
     let text = format!(
         "{:?} {:?} {:?}",
         grant(),

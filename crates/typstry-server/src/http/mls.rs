@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 
 use super::{AppError, AppState};
-use crate::store::{mls, projects};
+use crate::store::{mls, spaces};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,17 +22,17 @@ struct Bootstrap {
     owner_key: String,
 }
 
-/// `GET /api/p/{token}/mls`: what a newcomer needs to join the group with
+/// `GET /api/s/{token}/mls`: what a newcomer needs to join the group with
 /// an external commit. Live tokens only, since a retired token must not
 /// reach the sealed keyring of the generation that replaced it.
 pub async fn bootstrap(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<Response, AppError> {
-    let (project_id, _) = projects::resolve_token(&state.db, &token)
+    let (space_id, _) = spaces::resolve_token(&state.db, &token)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let group = mls::load_group(&state.db, &project_id)
+    let group = mls::load_group(&state.db, &space_id)
         .await?
         .ok_or(StatusCode::NOT_FOUND)?;
     let body = Json(Bootstrap {

@@ -1,13 +1,17 @@
 import { createProject, expect, shareLink, syncStatus, test } from "./fixtures";
 import { newDevice } from "./pair-helpers";
 
-test("a recovery key brings a new browser back as the owner and revokes the old device", async ({
+test("a recovery key brings a new browser back with every project and revokes the old device", async ({
   page,
   browser,
 }) => {
   await createProject(page, "Lost and found");
   const editLink = await shareLink(page, "Can edit");
   await page.keyboard.press("Escape");
+
+  // A second project, open in its own tab so both stay live on the old device.
+  const second = await page.context().newPage();
+  await createProject(second, "Second project");
 
   await page.getByRole("button", { name: /^You are / }).click();
   await page.getByRole("menuitem", { name: "Recovery key…" }).click();
@@ -16,6 +20,12 @@ test("a recovery key brings a new browser back as the owner and revokes the old 
   const words = (await dialog.getByLabel("Recovery words").textContent())!;
   expect(words.trim().split(/\s+/)).toHaveLength(17);
   await expect(dialog.getByRole("button", { name: "Done" })).toBeDisabled();
+  // Opening the projects puts the personal space link into their leaves,
+  // which is all the recovery has to go on.
+  await expect(dialog.getByRole("status")).toHaveText(
+    "Your projects are up to date.",
+    { timeout: 60_000 },
+  );
   await dialog.getByLabel("I have stored it").check();
   await dialog.getByRole("button", { name: "Done" }).click();
   await expect(dialog).toBeHidden();
@@ -25,6 +35,8 @@ test("a recovery key brings a new browser back as the owner and revokes the old 
   await fresh.getByLabel("Recovery words").fill(words);
   await fresh.getByLabel("Project link").fill(editLink);
   await fresh.getByRole("button", { name: "Recover" }).click();
+  await expect(fresh.getByRole("status")).toContainText("2 projects");
+  await fresh.getByRole("button", { name: "Open project" }).click();
 
   await expect(syncStatus(fresh)).toHaveText("Connected");
   await fresh.getByRole("button", { name: "Share", exact: true }).click();
@@ -55,6 +67,20 @@ test("a recovery key brings a new browser back as the owner and revokes the old 
       .getByRole("dialog", { name: "Share project" })
       .getByRole("button", { name: "Reset links" }),
   ).toBeEnabled();
+
+  await expect(
+    second.getByRole("heading", { name: "You were removed from this project" }),
+  ).toBeVisible({ timeout: 30_000 });
+
+  // The directory came along, so the other project is listed here too.
+  await fresh.goto("/");
+  const list = fresh.getByRole("region", { name: "Your projects" });
+  await expect(
+    list.getByRole("link", { name: /Lost and found/ }),
+  ).toBeVisible();
+  await expect(
+    list.getByRole("link", { name: /Second project/ }),
+  ).toBeVisible();
 
   await fresh.context().close();
 });

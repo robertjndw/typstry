@@ -25,7 +25,7 @@ use typstry_wire::elo::encode_container;
 #[tokio::test]
 async fn clones_an_empty_project() {
     let server = Server::start().await;
-    let (edit, _) = server.create_project().await;
+    let (edit, _) = server.create_space().await;
     let work = tempfile::tempdir().unwrap();
     let dir = clone(&edit, work.path(), "empty").await;
     let entries: Vec<_> = fs::read_dir(&dir)
@@ -328,7 +328,7 @@ async fn writers_compact_the_server_log() {
     }
     session.disconnect().await;
 
-    let records = typstry_server::store::docs::record_count(&server.state.db, &share.project_id)
+    let records = typstry_server::store::docs::record_count(&server.state.db, &share.space_id)
         .await
         .unwrap();
     assert!(records < 20, "{records} records left after compaction");
@@ -755,7 +755,7 @@ async fn inject_foreign_record(link: &str) {
     let record = keys
         .encrypt_delta(&signer, 4242, 0, end as u64, &plaintext)
         .unwrap();
-    let mut client = Client::connect(&ws_url(&link.origin).unwrap(), &share.project_id)
+    let mut client = Client::connect(&ws_url(&link.origin).unwrap(), &share.space_id)
         .await
         .unwrap();
     client
@@ -787,7 +787,7 @@ async fn records_under_another_key_are_skipped() {
     typstry(&a, &["push"]).await.unwrap();
 
     // A project made entirely of such records means the link's key is wrong.
-    let (empty, _) = server.create_project().await;
+    let (empty, _) = server.create_space().await;
     inject_foreign_record(&empty).await;
     let err = typstry(work.path(), &["clone", &empty, "wrong"])
         .await

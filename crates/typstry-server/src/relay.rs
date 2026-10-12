@@ -229,7 +229,7 @@ impl RelayRegistry {
             return Err(JoinError::Unknown);
         }
         let seat = match claim {
-            // A bearer token as random as the project ids, so a plain
+            // A bearer token as random as the space ids, so a plain
             // comparison leaks nothing worth timing.
             Some(given) if given == ch.claim => OWNER,
             Some(_) => return Err(JoinError::Unknown),

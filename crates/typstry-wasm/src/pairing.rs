@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use typstry_wire::crypto::PublicKey;
-use typstry_wire::pairing::{self as wire, Event, Grant, GrantedProject};
+use typstry_wire::pairing::{self as wire, Event, Grant, GrantedSpace};
 use wasm_bindgen::prelude::*;
 
 use crate::error::{from_code, from_pair, from_serde, invalid};
@@ -48,9 +48,11 @@ impl PairingCode {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectDto {
-    title: String,
-    link: String,
+struct SpaceDto {
+    token: String,
+    secret: String,
+    #[serde(with = "serde_bytes")]
+    owner_secrets: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -69,8 +71,8 @@ enum EventDto {
     Granted {
         #[serde(with = "serde_bytes")]
         graph: Vec<u8>,
-        projects: Vec<ProjectDto>,
         holder_name: String,
+        space: SpaceDto,
     },
     Rejected,
 }
@@ -89,14 +91,11 @@ impl From<Event> for EventDto {
             Event::Granted(grant) => Self::Granted {
                 holder_name: grant.holder_name,
                 graph: grant.graph,
-                projects: grant
-                    .projects
-                    .into_iter()
-                    .map(|p| ProjectDto {
-                        title: p.title,
-                        link: p.link,
-                    })
-                    .collect(),
+                space: SpaceDto {
+                    token: grant.space.token,
+                    secret: grant.space.secret.to_string(),
+                    owner_secrets: grant.space.owner_secrets.to_vec(),
+                },
             },
             Event::Rejected => Self::Rejected,
         }
@@ -172,21 +171,25 @@ impl Pairing {
 
     /// Holder only, after `awaitApproval`: the frame that hands over the
     /// person's `graph` (a `PersonGraph.encode`, with the new device added),
-    /// `projects`, and `holderName`, how the new device should label this
-    /// one. Projects are fitted as `fitGrantProjects` does and the name as
-    /// `fitDeviceName` does, so the limits never fail the grant; a name with
-    /// nothing printable throws `Malformed`.
+    /// `holderName`, how the new device should label this one, and `space`,
+    /// the person's personal space, whose directory lists their projects.
+    /// The name is fitted as `fitDeviceName` does, so the limit never fails
+    /// the grant; a name with nothing printable throws `Malformed`, as does a
+    /// space that is not a token, an edit secret and owner secrets.
     pub fn approve(
         &mut self,
         graph: &[u8],
-        #[wasm_bindgen(unchecked_param_type = "PairingProject[]")] projects: JsValue,
         holder_name: &str,
+        #[wasm_bindgen(unchecked_param_type = "PairingSpace")] space: JsValue,
     ) -> Result<Vec<u8>, JsValue> {
         let holder_name = wire::fit_device_name(holder_name)
             .ok_or_else(|| invalid("Malformed", "the holder's name is empty"))?;
-        let mut grant = Grant::new(holder_name, graph.to_vec());
-        grant.projects = fit_projects(projects)?;
-        self.inner.approve(&grant).map_err(from_pair)
+        let space: SpaceDto = serde_wasm_bindgen::from_value(space).map_err(from_serde)?;
+        let space =
+            GrantedSpace::new(space.token, space.secret, space.owner_secrets).map_err(from_pair)?;
+        self.inner
+            .approve(&Grant::new(holder_name, graph.to_vec(), space))
+            .map_err(from_pair)
     }
 
     /// Holder only, after `awaitApproval`: the frame that turns the device
@@ -194,37 +197,6 @@ impl Pairing {
     pub fn reject(&mut self) -> Result<Vec<u8>, JsValue> {
         self.inner.reject().map_err(from_pair)
     }
-}
-
-fn fit_projects(projects: JsValue) -> Result<Vec<GrantedProject>, JsValue> {
-    let projects: Vec<ProjectDto> = serde_wasm_bindgen::from_value(projects).map_err(from_serde)?;
-    let mut grant = Grant::new(String::new(), Vec::new());
-    for project in projects {
-        let Some(project) = GrantedProject::new(&project.title, project.link) else {
-            continue;
-        };
-        if !grant.push(project) {
-            break;
-        }
-    }
-    Ok(grant.projects)
-}
-
-/// What of `projects` a grant carries: titles cut to the byte limit, links
-/// that are too long or repeated left out, and at most as many as a grant
-/// holds, in order. `approve` does the same; this is for showing it.
-#[wasm_bindgen(js_name = fitGrantProjects, unchecked_return_type = "PairingProject[]")]
-pub fn fit_grant_projects(
-    #[wasm_bindgen(unchecked_param_type = "PairingProject[]")] projects: JsValue,
-) -> Result<JsValue, JsValue> {
-    let fitted: Vec<ProjectDto> = fit_projects(projects)?
-        .into_iter()
-        .map(|p| ProjectDto {
-            title: p.title,
-            link: p.link,
-        })
-        .collect();
-    serde_wasm_bindgen::to_value(&fitted).map_err(from_serde)
 }
 
 /// Whether the pairing takes `name` as a device name: not empty, at most
@@ -250,9 +222,10 @@ pub fn max_device_name_len() -> usize {
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"
-export type PairingProject = {
-  title: string;
-  link: string;
+export type PairingSpace = {
+  token: string;
+  secret: string;
+  ownerSecrets: Uint8Array;
 };
 export type PairingEvent =
   | { type: "verified" }
@@ -260,8 +233,8 @@ export type PairingEvent =
   | {
       type: "granted";
       graph: Uint8Array;
-      projects: PairingProject[];
       holderName: string;
+      space: PairingSpace;
     }
   | { type: "rejected" };
 export type PairingStep = { send?: Uint8Array; event?: PairingEvent };

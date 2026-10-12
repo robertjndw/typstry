@@ -17,7 +17,7 @@ test("created projects are listed and can be removed", async ({ page }) => {
   await createProject(page, "Listed");
   await page.getByRole("link", { name: "All projects" }).click();
 
-  const recent = page.getByRole("region", { name: "Recent projects" });
+  const recent = page.getByRole("region", { name: "Your projects" });
   await expect(recent.getByRole("link", { name: /Listed/ })).toBeVisible();
 
   await recent.getByRole("button", { name: "Delete Listed" }).click();
@@ -29,6 +29,34 @@ test("created projects are listed and can be removed", async ({ page }) => {
 
   await page.reload();
   await expect(page.getByRole("link", { name: /Listed/ })).toBeHidden();
+});
+
+test("every project is listed, past the old limit of twelve", async ({
+  page,
+}) => {
+  const count = 13;
+  for (let n = 1; n <= count; n++) await createProject(page, `Many ${n}`);
+  await page.goto("/");
+  const projects = page.getByRole("region", { name: "Your projects" });
+  await expect(projects.getByRole("link")).toHaveCount(count);
+  // Most recently opened first.
+  await expect(projects.getByRole("link").first()).toContainText(
+    `Many ${count}`,
+  );
+});
+
+test("a project renamed inside shows its new title on the start page", async ({
+  page,
+}) => {
+  await createProject(page, "Before");
+  await page.getByRole("button", { name: /Project title: Before/ }).click();
+  const input = page.getByRole("textbox", { name: "Project title" });
+  await input.fill("After");
+  await input.press("Enter");
+  await page.getByRole("link", { name: "All projects" }).click();
+  const projects = page.getByRole("region", { name: "Your projects" });
+  await expect(projects.getByRole("link", { name: /After/ })).toBeVisible();
+  await expect(projects.getByRole("link", { name: /Before/ })).toBeHidden();
 });
 
 test("a link without the key explains what is missing", async ({ page }) => {

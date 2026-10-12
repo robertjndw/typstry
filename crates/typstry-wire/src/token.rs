@@ -1,5 +1,5 @@
-//! Random identifiers for projects and share links. The server mints them
-//! for new projects, and clients mint the ones a rotation switches to, so
+//! Random identifiers for spaces and share links. The server mints them
+//! for new spaces, and clients mint the ones a rotation switches to, so
 //! the server never learns which secret a token belongs to. Both sides have
 //! to agree on the shape the server checks.
 

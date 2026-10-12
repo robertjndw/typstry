@@ -83,12 +83,12 @@ pub const OWNER_KEY_LEN: usize = 32;
 pub const OWNER_PROOF_LEN: usize = 64;
 
 /// The new links of a rotation, as the server needs them: it swaps the
-/// project's tokens in the same transaction as the commit. The rotating
+/// space's tokens in the same transaction as the commit. The rotating
 /// client picks the new tokens at random; the matching secrets travel only
 /// inside the sealed envelope, never to the server.
 ///
 /// Only the owner rotates, which the server checks with `owner_proof`, the
-/// signature of the project's current owner key over the whole submission.
+/// signature of the space's current owner key over the whole submission.
 /// `next_owner_key` replaces that key once the rotation is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rotate {
@@ -129,7 +129,7 @@ pub enum RefusalCode {
     Internal,
     /// The connection sent messages faster than the server accepts them.
     RateLimited,
-    /// A rotation that is not signed with the project's owner key. Nothing
+    /// A rotation that is not signed with the space's owner key. Nothing
     /// was stored.
     NotOwner,
 }
@@ -212,7 +212,7 @@ pub enum ClientMessage {
         envelope: Option<Vec<u8>>,
         rotate: Option<Rotate>,
     },
-    /// Creates the group of a new project. `owner_key` is the public owner
+    /// Creates the group of a new space. `owner_key` is the public owner
     /// key the first rotation has to be signed with.
     Init {
         req: u64,

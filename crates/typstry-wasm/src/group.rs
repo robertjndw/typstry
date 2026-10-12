@@ -1,15 +1,17 @@
-//! One device's view of a project's MLS group.
+//! One device's view of a space's MLS group.
 //!
-//! A thin layer over `typstry_wire::mls::ProjectGroup`: the operations that
+//! A thin layer over `typstry_wire::mls::SpaceGroup`: the operations that
 //! make a commit hand back a message for the delivery service, as a plain
 //! object ready for `encodeClientMessage` once the caller has set its `req`.
 //! The caller owns persistence and locking: save [`Group::export_state`]
 //! after every change, and never run two operations on one group at once.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use typstry_wire::identity::{self, person_fingerprint};
-use typstry_wire::mls::{self, LocalIdentity, Outcome, OwnerSecrets, ProjectGroup, Role};
-use typstry_wire::owner::{self, RotationClaim};
+use typstry_wire::mls::{
+    self, LocalIdentity, Outcome, OwnerSecrets, PersonSpace, Role, SpaceGroup,
+};
+use typstry_wire::owner::{self, Origin, OwnerSecret, RotationClaim};
 use wasm_bindgen::prelude::*;
 
 use crate::ds::ClientDto;
@@ -29,7 +31,7 @@ fn num(value: f64) -> Result<u64, JsValue> {
     }
 }
 
-/// The person graphs (`PersonGraph.encode` bytes) the leaves of a project
+/// The person graphs (`PersonGraph.encode` bytes) the leaves of a space
 /// carry, read from its sealed GroupInfo and keyring without joining. A
 /// device that lost everything uses it to find the person a recovery key
 /// belongs to.
@@ -47,7 +49,7 @@ pub fn graphs_in_group_info(
         .into())
 }
 
-/// The owner key share the project's tree holds for a recovery key
+/// The owner key share the space's tree holds for a recovery key
 /// (`recoverySeed`, from `RecoveryKey.fromWords`), read from the bootstrap
 /// (its sealed GroupInfo, keyring and the server's `ownerKey`) before
 /// joining, as `ownerSecrets` bytes to keep (see `mergeOwnerSecrets`) and
@@ -73,7 +75,54 @@ pub fn owner_share_for_recovery(
     Ok(secret.map(|secret| OwnerSecrets::received(secret).encode().to_vec()))
 }
 
-/// `held` (`ownerSecrets` bytes, e.g. `ProjectGroup.ownerSecrets()`) added
+/// The personal space a device points to: its edit token and its edit
+/// secret (base64url), as the web client's space binding has them.
+#[derive(Serialize, Deserialize)]
+struct PersonSpaceDto {
+    token: String,
+    secret: String,
+}
+
+/// The binding a caller passes, if any, checked for shape.
+fn person_space(space: Option<JsValue>) -> Result<Option<PersonSpace>, JsValue> {
+    let Some(space) = space.filter(|space| !space.is_null() && !space.is_undefined()) else {
+        return Ok(None);
+    };
+    let dto: PersonSpaceDto = serde_wasm_bindgen::from_value(space).map_err(from_serde)?;
+    PersonSpace::new(&dto.token, &dto.secret)
+        .map(Some)
+        .map_err(|why| crate::error::invalid("Malformed", why))
+}
+
+/// Every personal space binding the space's tree holds for a recovery key
+/// (`recoverySeed`), read from its sealed GroupInfo and keyring before
+/// joining, as `{ token, secret }[]`. Empty when no leaf of the key's person
+/// carries one that opens. Ordered by how many leaves carry a pointer, then
+/// the rightmost leaf; the caller tries them in order and keeps the first
+/// the server confirms. Needs no owner key: the binding is about the person,
+/// not the project.
+#[wasm_bindgen(js_name = personSpacesForRecovery, unchecked_return_type = "PersonSpaceBinding[]")]
+pub fn person_spaces_for_recovery(
+    link: &LinkSecret,
+    group_info: &[u8],
+    keyring: &[u8],
+    recovery_seed: &[u8],
+) -> Result<JsValue, JsValue> {
+    let recovery = device_key(recovery_seed)?;
+    let spaces = mls::person_spaces_for_recovery(&link.inner, group_info, keyring, &recovery)
+        .map_err(from_mls)?;
+    to_js(
+        &spaces
+            .iter()
+            .map(|space| PersonSpaceDto {
+                token: space.token().to_owned(),
+                secret: space.secret().to_owned(),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// `held` (`ownerSecrets` bytes, e.g. `SpaceGroup.ownerSecrets()`) added
 /// to `kept` (the copy saved beside the state), as the bytes to save in
 /// its place. Nothing in `kept` is dropped for what `held` lacks: which key
 /// is current is only what the server says, and a copy must keep the one
@@ -88,6 +137,53 @@ pub fn merge_owner_secrets(
         .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
         .unwrap_or_default();
     merged.merge(&owner_secrets(held)?);
+    Ok((!merged.is_empty()).then(|| merged.encode().to_vec()))
+}
+
+/// The public owner key (32 bytes) of an owner secret (the bare 32 bytes
+/// the directory keeps, see `ownerSecretList`). Throws `MalformedKey` for any
+/// other length.
+#[wasm_bindgen(js_name = ownerPublicKeyOf)]
+pub fn owner_public_key_of(secret: &[u8]) -> Result<Vec<u8>, JsValue> {
+    Ok(OwnerSecret::from_raw(secret)
+        .map_err(from_crypto)?
+        .public()
+        .to_vec())
+}
+
+/// Every secret of `ownerSecrets` bytes as its bare 32 bytes, newest first.
+/// Throws on damaged bytes.
+#[wasm_bindgen(js_name = ownerSecretList)]
+pub fn owner_secret_list(bytes: Option<Vec<u8>>) -> Result<Vec<js_sys::Uint8Array>, JsValue> {
+    Ok(owner_secrets(bytes)?
+        .iter()
+        .map(|secret| js_sys::Uint8Array::from(secret.to_raw().as_ref()))
+        .collect())
+}
+
+/// `ownerSecrets` bytes with `secrets` (bare 32 bytes each, newest first,
+/// as `ownerPublicKeyOf` takes) added in place of `bytes`, only as far as
+/// there is room: what `bytes` holds is never evicted, so a planted or stale
+/// directory entry cannot push out a key this device already has. Nothing in
+/// `bytes` is dropped; a damaged `bytes` counts as empty. Undefined when the
+/// result is empty.
+#[wasm_bindgen(js_name = withOwnerSecrets)]
+pub fn with_owner_secrets(
+    bytes: Option<Vec<u8>>,
+    secrets: Vec<js_sys::Uint8Array>,
+) -> Result<Option<Vec<u8>>, JsValue> {
+    let added = secrets
+        .iter()
+        .map(|raw| {
+            OwnerSecret::from_raw(&raw.to_vec())
+                .map(|secret| (secret, Origin::Received))
+                .map_err(from_crypto)
+        })
+        .collect::<Result<OwnerSecrets, _>>()?;
+    let mut merged = bytes
+        .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
+        .unwrap_or_default();
+    merged.extend_older(&added);
     Ok((!merged.is_empty()).then(|| merged.encode().to_vec()))
 }
 
@@ -155,7 +251,7 @@ fn owner_public(bytes: &[u8]) -> Result<owner::OwnerKey, JsValue> {
 /// The joins of [`Group::join_external_as`] and [`Group::rejoin_as`].
 #[allow(clippy::too_many_arguments)]
 fn join_as(
-    previous: Option<&ProjectGroup>,
+    previous: Option<&SpaceGroup>,
     leaf_keys: &LeafKeys,
     link: &LinkSecret,
     (group_info, keyring, owner_key): (&[u8], &[u8], &[u8]),
@@ -166,7 +262,7 @@ fn join_as(
 ) -> Result<JsValue, JsValue> {
     let owner_key = owner_public(owner_key)?;
     let kept = owner_secrets(owner_secret_bytes)?;
-    let (group, submit) = ProjectGroup::join_external_as(
+    let (group, submit) = SpaceGroup::join_external_as(
         leaf_keys.inner.duplicate(),
         &link.inner,
         mls::Bootstrap {
@@ -184,9 +280,9 @@ fn join_as(
     pair(group, submit.into_message(0).into())
 }
 
-/// A project's leaf keys, which outlive the group state, so a device that
+/// A space's leaf keys, which outlive the group state, so a device that
 /// lost its state can rejoin as itself (a resync) instead of leaving a ghost
-/// leaf behind. Per project, unlike the `DeviceKey` of the person.
+/// leaf behind. Per space, unlike the `DeviceKey` of the person.
 #[wasm_bindgen]
 pub struct LeafKeys {
     inner: mls::LeafKeys,
@@ -316,7 +412,7 @@ struct IdentityStepDto {
     share_owner_key: bool,
 }
 
-/// What a device brings to a project: its `DeviceKey.export` and the
+/// What a device brings to a space: its `DeviceKey.export` and the
 /// `PersonGraph.encode` that lists it. Bytes rather than the classes, because
 /// wasm-bindgen would move them out of the caller's objects.
 fn local_identity(device_seed: &[u8], graph: &[u8]) -> Result<LocalIdentity, JsValue> {
@@ -327,7 +423,7 @@ fn local_identity(device_seed: &[u8], graph: &[u8]) -> Result<LocalIdentity, JsV
 }
 
 /// [`local_identity`] where a device may have none, as when it joins a
-/// project it only views. Both or neither.
+/// space it only views. Both or neither.
 fn identity_of(
     device_seed: Option<Vec<u8>>,
     graph: Option<Vec<u8>>,
@@ -361,7 +457,7 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 
 /// `{ group, message }`, for the calls that make a group and a first
 /// message for the server together.
-fn pair(group: ProjectGroup, message: ClientDto) -> Result<JsValue, JsValue> {
+fn pair(group: SpaceGroup, message: ClientDto) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
     js_sys::Reflect::set(&out, &"group".into(), &Group { inner: group }.into())?;
     js_sys::Reflect::set(&out, &"message".into(), &to_js(&message)?)?;
@@ -470,7 +566,7 @@ export interface Member {
   personFingerprint?: string;
   /** The device key that vouched for this leaf, for a verified person. */
   devicePub?: Uint8Array;
-  /** The person's merged graph in this project shows the device revoked. */
+  /** The person's merged graph in this space shows the device revoked. */
   deviceRevoked: boolean;
   /** The verified person's own profile bytes from their graph. */
   personProfile?: Uint8Array;
@@ -479,6 +575,11 @@ export interface RevokedRemoval {
   message: Unsent<SubmitMessage>;
   /** The leaves the commit removes. */
   removed: number[];
+}
+/** Where a person's personal space is: its edit token and edit secret. */
+export interface PersonSpaceBinding {
+  token: string;
+  secret: string;
 }
 export interface IdentityStep {
   /** The stored graph with the group's copy merged in, if that adds anything. */
@@ -512,22 +613,22 @@ export interface Opened {
   plaintext: Uint8Array;
 }
 export interface Joined<M> {
-  group: ProjectGroup;
+  group: SpaceGroup;
   message: M;
 }
 "#;
 
-/// One device's view of a project's group.
-#[wasm_bindgen(js_name = ProjectGroup)]
+/// One device's view of a space's group.
+#[wasm_bindgen(js_name = SpaceGroup)]
 pub struct Group {
-    inner: ProjectGroup,
+    inner: SpaceGroup,
 }
 
-#[wasm_bindgen(js_class = ProjectGroup)]
+#[wasm_bindgen(js_class = SpaceGroup)]
 impl Group {
-    /// Creates the group of a new project from a fresh edit link. Returns
+    /// Creates the group of a new space from a fresh edit link. Returns
     /// `{ group, message }`, the message being the server's `init`. The
-    /// creator's person becomes the project's owner, so the device key and
+    /// creator's person becomes the space's owner, so the device key and
     /// graph are not optional.
     #[wasm_bindgen(unchecked_return_type = "Joined<InitMessage>")]
     pub fn create(
@@ -538,7 +639,7 @@ impl Group {
     ) -> Result<JsValue, JsValue> {
         let identity = local_identity(device_seed, graph)?;
         let (group, init) =
-            ProjectGroup::create(&link.inner, profile, &identity).map_err(from_mls)?;
+            SpaceGroup::create(&link.inner, profile, &identity).map_err(from_mls)?;
         pair(group, init.into_message(0).into())
     }
 
@@ -547,7 +648,7 @@ impl Group {
     /// Returns `{ group, message }` with the `submit` for the server. Call
     /// `confirmPending` once the server answers `accepted`; on `conflict`,
     /// drop the group and join again from the newer GroupInfo. `pinnedOwner`
-    /// is the owner's person id as first seen for the project
+    /// is the owner's person id as first seen for the space
     /// (`ownerPerson`), which the group must still have (else
     /// `OwnerChanged`). A device of the owner joins as the owner by bringing
     /// its identity.
@@ -565,7 +666,7 @@ impl Group {
     ) -> Result<JsValue, JsValue> {
         let identity = identity_of(device_seed, graph)?;
         let owner_key = owner_public(owner_key)?;
-        let (group, submit) = ProjectGroup::join_external(
+        let (group, submit) = SpaceGroup::join_external(
             &link.inner,
             mls::Bootstrap {
                 group_info,
@@ -644,7 +745,7 @@ impl Group {
         )
     }
 
-    /// Starts over with a new group of the same project when this one is
+    /// Starts over with a new group of the same space when this one is
     /// stuck. Returns `{ group, message }` with the `reset`. The leaf keeps
     /// its identity unless `deviceSeed` and `graph` give a new one.
     #[wasm_bindgen(unchecked_return_type = "Joined<ResetMessage>")]
@@ -749,18 +850,28 @@ impl Group {
     /// What to do to keep this device's identity in line with its person,
     /// in one pass over the tree, given `graph`, the `PersonGraph.encode`
     /// stored here. Returns `{ merged?, needsRefresh, rejoin, revoked,
-    /// shareOwnerKey }`: on `rejoin` join again with `joinExternalAs` and the
-    /// same leaf keys and do nothing else; otherwise store `merged` when set,
+    /// shareOwnerKey }`: pass the personal space `space` (`{ token, secret }`)
+    /// of this device, if it has one, and `needsRefresh` also says the leaf's
+    /// pointer to it is missing or stale. On `rejoin` join again with
+    /// `joinExternalAs` and the same leaf keys and do nothing else;
+    /// otherwise store `merged` when set,
     /// commit `selfUpdate(profile, merged ?? graph)` when `needsRefresh` or
     /// `shareOwnerKey`, and `removeRevoked` when `revoked` is not empty.
     /// After committing a refresh ask again, as it can change `revoked`.
     /// Throws what merging throws when the group's copy of the person does
     /// not merge with `graph`.
     #[wasm_bindgen(js_name = identityStep, unchecked_return_type = "IdentityStep")]
-    pub fn identity_step(&self, graph: &[u8]) -> Result<JsValue, JsValue> {
+    pub fn identity_step(
+        &self,
+        graph: &[u8],
+        #[wasm_bindgen(unchecked_param_type = "PersonSpaceBinding | undefined")] space: Option<
+            JsValue,
+        >,
+    ) -> Result<JsValue, JsValue> {
+        let space = person_space(space)?;
         let step = self
             .inner
-            .identity_step(&graph_of(graph)?)
+            .identity_step(&graph_of(graph)?, space.as_ref())
             .map_err(from_mls)?;
         to_js(&IdentityStepDto {
             merged: step.merged.map(|graph| graph.encode()),
@@ -781,17 +892,23 @@ impl Group {
     /// Refreshes this editor's leaf with a new profile. With a `graph` (a
     /// `PersonGraph.encode`) the leaf's graph is extended by it; throws
     /// `ForeignGraph` for another person's and `NoIdentity` for a leaf that
-    /// has none.
+    /// has none. With a `space` (`{ token, secret }`) the leaf's pointer to
+    /// the personal space is sealed anew to the person's recovery keys;
+    /// without, the leaf keeps the pointer it has.
     #[wasm_bindgen(js_name = selfUpdate, unchecked_return_type = "Unsent<SubmitMessage>")]
     pub fn self_update(
         &mut self,
         profile: &[u8],
         graph: Option<Vec<u8>>,
+        #[wasm_bindgen(unchecked_param_type = "PersonSpaceBinding | undefined")] space: Option<
+            JsValue,
+        >,
     ) -> Result<JsValue, JsValue> {
         let graph = graph.map(|bytes| graph_of(&bytes)).transpose()?;
+        let space = person_space(space)?;
         let submit = self
             .inner
-            .self_update(profile, graph.as_ref())
+            .self_update(profile, graph.as_ref(), space.as_ref())
             .map_err(from_mls)?;
         to_js(&ClientDto::from(submit.into_message(0)))
     }
@@ -885,8 +1002,8 @@ impl Group {
         }
     }
 
-    /// The project owner's person id, i.e. the person in the group whose tag
-    /// the policy holds. Pin it the first time a project is seen and pass it
+    /// The space owner's person id, i.e. the person in the group whose tag
+    /// the policy holds. Pin it the first time a space is seen and pass it
     /// as `pinnedOwner` to later joins. Undefined while none of the owner's
     /// devices is in the group, as after a reset.
     #[wasm_bindgen(js_name = ownerPerson)]
@@ -902,6 +1019,27 @@ impl Group {
     pub fn owner_secrets(&self) -> Option<Vec<u8>> {
         let held = self.inner.owner_secrets();
         (!held.is_empty()).then(|| held.encode().to_vec())
+    }
+
+    /// Takes `ownerSecrets` bytes kept outside the group, like the copies in
+    /// the person's directory: the secret of the owner key the server names
+    /// first, then the rest as far as there is room, so none of what this
+    /// device holds is evicted. Local only, nothing is committed. Throws on
+    /// damaged bytes.
+    #[wasm_bindgen(js_name = keepOwnerSecrets)]
+    pub fn keep_owner_secrets(&mut self, bytes: Option<Vec<u8>>) -> Result<(), JsValue> {
+        self.inner.keep_owner_secrets(&owner_secrets(bytes)?);
+        Ok(())
+    }
+
+    /// The bare 32-byte secret of the owner key the server names, if this
+    /// device holds it: the one worth spreading to the person's other
+    /// devices, unlike the older ones `ownerSecrets` keeps around.
+    #[wasm_bindgen(js_name = ownerSecret)]
+    pub fn owner_secret(&self) -> Option<Vec<u8>> {
+        self.inner
+            .owner_secret()
+            .map(|secret| secret.to_raw().to_vec())
     }
 
     /// Whether this device can rotate: an owner that holds the current
@@ -955,7 +1093,7 @@ impl Group {
     /// for a join the server never accepted.
     #[wasm_bindgen(js_name = importState)]
     pub fn import_state(bytes: &[u8]) -> Result<Group, JsValue> {
-        ProjectGroup::import_state(bytes)
+        SpaceGroup::import_state(bytes)
             .map(|inner| Self { inner })
             .map_err(from_mls)
     }

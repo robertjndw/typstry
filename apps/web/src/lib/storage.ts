@@ -33,3 +33,14 @@ export function writeJson(
     // Not persisting a convenience value is fine.
   }
 }
+
+export function removeKey(
+  key: string,
+  storage: Storage | null = getStorage(),
+): void {
+  try {
+    storage?.removeItem(key);
+  } catch {
+    // Same as a failed write: the value just stays around.
+  }
+}

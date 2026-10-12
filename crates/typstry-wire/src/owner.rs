@@ -1,10 +1,10 @@
-//! The owner key of a project: how the server tells the owner's rotations
+//! The owner key of a space: how the server tells the owner's rotations
 //! from anyone else's.
 //!
-//! A rotation swaps the project's tokens on the server, and the server
+//! A rotation swaps the space's tokens on the server, and the server
 //! cannot read the group to see who sent it. Were any edit token enough, an
 //! editor could submit a rotation whose envelope reaches nobody and lock
-//! everyone else out. So a project has an owner key, an Ed25519 key derived
+//! everyone else out. So a space has an owner key, an Ed25519 key derived
 //! from a random secret that only the owner's devices hold. The server keeps
 //! the public half it was given with `Init` and swaps tokens only for a
 //! rotation signed with it.
@@ -116,11 +116,12 @@ pub use secret::{Origin, OwnerSecret, OwnerSecrets};
 
 #[cfg(feature = "crypto")]
 mod secret {
+    use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use zeroize::Zeroizing;
 
     use super::{OwnerKey, OwnerProof, RotationClaim};
-    use crate::crypto::{CryptoError, KEY_LEN, hkdf, random};
+    use crate::crypto::{BASE64URL, CryptoError, KEY_LEN, hkdf, random};
 
     const SIGNING_INFO: &[u8] = b"typstry:v1:owner-signing-key";
     const EXPORT_VERSION: u8 = 1;
@@ -189,6 +190,33 @@ mod secret {
             out
         }
 
+        /// The bare 32 secret bytes, for a store that keeps its own framing
+        /// (the personal space's directory).
+        pub fn to_raw(&self) -> Zeroizing<[u8; KEY_LEN]> {
+            self.secret.clone()
+        }
+
+        /// Inverse of [`Self::to_raw`].
+        pub fn from_raw(bytes: &[u8]) -> Result<Self, CryptoError> {
+            let secret = <[u8; KEY_LEN]>::try_from(bytes).map_err(|_| CryptoError::MalformedKey)?;
+            Ok(Self::from_secret(Zeroizing::new(secret)))
+        }
+
+        /// [`Self::to_raw`] as base64url without padding.
+        pub fn to_base64url(&self) -> Zeroizing<String> {
+            Zeroizing::new(BASE64URL.encode(self.secret.as_ref()))
+        }
+
+        /// Inverse of [`Self::to_base64url`].
+        pub fn from_base64url(raw: &str) -> Result<Self, CryptoError> {
+            let bytes = Zeroizing::new(
+                BASE64URL
+                    .decode(raw)
+                    .map_err(|_| CryptoError::MalformedKey)?,
+            );
+            Self::from_raw(&bytes)
+        }
+
         /// Inverse of [`Self::export`].
         pub fn import(bytes: &[u8]) -> Result<Self, CryptoError> {
             if bytes.len() != EXPORT_LEN || bytes[0] != EXPORT_VERSION {
@@ -202,7 +230,7 @@ mod secret {
     /// How a device came by an owner key secret.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Origin {
-        /// This device generated it: it created the project or made the
+        /// This device generated it: it created the space or made the
         /// rotation that moved the server on to it.
         Made,
         /// Opened from a share, or taken along from another copy.
@@ -314,6 +342,7 @@ mod secret {
 
         /// The secret of `key` from `other`, if this set lacks it, as the
         /// newest: the one to use is not left out for want of room.
+        #[cfg(feature = "mls")]
         pub(crate) fn take_from(&mut self, other: &Self, key: &OwnerKey) {
             if let Some((secret, origin)) = other.entry(key) {
                 self.add(secret.clone(), *origin);
@@ -388,6 +417,23 @@ mod secret {
 #[cfg(all(test, feature = "crypto"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_round_trips_through_its_bare_bytes() {
+        let secret = OwnerSecret::generate();
+        let again = OwnerSecret::from_raw(secret.to_raw().as_ref()).unwrap();
+        assert_eq!(again.public(), secret.public());
+        let text = secret.to_base64url();
+        assert_eq!(text.len(), 43);
+        assert_eq!(
+            OwnerSecret::from_base64url(&text).unwrap().public(),
+            secret.public()
+        );
+        for bad in ["", "AAAA", "not base64!", &text[1..]] {
+            assert!(OwnerSecret::from_base64url(bad).is_err());
+        }
+        assert!(OwnerSecret::from_raw(&[0; 33]).is_err());
+    }
 
     fn claim<'a>(next: &'a OwnerKey) -> RotationClaim<'a> {
         RotationClaim {

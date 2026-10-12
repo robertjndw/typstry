@@ -116,9 +116,9 @@ async fn migrations_create_schema_in_wal_mode() {
             "doc_records",
             "mls_commits",
             "mls_groups",
-            "project_blobs",
-            "projects",
-            "retired_tokens"
+            "retired_tokens",
+            "space_blobs",
+            "spaces"
         ]
     );
 
@@ -134,7 +134,7 @@ async fn backup_writes_a_readable_copy() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
     let state = AppState::new(pool.clone(), BlobStore::new(dir.path()));
-    common::create_project(common::app(state, dir.path())).await;
+    common::create_space(common::app(state, dir.path())).await;
 
     let dest = dir.path().join("backup.db");
     db::backup(&pool, &dest).await.unwrap();
@@ -142,11 +142,11 @@ async fn backup_writes_a_readable_copy() {
     assert!(db::backup(&pool, &dest).await.is_err());
 
     let copy = db::open(&dest).await.unwrap();
-    let projects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects")
+    let spaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM spaces")
         .fetch_one(&copy)
         .await
         .unwrap();
-    assert_eq!(projects, 1);
+    assert_eq!(spaces, 1);
     let check: String = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_one(&copy)
         .await
@@ -155,7 +155,7 @@ async fn backup_writes_a_readable_copy() {
 }
 
 #[tokio::test]
-async fn create_project_ignores_any_body() {
+async fn create_space_ignores_any_body() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
     let app = common::app(
@@ -169,7 +169,7 @@ async fn create_project_ignores_any_body() {
         (Some("application/json"), "{}"),
         (Some("application/json"), r#"{"title":"Paper"}"#),
     ] {
-        let mut req = Request::post("/api/projects");
+        let mut req = Request::post("/api/spaces");
         if let Some(ct) = content_type {
             req = req.header("content-type", ct);
         }
@@ -181,16 +181,15 @@ async fn create_project_ignores_any_body() {
         assert_eq!(res.status(), StatusCode::CREATED, "{body:?}");
         let created: serde_json::Value =
             serde_json::from_slice(&to_bytes(res.into_body(), 1024).await.unwrap()).unwrap();
-        for key in ["projectId", "editToken", "viewToken"] {
+        for key in ["spaceId", "editToken", "viewToken"] {
             assert_eq!(created[key].as_str().unwrap().len(), 22, "{key}");
         }
     }
     // Nothing is seeded server side; the first client writes the doc.
-    let (projects, records): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM projects), (SELECT COUNT(*) FROM doc_records)",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!((projects, records), (3, 0));
+    let (spaces, records): (i64, i64) =
+        sqlx::query_as("SELECT (SELECT COUNT(*) FROM spaces), (SELECT COUNT(*) FROM doc_records)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((spaces, records), (3, 0));
 }

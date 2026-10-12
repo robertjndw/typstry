@@ -42,7 +42,7 @@ use typstry_wire::crypto::{
 };
 use typstry_wire::ds::DS_VERSION;
 use typstry_wire::identity::{DeviceKey, PersonGraph};
-use typstry_wire::mls::{LocalIdentity, MLS_STATE_VERSION, ProjectGroup, Role};
+use typstry_wire::mls::{LocalIdentity, MLS_STATE_VERSION, Role, SpaceGroup};
 use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 
 #[path = "../../../fixtures/compat/support.rs"]
@@ -389,7 +389,7 @@ fn write_fixture(out: &Path) {
         graph: PersonGraph::genesis(&device),
         device,
     };
-    let (group, _) = ProjectGroup::create(&link, PROFILE.as_bytes(), &identity).unwrap();
+    let (group, _) = SpaceGroup::create(&link, PROFILE.as_bytes(), &identity).unwrap();
     state.save_mls(&group).unwrap();
     state
         .save_doc(&LoroDoc::from_snapshot(&cached).unwrap())

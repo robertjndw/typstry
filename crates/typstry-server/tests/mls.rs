@@ -23,7 +23,7 @@ use typstry_server::http::AppState;
 use typstry_server::room::{DsConfig, Outbox, RoomCmd, RoomConfig};
 use typstry_server::store::docs;
 use typstry_server::store::mls;
-use typstry_server::store::projects::Permission as Access;
+use typstry_server::store::spaces::Permission as Access;
 use typstry_server::ws::ConnLimits;
 use typstry_wire::ds::{ClientMessage, DS_PATH, Permission, RefusalCode, Rotate, ServerMessage};
 use typstry_wire::elo::{encode_container, encode_delta_header, encode_record};
@@ -32,7 +32,7 @@ use typstry_wire::owner::{OwnerKey, OwnerSecret, RotationClaim};
 mod common;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// 16 bytes of project id and the incarnation as a big-endian u32.
+/// 16 bytes of space id and the incarnation as a big-endian u32.
 const GROUP: &[u8] = b"typstry-test-grp\0\0\0\0";
 const GROUP_1: &[u8] = b"typstry-test-grp\0\0\0\x01";
 
@@ -67,8 +67,8 @@ impl Server {
         common::app(self.state.clone(), &self.data)
     }
 
-    async fn project(&self) -> common::Created {
-        common::create_project(self.app()).await
+    async fn space(&self) -> common::Created {
+        common::create_space(self.app()).await
     }
 
     async fn get(&self, path: &str) -> (StatusCode, Value) {
@@ -380,21 +380,21 @@ fn refused(req: u64, code: RefusalCode) -> ServerMessage {
 }
 
 async fn inited(server: &Server) -> (common::Created, Ds) {
-    let project = server.project().await;
-    let mut ds = server.session(&project.edit).await;
+    let space = server.space().await;
+    let mut ds = server.session(&space.edit).await;
     assert_eq!(ds.request(init(1)).await.0, accepted(1));
-    (project, ds)
+    (space, ds)
 }
 
 #[tokio::test]
 async fn a_group_is_created_once() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let project = server.project().await;
-    let bootstrap = format!("/api/p/{}/mls", project.edit);
+    let space = server.space().await;
+    let bootstrap = format!("/api/s/{}/mls", space.edit);
     assert_eq!(server.get(&bootstrap).await.0, StatusCode::NOT_FOUND);
 
-    let mut viewer = server.session(&project.view).await;
+    let mut viewer = server.session(&space.view).await;
     assert_eq!(
         viewer.request(init(1)).await.0,
         refused(1, RefusalCode::Forbidden)
@@ -408,7 +408,7 @@ async fn a_group_is_created_once() {
         refused(2, RefusalCode::NoGroup)
     );
 
-    let mut editor = server.session(&project.edit).await;
+    let mut editor = server.session(&space.edit).await;
     // Weak owner keys, which some signatures pass for any message.
     let mut identity = [0; 32];
     identity[0] = 1;
@@ -428,7 +428,7 @@ async fn a_group_is_created_once() {
         editor.request(init(2)).await.0,
         refused(2, RefusalCode::GroupExists)
     );
-    let group = mls::load_group(&server.state.db, &project.id)
+    let group = mls::load_group(&server.state.db, &space.id)
         .await
         .unwrap()
         .unwrap();
@@ -454,9 +454,9 @@ async fn a_group_is_created_once() {
         owner(1).public()
     );
     // View links bootstrap too, and unknown ones do not.
-    let (status, _) = server.get(&format!("/api/p/{}/mls", project.view)).await;
+    let (status, _) = server.get(&format!("/api/s/{}/mls", space.view)).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = server.get("/api/p/0000000000000000000000/mls").await;
+    let (status, _) = server.get("/api/s/0000000000000000000000/mls").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -464,8 +464,8 @@ async fn a_group_is_created_once() {
 async fn the_first_commit_per_epoch_wins() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut a) = inited(&server).await;
-    let mut b = server.session(&project.edit).await;
+    let (space, mut a) = inited(&server).await;
+    let mut b = server.session(&space.edit).await;
 
     let commit_a = public_commit(GROUP, 0, From::Member);
     let commit_b = private_commit(GROUP, 0);
@@ -551,8 +551,8 @@ async fn submitted_frames_must_be_commits_for_this_group_and_epoch() {
 async fn view_tokens_may_only_join_with_external_commits() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
-    let mut viewer = server.session(&project.view).await;
+    let (space, mut editor) = inited(&server).await;
+    let mut viewer = server.session(&space.view).await;
 
     let forbidden = |req| refused(req, RefusalCode::Forbidden);
     assert_eq!(
@@ -623,7 +623,7 @@ async fn view_tokens_may_only_join_with_external_commits() {
             owner_key: None,
         }
     );
-    let (_, body) = server.get(&format!("/api/p/{}/mls", project.view)).await;
+    let (_, body) = server.get(&format!("/api/s/{}/mls", space.view)).await;
     assert_eq!(body["epoch"], 1);
     assert_eq!(
         STANDARD
@@ -637,14 +637,14 @@ async fn view_tokens_may_only_join_with_external_commits() {
 async fn rotation_swaps_the_links_and_retires_the_old_ones() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
-    let mut viewer = server.session(&project.view).await;
-    let mut bystander = server.session(&project.edit).await;
+    let (space, mut editor) = inited(&server).await;
+    let mut viewer = server.session(&space.view).await;
+    let mut bystander = server.session(&space.edit).await;
 
-    let (mut doc, reply) = server.doc(CrdtType::Elo, &project.id, &project.edit).await;
+    let (mut doc, reply) = server.doc(CrdtType::Elo, &space.id, &space.edit).await;
     assert!(matches!(reply, ProtocolMessage::JoinResponseOk { .. }));
     let (mut presence, _) = server
-        .doc(CrdtType::LoroEphemeralStore, &project.id, &project.view)
+        .doc(CrdtType::LoroEphemeralStore, &space.id, &space.view)
         .await;
 
     let (new_edit, new_view) = (common_token('E'), common_token('V'));
@@ -676,8 +676,8 @@ async fn rotation_swaps_the_links_and_retires_the_old_ones() {
     assert_eq!(editor.recv().await, retired);
 
     // Old tokens fail on the doc socket and the HTTP API.
-    for token in [&project.edit, &project.view] {
-        let (_, reply) = server.doc(CrdtType::Elo, &project.id, token).await;
+    for token in [&space.edit, &space.view] {
+        let (_, reply) = server.doc(CrdtType::Elo, &space.id, token).await;
         assert!(
             matches!(
                 reply,
@@ -688,12 +688,12 @@ async fn rotation_swaps_the_links_and_retires_the_old_ones() {
             ),
             "{reply:?}"
         );
-        let (status, _) = server.get(&format!("/api/p/{token}/mls")).await;
+        let (status, _) = server.get(&format!("/api/s/{token}/mls")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
-    let (_, reply) = server.doc(CrdtType::Elo, &project.id, &new_edit).await;
+    let (_, reply) = server.doc(CrdtType::Elo, &space.id, &new_edit).await;
     assert!(matches!(reply, ProtocolMessage::JoinResponseOk { .. }));
-    let (status, body) = server.get(&format!("/api/p/{new_view}/mls")).await;
+    let (status, body) = server.get(&format!("/api/s/{new_view}/mls")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["epoch"], 1);
     assert_eq!(
@@ -705,10 +705,10 @@ async fn rotation_swaps_the_links_and_retires_the_old_ones() {
         owner(2).public()
     );
 
-    let (status, share) = server.get(&format!("/api/share/{}", project.edit)).await;
+    let (status, share) = server.get(&format!("/api/share/{}", space.edit)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(share["retired"], true);
-    assert_eq!(share["projectId"], project.id);
+    assert_eq!(share["spaceId"], space.id);
     assert!(share.get("viewToken").is_none());
     let (_, share) = server.get(&format!("/api/share/{new_edit}")).await;
     assert!(share.get("retired").is_none());
@@ -716,7 +716,7 @@ async fn rotation_swaps_the_links_and_retires_the_old_ones() {
 
     // A retired token can still read the log, with the envelope, and no more.
     let mut old = server.ds().await;
-    assert_eq!(old.hello(&project.edit, 0, 0).await, retired);
+    assert_eq!(old.hello(&space.edit, 0, 0).await, retired);
     assert_eq!(old.recv().await, commit);
     old.assert_quiet().await;
     for (req, msg) in [
@@ -751,16 +751,16 @@ fn common_token(fill: char) -> String {
 async fn a_rotation_that_cannot_swap_tokens_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
-    let other = server.project().await;
+    let (space, mut editor) = inited(&server).await;
+    let other = server.space().await;
 
     let valid = common_token('V');
     let bad = [
         ("short", valid.as_str()),
         (valid.as_str(), "not-a-token-not-a-token!"),
-        // Someone else's live token, and the project's own.
+        // Someone else's live token, and the space's own.
         (other.edit.as_str(), valid.as_str()),
-        (valid.as_str(), project.view.as_str()),
+        (valid.as_str(), space.view.as_str()),
         (valid.as_str(), valid.as_str()),
     ];
     for (i, (edit, view)) in bad.into_iter().enumerate() {
@@ -772,7 +772,7 @@ async fn a_rotation_that_cannot_swap_tokens_changes_nothing() {
 
     // The commit was not stored, the GroupInfo and keyring are untouched,
     // the old links still work and the epoch is still open.
-    let group = mls::load_group(&server.state.db, &project.id)
+    let group = mls::load_group(&server.state.db, &space.id)
         .await
         .unwrap()
         .unwrap();
@@ -780,7 +780,7 @@ async fn a_rotation_that_cannot_swap_tokens_changes_nothing() {
     assert_eq!(group.group_info, b"gi-0");
     assert_eq!(group.keyring, b"keyring-0");
     assert!(
-        mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX)
+        mls::commits_since(&server.state.db, &space.id, 0, 0, u64::MAX)
             .await
             .unwrap()
             .is_empty()
@@ -790,7 +790,7 @@ async fn a_rotation_that_cannot_swap_tokens_changes_nothing() {
         .await
         .unwrap();
     assert_eq!(retired, 0);
-    let (_, doc_reply) = server.doc(CrdtType::Elo, &project.id, &project.edit).await;
+    let (_, doc_reply) = server.doc(CrdtType::Elo, &space.id, &space.edit).await;
     assert!(matches!(doc_reply, ProtocolMessage::JoinResponseOk { .. }));
 
     let (reply, _) = editor
@@ -803,7 +803,7 @@ async fn a_rotation_that_cannot_swap_tokens_changes_nothing() {
 async fn joiners_catch_up_from_the_epoch_they_are_at() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
+    let (space, mut editor) = inited(&server).await;
     let commits: Vec<Vec<u8>> = (0..4)
         .map(|epoch| public_commit(GROUP, epoch, From::Member))
         .collect();
@@ -821,7 +821,7 @@ async fn joiners_catch_up_from_the_epoch_they_are_at() {
     };
 
     let mut late = server.ds().await;
-    let ready = late.hello(&project.view, 0, 2).await;
+    let ready = late.hello(&space.view, 0, 2).await;
     assert_eq!(
         ready,
         ServerMessage::Ready {
@@ -843,7 +843,7 @@ async fn joiners_catch_up_from_the_epoch_they_are_at() {
 
     // A client of another incarnation is told to start over.
     let mut stale = server.ds().await;
-    stale.hello(&project.edit, 7, 0).await;
+    stale.hello(&space.edit, 7, 0).await;
     assert_eq!(
         stale.recv().await,
         ServerMessage::Reinitialized { incarnation: 0 }
@@ -873,17 +873,17 @@ async fn the_log_is_capped_by_count_even_when_young() {
         ..DsConfig::default()
     };
     let server = Server::start_with(dir.path(), ds).await;
-    let (project, mut editor) = inited(&server).await;
+    let (space, mut editor) = inited(&server).await;
     for epoch in 0..5 {
         append(&mut editor, epoch).await;
     }
-    let stored = mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX);
+    let stored = mls::commits_since(&server.state.db, &space.id, 0, 0, u64::MAX);
     assert_eq!(epochs(stored.await.unwrap()), [3, 4]);
 
     // A client behind the log is told what it can still get, and the
     // epoch it asked for is gone.
     let mut late = server.ds().await;
-    late.hello(&project.view, 0, 0).await;
+    late.hello(&space.view, 0, 0).await;
     assert!(matches!(
         late.recv().await,
         ServerMessage::Commit { epoch: 3, .. }
@@ -894,11 +894,11 @@ async fn the_log_is_capped_by_count_even_when_young() {
 async fn old_commits_are_pruned_but_the_newest_stays() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
+    let (space, mut editor) = inited(&server).await;
     for epoch in 0..4 {
         append(&mut editor, epoch).await;
     }
-    let stored = || mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX);
+    let stored = || mls::commits_since(&server.state.db, &space.id, 0, 0, u64::MAX);
     // Young commits are kept.
     assert_eq!(epochs(stored().await.unwrap()), [0, 1, 2, 3]);
 
@@ -922,11 +922,11 @@ async fn the_log_is_capped_by_bytes() {
         ..DsConfig::default()
     };
     let server = Server::start_with(dir.path(), ds).await;
-    let (project, mut editor) = inited(&server).await;
+    let (space, mut editor) = inited(&server).await;
     for epoch in 0..6 {
         append(&mut editor, epoch).await;
     }
-    let stored = mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX);
+    let stored = mls::commits_since(&server.state.db, &space.id, 0, 0, u64::MAX);
     assert_eq!(epochs(stored.await.unwrap()), [4, 5]);
 
     // Even a cap below one commit keeps the newest.
@@ -935,7 +935,7 @@ async fn the_log_is_capped_by_bytes() {
         .await
         .unwrap();
     append(&mut editor, 6).await;
-    let stored = mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX);
+    let stored = mls::commits_since(&server.state.db, &space.id, 0, 0, u64::MAX);
     assert_eq!(epochs(stored.await.unwrap()), [6]);
 }
 
@@ -949,8 +949,8 @@ async fn commits_and_blobs_have_size_limits() {
         ..DsConfig::default()
     };
     let server = Server::start_with(dir.path(), ds).await;
-    let project = server.project().await;
-    let mut editor = server.session(&project.edit).await;
+    let space = server.space().await;
+    let mut editor = server.session(&space.edit).await;
     assert_eq!(editor.request(init(1)).await.0, accepted(1));
 
     // One byte over the commit cap.
@@ -971,7 +971,7 @@ async fn commits_and_blobs_have_size_limits() {
             refused(req, RefusalCode::Malformed)
         );
     }
-    let head = mls::load_group(&server.state.db, &project.id)
+    let head = mls::load_group(&server.state.db, &space.id)
         .await
         .unwrap()
         .unwrap();
@@ -982,7 +982,7 @@ async fn commits_and_blobs_have_size_limits() {
         *group_info = b"gi-new".to_vec();
     }
     assert_eq!(editor.request(ok).await.0, accepted(5));
-    let (_, body) = server.get(&format!("/api/p/{}/mls", project.edit)).await;
+    let (_, body) = server.get(&format!("/api/s/{}/mls", space.edit)).await;
     assert_eq!(body["epoch"], 1);
     assert_eq!(
         STANDARD
@@ -996,7 +996,7 @@ async fn commits_and_blobs_have_size_limits() {
 async fn keyring_and_envelope_only_come_with_a_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
+    let (space, mut editor) = inited(&server).await;
 
     let rotate = || Rotate {
         edit_token: common_token('E'),
@@ -1032,7 +1032,7 @@ async fn keyring_and_envelope_only_come_with_a_rotation() {
             "case {i}"
         );
     }
-    let group = mls::load_group(&server.state.db, &project.id)
+    let group = mls::load_group(&server.state.db, &space.id)
         .await
         .unwrap()
         .unwrap();
@@ -1046,8 +1046,8 @@ async fn keyring_and_envelope_only_come_with_a_rotation() {
 async fn retired_sessions_read_the_log_only_up_to_their_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
-    let mut old = server.session(&project.view).await;
+    let (space, mut editor) = inited(&server).await;
+    let mut old = server.session(&space.view).await;
 
     let (new_edit, new_view) = (common_token('E'), common_token('V'));
     assert_eq!(
@@ -1092,7 +1092,7 @@ async fn retired_sessions_read_the_log_only_up_to_their_rotation() {
 
     // A new session on the retired token is held to the same epoch.
     let mut again = server.ds().await;
-    again.hello(&project.view, 0, 0).await;
+    again.hello(&space.view, 0, 0).await;
     assert_eq!(again.recv().await, commit(0));
     again.assert_quiet().await;
 
@@ -1107,7 +1107,7 @@ async fn retired_sessions_read_the_log_only_up_to_their_rotation() {
 async fn retired_tokens_expire_with_the_commit_log() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
+    let (space, mut editor) = inited(&server).await;
     let (new_edit, new_view) = (common_token('E'), common_token('V'));
     assert_eq!(
         editor.request(rotation(1, 0, &new_edit, &new_view)).await.0,
@@ -1116,7 +1116,7 @@ async fn retired_tokens_expire_with_the_commit_log() {
     let mut current = server.session(&new_edit).await;
     let mut old = server.ds().await;
     assert!(matches!(
-        old.hello(&project.edit, 0, 0).await,
+        old.hello(&space.edit, 0, 0).await,
         ServerMessage::Ready {
             permission: Permission::Retired,
             ..
@@ -1136,7 +1136,7 @@ async fn retired_tokens_expire_with_the_commit_log() {
     );
     let mut gone = server.ds().await;
     assert_eq!(
-        gone.hello(&project.edit, 0, 0).await,
+        gone.hello(&space.edit, 0, 0).await,
         refused(0, RefusalCode::Forbidden)
     );
 }
@@ -1145,8 +1145,8 @@ async fn retired_tokens_expire_with_the_commit_log() {
 async fn group_ids_must_name_the_expected_incarnation() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let project = server.project().await;
-    let mut editor = server.session(&project.edit).await;
+    let space = server.space().await;
+    let mut editor = server.session(&space.edit).await;
 
     let init_with = |req, group_id: &[u8]| ClientMessage::Init {
         req,
@@ -1156,7 +1156,7 @@ async fn group_ids_must_name_the_expected_incarnation() {
         owner_key: owner(1).public(),
     };
     for (req, id) in [
-        (1, b"project-0".as_slice()),
+        (1, b"space-0".as_slice()),
         (2, GROUP_1),
         (3, b"typstry-test-grp\0\0\0\0\0"),
         (4, b""),
@@ -1177,10 +1177,10 @@ async fn group_ids_must_name_the_expected_incarnation() {
         keyring: b"k".to_vec(),
     };
     for (req, incarnation, id) in [
-        // The new id must be the next incarnation of the same project.
+        // The new id must be the next incarnation of the same space.
         (6, 0, GROUP),
         (7, 0, b"typstry-test-grp\0\0\0\x02".as_slice()),
-        (8, 0, b"another-project!\0\0\0\x01".as_slice()),
+        (8, 0, b"another-space!\0\0\0\x01".as_slice()),
         (9, 0, b"short"),
         (
             10,
@@ -1205,8 +1205,8 @@ async fn group_ids_must_name_the_expected_incarnation() {
 async fn a_reset_starts_a_new_incarnation() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
-    let mut viewer = server.session(&project.view).await;
+    let (space, mut editor) = inited(&server).await;
+    let mut viewer = server.session(&space.view).await;
     let (reply, _) = editor
         .request(submit(1, 0, public_commit(GROUP, 0, From::Member)))
         .await;
@@ -1243,7 +1243,7 @@ async fn a_reset_starts_a_new_incarnation() {
     );
 
     // The old log is gone and the epoch counter starts over.
-    let (_, body) = server.get(&format!("/api/p/{}/mls", project.edit)).await;
+    let (_, body) = server.get(&format!("/api/s/{}/mls", space.edit)).await;
     assert_eq!(
         (body["incarnation"].as_u64(), body["epoch"].as_u64()),
         (Some(1), Some(0))
@@ -1257,7 +1257,7 @@ async fn a_reset_starts_a_new_incarnation() {
         .await;
     assert_eq!(reply, accepted(6));
     let mut fresh = server.ds().await;
-    fresh.hello(&project.edit, 1, 0).await;
+    fresh.hello(&space.edit, 1, 0).await;
     assert!(matches!(
         fresh.recv().await,
         ServerMessage::Commit { epoch: 0, .. }
@@ -1269,7 +1269,7 @@ async fn a_reset_starts_a_new_incarnation() {
 async fn bad_handshakes_are_closed() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let project = server.project().await;
+    let space = server.space().await;
 
     let mut ds = server.ds().await;
     let reply = ds.hello(&common_token('x'), 0, 0).await;
@@ -1280,9 +1280,9 @@ async fn bad_handshakes_are_closed() {
     let mut ds = server.ds().await;
     ds.send(init(1)).await;
     assert_eq!(ds.closed().await.0, 1002);
-    let mut ds = server.session(&project.edit).await;
+    let mut ds = server.session(&space.edit).await;
     ds.send(ClientMessage::Hello {
-        token: project.edit.clone(),
+        token: space.edit.clone(),
         incarnation: 0,
         since_epoch: 0,
     })
@@ -1297,7 +1297,7 @@ async fn bad_handshakes_are_closed() {
     assert_eq!(ds.closed().await.0, 1002);
 }
 
-/// Joins `conn` to the project's doc room and returns once the room has
+/// Joins `conn` to the space's doc room and returns once the room has
 /// answered, which also means every command sent before has been handled.
 async fn join_room(
     room: &tokio::sync::mpsc::Sender<RoomCmd>,
@@ -1334,13 +1334,13 @@ fn doc_update(conn: u64, peer: u64) -> RoomCmd {
 async fn doc_updates_from_connections_that_are_not_peers_are_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut editor) = inited(&server).await;
-    let room = server.state.rooms.get(&project.id).unwrap();
-    let stored = || docs::record_count(&server.state.db, &project.id);
+    let (space, mut editor) = inited(&server).await;
+    let room = server.state.rooms.get(&space.id).unwrap();
+    let stored = || docs::record_count(&server.state.db, &space.id);
 
     // A connection that never joined, or already left, has no standing.
     room.send(doc_update(900, 1)).await.unwrap();
-    let (joined, _outbox, _rx) = join_room(&room, 901, &project.edit).await;
+    let (joined, _outbox, _rx) = join_room(&room, 901, &space.edit).await;
     assert!(joined);
     room.send(RoomCmd::Leave {
         conn: 901,
@@ -1352,7 +1352,7 @@ async fn doc_updates_from_connections_that_are_not_peers_are_dropped() {
 
     // Neither does one whose link a rotation just retired, even though its
     // update was queued before the room closed it.
-    let (joined, _outbox2, _rx2) = join_room(&room, 902, &project.edit).await;
+    let (joined, _outbox2, _rx2) = join_room(&room, 902, &space.edit).await;
     assert!(joined);
     let (new_edit, new_view) = (common_token('E'), common_token('V'));
     assert_eq!(
@@ -1375,8 +1375,8 @@ async fn doc_updates_from_connections_that_are_not_peers_are_dropped() {
 
 /// What a refused rotation must leave alone: the head, the log, the owner
 /// key and the tokens.
-async fn assert_untouched(server: &Server, project: &common::Created) {
-    let group = mls::load_group(&server.state.db, &project.id)
+async fn assert_untouched(server: &Server, space: &common::Created) {
+    let group = mls::load_group(&server.state.db, &space.id)
         .await
         .unwrap()
         .unwrap();
@@ -1385,7 +1385,7 @@ async fn assert_untouched(server: &Server, project: &common::Created) {
     assert_eq!(group.keyring, b"keyring-0");
     assert_eq!(group.owner_key, owner(1).public());
     assert!(
-        mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX)
+        mls::commits_since(&server.state.db, &space.id, 0, 0, u64::MAX)
             .await
             .unwrap()
             .is_empty()
@@ -1395,19 +1395,19 @@ async fn assert_untouched(server: &Server, project: &common::Created) {
         .await
         .unwrap();
     assert_eq!(retired, 0);
-    let (_, share) = server.get(&format!("/api/share/{}", project.edit)).await;
-    assert_eq!(share["viewToken"], project.view);
+    let (_, share) = server.get(&format!("/api/share/{}", space.edit)).await;
+    assert_eq!(share["viewToken"], space.view);
 }
 
 #[tokio::test]
 async fn an_editor_without_the_owner_key_cannot_swap_the_links() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut owner_ds) = inited(&server).await;
-    let mut editor = server.session(&project.edit).await;
-    let (mut doc, _) = server.doc(CrdtType::Elo, &project.id, &project.edit).await;
+    let (space, mut owner_ds) = inited(&server).await;
+    let mut editor = server.session(&space.edit).await;
+    let (mut doc, _) = server.doc(CrdtType::Elo, &space.id, &space.edit).await;
     let (mut presence, _) = server
-        .doc(CrdtType::LoroEphemeralStore, &project.id, &project.view)
+        .doc(CrdtType::LoroEphemeralStore, &space.id, &space.view)
         .await;
 
     let (edit, view) = (common_token('E'), common_token('V'));
@@ -1425,7 +1425,7 @@ async fn an_editor_without_the_owner_key_cannot_swap_the_links() {
         assert_eq!(reply, refused(req, RefusalCode::NotOwner));
         assert!(others.is_empty());
     }
-    assert_untouched(&server, &project).await;
+    assert_untouched(&server, &space).await;
     // Nobody was told of a commit or a rotation, and nobody was cut off.
     owner_ds.assert_quiet().await;
     doc.assert_open().await;
@@ -1441,7 +1441,7 @@ async fn an_editor_without_the_owner_key_cannot_swap_the_links() {
 async fn an_owner_proof_holds_for_exactly_the_rotation_it_signs() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut ds) = inited(&server).await;
+    let (space, mut ds) = inited(&server).await;
     let (edit, view) = (common_token('E'), common_token('V'));
     let other_key = owner(3).public();
     type Tweak = Box<dyn for<'c> Fn(&mut RotationClaim<'c>)>;
@@ -1466,7 +1466,7 @@ async fn an_owner_proof_holds_for_exactly_the_rotation_it_signs() {
             "case {i}"
         );
     }
-    assert_untouched(&server, &project).await;
+    assert_untouched(&server, &space).await;
 }
 
 #[tokio::test]
@@ -1501,8 +1501,8 @@ async fn the_owner_key_moves_on_with_every_rotation() {
 async fn of_two_owner_rotations_for_one_epoch_the_second_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
-    let (project, mut a) = inited(&server).await;
-    let mut b = server.session(&project.edit).await;
+    let (space, mut a) = inited(&server).await;
+    let mut b = server.session(&space.edit).await;
     let first = rotation(1, 0, &common_token('a'), &common_token('b'));
     assert_eq!(a.request(first).await.0, accepted(1));
     let tokens = (common_token('c'), common_token('d'));
@@ -1542,11 +1542,11 @@ async fn of_two_owner_rotations_for_one_epoch_the_second_conflicts() {
         envelope: envelope.as_deref(),
         rotate: Some(rotate),
     };
-    let submitted = mls::submit(&server.state.db, &project.id, &args)
+    let submitted = mls::submit(&server.state.db, &space.id, &args)
         .await
         .unwrap();
     assert_eq!(submitted, mls::Submitted::Conflict { head: 1 });
-    let group = mls::load_group(&server.state.db, &project.id)
+    let group = mls::load_group(&server.state.db, &space.id)
         .await
         .unwrap()
         .unwrap();
@@ -1575,20 +1575,20 @@ async fn a_reset_keeps_the_owner_key_and_the_tokens() {
     let (status, share) = server.get(&format!("/api/share/{edit}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(share["viewToken"], view);
-    let project_id = share["projectId"].as_str().unwrap().to_owned();
-    let group = mls::load_group(&server.state.db, &project_id)
+    let space_id = share["spaceId"].as_str().unwrap().to_owned();
+    let group = mls::load_group(&server.state.db, &space_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!((group.incarnation, group.owner_key), (1, owner(2).public()));
-    let (_, body) = server.get(&format!("/api/p/{edit}/mls")).await;
+    let (_, body) = server.get(&format!("/api/s/{edit}/mls")).await;
     assert_eq!(
         STANDARD.decode(body["ownerKey"].as_str().unwrap()).unwrap(),
         owner(2).public()
     );
 
     // The new incarnation's first rotation still needs the key the chain
-    // arrived at, not the one the project started with.
+    // arrived at, not the one the space started with.
     let tokens = (common_token('c'), common_token('d'));
     let tokens = (tokens.0.as_str(), tokens.1.as_str());
     let first_key = signed_rotation(3, GROUP_1, 0, tokens, &owner(1), &owner(3).public());

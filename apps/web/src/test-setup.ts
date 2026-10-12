@@ -2,8 +2,10 @@ import "@testing-library/jest-dom/vitest";
 // Projects persist to IndexedDB, which jsdom lacks.
 import "fake-indexeddb/auto";
 import { readFileSync } from "node:fs";
+import { afterEach } from "vitest";
 import path from "node:path";
 
+import { resetDirectory } from "./directory/store";
 import { initSync } from "../vendor/typstry-wasm/typstry_wasm.js";
 
 // The wasm build of the crypto, compiled from the file instead of fetched:
@@ -47,3 +49,7 @@ if (typeof window !== "undefined")
     removeEventListener() {}
     terminate() {}
   } as unknown as typeof Worker;
+
+// The directory is a page-wide singleton over the shared fake IndexedDB, so
+// without this one test's projects would show up in the next.
+afterEach(() => resetDirectory());

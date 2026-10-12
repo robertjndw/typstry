@@ -25,7 +25,8 @@ impl Session {
             .iter()
             .copied()
             .filter(|hash| {
-                self.state
+                self.core
+                    .state
                     .blob_path(hash)
                     .is_none_or(|path| !path.is_file())
             })
@@ -39,8 +40,8 @@ impl Session {
         let downloads: Vec<_> = missing
             .into_iter()
             .map(|hash| {
-                let api = self.api.clone();
-                let token = self.config.token.clone();
+                let api = self.core.api.clone();
+                let token = self.core.config.token.clone();
                 let hash = hash.to_owned();
                 async move {
                     let sealed = api.get_blob(&token, &hash).await;
@@ -88,7 +89,7 @@ impl Session {
                     "asset {hash} does not decrypt with this project's key"
                 )),
             })?;
-        self.state.write_blob(hash, &bytes)?;
+        self.core.state.write_blob(hash, &bytes)?;
         self.base
             .assets
             .insert(BlobHash::from(hash), Digest::of(&bytes));
@@ -100,7 +101,7 @@ impl Session {
     pub fn cached_content_bytes(&self, content: &FileContent) -> anyhow::Result<Vec<u8>> {
         match content {
             FileContent::Text(text) => Ok(text.as_bytes().to_vec()),
-            FileContent::Asset { hash, .. } => self.state.read_blob(hash).with_context(|| {
+            FileContent::Asset { hash, .. } => self.core.state.read_blob(hash).with_context(|| {
                 format!("asset {hash} of this version is not cached; run without --offline")
             }),
         }
@@ -109,7 +110,7 @@ impl Session {
     /// The plaintext of the asset with ciphertext `hash`, from the cache or
     /// the server. Records its digest in the base's asset map.
     pub async fn asset_bytes(&mut self, hash: &str) -> anyhow::Result<Vec<u8>> {
-        if let Some(bytes) = self.state.read_blob(hash) {
+        if let Some(bytes) = self.core.state.read_blob(hash) {
             // Assets run to megabytes; hash them only when the digest is
             // not known yet.
             if !self.base.assets.contains_key(hash) {
@@ -119,7 +120,11 @@ impl Session {
             }
             return Ok(bytes);
         }
-        let sealed = self.api.get_blob(&self.config.token, hash).await?;
+        let sealed = self
+            .core
+            .api
+            .get_blob(&self.core.config.token, hash)
+            .await?;
         self.store_asset_fetching_keys(hash, &sealed).await
     }
 
@@ -191,8 +196,12 @@ impl Session {
                     bail!("{path} is too large to upload");
                 }
                 let sealed = self.doc_keys()?.seal_blob(&bytes);
-                let stored = self.api.upload_blob(&self.config.token, sealed).await?;
-                self.state.write_blob(stored.hash.as_str(), &bytes)?;
+                let stored = self
+                    .core
+                    .api
+                    .upload_blob(&self.core.config.token, sealed)
+                    .await?;
+                self.core.state.write_blob(stored.hash.as_str(), &bytes)?;
                 self.base
                     .assets
                     .insert(stored.hash.clone(), file.digest.clone());

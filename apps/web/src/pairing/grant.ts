@@ -4,48 +4,35 @@ import {
   adoptGraph,
   devicePublicKey,
   loadWasm,
-  type PairingProject,
+  type PairingSpace,
 } from "@/crypto/wasm";
 import { errorKind } from "@/lib/errors";
 import type { DocBackend } from "@/persist/local-doc-store";
-import {
-  adoptProjectLink,
-  loadProjectKey,
-  loadRecent,
-  parseProjectLink,
-  projectUrl,
-} from "@/project/recent";
+import { adoptPersonalSpace } from "@/directory/adopt-space";
+import { clearBinding } from "@/directory/binding";
+import { ensureSpace } from "@/directory/ensure-space";
+import { refreshDirectoryService } from "@/directory/service";
 import { resolveShare, type ApiOptions } from "@/sync/api";
 
 import { localDeviceKey, localIdentity, mergeOwnGraph } from "@/mls/identity";
 
 import { defaultDeviceName } from "./device-name";
-import {
-  GrantRefusedError,
-  type Grant,
-  type PairedProject,
-  type PairingDevice,
-} from "./session";
+import { GrantRefusedError, type Grant, type PairingDevice } from "./session";
 
 /**
  * What this browser hands to a new device: the person graph with the device
- * added, and the links of the projects it holds a key for. The links are
- * secrets, which is why they only ever travel inside the sealed pairing.
- * The pairing cuts the list to what a grant holds.
+ * added, and the personal space that syncs the directory of projects. The
+ * space is made here if it does not exist yet and its key and owner secrets
+ * travel along, only ever inside the sealed pairing. Pairing runs through the
+ * server, so a space that cannot be made fails the grant.
  */
 export async function holderGrant(
-  backend: Pick<
-    DocBackend,
-    | "loadDeviceKey"
-    | "saveDeviceKey"
-    | "loadGraph"
-    | "mergeGraph"
-    | "saveLabels"
-    | "loadLabels"
-  >,
+  backend: DocBackend,
   device: PairingDevice,
-  origin = window.location.origin,
+  opts: ApiOptions = {},
 ): Promise<Grant> {
+  // Before the device is added, so a failure leaves nothing behind.
+  const space = await spaceToGrant(backend, opts);
   const { deviceSeed, graph } = await localIdentity(backend);
   const own = PersonGraph.decode(graph);
   let bytes: Uint8Array;
@@ -74,30 +61,49 @@ export async function holderGrant(
   const saved = await mergeOwnGraph(backend, bytes);
   await backend.saveLabels({ [toHex(device.pub)]: device.name });
 
-  const projects: PairingProject[] = [];
-  for (const recent of loadRecent()) {
-    const key = loadProjectKey(recent.projectId);
-    if (key)
-      projects.push({
-        title: recent.title,
-        link: projectUrl(recent.token, key, origin),
-      });
+  return { graph: saved, holderName, space };
+}
+
+async function spaceToGrant(
+  backend: DocBackend,
+  opts: ApiOptions,
+): Promise<PairingSpace> {
+  try {
+    const binding = await ensureSpace({ ...opts, backend });
+    const ownerSecrets = (await backend.loadMls(binding.spaceId))?.ownerSecrets;
+    if (!ownerSecrets) throw new Error("no owner key kept for the space");
+    // The holder syncs its own directory from now on, whether or not the
+    // other device ever finishes.
+    void refreshDirectoryService().catch((error) =>
+      console.warn("could not start the directory sync", error),
+    );
+    return {
+      token: binding.token,
+      secret: binding.secret,
+      ownerSecrets,
+    };
+  } catch (error) {
+    console.warn("could not set up the personal space", error);
+    throw new GrantRefusedError(
+      "could not set up your personal space, which carries your projects to the new device",
+    );
   }
-  return { graph: saved, projects, holderName };
 }
 
 /**
- * Takes a grant on the new device: stores the person graph, then the key of
- * each project and puts it in the recent list. The group is joined when the
- * project is first opened, and the join carries the identity by itself.
- * Returns the projects that can be opened now; one that cannot be looked up
- * is left out rather than failing the rest.
+ * Takes a grant on the new device: stores the person graph and binds the
+ * directory to the personal space, whose first sync brings the projects.
  */
 export async function applyGrant(
   grant: Grant,
   backend: Pick<
     DocBackend,
-    "loadDeviceKey" | "saveDeviceKey" | "mergeGraph" | "saveLabels"
+    | "loadDeviceKey"
+    | "saveDeviceKey"
+    | "mergeGraph"
+    | "saveLabels"
+    | "loadMls"
+    | "saveMls"
   >,
   deviceName: string,
   opts: ApiOptions & {
@@ -106,7 +112,7 @@ export async function applyGrant(
     /** Give up the person this browser has for the granted one. */
     replace?: boolean;
   } = {},
-): Promise<PairedProject[]> {
+): Promise<void> {
   await loadWasm();
   // A key made for this pairing is stored only once the grant proved to
   // list it, so a refused pairing leaves nothing behind.
@@ -149,28 +155,30 @@ export async function applyGrant(
   if (holder) labels[toHex(holder)] = grant.holderName;
   await backend.saveLabels(labels);
 
-  // Looked up side by side, but stored one by one in the grant's order: each
-  // store rewrites the recent list, and the order decides where it ends up.
-  const links = grant.projects.flatMap((project) => {
-    const parsed = parseProjectLink(project.link);
-    return parsed ? [{ title: project.title, parsed }] : [];
-  });
-  const shares = await Promise.allSettled(
-    links.map(({ parsed }) => resolveShare(parsed.token, opts)),
-  );
-  const opened: PairedProject[] = [];
-  links.forEach(({ title, parsed }, i) => {
-    const share = shares[i]!;
-    if (share.status === "rejected") {
-      console.error(share.reason);
-      return;
-    }
-    if (!share.value) return;
-    adoptProjectLink(parsed, share.value, title);
-    opened.push({
-      title: title || "Untitled",
-      link: `/p/${encodeURIComponent(parsed.token)}`,
-    });
-  });
-  return opened;
+  await adoptSpace(grant.space, backend, opts.replace ?? false, opts);
+}
+
+/**
+ * Takes the personal space of the person. Never fails the pairing; a device
+ * without it keeps a local directory.
+ */
+async function adoptSpace(
+  space: PairingSpace,
+  backend: Pick<DocBackend, "loadMls" | "saveMls">,
+  replace: boolean,
+  opts: ApiOptions,
+): Promise<void> {
+  // The space belonged to the person this browser gives up. The directory
+  // itself stays and merges into the new person's, owner keys included, the
+  // way `typstry pair --replace` moves its folders over: the projects belong
+  // to whoever switches, and dropping the keys could leave a project this
+  // browser owned alone with no owner at all.
+  if (replace) clearBinding();
+  try {
+    const share = await resolveShare(space.token, opts);
+    if (!share) throw new Error("the personal space does not exist any more");
+    await adoptPersonalSpace(backend, { ...space, share });
+  } catch (error) {
+    console.warn("could not take the personal space", error);
+  }
 }

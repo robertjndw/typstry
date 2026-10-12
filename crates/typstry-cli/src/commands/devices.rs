@@ -2,22 +2,32 @@ use std::io::{IsTerminal, Read};
 
 use anyhow::{Context, bail};
 use futures_util::{StreamExt, stream};
+use typstry_doc::directory::State;
 use typstry_wire::crypto::{LinkSecret, PublicKey};
 use typstry_wire::identity::{
-    AdoptError, DeviceInfo, DeviceState, EntryKind, FLAG_RECOVERY, PersonGraph, RecoverError,
-    RecoverOptions, RecoveryKey, device_fingerprint, person_fingerprint, recover as recover_graph,
+    AdoptError, DeviceInfo, DeviceKey, DeviceState, EntryKind, FLAG_RECOVERY, PersonGraph,
+    RecoverError, RecoverOptions, RecoveryKey, device_fingerprint, person_fingerprint,
+    recover as recover_graph,
 };
-use typstry_wire::mls::{OwnerSecrets, graphs_in_group_info, owner_share_for_recovery};
+use typstry_wire::mls::{
+    OwnerSecret, OwnerSecrets, PersonSpace, graphs_in_group_info, owner_share_for_recovery,
+    person_spaces_for_recovery,
+};
+use typstry_wire::pairing::GrantedSpace;
 
 use super::members::publish_rotation;
 use super::{Ctx, Line, MIN_PREFIX, Output, print_warnings, unique};
 use crate::api::Api;
-use crate::engine::{Identity, Session};
+use crate::directory::{LOCK_WAIT, bound_servers, normalize, project_dir_of};
+use crate::engine::{DocKind, Identity, Session, SpaceCore};
 use crate::link::ShareLink;
 use crate::mls::{profile_bytes, profile_identity};
+use crate::space::{drop_revoked, ensure_space, join_space, sync_bound, sync_server};
+use crate::state::{Config, StateDir};
 use crate::user::{
-    catalog, device_key_path, device_labels, ensure_valid_device, load_identity,
-    load_or_create_device, merge_graph, remember_owner_keys, set_device_label, update_graph,
+    catalog, catalog_with_forgotten, config_dir, device_key_path, device_labels,
+    ensure_valid_device, load_identity, load_or_create_device, merge_graph, owner_keys,
+    remember_owner_keys, set_device_label, update_graph,
 };
 
 /// List the devices that are you, or revoke one.
@@ -46,6 +56,8 @@ pub enum Action {
     Revoke {
         /// The device's name from `typstry devices`, or the start of its
         /// fingerprint.
+        // Fingerprints are base64url, so one starts with '-' now and then.
+        #[arg(allow_hyphen_values = true)]
         device: String,
     },
     /// Make a recovery key: 17 words that let you take your account back
@@ -96,13 +108,21 @@ const SPREAD_CONCURRENCY: usize = 4;
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     match args.action {
         None => list(),
-        Some(Action::Revoke { device }) => revoke(ctx, &device).await,
+        Some(Action::Revoke { device }) => {
+            sync_bound().await;
+            revoke(ctx, &device).await
+        }
         Some(Action::Recovery) => recovery(ctx).await,
         Some(Action::Recover {
             link,
             replace,
             keep_devices,
-        }) => recover(&link, replace, keep_devices).await,
+        }) => {
+            // Before the words are asked for: a pass holds the directory's
+            // lock for a while.
+            sync_bound().await;
+            recover(ctx, &link, replace, keep_devices).await
+        }
         Some(Action::Profile { color }) => profile(ctx, color.as_deref()).await,
     }
 }
@@ -212,10 +232,57 @@ async fn revoke(ctx: &Ctx, query: &str) -> anyhow::Result<()> {
         out.out(format!("Revoked {name}."));
     }
 
-    let spread = spread(ctx, &mut out).await?;
+    clean_everywhere(ctx, &mut out).await
+}
+
+/// Removes the revoked devices from the personal space and from every
+/// project this device can reach, and says what it could not.
+async fn clean_everywhere(ctx: &Ctx, out: &mut Output) -> anyhow::Result<()> {
+    // First, so the revoked device stops hearing of the projects (their
+    // links are in the directory) before their links are replaced.
+    let servers = bound_servers()?;
+    // Servers whose directory the revoked device may still read. Project
+    // links replaced there would be recorded into it, handing it the new ones.
+    let mut unsecured = Vec::new();
+    for server in &servers {
+        match drop_revoked(server).await {
+            Ok(None) => {}
+            Ok(Some(0)) => out.out(format!(
+                "Replaced the links of your personal space on {server}."
+            )),
+            Ok(Some(_)) => out.out(format!(
+                "Removed it from your personal space on {server} and replaced its links."
+            )),
+            Err(err) => {
+                out.err(format!(
+                    "Not reached: your personal space on {server}: {err:#}\n\
+                     Until it is cleaned, the revoked device keeps reading your project \
+                     directory."
+                ));
+                out.err(format!(
+                    "Your project list on {server} could not be secured, so no project links \
+                     there were replaced. Run `typstry devices revoke` again once it can be \
+                     reached."
+                ));
+                unsecured.push(server.clone());
+            }
+        }
+    }
+
+    let spread = spread(ctx, out, Scope::Revoke(&unsecured)).await?;
+    // The rotations recorded in the directory go out under the personal
+    // space's new links.
+    for server in &servers {
+        sync_server(server).await;
+    }
     for (title, removed) in spread.counted(|c| c.removed) {
         out.out(format!(
             "Cleaned {title}: removed {removed} device(s) and replaced the links."
+        ));
+    }
+    for title in spread.reset() {
+        out.out(format!(
+            "Replaced the links of {title}: you own it, and the revoked device may know them."
         ));
     }
     for (title, left) in spread.counted(|c| c.left) {
@@ -225,17 +292,30 @@ async fn revoke(ctx: &Ctx, query: &str) -> anyhow::Result<()> {
         ));
     }
     if spread.counted(|c| c.removed).next().is_none()
+        && spread.reset().next().is_none()
         && spread.counted(|c| c.left).next().is_none()
         && spread.unreached.is_empty()
+        && unsecured.is_empty()
     {
         out.out("No project had a leaf of that device.");
     }
     spread.report_unreached(
-        &mut out,
+        out,
         "Until they are cleaned, the revoked device keeps the access it had there. \
          Run `typstry devices revoke` again once they can be reached.",
     );
     Ok(())
+}
+
+/// What [`spread`] is for.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// Only the saved graph goes into the projects, e.g. a new profile.
+    Graph,
+    /// A revocation: the owned projects' links are replaced, including the
+    /// ones without a folder here, except on these servers (the personal
+    /// space there could not be secured).
+    Revoke(&'a [String]),
 }
 
 /// What a pass over the projects did.
@@ -254,6 +334,9 @@ struct Cleanup {
     /// Still there, for the owner's devices to remove: someone else owns
     /// the project.
     left: usize,
+    /// The links were replaced without removing anyone: an owned project
+    /// the revoked device had no leaf in but may know the links of.
+    reset: bool,
 }
 
 impl Spread {
@@ -263,6 +346,13 @@ impl Spread {
             .iter()
             .map(move |(title, cleanup)| (title, count(cleanup)))
             .filter(|(_, n)| *n > 0)
+    }
+
+    fn reset(&self) -> impl Iterator<Item = &String> {
+        self.reached
+            .iter()
+            .filter(|(_, cleanup)| cleanup.reset)
+            .map(|(title, _)| title)
     }
 
     fn report_unreached(&self, out: &mut Output, consequence: &str) {
@@ -284,11 +374,47 @@ impl Spread {
 ///
 /// Projects run a few at a time. Each one's lines are held back and
 /// printed whole, in catalog order, so they do not interleave.
-async fn spread(ctx: &Ctx, out: &mut Output) -> anyhow::Result<Spread> {
-    let cleanups = catalog()?.into_iter().map(|entry| async move {
+///
+/// For a revocation, a project this person owns is reset even without
+/// a folder here (this device holds its owner key): it is opened headless
+/// and has its links replaced. Otherwise a folder-less one is only
+/// reported.
+async fn spread(ctx: &Ctx, out: &mut Output, scope: Scope<'_>) -> anyhow::Result<Spread> {
+    let revoking = matches!(scope, Scope::Revoke(_));
+    // Projects that are gone have nothing to clean, and a folder-less
+    // one is only worth a note while the person can still open it. Dropped
+    // ones are only hidden, their links work, so a revocation covers them.
+    let all = if revoking {
+        catalog_with_forgotten()?
+    } else {
+        catalog()?
+    };
+    let projects = all.into_iter().filter(|entry| {
+        let blocked = match scope {
+            Scope::Revoke(servers) => ShareLink::parse(&entry.link)
+                .is_ok_and(|l| servers.iter().any(|s| s == normalize(&l.origin))),
+            Scope::Graph => false,
+        };
+        !blocked
+            && (entry.dir.is_some()
+                || entry.state == State::Listed
+                || (revoking && entry.state == State::Forgotten))
+    });
+    let cleanups = projects.map(|entry| async move {
         let mut lines = Output::collect();
         let result = match &entry.dir {
-            Some(dir) => clean_project(ctx, &entry.title, dir, &mut lines).await,
+            Some(dir) => clean_project(ctx, &entry.title, dir, revoking, &mut lines).await,
+            None if revoking => {
+                let forgotten = entry.state == State::Forgotten;
+                clean_detached(
+                    ctx,
+                    &entry.link,
+                    entry.project_id.as_deref(),
+                    forgotten,
+                    &mut lines,
+                )
+                .await
+            }
             None => Err(anyhow::anyhow!(
                 "no folder on this device; run the command where it is cloned, \
                  or clone it here first"
@@ -325,6 +451,11 @@ async fn recovery(ctx: &Ctx) -> anyhow::Result<()> {
         "this device was revoked from your devices, so it cannot add a recovery key; \
          run this on a device of yours that is still valid",
     )?;
+    // A key with nowhere to point would recover the project it was found in
+    // and nothing else.
+    for server in project_servers()? {
+        ensure_space(&server).await?;
+    }
     let (key, words) = RecoveryKey::generate();
     identity
         .graph
@@ -338,6 +469,9 @@ async fn recovery(ctx: &Ctx) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("cannot add the recovery key: {err}"))?;
     merge_graph(&identity.graph)?;
     set_device_label(&key.public(), RECOVERY_LABEL)?;
+    // After the graph is saved, so this device's leaf in the personal spaces
+    // carries the key too: that is how a recovery gets their owner keys.
+    sync_bound().await;
 
     let mut out = Output::terminal();
     out.out("Your recovery key. It is shown once and not stored anywhere:");
@@ -352,7 +486,7 @@ async fn recovery(ctx: &Ctx) -> anyhow::Result<()> {
         "Running this again adds another key; revoke an old one with `typstry devices revoke`.",
     );
 
-    let spread = spread(ctx, &mut out).await?;
+    let spread = spread(ctx, &mut out, Scope::Graph).await?;
     if spread.reached.is_empty() {
         out.err(
             "No project carries the key yet, so it cannot recover anything. Run `typstry pull` \
@@ -369,6 +503,18 @@ async fn recovery(ctx: &Ctx) -> anyhow::Result<()> {
         "Run `typstry pull` in those folders, or this command's cleanup again, to put the key there.",
     );
     Ok(())
+}
+
+/// The servers this person has projects on.
+fn project_servers() -> anyhow::Result<Vec<String>> {
+    let mut servers: Vec<String> = catalog()?
+        .iter()
+        .filter_map(|entry| ShareLink::parse(&entry.link).ok())
+        .map(|link| normalize(&link.origin).to_owned())
+        .collect();
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
 }
 
 /// The words, from a terminal prompt or from standard input. Never an
@@ -390,7 +536,7 @@ fn read_words() -> anyhow::Result<String> {
     Ok(words)
 }
 
-async fn recover(link: &str, replace: bool, keep_devices: bool) -> anyhow::Result<()> {
+async fn recover(ctx: &Ctx, link: &str, replace: bool, keep_devices: bool) -> anyhow::Result<()> {
     let link = ShareLink::parse(link.trim())?;
     let recovery = RecoveryKey::from_words(&read_words()?)
         .map_err(|err| anyhow::anyhow!("that is not a recovery key: {err}"))?;
@@ -407,10 +553,19 @@ async fn recover(link: &str, replace: bool, keep_devices: bool) -> anyhow::Resul
         eprintln!("warning: could not read the project's owner key ({err})");
         None
     });
+    // Same reason as above: the pointer and the space's owner key sit in the
+    // leaves of the lost devices.
+    let space = match restorable_space(&api, &secret, &boot, &recovery).await {
+        Ok(space) => space,
+        Err(err) => {
+            eprintln!("warning: could not read your personal space from the project ({err:#})");
+            None
+        }
+    };
     // Asked before anything is saved, so a failure here leaves nothing half
     // done.
     let owner = match owner {
-        Some(owner) => Some((api.resolve_share(&link.token).await?.project_id, owner)),
+        Some(owner) => Some((api.resolve_share(&link.token).await?.space_id, owner)),
         None => None,
     };
     // Read first, so a damaged graph or a missing device key is reported
@@ -437,10 +592,15 @@ async fn recover(link: &str, replace: bool, keep_devices: bool) -> anyhow::Resul
     // Kept on this machine for the folder `typstry clone` makes next.
     let owner_kept = match owner {
         Some((project, owner)) => {
-            remember_owner_keys(&link.origin, &project, &OwnerSecrets::received(owner))?;
+            keep_owner_key(&link.origin, &project, owner)?;
             true
         }
         None => false,
+    };
+
+    let restored = match space {
+        Some(space) => restore_projects(&link.origin, &recovery, &space).await,
+        None => None,
     };
 
     println!(
@@ -456,6 +616,17 @@ async fn recover(link: &str, replace: bool, keep_devices: bool) -> anyhow::Resul
         }
     }
     println!("Next, run `typstry clone <link>` to get the project; you own what you owned.");
+    if let Some((listed, owned)) = restored {
+        println!(
+            "Your personal space is back: {listed} project(s) in your list, {owned} of them \
+             yours to manage. `typstry list` shows them; clone one to work on it."
+        );
+        if !revoked.is_empty() {
+            let mut out = Output::terminal();
+            clean_everywhere(ctx, &mut out).await?;
+        }
+        return Ok(());
+    }
     if owner_kept {
         println!(
             "This device took the project's owner key along, so it can remove members and \
@@ -469,6 +640,129 @@ async fn recover(link: &str, replace: bool, keep_devices: bool) -> anyhow::Resul
              it, and from the others when their owner's devices do. For projects with a folder \
              here, run `typstry devices revoke <name>` to finish the cleanup right away."
         );
+    }
+    Ok(())
+}
+
+/// The personal space the project's leaves point to, with its owner key,
+/// read while the lost devices' leaves still stand for the person. None
+/// when no leaf carries a pointer for this recovery key.
+async fn restorable_space(
+    api: &Api,
+    secret: &LinkSecret,
+    boot: &crate::api::Bootstrap,
+    recovery: &DeviceKey,
+) -> anyhow::Result<Option<GrantedSpace>> {
+    let candidates = person_spaces_for_recovery(secret, &boot.group_info, &boot.keyring, recovery)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // Any leaf of the person can carry any pointer, including a stolen
+    // device's, so each is checked: a space only counts if the recovery key
+    // opens its owner key. The best-ranked one that passes is the person's.
+    for pointer in &candidates {
+        if let Some(space) = usable_space(api, pointer, recovery).await {
+            return Ok(Some(space));
+        }
+    }
+    eprintln!(
+        "warning: none of the personal spaces the project points to could be restored with \
+         this recovery key"
+    );
+    Ok(None)
+}
+
+/// The space `pointer` leads to, if it is a live one this recovery key
+/// holds the owner key of. Anything else is skipped.
+async fn usable_space(
+    api: &Api,
+    pointer: &PersonSpace,
+    recovery: &DeviceKey,
+) -> Option<GrantedSpace> {
+    let space_secret = LinkSecret::from_base64url(pointer.secret()).ok()?;
+    let share = api.resolve_share(pointer.token()).await.ok()?;
+    if share.retired {
+        return None;
+    }
+    let space_boot = api.mls_bootstrap(pointer.token()).await.ok()?;
+    let owner = owner_share_for_recovery(&space_secret, space_boot.as_mls(), recovery)
+        .ok()
+        .flatten()?;
+    Some(GrantedSpace {
+        token: pointer.token().to_owned(),
+        secret: pointer.secret().to_owned().into(),
+        owner_secrets: OwnerSecrets::received(owner).encode().to_vec().into(),
+    })
+}
+
+/// Binds this machine to the recovered personal space, reads the directory
+/// and takes the owner key of every project in it that the person owns.
+/// Best effort, each failure a warning: the project the link led to is
+/// recovered either way. Returns how many projects the list holds and how
+/// many of them the person owns, None if the space could not be joined.
+async fn restore_projects(
+    server: &str,
+    recovery: &DeviceKey,
+    space: &GrantedSpace,
+) -> Option<(usize, usize)> {
+    if let Err(err) = join_space(server, space).await {
+        eprintln!("warning: could not restore your personal space: {err:#}");
+        return None;
+    }
+    sync_server(server).await;
+    let doc = match crate::directory::read(server) {
+        Ok(doc) => doc,
+        Err(err) => {
+            eprintln!("warning: could not read your project list: {err:#}");
+            return None;
+        }
+    };
+    let entries: Vec<_> = typstry_doc::directory::list(&doc, crate::directory::now())
+        .into_iter()
+        .filter(|entry| entry.state != State::Forgotten)
+        .collect();
+    let mut owned = 0;
+    for entry in &entries {
+        let title = entry.title.as_deref().unwrap_or("Untitled");
+        match take_owner_key(server, entry, recovery).await {
+            Ok(true) => owned += 1,
+            Ok(false) => {}
+            Err(err) => eprintln!("warning: could not take the owner key of {title}: {err:#}"),
+        }
+    }
+    Some((entries.len(), owned))
+}
+
+/// Keeps the owner key the person's lost devices left for the recovery
+/// key in one listed project. False when it is not theirs.
+async fn take_owner_key(
+    server: &str,
+    entry: &typstry_doc::directory::Entry,
+    recovery: &DeviceKey,
+) -> anyhow::Result<bool> {
+    let secret = LinkSecret::from_base64url(&entry.link.secret).context("reading the link")?;
+    let api = Api::new(server)?;
+    // The entry is only a claim: a key found behind a link that belongs to
+    // another project must not be filed under this one.
+    let share = api.resolve_share(&entry.link.token).await?;
+    if share.space_id != entry.project_id {
+        bail!("your project list files this link under another project; skipped");
+    }
+    let boot = api.mls_bootstrap(&entry.link.token).await?;
+    let Some(owner) = owner_share_for_recovery(&secret, boot.as_mls(), recovery)? else {
+        return Ok(false);
+    };
+    keep_owner_key(server, &entry.project_id, owner)?;
+    Ok(true)
+}
+
+/// Keeps a recovered owner key on this machine and puts it in the directory
+/// for the person's other devices. Only the first part has to work: the
+/// directory is a convenience.
+fn keep_owner_key(server: &str, project_id: &str, owner: OwnerSecret) -> anyhow::Result<()> {
+    remember_owner_keys(server, project_id, &OwnerSecrets::received(owner.clone()))?;
+    if let Err(err) = crate::directory::record_owner_keys(server, project_id, &owner) {
+        eprintln!("warning: could not share the owner key with your devices: {err:#}");
     }
     Ok(())
 }
@@ -546,13 +840,16 @@ async fn profile(ctx: &Ctx, color: Option<&str>) -> anyhow::Result<()> {
         .append(&identity.device, EntryKind::SetProfile { profile: bytes })
         .map_err(|err| anyhow::anyhow!("cannot change the profile: {err}"))?;
     merge_graph(&identity.graph)?;
+    // After the graph is saved, so the personal spaces carry the new profile
+    // as well; the projects get it from the spread below.
+    sync_bound().await;
 
     let mut out = Output::terminal();
     out.out(format!(
         "Your devices now go by {} ({}).",
         wanted.name, wanted.color
     ));
-    let spread = spread(ctx, &mut out).await?;
+    let spread = spread(ctx, &mut out, Scope::Graph).await?;
     spread.report_unreached(
         &mut out,
         "Other members see the new profile there once you open them (`typstry pull`).",
@@ -573,12 +870,15 @@ fn valid_color(color: &str) -> anyhow::Result<String> {
 
 /// Puts the saved graph into one project and, where this device holds the
 /// owner key, removes the revoked devices from it. Elsewhere the graph in
-/// this device's leaf is how the owner's devices learn what to remove. An
+/// this device's leaf is how the owner's devices learn what to remove. With
+/// `reset_links` (a revocation), an owned project gets new links even when
+/// no revoked leaf is in it: the revoked device may know the old ones. An
 /// error says why the project could not be reached.
 async fn clean_project(
     ctx: &Ctx,
     title: &str,
     dir: &std::path::Path,
+    reset_links: bool,
     out: &mut Output,
 ) -> anyhow::Result<Cleanup> {
     if !dir.is_dir() {
@@ -600,21 +900,134 @@ async fn clean_project(
     }
     if !session.holds_owner_key() {
         let left = session.revoked_in_group();
-        if left > 0 && session.ensure_owner().is_ok() {
+        // An owned project that a revocation would reset is out of reach
+        // without the key even when no revoked leaf is in it: the revoked
+        // device may still know its links.
+        if (left > 0 || reset_links) && session.ensure_owner().is_ok() {
             // Reported as unreached so a later run is suggested: the key
             // comes once another owner device opens the project.
             bail!(
                 "this device does not have the project's owner key yet, so it cannot remove \
-                 anyone; `typstry pull` on another of your devices that can hands it over"
+                 anyone or reset the links; `typstry pull` on another of your devices that can \
+                 hands it over"
             );
         }
-        return Ok(Cleanup { removed: 0, left });
+        return Ok(Cleanup {
+            left,
+            ..Cleanup::default()
+        });
     }
     let removed = session.remove_revoked().await?;
     if removed == 0 {
-        return Ok(Cleanup::default());
+        if !reset_links {
+            return Ok(Cleanup::default());
+        }
+        session.reset_links().await?;
+        out.out(format!("{title}:"));
+        publish_rotation(&mut session, out).await?;
+        return Ok(Cleanup {
+            reset: true,
+            ..Cleanup::default()
+        });
     }
     out.out(format!("{title}:"));
     publish_rotation(&mut session, out).await?;
-    Ok(Cleanup { removed, left: 0 })
+    Ok(Cleanup {
+        removed,
+        ..Cleanup::default()
+    })
+}
+
+/// [`clean_project`] for a project this device has no folder for but owns:
+/// a headless seat under the config dir joins the group with the link the
+/// directory holds and replaces the links. That happens even when the
+/// revoked device has no leaf in it, since the directory (or a shared
+/// link) may have handed it the project's links. Someone else's project is
+/// an error saying so: their owner's devices remove the leaf. A dropped
+/// project that is not the person's to reset is not worth a word, they
+/// chose not to see it.
+///
+/// `project_id` is what the directory files the link under; the server has
+/// the last word, and an entry that disagrees is moved to its project.
+async fn clean_detached(
+    ctx: &Ctx,
+    link: &str,
+    project_id: Option<&str>,
+    forgotten: bool,
+    out: &mut Output,
+) -> anyhow::Result<Cleanup> {
+    const NO_KEY_HERE: &str = "no folder on this device and no owner key for it here, so its \
+         owner's devices remove the revoked device when they open it";
+    let link = ShareLink::parse(link)?;
+    let share = Api::new(&link.origin)?.resolve_share(&link.token).await?;
+    if share.retired {
+        if forgotten {
+            return Ok(Cleanup::default());
+        }
+        bail!("the link in your directory was replaced; open the project on a device that has it");
+    }
+    if let Some(listed) = project_id
+        && listed != share.space_id
+    {
+        // The server has the last word on what the token opens. Keys of the
+        // project the entry names are not keys of this one, so only the
+        // server's id is acted on, and the entry is moved to it.
+        if let Err(err) =
+            crate::directory::refile_if_misfiled(&link.origin, &link.token, &share.space_id)
+        {
+            out.err(format!(
+                "warning: could not update your project directory: {err:#}"
+            ));
+        }
+    }
+    crate::directory::import_owner_keys(&link.origin, &share.space_id);
+    if owner_keys(&link.origin, &share.space_id).is_empty() {
+        if forgotten {
+            return Ok(Cleanup::default());
+        }
+        bail!(NO_KEY_HERE);
+    }
+    if !share.permission.can_write() {
+        bail!("the link in your directory is view-only, so it cannot reset the project");
+    }
+    let dir = project_dir_of(&config_dir()?, &link.origin, &share.space_id);
+    let state =
+        tokio::task::spawn_blocking(move || StateDir::open_headless_waiting(&dir, LOCK_WAIT))
+            .await??;
+    // A seat from an earlier run keeps its group, so it is not another
+    // device in the project each time.
+    if StateDir::peek_headless_config(state.dir()).is_none_or(|c| c.project_id != share.space_id) {
+        state.save_config(&Config::new(&link, &share, None, None))?;
+    }
+    let mut core = SpaceCore::open(state, DocKind::PROJECT, ctx.name.as_deref(), None)?;
+    let result = reset_detached(&mut core).await;
+    for warning in core.take_warnings() {
+        out.err(format!("warning: {warning}"));
+    }
+    result
+}
+
+async fn reset_detached(core: &mut SpaceCore) -> anyhow::Result<Cleanup> {
+    core.follow_group().await?;
+    if core.identity_step()?.is_some_and(|step| step.needs_refresh) {
+        bail!("your devices could not be added to the project's group; try again");
+    }
+    if !core.holds_owner_key() {
+        bail!(
+            "this device does not have the project's owner key yet, so it cannot reset its \
+             links; `typstry pull` on another of your devices that has the project hands it over"
+        );
+    }
+    let removed = core.remove_revoked().await?;
+    if removed > 0 {
+        return Ok(Cleanup {
+            removed,
+            ..Cleanup::default()
+        });
+    }
+    core.reset_links().await?;
+    Ok(Cleanup {
+        reset: true,
+        ..Cleanup::default()
+    })
 }

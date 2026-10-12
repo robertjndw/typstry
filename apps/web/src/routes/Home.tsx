@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
@@ -26,14 +27,23 @@ import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
 import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 import { readDrop, readPicked, type PendingImport } from "@/import/sources";
 import { assertImportable, ImportError, writeImport } from "@/import/import";
 import { provisionalIdentity, useStoredIdentity } from "@/presence/identity";
 import { formatAbsolute, formatRelative } from "@/project/history-items";
 import { createLocalProject, deleteLocalProject } from "@/project/create";
-import { loadRecent, projectUrl, type RecentProject } from "@/project/recent";
+import type { Entry } from "@/directory/directory";
+import { useDirectory } from "@/directory/store";
+import { projectUrl } from "@/project/recent";
 
 const TITLE_MAX_LENGTH = 120;
+
+/** Why a listed project cannot be opened, by state. */
+const UNAVAILABLE: Partial<Record<Entry["state"], string>> = {
+  removed: "You were removed",
+  gone: "Link no longer works",
+};
 
 const FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
   {
@@ -67,16 +77,17 @@ export function Home() {
   const fileInput = useRef<HTMLInputElement>(null);
   const busy = creating || importing;
   const [error, setError] = useState<string | null>(null);
-  const [recent, setRecent] = useState(loadRecent);
-  const [pendingDelete, setPendingDelete] = useState<RecentProject | null>(
-    null,
+  const entries = useDirectory();
+  const projects = useMemo(
+    () => entries?.filter((e) => e.state !== "forgotten") ?? null,
+    [entries],
   );
+  const [pendingDelete, setPendingDelete] = useState<Entry | null>(null);
   const stored = useStoredIdentity();
   const [provisional] = useState(() => provisionalIdentity());
   const now = useNow(60_000);
 
-  async function deleteProject(project: RecentProject) {
-    setRecent((list) => list.filter((p) => p.projectId !== project.projectId));
+  async function deleteProject(project: Entry) {
     try {
       await deleteLocalProject(project.projectId);
     } catch (err) {
@@ -316,55 +327,69 @@ export function Home() {
         </div>
       </section>
 
-      {recent.length > 0 ? (
+      {projects === null ? null : projects.length > 0 ? (
         <section
-          aria-labelledby="recent-heading"
+          aria-labelledby="projects-heading"
           className="flex flex-col gap-3"
         >
           <h2
-            id="recent-heading"
+            id="projects-heading"
             className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
           >
-            Recent projects
+            Your projects
           </h2>
           <ul className="divide-y overflow-hidden rounded-lg border bg-card">
-            {recent.map((p) => (
-              <li
-                key={p.projectId}
-                className="group relative flex items-center transition-colors hover:bg-muted/60"
-              >
-                <Link
-                  to={`/p/${encodeURIComponent(p.token)}`}
-                  className="flex min-w-0 flex-1 items-center gap-3 py-3 pr-1 pl-4 text-sm outline-none focus-visible:bg-muted/60"
+            {projects.map((p) => {
+              const at = p.openedAt ?? p.addedAt;
+              const unavailable = UNAVAILABLE[p.state];
+              return (
+                <li
+                  key={p.projectId}
+                  className="group relative flex items-center transition-colors hover:bg-muted/60"
                 >
-                  <FileTextIcon
-                    aria-hidden
-                    className="size-4 shrink-0 text-muted-foreground"
-                  />
-                  <span className="min-w-0 flex-1 truncate font-medium">
-                    {titleOf(p)}
-                  </span>
-                  <time
-                    dateTime={new Date(p.visitedAt).toISOString()}
-                    title={formatAbsolute(p.visitedAt)}
-                    className="shrink-0 text-xs text-muted-foreground tabular-nums"
+                  <Link
+                    to={projectUrl(p.link.token, p.link.secret, "")}
+                    className="flex min-w-0 flex-1 items-center gap-3 py-3 pr-1 pl-4 text-sm outline-none focus-visible:bg-muted/60"
                   >
-                    {capitalize(formatRelative(p.visitedAt, now))}
-                  </time>
-                </Link>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={`Delete ${titleOf(p)}`}
-                  title="Delete"
-                  // Always visible on touch screens, which have no hover.
-                  className="mr-2 text-muted-foreground hover:text-destructive focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100"
-                  onClick={() => setPendingDelete(p)}
-                >
-                  <Trash2Icon />
-                </Button>
-              </li>
-            ))}
+                    <FileTextIcon
+                      aria-hidden
+                      className="size-4 shrink-0 text-muted-foreground"
+                    />
+                    <span
+                      className={cn(
+                        "min-w-0 flex-1 truncate font-medium",
+                        unavailable && "text-muted-foreground",
+                      )}
+                    >
+                      {titleOf(p)}
+                    </span>
+                    {unavailable && (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {unavailable}
+                      </span>
+                    )}
+                    <time
+                      dateTime={new Date(at).toISOString()}
+                      title={formatAbsolute(at)}
+                      className="shrink-0 text-xs text-muted-foreground tabular-nums"
+                    >
+                      {capitalize(formatRelative(at, now))}
+                    </time>
+                  </Link>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Delete ${titleOf(p)}`}
+                    title="Delete"
+                    // Always visible on touch screens, which have no hover.
+                    className="mr-2 text-muted-foreground hover:text-destructive focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100"
+                    onClick={() => setPendingDelete(p)}
+                  >
+                    <Trash2Icon />
+                  </Button>
+                </li>
+              );
+            })}
           </ul>
         </section>
       ) : (
@@ -410,6 +435,6 @@ function capitalize(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-function titleOf(project: RecentProject | null): string {
+function titleOf(project: Entry | null): string {
   return project?.title || "Untitled";
 }

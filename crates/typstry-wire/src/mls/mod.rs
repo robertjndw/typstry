@@ -1,8 +1,8 @@
-//! MLS (RFC 9420) membership for a project.
+//! MLS (RFC 9420) membership for a space.
 //!
-//! The group gives a project what a share link alone cannot: a roster of
+//! The group gives a space what a share link alone cannot: a roster of
 //! devices, each with its own signature key and a profile only members can
-//! read, so authors are authenticated. It also lets the project's owner
+//! read, so authors are authenticated. It also lets the space's owner
 //! remove members, and carries the new links to the members who remain after
 //! a removal or a link reset. It does not encrypt documents. Records, blobs
 //! and profiles are sealed under the doc keys of the
@@ -10,19 +10,19 @@
 //! the `crypto` module for why there is no per-epoch key for content). Doc
 //! sync never waits on MLS.
 //!
-//! A [`ProjectGroup`] is one device's view of the group. Nobody is invited:
+//! A [`SpaceGroup`] is one device's view of the group. Nobody is invited:
 //! the link opens the sealed GroupInfo on the server and a newcomer joins
 //! with an external commit. The server only orders commits, first one per
 //! epoch wins, so every member runs the same [`policy`] on every staged
 //! commit before merging it.
 //!
 //! Commits made here are not merged until the server says `Accepted`:
-//! call [`ProjectGroup::confirm_pending`] then. A `Conflict` or a refusal
-//! is the only reason to call [`ProjectGroup::discard_pending`]; after a
+//! call [`SpaceGroup::confirm_pending`] then. A `Conflict` or a refusal
+//! is the only reason to call [`SpaceGroup::discard_pending`]; after a
 //! transport error the outcome is unknown, so keep the commit (it is saved
 //! with the state) and let the log decide: when it echoes the commit
-//! [`ProjectGroup::process_commit`] confirms it, and when another commit
-//! won the epoch it discards ours. [`ProjectGroup::pending_submit`] returns
+//! [`SpaceGroup::process_commit`] confirms it, and when another commit
+//! won the epoch it discards ours. [`SpaceGroup::pending_submit`] returns
 //! what to send again.
 //!
 //! A member can say whose device it is. Its leaf then carries an identity: a
@@ -40,7 +40,7 @@
 //! that the person's graph, merged over their leaves in the tree as it was
 //! before the commit, counts as valid. So the creator's other devices are
 //! owners as soon as they are paired, though they can only reset the links
-//! once a device holding the project's owner key has handed it over, and a
+//! once a device holding the space's owner key has handed it over, and a
 //! device the person revokes stops being one as soon as any leaf carries the
 //! revoke. If the leaves of one person carry graphs that cannot be merged
 //! (past the caps), no leaf of that person is verified and nobody is owner
@@ -50,27 +50,28 @@
 //!
 //! Only the owner removes members or rotates the links. Members refuse
 //! anyone else's rotation, and the server, which cannot read the group,
-//! swaps the tokens only for a rotation signed with the project's owner key
+//! swaps the tokens only for a rotation signed with the space's owner key
 //! (see [`crate::owner`]). That key changes with every rotation, and its
 //! secret travels from owner device to owner device in their leaves (see
 //! [`owner_share`]): a device of the owner's person is an owner as soon as
 //! it is paired, but it can rotate only once a device that holds the key has
 //! handed it over ([`IdentityStep::share_owner_key`]). Which key is current
 //! is what the server says, with the GroupInfo a device joins from and with
-//! every rotation in the log ([`ProjectGroup::owner_key`]), never what the
+//! every rotation in the log ([`SpaceGroup::owner_key`]), never what the
 //! group says; what it says picks a secret but never drops one
 //! ([`OwnerSecrets`]). Revoked devices, of anyone, are removed by the owner's
-//! devices ([`ProjectGroup::remove_revoked`]).
+//! devices ([`SpaceGroup::remove_revoked`]).
 //!
 //! Any editor can still reset a stalled group, and the reset keeps the tag,
 //! the owner key and the tokens. Members pin the owner's person id
-//! ([`ProjectGroup::owner_person`]) and whoever joins checks the group's tag
+//! ([`SpaceGroup::owner_person`]) and whoever joins checks the group's tag
 //! against it. A device that rejoins after a reset also checks that the new
 //! group keeps the keyring and the owner it had, see
-//! [`ProjectGroup::join_external_as`].
+//! [`SpaceGroup::join_external_as`].
 
 pub mod extensions;
 pub mod owner_share;
+pub mod person_share;
 pub mod policy;
 pub mod rotation;
 pub mod storage;
@@ -92,9 +93,11 @@ use zeroize::Zeroizing;
 
 use self::extensions::{
     CIPHERSUITE, EditorInfo, Policy, capabilities, group_extensions, leaf_parameters, read_leaf,
-    read_owner_shares, read_policy,
+    read_owner_shares, read_person_shares, read_policy,
 };
 use self::owner_share::{OwnerShares, ShareScope};
+pub use self::person_share::PersonSpace;
+use self::person_share::{PersonShares, sealable};
 use self::policy::{CommitFacts, IdentityFacts, LeafFacts, LeafRole, Removal, Violation};
 use self::rotation::{Binding, ROTATION_LABEL, Recipient, Tokens};
 pub use self::storage::{LeafKeys, MLS_STATE_VERSION};
@@ -106,7 +109,7 @@ use crate::ds::{ClientMessage, Rotate};
 use crate::identity::{
     DeviceKey, DeviceState, GraphError, LeafBinding, LeafIdentity, PersonGraph, PersonId,
 };
-use crate::mls_frame::{GROUP_ID_LEN, PROJECT_ID_LEN, group_id_of, split_group_id};
+use crate::mls_frame::{GROUP_ID_LEN, SPACE_ID_LEN, group_id_of, split_group_id};
 pub use crate::owner::{Origin, OwnerSecret, OwnerSecrets};
 use crate::owner::{OwnerKey, RotationClaim};
 use crate::token;
@@ -142,7 +145,7 @@ pub enum MlsError {
     #[error("the group does not match the link: {0}")]
     Mismatch(String),
     /// Kept apart from [`Self::Mismatch`]: a wrong link is the user's typo,
-    /// a different owner is someone taking the project over.
+    /// a different owner is someone taking the space over.
     #[error("the group's owner {0}")]
     OwnerChanged(&'static str),
     /// A group this device rejoins after a reset or a gap does not keep
@@ -175,7 +178,7 @@ pub enum Role {
     Viewer,
 }
 
-/// What a device brings to a project to be recognised as a person's: its
+/// What a device brings to a space to be recognised as a person's: its
 /// own key and the person graph that lists it.
 pub struct LocalIdentity {
     pub device: DeviceKey,
@@ -192,7 +195,7 @@ pub enum Person {
     /// does not list. Never shown as the claimed person.
     Unverified,
     /// A device of the person `id` vouches for the leaf's key and the
-    /// person's graph, merged across all of their leaves in this project,
+    /// person's graph, merged across all of their leaves in this space,
     /// lists it. `revoked` is its verdict there: the device was valid once
     /// and no longer is.
     Verified {
@@ -214,7 +217,7 @@ pub struct MemberInfo {
     pub sig_pub: PublicKey,
     pub person: Person,
     /// The person's own profile from their merged graph, for a verified
-    /// member. Unlike `profile` it is the same in every project.
+    /// member. Unlike `profile` it is the same in every space.
     pub person_profile: Option<Vec<u8>>,
 }
 
@@ -225,14 +228,16 @@ pub struct Rotation {
     pub tokens: Tokens,
 }
 
-/// See [`ProjectGroup::identity_step`].
+/// See [`SpaceGroup::identity_step`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityStep {
     /// The local graph with what the tree knows of the same person merged
     /// in. `None` when the tree adds nothing, so there is nothing to store.
     pub merged: Option<PersonGraph>,
     /// Whether the merged graph (else the local one) holds entries of this
-    /// device's person that its own leaf lacks.
+    /// device's person that its own leaf lacks, or, given a personal space,
+    /// the leaf's pointer to it is missing or is for another binding or
+    /// other recovery keys than the person has now.
     pub needs_refresh: bool,
     /// Whether this device's leaf names another person than `local`, which
     /// lists the leaf's device as valid: the device switched persons since
@@ -241,19 +246,19 @@ pub struct IdentityStep {
     /// the way over is an external join with the same [`LeafKeys`], which
     /// replaces the old leaf.
     pub rejoin: bool,
-    /// [`ProjectGroup::revoked_leaves`] of the tree as it is, for a device
+    /// [`SpaceGroup::revoked_leaves`] of the tree as it is, for a device
     /// that can remove them: an owner that holds the owner key. Empty for
     /// everyone else, who leaves the removal to the owner.
     pub revoked: Vec<u32>,
     /// Whether this device holds the owner key and another owner device or
     /// recovery key of the owner's has no share of it in any owner's leaf
-    /// yet. A [`ProjectGroup::self_update`] puts the shares in. Every
+    /// yet. A [`SpaceGroup::self_update`] puts the shares in. Every
     /// holder sees the same tree, so once one of them has done it the
     /// others find nothing left to do.
     pub share_owner_key: bool,
 }
 
-/// What [`ProjectGroup::remove_revoked`] made.
+/// What [`SpaceGroup::remove_revoked`] made.
 #[derive(Debug, Clone)]
 pub struct RevokedRemoval {
     pub submit: SubmitPayload,
@@ -261,14 +266,14 @@ pub struct RevokedRemoval {
     pub removed: Vec<u32>,
 }
 
-/// What [`ProjectGroup::process_commit`] found.
+/// What [`SpaceGroup::process_commit`] found.
 #[derive(Debug)]
 pub enum Outcome {
     /// The commit was valid and merged.
     Advanced,
     /// Merged, and the keys rotated. Switch to the new link and tokens, and
-    /// fetch the keyring ([`ProjectGroup::set_keyring`]) when
-    /// [`ProjectGroup::needs_keyring`] says so. A member who was not sent
+    /// fetch the keyring ([`SpaceGroup::set_keyring`]) when
+    /// [`SpaceGroup::needs_keyring`] says so. A member who was not sent
     /// the edit link gets a view link and no edit token. Also the result for
     /// this device's own rotation when the log echoes it before the
     /// `Accepted` reply was seen, in which case the keys are current already.
@@ -286,7 +291,7 @@ pub enum Outcome {
     AlreadyApplied,
 }
 
-/// The first message of a project: creates its group on the server.
+/// The first message of a space: creates its group on the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitPayload {
     pub group_id: Vec<u8>,
@@ -393,7 +398,7 @@ enum Pending {
     Join { submit: SubmitPayload },
 }
 
-pub struct ProjectGroup {
+pub struct SpaceGroup {
     provider: OpenMlsRustCrypto,
     group: MlsGroup,
     device: LeafKeys,
@@ -415,9 +420,9 @@ pub struct ProjectGroup {
     dead: bool,
 }
 
-impl std::fmt::Debug for ProjectGroup {
+impl std::fmt::Debug for SpaceGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProjectGroup")
+        f.debug_struct("SpaceGroup")
             .field("epoch", &self.epoch())
             .field("link", &self.link)
             .finish_non_exhaustive()
@@ -445,7 +450,7 @@ fn check_group_id(group_id: &[u8]) -> Result<(), MlsError> {
     }
 }
 
-/// The sealed identity that makes the project's `leaf` a device of the
+/// The sealed identity that makes the space's `leaf` a device of the
 /// person in `local`. Refuses a device the graph does not list as valid,
 /// which every other member would read as unverified anyway.
 fn seal_identity(
@@ -605,7 +610,7 @@ fn vouched_graph<'i>(
 /// off its sealed GroupInfo without joining. This is how a device that lost
 /// all of its own state finds out which person a recovery key belongs to.
 /// A person whose leaves do not merge is left out, as
-/// [`ProjectGroup::members`] would read all of them unverified.
+/// [`SpaceGroup::members`] would read all of them unverified.
 pub fn graphs_in_group_info(
     link: &LinkSecret,
     sealed_group_info: &[u8],
@@ -616,9 +621,9 @@ pub fn graphs_in_group_info(
     Ok(graphs.0.into_values().flatten().collect())
 }
 
-/// The owner key share a project's tree holds for the recovery key
+/// The owner key share a space's tree holds for the recovery key
 /// `recovery`, read off the bootstrap without joining, for a device that
-/// recovers to take the key along into [`ProjectGroup::join_external_as`].
+/// recovers to take the key along into [`SpaceGroup::join_external_as`].
 /// `None` when no leaf has one for the owner key the server holds.
 ///
 /// Read before the join on purpose. The recovered graph revokes the
@@ -655,6 +660,72 @@ pub fn owner_share_for_recovery(
         };
         shares.open_recovery(crypto.crypto(), &scope, recovery)
     }))
+}
+
+/// Every personal space binding a space's tree holds for the recovery key
+/// `recovery`, read off a sealed GroupInfo and its keyring without joining,
+/// for a device that recovers through a link to any project of the
+/// person's. See [`person_share`].
+///
+/// Only leaves of the recovery key's own person count, and only valid
+/// devices of it, so a pointer comes from a device that was the person's.
+/// An entry that does not open is skipped. Devices can disagree, e.g. two
+/// personal spaces made on devices that never met, and a stolen device can
+/// plant a pointer of its own, so this does not choose: it returns each
+/// distinct pointer once, the one most leaves carry first, ties broken by
+/// the rightmost leaf. The caller tries them in order and keeps the first
+/// the server confirms.
+pub fn person_spaces_for_recovery(
+    link: &LinkSecret,
+    sealed_group_info: &[u8],
+    keyring: &[u8],
+    recovery: &DeviceKey,
+) -> Result<Vec<PersonSpace>, MlsError> {
+    let (keyring, info, tree) = tree_of_group_info(link, sealed_group_info, keyring)?;
+    let key = keyring.identity_key();
+    let graphs = TreeGraphs::of_leaves(&key, tree.leaves());
+    let public = recovery.public();
+    let Some(graph) = graphs
+        .0
+        .values()
+        .flatten()
+        .find(|g| g.is_recovery(&public) && g.device_state(&public) == DeviceState::Valid)
+    else {
+        return Ok(Vec::new());
+    };
+    let crypto = OpenMlsRustCrypto::default();
+    // (pointer, leaves carrying it, rightmost leaf position)
+    let mut found: Vec<(PersonSpace, usize, usize)> = Vec::new();
+    for (position, leaf) in tree.leaves().enumerate() {
+        let opened = (|| {
+            let signer = signer_pub(leaf)?;
+            let identity = leaf_identity(&key, leaf)?;
+            let device = identity.binding.device;
+            if !(identity.binding.verify(&signer)
+                && identity.graph.id() == graph.id()
+                && graph.introduces(&device)
+                && !graph.is_recovery(&device)
+                && graph.device_state(&device) == DeviceState::Valid)
+            {
+                return None;
+            }
+            let scope = ShareScope {
+                group_id: info.group_id().as_slice(),
+                sender: &signer,
+            };
+            read_person_shares(leaf)?.open_recovery(crypto.crypto(), &scope, recovery)
+        })();
+        let Some(space) = opened else { continue };
+        match found.iter_mut().find(|(s, _, _)| *s == space) {
+            Some(entry) => {
+                entry.1 += 1;
+                entry.2 = position;
+            }
+            None => found.push((space, 1, position)),
+        }
+    }
+    found.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    Ok(found.into_iter().map(|(space, _, _)| space).collect())
 }
 
 /// The keyring, GroupInfo and verified ratchet tree of a sealed GroupInfo.
@@ -717,7 +788,7 @@ fn person_of(identity: Option<&IdentityFacts>, graphs: &TreeGraphs, sig_pub: &Pu
     }
 }
 
-/// One pass over a tree's identities, see [`ProjectGroup::tree_identities`].
+/// One pass over a tree's identities, see [`SpaceGroup::tree_identities`].
 struct TreeIdentities {
     own: LeafNodeIndex,
     leaves: Vec<(LeafNodeIndex, Option<PublicKey>, Option<IdentityFacts>)>,
@@ -891,15 +962,18 @@ impl OwnerView {
     /// The owner's valid recovery keys, which owner key shares are sealed to
     /// as well.
     fn recovery_keys(&self) -> Vec<PublicKey> {
-        self.0.as_ref().map_or_else(Vec::new, |graph| {
-            graph
-                .devices()
-                .into_iter()
-                .filter(|d| d.recovery && d.state == DeviceState::Valid)
-                .map(|d| d.device)
-                .collect()
-        })
+        self.0.as_ref().map_or_else(Vec::new, valid_recovery_keys)
     }
+}
+
+/// The valid recovery keys of a person's graph.
+fn valid_recovery_keys(graph: &PersonGraph) -> Vec<PublicKey> {
+    graph
+        .devices()
+        .into_iter()
+        .filter(|d| d.recovery && d.state == DeviceState::Valid)
+        .map(|d| d.device)
+        .collect()
 }
 
 /// Refuses a group whose owner is not the person this device pinned.
@@ -920,15 +994,15 @@ fn check_owner(
 struct JoinOptions {
     editor: Option<EditorInfo>,
     identity: Option<Vec<u8>>,
-    /// The owner's person, as this device first saw it for the project.
+    /// The owner's person, as this device first saw it for the space.
     pinned_owner: Option<PersonId>,
     /// The owner key secrets the joiner takes along.
     owner: OwnerSecrets,
     lineage: Option<Lineage>,
 }
 
-/// What a device knew of a project before it rejoins, which the new group
-/// has to keep (see [`ProjectGroup::join_external_as`]).
+/// What a device knew of a space before it rejoins, which the new group
+/// has to keep (see [`SpaceGroup::join_external_as`]).
 struct Lineage {
     keyring: Keyring,
     /// `None` when the old state had no readable policy.
@@ -1072,13 +1146,13 @@ fn commit_facts<'a>(
     Ok(facts)
 }
 
-impl ProjectGroup {
-    /// Creates the group of a new project from a fresh edit link: this
+impl SpaceGroup {
+    /// Creates the group of a new space from a fresh edit link: this
     /// device as the only member, generation 1 keys, and the payload for
     /// the server's `Init`.
     ///
-    /// The creator's person becomes the project's owner for good, so a
-    /// project cannot be created without an identity: it would have no owner
+    /// The creator's person becomes the space's owner for good, so a
+    /// space cannot be created without an identity: it would have no owner
     /// to remove anyone. This device starts out holding the owner key, the
     /// public half of which goes to the server with the payload.
     pub fn create(
@@ -1086,7 +1160,7 @@ impl ProjectGroup {
         profile: &[u8],
         identity: &LocalIdentity,
     ) -> Result<(Self, InitPayload), MlsError> {
-        let project_id: [u8; PROJECT_ID_LEN] = random();
+        let space_id: [u8; SPACE_ID_LEN] = random();
         let keyring = Keyring::new(link);
         let policy = Policy::new(link.attest_pub(), keyring.owner_tag(&identity.graph.id()));
         let device = LeafKeys::generate();
@@ -1098,7 +1172,7 @@ impl ProjectGroup {
             link,
             keyring,
             policy,
-            group_id_of(&project_id, 0),
+            group_id_of(&space_id, 0),
             profile,
             Some(sealed),
             (
@@ -1115,9 +1189,9 @@ impl ProjectGroup {
         Ok((group, payload))
     }
 
-    /// The cleartext person id of the project's owner, i.e. the person in
+    /// The cleartext person id of the space's owner, i.e. the person in
     /// the tree whose tag the policy holds. Callers pin it the first time
-    /// they see the project and pass it to later joins. `None` when none of
+    /// they see the space and pass it to later joins. `None` when none of
     /// the owner's devices is in the group, as after a reset until they
     /// rejoin.
     pub fn owner_person(&self) -> Option<PersonId> {
@@ -1131,7 +1205,7 @@ impl ProjectGroup {
             .copied()
     }
 
-    /// Starts over with a new group of the same project when the current one
+    /// Starts over with a new group of the same space when the current one
     /// is stuck, e.g. after an invalid commit. The link, the keys, the device
     /// and the policy with its owner tag stay; only the roster is rebuilt, as
     /// everyone rejoins. Any editor may do it, so it never grants anyone the
@@ -1152,7 +1226,7 @@ impl ProjectGroup {
             None => self.own_identity(),
         };
         let incarnation = self.incarnation();
-        let next = group_id_of(&self.project_id(), incarnation + 1);
+        let next = group_id_of(&self.space_id(), incarnation + 1);
         let (group, group_info, keyring) = Self::start(
             self.device.duplicate(),
             &self.link,
@@ -1195,6 +1269,7 @@ impl ProjectGroup {
             keys.seal(profile, PROFILE_CONTEXT),
             sealed_identity,
             None,
+            None,
         )
         .map_err(MlsError::Malformed)?;
         let config = MlsGroupCreateConfig::builder()
@@ -1235,7 +1310,7 @@ impl ProjectGroup {
     /// Joins an existing group with an external commit, as a new device.
     ///
     /// `pinned_owner` is the owner's person id as this device first saw it
-    /// for the project, if it has one (see [`Self::owner_person`]): a group
+    /// for the space, if it has one (see [`Self::owner_person`]): a group
     /// whose owner tag is not that person's is refused. An owner's device
     /// joins as the owner by presenting its identity, with no key to bring.
     pub fn join_external(
@@ -1266,7 +1341,7 @@ impl ProjectGroup {
     /// keep what that one had: every generation of its keyring, unchanged,
     /// and its owner tag. Any editor can reset the group with a GroupInfo
     /// and keyring of their making, and this is what keeps such a reset from
-    /// rewriting the project's history or its owner for those who knew it.
+    /// rewriting the space's history or its owner for those who knew it.
     ///
     /// The owner key secrets `previous` held are taken along, and so are
     /// `owner_keys` (copies kept beside the state, or one opened with
@@ -1287,7 +1362,7 @@ impl ProjectGroup {
         profile: &[u8],
         identity: Option<&LocalIdentity>,
         pinned_owner: Option<PersonId>,
-        previous: Option<&ProjectGroup>,
+        previous: Option<&SpaceGroup>,
         owner_keys: &OwnerSecrets,
     ) -> Result<(Self, SubmitPayload), MlsError> {
         let keyring = Keyring::open_verified(link, boot.keyring)?;
@@ -1355,6 +1430,7 @@ impl ProjectGroup {
             options.editor.as_ref(),
             keys.seal(profile, PROFILE_CONTEXT),
             options.identity,
+            None,
             None,
         )
         .map_err(MlsError::Malformed)?;
@@ -1426,12 +1502,12 @@ impl ProjectGroup {
             .1
     }
 
-    fn project_id(&self) -> [u8; PROJECT_ID_LEN] {
+    fn space_id(&self) -> [u8; SPACE_ID_LEN] {
         split_group_id(&self.group_id)
             .expect("the group id was checked on the way in")
             .0
             .try_into()
-            .expect("a project id has a fixed length")
+            .expect("a space id has a fixed length")
     }
 
     pub fn epoch(&self) -> u64 {
@@ -1658,7 +1734,11 @@ impl ProjectGroup {
     ///
     /// Fails with [`MlsError::Identity`] when the tree's copy of the person
     /// does not merge with `local`, e.g. past the caps.
-    pub fn identity_step(&self, local: &PersonGraph) -> Result<IdentityStep, MlsError> {
+    pub fn identity_step(
+        &self,
+        local: &PersonGraph,
+        space: Option<&PersonSpace>,
+    ) -> Result<IdentityStep, MlsError> {
         let tree = self.tree_identities();
         let merged = match tree.graphs.get(&local.id()) {
             Some(seen) if !local.is_superset_of(seen) => {
@@ -1669,10 +1749,24 @@ impl ProjectGroup {
             _ => None,
         };
         let current = merged.as_ref().unwrap_or(local);
-        let needs_refresh = self.is_active()
-            && self.link.can_attest()
+        let can_refresh = self.is_active() && self.link.can_attest();
+        let needs_refresh = can_refresh
             && tree.own_identity().is_some_and(|own| {
                 own.graph.id() == current.id() && !own.graph.is_superset_of(current)
+            });
+        // The personal space pointer is stale when it names another
+        // binding or other recovery keys than the person has now. Judged
+        // on the person's graph as merged, which is what the refresh will
+        // seal to. Leaves that never had one and have no key to seal to are
+        // fine as they are.
+        let person_stale = can_refresh
+            && space.is_some_and(|space| {
+                let wanted = valid_recovery_keys(current);
+                let carried = self.group.own_leaf_node().and_then(read_person_shares);
+                match carried {
+                    Some(carried) => !carried.is_current(space, &wanted),
+                    None => !sealable(&wanted).is_empty(),
+                }
             });
         let rejoin = self.is_active()
             && tree.own_identity().is_some_and(|own| {
@@ -1684,7 +1778,7 @@ impl ProjectGroup {
             && self.ensure_editor().is_ok()
             && tree.owners.iter().any(|(index, ..)| *index == tree.own);
         Ok(IdentityStep {
-            needs_refresh,
+            needs_refresh: needs_refresh || person_stale,
             rejoin,
             revoked: if holder { tree.revoked() } else { Vec::new() },
             share_owner_key: holder
@@ -1798,6 +1892,17 @@ impl ProjectGroup {
     /// what the server says.
     pub fn owner_secrets(&self) -> &OwnerSecrets {
         &self.owner
+    }
+
+    /// Takes owner key secrets kept outside the group, like the copies in
+    /// the person's directory, the same way a join takes them along. Local
+    /// only, nothing is committed: which key is current is still what the
+    /// server says, and a secret of no key it names is merely kept.
+    pub fn keep_owner_secrets(&mut self, held: &OwnerSecrets) {
+        if let Some(current) = self.owner_key {
+            self.owner.take_from(held, &current);
+        }
+        self.owner.extend_older(held);
     }
 
     /// The owner key the server holds, as of this device's epoch: what it
@@ -1918,6 +2023,38 @@ impl ProjectGroup {
         Some(OwnerShares::seal(self.provider.crypto(), &scope, secret, &leaves, &recovery).encode())
     }
 
+    /// The encoded personal space pointer for this device's next leaf.
+    /// With a `space`, sealed to the valid recovery keys of the person the
+    /// leaf will show (`identity`, else the leaf's own), and `None` when
+    /// there is none. Without, the pointer the leaf has now.
+    fn person_shares_for(
+        &self,
+        space: Option<&PersonSpace>,
+        identity: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let own = self.group.own_leaf_node()?;
+        let Some(space) = space else {
+            return own
+                .extensions()
+                .unknown(extensions::EXT_PERSON_SHARES)
+                .map(|ext| ext.0.clone());
+        };
+        let key = self.keys.keyring().identity_key();
+        let graph = match identity {
+            Some(sealed) => open_identity(&key, sealed)?.graph,
+            None => leaf_identity(&key, own)?.graph,
+        };
+        let recovery = valid_recovery_keys(&graph);
+        if sealable(&recovery).is_empty() {
+            return None;
+        }
+        let scope = ShareScope {
+            group_id: &self.group_id,
+            sender: &self.device.signer_pub(),
+        };
+        Some(PersonShares::seal(self.provider.crypto(), &scope, space, &recovery).encode())
+    }
+
     fn ensure_idle(&self) -> Result<(), MlsError> {
         self.ensure_alive()?;
         if self.pending.is_some() {
@@ -1933,10 +2070,17 @@ impl ProjectGroup {
     /// The leaf keeps the identity it has, with its graph extended by `graph`
     /// when one is given (see [`Self::identity_step`]). The device and the
     /// person never change, and a graph of another person is refused.
+    ///
+    /// With a personal `space` the leaf's pointer to it is sealed anew to
+    /// the person's recovery keys, as the identity the leaf will carry shows
+    /// them. Without, whatever pointer the leaf has stays as it is: it is
+    /// bound to the group and the leaf key, neither of which a refresh
+    /// changes.
     pub fn self_update(
         &mut self,
         profile: &[u8],
         graph: Option<&PersonGraph>,
+        space: Option<&PersonSpace>,
     ) -> Result<SubmitPayload, MlsError> {
         self.ensure_idle()?;
         self.ensure_editor()?;
@@ -1946,7 +2090,7 @@ impl ProjectGroup {
             None => self.own_identity(),
             Some(graph) => Some(self.extended_identity(graph)?),
         };
-        self.commit_leaf(Some(editor), profile, identity)
+        self.commit_leaf(Some(editor), profile, identity, space)
     }
 
     /// This leaf's identity with `graph` merged into its graph. The binding
@@ -1970,6 +2114,7 @@ impl ProjectGroup {
         editor: Option<EditorInfo>,
         profile: &[u8],
         identity: Option<Vec<u8>>,
+        space: Option<&PersonSpace>,
     ) -> Result<SubmitPayload, MlsError> {
         // Only the current one: the older ones stay with this device, and
         // sealing them would only hand out keys that sign nothing.
@@ -1979,7 +2124,8 @@ impl ProjectGroup {
             }
             _ => None,
         };
-        self.commit_leaf_with(editor, profile, identity, shares)
+        let person = self.person_shares_for(space, identity.as_deref());
+        self.commit_leaf_with(editor, profile, identity, shares, person)
     }
 
     /// [`Self::commit_leaf`] with the owner shares chosen by the caller,
@@ -1990,12 +2136,14 @@ impl ProjectGroup {
         profile: &[u8],
         identity: Option<Vec<u8>>,
         shares: Option<Vec<u8>>,
+        person_shares: Option<Vec<u8>>,
     ) -> Result<SubmitPayload, MlsError> {
         let params = leaf_parameters(
             editor.as_ref(),
             self.keys.seal(profile, PROFILE_CONTEXT),
             identity,
             shares,
+            person_shares,
         )
         .map_err(MlsError::Malformed)?;
         let signer = self.device.signature_pair();
@@ -2038,7 +2186,7 @@ impl ProjectGroup {
     }
 
     /// Removes the members at `leaves` and rotates the keys in one commit,
-    /// so what the removed members hold stops being the project's links.
+    /// so what the removed members hold stops being the space's links.
     /// Only the remaining members learn the new ones (see [`rotation`]), and
     /// only the remaining owner devices the next owner key. Owner only, and
     /// [`MlsError::NoOwnerKey`] for an owner device that does not hold the
@@ -2112,11 +2260,15 @@ impl ProjectGroup {
         // roster never shows the committer attested by a retired link.
         let generation = next_policy.generation();
         let editor = editor_info(&self.device, &link, generation)?;
+        // A rotation keeps the leaf key and the group id, so the pointer
+        // still opens as it is.
+        let person = self.person_shares_for(None, None);
         let params = leaf_parameters(
             Some(&editor),
             keys.seal(&self.profile, PROFILE_CONTEXT),
             identity,
             shares,
+            person,
         )
         .map_err(MlsError::Malformed)?;
         let recipients = self.remaining_editors(&policy, &removed);

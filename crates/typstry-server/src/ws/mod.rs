@@ -184,8 +184,8 @@ pub struct ConnLimits {
     /// Sustained records per second, per bucket. Typing produces one doc
     /// record per keystroke at most, so 50/s leaves plenty of headroom.
     pub updates_per_sec: f64,
-    /// Rooms one connection may join. A project needs two (doc and
-    /// presence); the rest is slack for switching projects in one tab.
+    /// Rooms one connection may join. A space needs two (doc and
+    /// presence); the rest is slack for switching spaces in one tab.
     pub max_rooms: usize,
     /// Bytes of live traffic queued for a slow client before it is
     /// dropped. A join's backfill is queued outside this budget, so it

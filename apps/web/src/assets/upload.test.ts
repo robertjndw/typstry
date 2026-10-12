@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { BLOB_OVERHEAD } from "@/crypto/project-crypto";
+import { BLOB_OVERHEAD } from "@/crypto/space-crypto";
 import { newProject as newKeys } from "@/crypto/test-utils";
 import { createFile, getText } from "@/doc/fs-ops";
 import { NODE, initProject } from "@/doc/schema";
@@ -73,7 +73,7 @@ describe("uploadFiles", () => {
     // Both uploads run concurrently, so either may have been sent first.
     const sent = await Promise.all(
       fetch.mock.calls.map(async ([url, init]) => {
-        expect(url).toBe(`/api/p/${TOKEN}/assets`);
+        expect(url).toBe(`/api/s/${TOKEN}/assets`);
         expect(init?.method).toBe("POST");
         // Only ciphertext leaves the browser.
         const body = init?.body as Uint8Array;

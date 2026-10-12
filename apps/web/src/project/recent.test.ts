@@ -1,73 +1,53 @@
-import {
-  forgetProject,
-  loadProjectKey,
-  loadShare,
-  loadShareLinks,
-  loadRecent,
-  rememberProject,
-  rememberShare,
-  saveProjectKey,
-  saveShareLinks,
-  updateRecentTitle,
-} from "./recent";
+import { LinkSecret } from "@/crypto/wasm";
+import { directory } from "@/directory/store";
+import { editSecret, token, viewSecret } from "@/directory/test-utils";
+import { loadSpaceKey } from "@/space/space-links";
 
-describe("recent projects", () => {
+import { adoptProjectLink, parseProjectLink, projectUrl } from "./recent";
+
+describe("project links", () => {
   afterEach(() => localStorage.clear());
 
-  it("updates a renamed project's title in place", () => {
-    rememberProject(
-      { projectId: "a", token: "ta", title: "A" },
-      localStorage,
-      1,
+  it("round-trips through a url", () => {
+    const key = LinkSecret.generateEdit().toBase64url();
+    const url = projectUrl(token(1), key, "https://t.test");
+    expect(parseProjectLink(url)).toEqual({ token: token(1), key });
+    expect(parseProjectLink("https://t.test/q/abc")).toBeNull();
+  });
+
+  it("adopting a link stores the key and lists the project", async () => {
+    const key = editSecret(3);
+    await adoptProjectLink(
+      { token: token(3), key },
+      { spaceId: "p3", permission: "write" },
+      "Thesis",
     );
-    rememberProject(
-      { projectId: "b", token: "tb", title: "B" },
-      localStorage,
-      2,
-    );
-    updateRecentTitle("a", "A renamed", localStorage);
-    updateRecentTitle("unknown", "X", localStorage);
-    expect(
-      loadRecent(localStorage).map((p) => [p.projectId, p.title, p.visitedAt]),
-    ).toEqual([
-      ["b", "B", 2],
-      ["a", "A renamed", 1],
+    expect(loadSpaceKey("p3")).toBe(key);
+    expect((await directory()).list(Date.now())).toMatchObject([
+      {
+        projectId: "p3",
+        title: "Thesis",
+        link: { token: token(3), secret: key, edit: true },
+      },
     ]);
   });
 
-  it("forgets everything stored about one project", () => {
-    const key = "A".repeat(43);
-    for (const id of ["a", "b"]) {
-      rememberProject(
-        { projectId: id, token: `t${id}`, title: id },
-        localStorage,
-      );
-      saveShareLinks(
-        id,
-        { editToken: `e${id}`, viewToken: `v${id}` },
-        localStorage,
-      );
-      rememberShare(
-        `e${id}`,
-        { projectId: id, permission: "write" },
-        localStorage,
-      );
-      rememberShare(
-        `v${id}`,
-        { projectId: id, permission: "read" },
-        localStorage,
-      );
-    }
-    saveProjectKey("a", key, localStorage);
-
-    forgetProject("a", localStorage);
-
-    expect(loadRecent(localStorage).map((p) => p.projectId)).toEqual(["b"]);
-    expect(loadShareLinks("a", localStorage)).toBeNull();
-    expect(loadProjectKey("a", localStorage)).toBeNull();
-    expect(loadShare("ea", localStorage)).toBeNull();
-    expect(loadShare("va", localStorage)).toBeNull();
-    expect(loadShareLinks("b", localStorage)).not.toBeNull();
-    expect(loadShare("vb", localStorage)).not.toBeNull();
+  it("never trades a stored edit secret for a view one", async () => {
+    const edit = editSecret(4);
+    await adoptProjectLink(
+      { token: token(4), key: edit },
+      { spaceId: "p4", permission: "write" },
+      "T",
+    );
+    await adoptProjectLink(
+      { token: token(5), key: viewSecret() },
+      { spaceId: "p4", permission: "read" },
+      "T",
+    );
+    expect(loadSpaceKey("p4")).toBe(edit);
+    // Both links are known, and the edit one is the one that opens it.
+    expect((await directory()).bestLink("p4", Date.now())?.token).toBe(
+      token(4),
+    );
   });
 });

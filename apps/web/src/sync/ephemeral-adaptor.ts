@@ -3,13 +3,19 @@ import type { CrdtAdaptorContext, CrdtDocAdaptor } from "loro-adaptors";
 import { CrdtType } from "loro-protocol";
 
 import { toHex } from "@/crypto/bytes";
-import type { ProjectCrypto } from "@/crypto/project-crypto";
+import type { SpaceCrypto } from "@/crypto/space-crypto";
 import { toError } from "@/lib/errors";
 import { createSerialQueue } from "@/lib/serial-queue";
 
 const RESEND_MS = 2000;
 // Long enough that nothing expires between applying an update and reading its keys.
 const SCRATCH_TIMEOUT_MS = 60_000;
+
+/** What the presence adaptor needs of a space's keys. */
+export type PresenceCrypto = Pick<
+  SpaceCrypto,
+  "onChange" | "sealPresence" | "openPresence" | "signers"
+>;
 
 /**
  * Presence over the `%EPH` room, end-to-end encrypted. The server only
@@ -33,7 +39,7 @@ export class EphemeralStoreAdaptor implements CrdtDocAdaptor {
   readonly crdtType = CrdtType.LoroEphemeralStore;
 
   private readonly store: EphemeralStore;
-  private readonly crypto: ProjectCrypto;
+  private readonly crypto: PresenceCrypto;
   private ctx?: CrdtAdaptorContext;
   private unsubscribe?: () => void;
   private stopKeyListener?: () => void;
@@ -45,7 +51,7 @@ export class EphemeralStoreAdaptor implements CrdtDocAdaptor {
   // Keeps sends and applies in order across the async crypto.
   private readonly enqueue = createSerialQueue("presence sync step failed");
 
-  constructor(store: EphemeralStore, crypto: ProjectCrypto) {
+  constructor(store: EphemeralStore, crypto: PresenceCrypto) {
     this.store = store;
     this.crypto = crypto;
   }

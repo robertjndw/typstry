@@ -4,15 +4,16 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { toBase64 } from "@/crypto/bytes";
+import type { SpaceCrypto } from "@/crypto/space-crypto";
 import { newProject } from "@/crypto/test-utils";
 import { initProject } from "@/doc/schema";
 import { IDENTITY_KEY, resetIdentityCache } from "@/presence/identity";
 import {
-  loadProjectKey,
+  loadSpaceKey,
   rememberShare,
-  saveProjectKey,
+  saveSpaceKey,
   saveShareLinks,
-} from "@/project/recent";
+} from "@/space/space-links";
 import { routes } from "@/router";
 import type { ConnectOptions } from "@/sync/connection";
 
@@ -28,7 +29,7 @@ const sync = vi.hoisted(() => ({
 
 // Stands in for the server: seeds the doc on join and reports it synced.
 vi.mock("@/sync/connection", () => ({
-  connectProject: (opts: ConnectOptions) => {
+  connectSpace: (opts: ConnectOptions) => {
     sync.connected.push(opts);
     if (sync.synced) opts.doc.import(seed.doc.export({ mode: "snapshot" }));
     return {
@@ -58,7 +59,7 @@ function renderProject(
             keyring: toBase64(keys.signed),
             ownerKey: toBase64(new Uint8Array(32)),
           })
-        : Response.json({ projectId, permission }, { status: 200 }),
+        : Response.json({ spaceId: projectId, permission }, { status: 200 }),
     ),
   );
   const router = createMemoryRouter(routes, {
@@ -107,8 +108,8 @@ describe("project route", () => {
     );
 
     const [opts] = sync.connected;
-    expect(opts).toMatchObject({ projectId: "proj1", canWrite: true });
-    expect(opts!.crypto.editSecret).toBe(KEY);
+    expect(opts).toMatchObject({ spaceId: "proj1", canWrite: true });
+    expect((opts!.crypto as SpaceCrypto).editSecret).toBe(KEY);
   });
 
   it("asks for the full link when the key is missing", async () => {
@@ -133,7 +134,7 @@ describe("project route", () => {
     // Now the server is unreachable and the link lacks the key.
     sync.synced = false;
     rememberShare("tok-current", {
-      projectId: "proj-offline",
+      spaceId: "proj-offline",
       permission: "write",
     });
     vi.stubGlobal(
@@ -196,10 +197,10 @@ describe("project route", () => {
       IDENTITY_KEY,
       JSON.stringify({ name: "Creator", color: "#1d4ed8" }),
     );
-    saveProjectKey("proj1", KEY);
+    saveSpaceKey("proj1", KEY);
     renderProject("read", { hash: `#${VIEW_KEY}` });
     await screen.findByText("Server seeded");
-    expect(loadProjectKey("proj1")).toBe(KEY);
+    expect(loadSpaceKey("proj1")).toBe(KEY);
   });
 
   it("shows both links to the creator", async () => {

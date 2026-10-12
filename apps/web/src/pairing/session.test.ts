@@ -7,14 +7,16 @@ import {
   deviceFingerprint,
 } from "@/crypto/wasm";
 
+import { MemoryBackend } from "@/persist/local-doc-store";
+
 import {
   GrantRefusedError,
   PairSession,
   type Grant,
   type PairRole,
-  type PairedProject,
   type PairingDevice,
 } from "./session";
+import { someSpace } from "./test-utils";
 
 /** Two sockets joined like the relay does, which holds frames for a late peer. */
 class FakeRelay {
@@ -77,24 +79,20 @@ class FakeSocket {
 
 const DEVICE = DeviceKey.generate();
 const GRAPH = PersonGraph.genesis(DEVICE.export()).encode();
-const PROJECT = {
-  title: "Thesis",
-  link: "https://x.test/p/tok#key",
-};
+const SPACE = await someSpace(new MemoryBackend());
 
 function holder(onGrant?: (device: PairingDevice) => void): PairRole {
   return {
     kind: "holder",
     grant: async (device) => {
       onGrant?.(device);
-      return { graph: GRAPH, projects: [PROJECT], holderName: "Desk" };
+      return { graph: GRAPH, holderName: "Desk", space: SPACE };
     },
   };
 }
 
 function newDevice(
-  onGrant: (grant: Grant) => Promise<PairedProject[]> = async (grant) =>
-    grant.projects,
+  onGrant: (grant: Grant) => Promise<void> = async () => {},
   devicePub: Uint8Array = DeviceKey.generate().publicKey(),
 ): PairRole {
   return { kind: "new", deviceName: "Laptop", devicePub, onGrant };
@@ -134,16 +132,17 @@ function codes(): [PairingCode, PairingCode] {
 }
 
 describe("PairSession", () => {
-  it("hands the graph and projects to the new device after approval", async () => {
+  it("hands the graph and the space to the new device after approval", async () => {
     let received: Uint8Array | null = null;
     let holderName = "";
+    let space: Grant["space"] | null = null;
     const devicePub = DeviceKey.generate().publicKey();
     const { a, b } = pair(codes(), [
       holder(),
       newDevice(async (grant) => {
         received = grant.graph.slice();
         holderName = grant.holderName;
-        return grant.projects;
+        space = grant.space;
       }, devicePub),
     ]);
     await until(a, "awaitingApproval");
@@ -160,11 +159,9 @@ describe("PairSession", () => {
     await until(b, "done");
     expect(received).toEqual(GRAPH);
     expect(holderName).toBe("Desk");
-    expect(b.state).toEqual({ status: "done", projects: [PROJECT] });
-    expect(a.state).toEqual({
-      status: "done",
-      projects: [{ title: PROJECT.title, link: PROJECT.link }],
-    });
+    expect(space).toEqual(SPACE);
+    expect(b.state).toEqual({ status: "done" });
+    expect(a.state).toEqual({ status: "done" });
   });
 
   it("gives the holder the name and key of the device it approves", async () => {
@@ -231,7 +228,7 @@ describe("PairSession", () => {
       grant: async () => {
         grants++;
         await new Promise<void>((resolve) => (release = resolve));
-        return { graph: GRAPH, projects: [PROJECT], holderName: "Desk" };
+        return { graph: GRAPH, holderName: "Desk", space: SPACE };
       },
     };
     const devicePub = DeviceKey.generate().publicKey();

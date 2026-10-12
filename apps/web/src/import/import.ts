@@ -9,6 +9,7 @@ import {
   type AssetInfo,
   type ProjectDoc,
 } from "@/doc/schema";
+import { mapConcurrent } from "@/lib/concurrent";
 import { toError } from "@/lib/errors";
 
 import { unzip } from "./unzip";
@@ -192,26 +193,18 @@ export async function writeImport(
   const stored = new Map<string, AssetInfo>();
   const failed: string[] = [];
   let firstError: Error | undefined;
-  let next = 0;
   let settled = 0;
   onProgress?.(0, binaries.length);
-  async function worker() {
-    while (next < binaries.length) {
-      const [path, bytes] = binaries[next++]!;
-      try {
-        const file = new File(
-          [bytes as Uint8Array<ArrayBuffer>],
-          basename(path),
-        );
-        stored.set(path, await assets.store(file));
-      } catch (err) {
-        failed.push(path);
-        firstError ??= toError(err);
-      }
-      onProgress?.(++settled, binaries.length);
+  await mapConcurrent(binaries, UPLOAD_CONCURRENCY, async ([path, bytes]) => {
+    try {
+      const file = new File([bytes as Uint8Array<ArrayBuffer>], basename(path));
+      stored.set(path, await assets.store(file));
+    } catch (err) {
+      failed.push(path);
+      firstError ??= toError(err);
     }
-  }
-  await Promise.all(Array.from({ length: UPLOAD_CONCURRENCY }, () => worker()));
+    onProgress?.(++settled, binaries.length);
+  });
   if (failed.length > 0) {
     throw new ImportError(
       `Could not upload ${failed.length === 1 ? failed[0] : `${failed.length} files`}: ${firstError?.message}`,

@@ -1,9 +1,9 @@
 pub mod assets;
 mod error;
 pub mod mls;
-pub mod projects;
 pub mod protocol;
 pub mod relay;
+pub mod spaces;
 
 use std::path::Path;
 use std::time::Duration;
@@ -88,8 +88,8 @@ const API_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn router(state: AppState, web_dist: &Path) -> Router {
     let api = Router::new()
-        .route("/api/projects", post(projects::create))
-        .route("/api/share/{token}", get(projects::share))
+        .route("/api/spaces", post(spaces::create))
+        .route("/api/share/{token}", get(spaces::share))
         .route(typstry_wire::relay::RELAY_API_PATH, post(relay::allocate))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -99,9 +99,9 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
     // takes minutes, and the size cap already bounds what one can cost.
     let gated = Router::new()
         .merge(api)
-        .route("/api/p/{token}/assets", post(assets::upload))
-        .route("/api/p/{token}/blobs/{hash}", get(assets::blob))
-        .route("/api/p/{token}/mls", get(mls::bootstrap))
+        .route("/api/s/{token}/assets", post(assets::upload))
+        .route("/api/s/{token}/blobs/{hash}", get(assets::blob))
+        .route("/api/s/{token}/mls", get(mls::bootstrap))
         .route("/ws", get(ws::handler))
         .route(typstry_wire::ds::DS_PATH, get(ws::mls::handler))
         .route(typstry_wire::relay::RELAY_WS_PATH, get(ws::relay::handler))

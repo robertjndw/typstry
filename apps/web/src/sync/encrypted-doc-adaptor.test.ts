@@ -10,7 +10,7 @@ import {
 } from "loro-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ProjectCrypto } from "@/crypto/project-crypto";
+import { SpaceCrypto } from "@/crypto/space-crypto";
 import { editorOf, newProject, viewerOf } from "@/crypto/test-utils";
 import { DocKeys } from "@/crypto/wasm";
 
@@ -129,7 +129,7 @@ async function settle() {
 
 function makeClient(
   server: FakeServer,
-  crypto: ProjectCrypto,
+  crypto: SpaceCrypto,
   opts: {
     canWrite?: boolean;
     compactAfterDeltas?: number;
@@ -138,6 +138,8 @@ function makeClient(
     doc?: LoroDoc;
     compactOnJoin?: boolean;
     onUnknownGeneration?: (generation: number) => void;
+    accept?: (doc: LoroDoc) => boolean | undefined;
+    onRefused?: () => void;
   } = {},
 ): Client {
   const doc = opts.doc ?? new LoroDoc();
@@ -152,6 +154,8 @@ function makeClient(
     retryMs: 10,
     onDecryptError,
     onUnknownGeneration: opts.onUnknownGeneration,
+    accept: opts.accept,
+    onRefused: opts.onRefused,
   });
   const ctx = {
     send: vi.fn((updates: Uint8Array[]) => {
@@ -213,6 +217,141 @@ describe("EncryptedDocAdaptor", () => {
       decoder.decode(bytes).includes("secret"),
     );
     expect(leaked).toBe(false);
+  });
+
+  describe("accept", () => {
+    /** Undecided while the doc has no kind, like the real callers. */
+    const kindIs = (want: string) => (doc: LoroDoc) => {
+      const kind = doc.getMap("meta").get("kind");
+      return kind === undefined ? undefined : kind === want;
+    };
+
+    function directoryClient(server: FakeServer) {
+      const dir = makeClient(server, project.crypto);
+      dir.doc.getMap("meta").set("kind", "directory");
+      write(dir.doc, "directory secrets");
+      return dir;
+    }
+
+    it("never sends local ops into a space of another kind", async () => {
+      const server = new FakeServer();
+      const dir = directoryClient(server);
+      await dir.join();
+      await settle();
+      const sent = server.received.length;
+
+      const onRefused = vi.fn();
+      const local = makeClient(server, project.crypto, {
+        accept: kindIs("project"),
+        onRefused,
+      });
+      write(local.doc, "local project history");
+      await local.join();
+      await settle();
+      write(local.doc, " and more");
+      await settle();
+
+      expect(onRefused).toHaveBeenCalledTimes(1);
+      expect(server.received).toHaveLength(sent);
+      expect(local.ctx.send).not.toHaveBeenCalled();
+      expect(local.adaptor.hasPendingPush).toBe(false);
+    });
+
+    it("pushes as before when the doc is accepted", async () => {
+      const server = new FakeServer();
+      const dir = directoryClient(server);
+      await dir.join();
+      await settle();
+
+      const accept = vi.fn(kindIs("directory"));
+      const onRefused = vi.fn();
+      const local = makeClient(server, project.crypto, { accept, onRefused });
+      local.doc.getText("mine").insert(0, "entry");
+      local.doc.commit();
+      await local.join();
+      await settle();
+
+      expect(accept).toHaveLastReturnedWith(true);
+      expect(onRefused).not.toHaveBeenCalled();
+      const fresh = makeClient(server, project.crypto);
+      await fresh.join();
+      await fresh.adaptor.waitForReachingServerVersion();
+      expect(fresh.doc.getText("mine").toString()).toBe("entry");
+    });
+
+    it("holds ops made during catch-up and sends them once accepted", async () => {
+      const server = new FakeServer();
+      const dir = directoryClient(server);
+      await dir.join();
+      await settle();
+
+      const accept = vi.fn(kindIs("directory"));
+      const local = makeClient(server, project.crypto, { accept });
+      const { res, backfill } = server.join(local.adaptor.getVersion());
+      const joined = local.adaptor.handleJoinOk(res);
+      write(local.doc, "typed while catching up");
+      await settle();
+      expect(local.ctx.send).not.toHaveBeenCalled();
+      expect(accept).not.toHaveReturnedWith(true);
+
+      local.adaptor.applyUpdate(backfill);
+      await joined;
+      await local.adaptor.waitForReachingServerVersion();
+      await settle();
+      // Decided on the backfill, not the empty doc.
+      expect(accept).toHaveLastReturnedWith(true);
+      expect(local.ctx.send).toHaveBeenCalled();
+
+      const fresh = makeClient(server, project.crypto);
+      await fresh.join();
+      await fresh.adaptor.waitForReachingServerVersion();
+      const text = fresh.doc.getText("t").toString();
+      expect(text).toContain("typed while catching up");
+      expect(text).toContain("directory secrets");
+    });
+
+    it("sends once the kind is known, even if a record never decrypts", async () => {
+      const server = new FakeServer();
+      const owner = makeClient(server, project.crypto);
+      owner.doc.getMap("meta").set("kind", "project");
+      write(owner.doc, "start");
+      await owner.join();
+      await settle();
+      // A record nobody with this project's keys can open keeps every
+      // reader from catching up with the server for good.
+      const stranger = makeClient(server, newProject().crypto);
+      write(stranger.doc, "junk");
+      await stranger.join();
+      await settle();
+
+      const local = makeClient(server, project.crypto, {
+        accept: kindIs("project"),
+      });
+      await local.join();
+      await settle();
+      expect(local.onDecryptError).toHaveBeenCalled();
+      write(local.doc, " and mine");
+      await vi.waitFor(() => expect(local.ctx.send).toHaveBeenCalled());
+
+      await settle();
+      expect(owner.doc.getText("t").toString()).toContain("and mine");
+    });
+
+    it("stays refused across a reconnect", async () => {
+      const server = new FakeServer();
+      const dir = directoryClient(server);
+      await dir.join();
+      await settle();
+      const local = makeClient(server, project.crypto, {
+        accept: kindIs("project"),
+      });
+      await local.join();
+      await settle();
+      write(local.doc, "after refusal");
+      await local.join();
+      await settle();
+      expect(local.ctx.send).not.toHaveBeenCalled();
+    });
   });
 
   it("uploads edits made before joining", async () => {
@@ -452,7 +591,7 @@ describe("EncryptedDocAdaptor", () => {
 
   it("reports a record from a newer generation without calling it a decrypt error", async () => {
     const server = new FakeServer();
-    const rotated = new ProjectCrypto(
+    const rotated = new SpaceCrypto(
       project.link,
       new DocKeys(project.keyring.next(project.link)),
     );

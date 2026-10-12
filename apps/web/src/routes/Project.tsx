@@ -164,14 +164,18 @@ function ProjectSessionView({
         <div className="h-svh">
           <ProjectProvider doc={project} assets={assets} readOnly={!canWrite}>
             <RosterProvider mls={mls} signers={crypto.signers}>
-              <PresenceProvider ephemeral={ephemeral} identity={identity}>
+              <PresenceProvider
+                ephemeral={ephemeral}
+                identity={identity}
+                crypto={crypto}
+              >
                 <ProjectWorkspace
                   documentTitle
                   onSyncNow={syncNow}
                   status={<ConnectionStatus status={status} />}
                   share={
                     <ShareDialog
-                      projectId={share.projectId}
+                      projectId={share.spaceId}
                       token={token}
                       crypto={crypto}
                       permission={share.permission}
