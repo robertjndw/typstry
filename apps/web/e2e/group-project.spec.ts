@@ -275,7 +275,7 @@ test("a thesis group works together from the first file to the hand-in", async (
     await carol.context().setOffline(false);
     await carol.goto("/");
     await carol
-      .getByRole("region", { name: "Recent projects" })
+      .getByRole("region", { name: "Your projects" })
       .getByRole("link", { name: /^Thesis/ })
       .click();
     await expect(syncStatus(carol)).toHaveText("Connected");
