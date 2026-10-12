@@ -8,6 +8,8 @@ import {
   devicePublicKey,
   graphsInGroupInfo,
   loadWasm,
+  mergeOwnerSecrets,
+  ownerShareForRecovery,
   recoverIdentity,
   type RecoveredIdentity,
 } from "@/crypto/wasm";
@@ -15,9 +17,15 @@ import { errorKind, toError } from "@/lib/errors";
 import type { DocBackend } from "@/persist/local-doc-store";
 import { defaultDeviceName } from "@/pairing/device-name";
 import { adoptProjectLink, parseProjectLink } from "@/project/recent";
-import { fetchMlsBootstrap, resolveShare, type ApiOptions } from "@/sync/api";
+import {
+  fetchMlsBootstrap,
+  resolveShare,
+  type ApiOptions,
+  type MlsBootstrap,
+} from "@/sync/api";
 
 import { adoptProfile, localIdentity, mergeOwnGraph } from "./identity";
+import { emptyRecord } from "./session";
 
 export const RECOVERY_LABEL = "Recovery key";
 
@@ -177,12 +185,58 @@ function recoveryFailure(error: unknown): RecoveryError {
 }
 
 /**
+ * The owner key share a project holds for the recovery key `words` belong
+ * to, or undefined when it holds none (a project of someone else, or one
+ * made before the recovery key). Read it before the recovered device joins:
+ * the shares sit in the leaves of the devices the recovery revokes, and the
+ * words are gone once recovery is over.
+ */
+export function recoveredOwnerKey(
+  words: string,
+  link: LinkSecret,
+  boot: Pick<MlsBootstrap, "groupInfo" | "keyring" | "ownerKey">,
+): Uint8Array | undefined {
+  try {
+    return ownerShareForRecovery(
+      link,
+      boot.groupInfo,
+      boot.keyring,
+      boot.ownerKey,
+      recoverySeed(words),
+    );
+  } catch (error) {
+    // Recovering the person still works without it; only removing the lost
+    // devices from this project does not.
+    console.warn("could not read the owner key for the recovery key", error);
+    return undefined;
+  }
+}
+
+/**
+ * Adds `ownerSecrets` (from `recoveredOwnerKey`) to the project's group
+ * record, where the join that follows picks them up: with them the
+ * recovered device can remove the lost devices and replace the links they
+ * hold. What the record kept already stays.
+ */
+export async function keepOwnerKey(
+  backend: Pick<DocBackend, "loadMls" | "saveMls">,
+  projectId: string,
+  ownerSecrets: Uint8Array,
+): Promise<void> {
+  const record = await backend.loadMls(projectId);
+  await backend.saveMls(projectId, {
+    ...(record ?? emptyRecord()),
+    ownerSecrets: mergeOwnerSecrets(record?.ownerSecrets, ownerSecrets),
+  });
+}
+
+/**
  * Recovers from the words and a link of one of the person's projects: reads
  * the person graphs out of the project's GroupInfo, then recovers. Returns
  * the path to open, which joins the project as the person.
  */
 export async function recoverFromLink(
-  backend: CreateBackend,
+  backend: CreateBackend & Pick<DocBackend, "loadMls" | "saveMls">,
   input: {
     words: string;
     link: string;
@@ -205,9 +259,11 @@ export async function recoverFromLink(
   if (!share) throw new RecoveryError("That project does not exist any more.");
   if (!boot) throw new RecoveryError("That project has no members to read.");
   let graphs: Uint8Array[];
+  let ownerSecrets: Uint8Array | undefined;
   const secret = LinkSecret.parse(parsed.key);
   try {
     graphs = graphsInGroupInfo(secret, boot.groupInfo, boot.keyring);
+    ownerSecrets = recoveredOwnerKey(input.words, secret, boot);
   } catch (error) {
     throw new RecoveryError(
       `That link does not open the project: ${toError(error).message}`,
@@ -216,6 +272,7 @@ export async function recoverFromLink(
     secret.free();
   }
   await recoverDevice(backend, { ...input, graphs });
+  if (ownerSecrets) await keepOwnerKey(backend, share.projectId, ownerSecrets);
 
   adoptProjectLink(parsed, share, "");
   return { path: `/p/${encodeURIComponent(parsed.token)}#${parsed.key}` };

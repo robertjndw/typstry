@@ -154,6 +154,41 @@ describe("DsClient", () => {
     client.stop();
   });
 
+  it("sends a signed rotation and hears the server refuse it as not the owner's", async () => {
+    const { client } = setup();
+    client.start();
+    await flush();
+    const socket = last();
+    socket.open();
+    socket.receive(frames.ready(1, 3));
+
+    const reply = client.request({
+      type: "submit",
+      epoch: 3,
+      commit: new Uint8Array([1]),
+      groupInfo: new Uint8Array([2]),
+      keyring: new Uint8Array([3]),
+      envelope: new Uint8Array([4]),
+      rotate: {
+        editToken: "e",
+        viewToken: "v",
+        nextOwnerKey: new Uint8Array(32).fill(5),
+        ownerProof: new Uint8Array(64).fill(6),
+      },
+    });
+    await flush();
+    const sent = socket.frames.at(-1)!;
+    // Both owner fields go out whole.
+    expect(sent.join(",")).toContain(new Array(32).fill(5).join(","));
+    expect(sent.join(",")).toContain(new Array(64).fill(6).join(","));
+    socket.receive(frames.refused(sent[1]!, "notOwner"));
+    await expect(reply).resolves.toEqual({
+      type: "refused",
+      code: "notOwner",
+    });
+    client.stop();
+  });
+
   it("passes everything else to the owner", async () => {
     const { client, messages } = setup();
     client.start();
@@ -162,10 +197,19 @@ describe("DsClient", () => {
     socket.open();
     socket.receive(frames.ready(0, 1));
     socket.receive(frames.commit(3, new Uint8Array([9, 9])));
-    socket.receive(frames.reinitialized(4));
+    socket.receive(
+      frames.commit(4, new Uint8Array([8]), new Uint8Array(32).fill(5)),
+    );
+    socket.receive(frames.reinitialized(5));
     expect(messages).toEqual([
       { type: "commit", epoch: 3, commit: new Uint8Array([9, 9]) },
-      { type: "reinitialized", incarnation: 4 },
+      {
+        type: "commit",
+        epoch: 4,
+        commit: new Uint8Array([8]),
+        ownerKey: new Uint8Array(32).fill(5),
+      },
+      { type: "reinitialized", incarnation: 5 },
     ]);
     client.stop();
   });

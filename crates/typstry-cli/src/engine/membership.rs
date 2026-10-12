@@ -31,6 +31,10 @@ pub(super) const NO_KEYS: &str =
 
 pub const NOT_OWNER: &str = "Only the project owner can remove members or reset links.";
 
+pub const NO_OWNER_KEY: &str = "This device does not have the project's owner key yet. Open the \
+     project on another of your devices that can remove members (`typstry pull` there) and it is \
+     handed over. If none is left, the links can no longer be reset.";
+
 /// Rejoins in a row before giving up, e.g. against a group that keeps being
 /// reset.
 const RESYNCS: u32 = 3;
@@ -79,6 +83,13 @@ impl Session {
     /// that one is current (no rotation moved the token) and open, so a
     /// commit can go out on it without a second hello.
     async fn follow(&mut self) -> anyhow::Result<Option<Ds>> {
+        let followed = self.follow_inner().await;
+        // Following is where a key handed over or rotated in arrives.
+        self.keep_owner_key();
+        followed
+    }
+
+    async fn follow_inner(&mut self) -> anyhow::Result<Option<Ds>> {
         let mut rejoin = self.group.is_none();
         let mut switched = false;
         for _ in 0..RESYNCS {
@@ -132,12 +143,33 @@ impl Session {
         let device = device.unwrap_or_else(LeafKeys::generate);
         // Before the join, so a refused or interrupted attempt keeps it.
         self.state.save_device(&device)?;
+        // A join leaf carries no shares, so a key not taken along here only
+        // comes back once another owner device hands it over, if any is left.
+        // The join picks whichever of these the server holds. A view-only
+        // folder could never use the machine's keys, so it does not get them.
+        let mut owner_keys = self.state.load_owner_keys();
+        if self.config.can_sign() {
+            owner_keys.extend_older(&user::owner_keys(
+                &self.config.server,
+                &self.config.project_id,
+            ));
+        }
         let link = self.config.link();
         if self.local.is_none() {
             self.local = Some(user::load_or_create_identity()?);
         }
         let local = self.local.as_ref().expect("loaded right above");
-        let group = join_group(&self.api, &link, device, &self.identity, local, pinned).await?;
+        let group = join_group(
+            &self.api,
+            &link,
+            device,
+            &self.identity,
+            local,
+            pinned,
+            self.group.as_ref(),
+            &owner_keys,
+        )
+        .await?;
         // The first join pins the project's owner for good.
         if self.config.owner_person.is_none()
             && let Some(owner) = group.owner_person()
@@ -180,12 +212,13 @@ impl Session {
                         break;
                     }
                 };
-                let (epoch, commit, envelope) = match msg {
+                let (epoch, commit, envelope, owner_key) = match msg {
                     ServerMessage::Commit {
                         epoch,
                         commit,
                         envelope,
-                    } => (epoch, commit, envelope),
+                        owner_key,
+                    } => (epoch, commit, envelope, owner_key),
                     ServerMessage::Reinitialized { .. } => {
                         rejoin = true;
                         break;
@@ -195,7 +228,8 @@ impl Session {
                     }
                     _ => continue,
                 };
-                match group.process_commit(epoch, &commit, envelope.as_deref()) {
+                match group.process_commit(epoch, &commit, envelope.as_deref(), owner_key.as_ref())
+                {
                     Ok(Outcome::Advanced | Outcome::AlreadyApplied) => {}
                     Ok(Outcome::Rotated(rotation)) => {
                         adopt(&mut self.config, &rotation);
@@ -323,7 +357,9 @@ impl Session {
                 }
             }
             let group = self.group.as_mut().context(NO_KEYS)?;
-            if group.has_pending() || !step.needs_refresh {
+            // The same commit hands the owner key to the owner devices that
+            // lack it, which is the only way a newly paired one gets it.
+            if group.has_pending() || !(step.needs_refresh || step.share_owner_key) {
                 return Ok(current(ds));
             }
             let mut conn = match ds.take() {
@@ -398,6 +434,36 @@ impl Session {
         if is_owner { Ok(()) } else { bail!(NOT_OWNER) }
     }
 
+    /// Whether this folder can remove members and reset the links: an
+    /// owner device that holds the project's current owner key.
+    pub fn holds_owner_key(&self) -> bool {
+        self.group.as_ref().is_some_and(|g| g.holds_owner_key())
+    }
+
+    /// The devices the group shows as revoked, of anyone, which are still
+    /// in it: only an owner device holding the owner key can remove them.
+    pub fn revoked_in_group(&self) -> usize {
+        self.group.as_ref().map_or(0, |g| g.revoked_leaves().len())
+    }
+
+    /// Leaves the owner keys this folder holds where the machine's other
+    /// folders of the project find them when they join: all of them, since
+    /// which is current is only what the server says. Best effort: they can
+    /// still be handed the current one through the group.
+    fn keep_owner_key(&mut self) {
+        let Some(group) = self.group.as_ref() else {
+            return;
+        };
+        if let Err(err) = user::remember_owner_keys(
+            &self.config.server,
+            &self.config.project_id,
+            group.owner_secrets(),
+        ) {
+            self.warnings
+                .push(format!("could not keep the project's owner key: {err:#}"));
+        }
+    }
+
     /// Fetches the keyring the server holds and applies it. False when the
     /// group has not reached its generation yet, which only following the
     /// group's commits can fix.
@@ -470,16 +536,17 @@ impl Session {
         .await
     }
 
-    /// Removes the devices of this device's own person that its graph
-    /// revokes from the group, and rotates the links. Any editor may, owner
-    /// or not. The revoke has to be in the group already, which following
-    /// puts there. Returns how many devices went; with none to remove the
-    /// links stay as they are.
+    /// Removes the devices the group shows as revoked, of whichever person,
+    /// and rotates the links. Only an owner device holding the owner key
+    /// can; everyone else commits the revoke into their own leaf when
+    /// following and leaves the removal to it. The revoke has to be in the
+    /// group already, which following puts there. Returns how many devices
+    /// went; with none to remove the links stay as they are.
     pub async fn remove_revoked(&mut self) -> anyhow::Result<usize> {
         let group = self.group.as_ref().context(NO_KEYS)?;
         // Counted again when the commit is built, after following: by then
         // another device may have removed some, or the refresh revealed more.
-        let removed = AtomicUsize::new(group.revoked_own_leaves().len());
+        let removed = AtomicUsize::new(group.revoked_leaves().len());
         if removed.load(Ordering::Relaxed) == 0 {
             return Ok(0);
         }
@@ -492,25 +559,37 @@ impl Session {
         Ok(removed.into_inner())
     }
 
-    /// Removes the leaves of this person's revoked devices, e.g. the ones a
-    /// recovery key revoked, which no device of the person was around to
-    /// clean up. Best effort: a failure is a warning and the next run tries
-    /// again. Returns whether the links were replaced.
-    pub(super) async fn remove_own_revoked_devices(&mut self) -> bool {
+    /// Removes the leaves of revoked devices, e.g. ones a recovery key or
+    /// another person's device revoked, when this folder holds the owner
+    /// key; otherwise only says that they are still there. Best effort: a
+    /// failure is a warning and the next run tries again. Returns whether
+    /// the links were replaced.
+    pub(super) async fn remove_revoked_devices(&mut self) -> bool {
         if !self.can_write() {
+            return false;
+        }
+        let revoked = self.revoked_in_group();
+        if revoked == 0 {
+            return false;
+        }
+        if !self.holds_owner_key() {
+            self.warnings.push(format!(
+                "{revoked} revoked device(s) are still in the project and keep their access until \
+                 a device that holds the project's owner key opens it (`typstry pull` there)"
+            ));
             return false;
         }
         match self.remove_revoked().await {
             Ok(0) => false,
             Ok(count) => {
                 self.warnings.push(format!(
-                    "removed {count} revoked device(s) of yours from the project and replaced its links"
+                    "removed {count} revoked device(s) from the project and replaced its links"
                 ));
                 true
             }
             Err(err) => {
                 self.warnings.push(format!(
-                    "could not remove your revoked devices from the project yet ({err:#})"
+                    "could not remove the revoked devices from the project yet ({err:#})"
                 ));
                 false
             }
@@ -591,6 +670,7 @@ impl Session {
                 Some(pending) => pending.clone(),
                 None => build(group).map_err(|err| match err.downcast_ref::<MlsError>() {
                     Some(MlsError::NotOwner) => anyhow::anyhow!(NOT_OWNER),
+                    Some(MlsError::NoOwnerKey) => anyhow::anyhow!(NO_OWNER_KEY),
                     _ => err,
                 })?,
             };
@@ -612,6 +692,7 @@ impl Session {
                     remember(self.state.root(), &self.config, &mut self.warnings);
                     self.state.save_mls(group)?;
                     self.resolved = None;
+                    self.keep_owner_key();
                     return Ok(());
                 }
                 // Either another commit won the epoch or ours landed and

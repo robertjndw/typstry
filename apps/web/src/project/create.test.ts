@@ -77,6 +77,9 @@ describe("createLocalProject", () => {
     expect(group.link().toBase64url()).toBe(created.key);
     // The device is kept apart, for a rejoin after lost state.
     expect(stored!.device).not.toBeNull();
+    // So is the owner key, which may be the only copy there is.
+    expect(stored!.ownerSecrets).toEqual(group.ownerSecrets());
+    expect(group.holdsOwnerKey).toBe(true);
     // With no name picked yet, the profile is the one the project page will
     // show, so opening the project does not change it.
     expect(decodeProfile(group.members()[0]!.profile!)).toEqual(

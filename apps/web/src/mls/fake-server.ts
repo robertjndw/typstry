@@ -1,8 +1,10 @@
 // A stand-in for the delivery service for tests of the session: sequences
 // commits like crates/typstry-server's room does (the first submit for an
-// epoch wins), relays them, and retires tokens on a rotation. It never looks
+// epoch wins), relays them, and retires tokens on a rotation, which has to
+// be signed with the owner key like the real server wants. It never looks
 // inside a commit.
 import { ownBuffer } from "@/crypto/bytes";
+import { verifyOwnerRotation, type InitMessage } from "@/crypto/wasm";
 import type { MlsBootstrap } from "@/sync/api";
 
 import {
@@ -22,6 +24,8 @@ interface Logged {
   epoch: number;
   commit: Uint8Array;
   envelope?: Uint8Array;
+  /** The owner key a rotation moved the server on to. */
+  ownerKey?: Uint8Array;
 }
 
 export class FakeServer {
@@ -30,6 +34,11 @@ export class FakeServer {
   groupInfo: Uint8Array<ArrayBuffer> = new Uint8Array();
   keyring: Uint8Array<ArrayBuffer> = new Uint8Array();
   infoEpoch = 0;
+  /** What rotations are checked against. A reset moves only the group id. */
+  groupId: Uint8Array = new Uint8Array();
+  ownerKey: Uint8Array = new Uint8Array();
+  /** Rotations refused for a bad owner signature, for tests to look at. */
+  notOwner = 0;
   log: Logged[] = [];
   live = new Map<string, Permission>();
   retired = new Map<string, number>();
@@ -50,9 +59,13 @@ export class FakeServer {
   }
 
   /** The creator's `init`, as the server stores it. */
-  seed(init: { groupInfo: Uint8Array; keyring: Uint8Array }): void {
+  seed(
+    init: Pick<InitMessage, "groupId" | "groupInfo" | "keyring" | "ownerKey">,
+  ): void {
     this.groupInfo = ownBuffer(init.groupInfo);
     this.keyring = ownBuffer(init.keyring);
+    this.groupId = ownBuffer(init.groupId);
+    this.ownerKey = ownBuffer(init.ownerKey);
   }
 
   bootstrap = async (token: string): Promise<MlsBootstrap | null> => {
@@ -62,6 +75,7 @@ export class FakeServer {
       epoch: this.infoEpoch,
       groupInfo: this.groupInfo,
       keyring: this.keyring,
+      ownerKey: this.ownerKey,
     };
   };
 
@@ -85,13 +99,15 @@ export class FakeServer {
     const permission = conn.permission;
     switch (message.type) {
       case "init":
-        this.groupInfo = ownBuffer(message.groupInfo);
-        this.keyring = ownBuffer(message.keyring);
+        this.seed(message);
         this.head = 0;
         this.infoEpoch = 0;
         return { type: "accepted" };
       case "reset":
+        // The real server keeps the owner key across a reset too, so an
+        // editor's reset cannot plant a key of its own.
         this.incarnation = message.incarnation + 1;
+        this.groupId = ownBuffer(message.groupId);
         this.groupInfo = ownBuffer(message.groupInfo);
         this.keyring = ownBuffer(message.keyring);
         this.head = 0;
@@ -109,10 +125,23 @@ export class FakeServer {
           return { type: "refused", code: "retired" };
         if (message.epoch !== this.head)
           return { type: "conflict", head: this.head };
-        const logged = {
+        // After the epoch check, as on the server: a rotation that lost the
+        // race hears `conflict`, not that its signature is stale.
+        if (
+          message.rotate &&
+          !verifyOwnerRotation(this.ownerKey, this.groupId, {
+            ...message,
+            req: 0,
+          })
+        ) {
+          this.notOwner++;
+          return { type: "refused", code: "notOwner" };
+        }
+        const logged: Logged = {
           epoch: message.epoch,
           commit: message.commit,
           envelope: message.envelope,
+          ownerKey: message.rotate?.nextOwnerKey,
         };
         this.log.push(logged);
         this.head = message.epoch + 1;
@@ -130,9 +159,10 @@ export class FakeServer {
   }
 
   private rotate(
-    next: { editToken: string; viewToken: string },
+    next: { editToken: string; viewToken: string; nextOwnerKey: Uint8Array },
     epoch: number,
   ): void {
+    this.ownerKey = ownBuffer(next.nextOwnerKey);
     for (const token of this.live.keys()) this.retired.set(token, epoch);
     this.live.clear();
     this.live.set(next.editToken, "write");

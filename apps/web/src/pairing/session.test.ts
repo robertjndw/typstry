@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { DeviceKey, PairingCode, PersonGraph } from "@/crypto/wasm";
+import {
+  DeviceKey,
+  PairingCode,
+  PersonGraph,
+  deviceFingerprint,
+} from "@/crypto/wasm";
 
 import {
   GrantRefusedError,
@@ -132,19 +137,25 @@ describe("PairSession", () => {
   it("hands the graph and projects to the new device after approval", async () => {
     let received: Uint8Array | null = null;
     let holderName = "";
+    const devicePub = DeviceKey.generate().publicKey();
     const { a, b } = pair(codes(), [
       holder(),
       newDevice(async (grant) => {
         received = grant.graph.slice();
         holderName = grant.holderName;
         return grant.projects;
-      }),
+      }, devicePub),
     ]);
     await until(a, "awaitingApproval");
+    // Both sides derive the same fingerprint from the key, which is what the
+    // user compares.
     expect(a.state).toEqual({
       status: "awaitingApproval",
       deviceName: "Laptop",
+      fingerprint: deviceFingerprint(devicePub),
     });
+    expect(b.ownFingerprint).toBe(deviceFingerprint(devicePub));
+    expect(a.ownFingerprint).toBeNull();
     await a.approve();
     await until(b, "done");
     expect(received).toEqual(GRAPH);
@@ -223,10 +234,15 @@ describe("PairSession", () => {
         return { graph: GRAPH, projects: [PROJECT], holderName: "Desk" };
       },
     };
-    const { a, b } = pair(codes(), [slow, newDevice()]);
+    const devicePub = DeviceKey.generate().publicKey();
+    const { a, b } = pair(codes(), [slow, newDevice(undefined, devicePub)]);
     await until(a, "awaitingApproval");
     const first = a.approve();
-    expect(a.state).toEqual({ status: "approving", deviceName: "Laptop" });
+    expect(a.state).toEqual({
+      status: "approving",
+      deviceName: "Laptop",
+      fingerprint: deviceFingerprint(devicePub),
+    });
     await a.approve();
     a.reject();
     expect(a.state.status).toBe("approving");

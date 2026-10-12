@@ -108,6 +108,7 @@ describe("EphemeralStoreAdaptor", () => {
       link,
       init.groupInfo,
       init.keyring,
+      init.ownerKey,
       profile,
     );
     a.processCommit(submit.epoch, submit.commit);

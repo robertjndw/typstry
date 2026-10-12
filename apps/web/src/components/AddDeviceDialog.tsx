@@ -99,6 +99,7 @@ function AddDevice({
             <PairingStatus
               state={state}
               holder={holder === true}
+              fingerprint={session?.ownFingerprint}
               onRestart={reset}
             />
           )}

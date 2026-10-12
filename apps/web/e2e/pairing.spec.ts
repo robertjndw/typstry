@@ -46,6 +46,14 @@ test("a new device pairs with a code, gets the projects and is one person", asyn
   const approval = page.getByRole("dialog", {
     name: "Work laptop wants to join as you",
   });
+  // The holder can check the key against what the new device shows itself.
+  const ownFingerprint = (
+    await other.getByLabel("This device's fingerprint").textContent()
+  )?.trim();
+  expect(ownFingerprint).toBeTruthy();
+  await expect(
+    approval.getByLabel("Fingerprint of the joining device"),
+  ).toHaveText(ownFingerprint!);
   await approval.getByRole("button", { name: "Approve" }).click();
   await expect(
     page
@@ -81,7 +89,7 @@ test("the paired device is the owner and can remove a member", async ({
   page,
   browser,
 }) => {
-  await createProject(page, "Owned");
+  const projectUrl = await createProject(page, "Owned");
   const editLink = await shareLink(page, "Can edit");
   await page.goto("/");
   const code = await showCode(page);
@@ -108,7 +116,17 @@ test("the paired device is the owner and can remove a member", async ({
   const list = dialog.getByRole("list", { name: "Members" });
   await expect(list.getByRole("listitem")).toHaveCount(2);
   await expect(list.getByRole("listitem").first()).toContainText("Owner");
-  await dialog.getByRole("button", { name: "Remove Third Tester" }).click();
+  // The owner key only reaches the new device from one that holds it, and
+  // the holder has not had the project open since the new device joined.
+  const remove = dialog.getByRole("button", { name: "Remove Third Tester" });
+  await expect(
+    dialog.getByText(/does not have the project's owner key yet/),
+  ).toBeVisible();
+  await expect(remove).toBeDisabled();
+  await page.goto(projectUrl);
+  await expect(syncStatus(page)).toHaveText("Connected");
+  await expect(remove).toBeEnabled();
+  await remove.click();
   const confirm = other.getByRole("dialog", { name: "Remove Third Tester?" });
   await confirm.getByRole("button", { name: "Remove", exact: true }).click();
   await expect(confirm).toBeHidden();
@@ -118,6 +136,34 @@ test("the paired device is the owner and can remove a member", async ({
   ).toBeVisible();
 
   await third.context().close();
+  await other.context().close();
+});
+
+test("a device with projects waits for a click before using a link", async ({
+  page,
+  browser,
+}) => {
+  await createProject(page, "Mine");
+  await page.goto("/");
+  const code = await showCode(page);
+
+  const other = await newDevice(browser);
+  await createProject(other, "Theirs");
+  await other.goto(`/pair#${code}`);
+  await expect(
+    other.getByText(/add another device to your account/),
+  ).toBeVisible();
+  // Nothing reached the holder: no one is asking to join.
+  await expect(
+    page.getByRole("dialog", { name: /wants to join as you/ }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("img", { name: /QR code/ })).toBeVisible();
+
+  await other
+    .getByRole("button", { name: "Connect to the other device" })
+    .click();
+  await expect(other.getByRole("alert")).toContainText("Pairing failed");
+
   await other.context().close();
 });
 

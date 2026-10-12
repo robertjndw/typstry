@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { DeviceKey, PersonGraph, RecoveryKey } from "@/crypto/wasm";
+import {
+  DeviceKey,
+  LinkSecret,
+  PersonGraph,
+  ProjectGroup,
+  RecoveryKey,
+  mergeOwnerSecrets,
+} from "@/crypto/wasm";
 import { toHex } from "@/crypto/bytes";
 import { MemoryBackend } from "@/persist/local-doc-store";
 import {
@@ -13,7 +20,9 @@ import { localDeviceKey, localIdentity } from "./identity";
 import {
   createRecoveryKey,
   DeviceRevokedError,
+  keepOwnerKey,
   recoverDevice,
+  recoveredOwnerKey,
   RecoveryError,
 } from "./recovery";
 
@@ -179,5 +188,66 @@ describe("recoverDevice", () => {
     await expect(
       recoverDevice(backend, { words, graphs: [bytes] }),
     ).rejects.toThrow(/was revoked/);
+  });
+});
+
+describe("recoveredOwnerKey", () => {
+  it("finds nothing in a project that sealed no share to the key", async () => {
+    const backend = new MemoryBackend();
+    const { deviceSeed } = await localIdentity(backend);
+    const words = await createRecoveryKey(backend);
+    const link = LinkSecret.generateEdit();
+    const { message } = ProjectGroup.create(
+      link,
+      encodeProfile({ name: "Ada", color: "#1d4ed8" }),
+      deviceSeed,
+      (await backend.loadGraph())!,
+    );
+    // Shares to the recovery key only go in with the creator's first
+    // refresh, which this project never had.
+    expect(recoveredOwnerKey(words, link, message)).toBeUndefined();
+  });
+});
+
+describe("keepOwnerKey", () => {
+  function ownerSecrets(): Uint8Array {
+    const seed = DeviceKey.generate().export();
+    const { group } = ProjectGroup.create(
+      LinkSecret.generateEdit(),
+      encodeProfile({ name: "Ada", color: "#1d4ed8" }),
+      seed,
+      PersonGraph.genesis(seed).encode(),
+    );
+    const secrets = group.ownerSecrets()!;
+    group.free();
+    return secrets;
+  }
+
+  it("adds the keys to what is stored for the project", async () => {
+    const backend = new MemoryBackend();
+    const device = new Uint8Array([1, 2]);
+    await backend.saveMls("p", {
+      state: null,
+      device,
+      removed: false,
+      rotation: null,
+    });
+    const [one, two] = [ownerSecrets(), ownerSecrets()];
+    await keepOwnerKey(backend, "p", one);
+    await keepOwnerKey(backend, "q", two);
+    expect(await backend.loadMls("p")).toMatchObject({
+      device,
+      ownerSecrets: one,
+    });
+    expect(await backend.loadMls("q")).toMatchObject({
+      state: null,
+      ownerSecrets: two,
+    });
+    // A second one goes in beside the first, which stays.
+    await keepOwnerKey(backend, "p", two);
+    const both = (await backend.loadMls("p"))!.ownerSecrets!;
+    expect(mergeOwnerSecrets(both, one)).toEqual(both);
+    expect(mergeOwnerSecrets(both, two)).toEqual(both);
+    expect(both).not.toEqual(one);
   });
 });

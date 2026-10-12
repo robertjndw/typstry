@@ -17,6 +17,32 @@ use crate::error::{from_serde, invalid};
 pub struct RotateDto {
     pub edit_token: String,
     pub view_token: String,
+    #[serde(with = "serde_bytes")]
+    pub next_owner_key: [u8; 32],
+    #[serde(with = "serde_bytes")]
+    pub owner_proof: [u8; 64],
+}
+
+impl From<RotateDto> for Rotate {
+    fn from(r: RotateDto) -> Self {
+        Self {
+            edit_token: r.edit_token,
+            view_token: r.view_token,
+            next_owner_key: r.next_owner_key,
+            owner_proof: r.owner_proof,
+        }
+    }
+}
+
+impl From<Rotate> for RotateDto {
+    fn from(r: Rotate) -> Self {
+        Self {
+            edit_token: r.edit_token,
+            view_token: r.view_token,
+            next_owner_key: r.next_owner_key,
+            owner_proof: r.owner_proof,
+        }
+    }
 }
 
 /// What a client sends. Messages that expect an answer carry a `req` the
@@ -56,6 +82,8 @@ pub enum ClientDto {
         group_info: Vec<u8>,
         #[serde(with = "serde_bytes")]
         keyring: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        owner_key: [u8; 32],
     },
     Reset {
         req: u64,
@@ -99,21 +127,20 @@ impl From<ClientDto> for ClientMessage {
                 group_info,
                 keyring,
                 envelope,
-                rotate: rotate.map(|r| Rotate {
-                    edit_token: r.edit_token,
-                    view_token: r.view_token,
-                }),
+                rotate: rotate.map(Rotate::from),
             },
             ClientDto::Init {
                 req,
                 group_id,
                 group_info,
                 keyring,
+                owner_key,
             } => Self::Init {
                 req,
                 group_id,
                 group_info,
                 keyring,
+                owner_key,
             },
             ClientDto::Reset {
                 req,
@@ -160,21 +187,20 @@ impl From<ClientMessage> for ClientDto {
                 group_info,
                 keyring,
                 envelope,
-                rotate: rotate.map(|r| RotateDto {
-                    edit_token: r.edit_token,
-                    view_token: r.view_token,
-                }),
+                rotate: rotate.map(RotateDto::from),
             },
             ClientMessage::Init {
                 req,
                 group_id,
                 group_info,
                 keyring,
+                owner_key,
             } => Self::Init {
                 req,
                 group_id,
                 group_info,
                 keyring,
+                owner_key,
             },
             ClientMessage::Reset {
                 req,
@@ -214,6 +240,7 @@ pub enum RefusalDto {
     Retired,
     Internal,
     RateLimited,
+    NotOwner,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -236,6 +263,9 @@ pub enum ServerDto {
         commit: Vec<u8>,
         #[serde(default, with = "serde_bytes")]
         envelope: Option<Vec<u8>>,
+        /// For a rotation, the owner key the server moved on to.
+        #[serde(default, with = "serde_bytes")]
+        owner_key: Option<[u8; 32]>,
     },
     Accepted {
         req: u64,
@@ -275,10 +305,12 @@ impl From<ServerMessage> for ServerDto {
                 epoch,
                 commit,
                 envelope,
+                owner_key,
             } => Self::Commit {
                 epoch,
                 commit,
                 envelope,
+                owner_key,
             },
             ServerMessage::Accepted { req } => Self::Accepted { req },
             ServerMessage::Conflict { req, head } => Self::Conflict { req, head },
@@ -294,6 +326,7 @@ impl From<ServerMessage> for ServerDto {
                     RefusalCode::Retired => RefusalDto::Retired,
                     RefusalCode::Internal => RefusalDto::Internal,
                     RefusalCode::RateLimited => RefusalDto::RateLimited,
+                    RefusalCode::NotOwner => RefusalDto::NotOwner,
                 },
             },
             ServerMessage::Reinitialized { incarnation } => Self::Reinitialized { incarnation },
@@ -347,14 +380,47 @@ mod tests {
             rotate: Some(Rotate {
                 edit_token: "e".into(),
                 view_token: "v".into(),
+                next_owner_key: [5; 32],
+                owner_proof: [6; 64],
             }),
         };
         let dto = ClientDto::from(message.clone());
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains(r#""type":"submit""#), "{json}");
         assert!(json.contains(r#""groupInfo""#), "{json}");
+        assert!(json.contains(r#""nextOwnerKey""#), "{json}");
+        assert!(json.contains(r#""ownerProof""#), "{json}");
         let back: ClientDto = serde_json::from_str(&json).unwrap();
         assert_eq!(ClientMessage::from(back), message);
+
+        let init = ClientMessage::Init {
+            req: 1,
+            group_id: vec![1],
+            group_info: vec![2],
+            keyring: vec![3],
+            owner_key: [7; 32],
+        };
+        let json = serde_json::to_string(&ClientDto::from(init.clone())).unwrap();
+        assert!(json.contains(r#""ownerKey""#), "{json}");
+        let back: ClientDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(ClientMessage::from(back), init);
+        // A key of the wrong length is refused, not padded.
+        let short = json.replace(&format!("{:?}", [7u8; 32]).replace(' ', ""), "[7,7]");
+        assert!(
+            serde_json::from_str::<ClientDto>(&short).is_err(),
+            "{short}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_for_a_rotation_without_the_owner_key_has_a_name() {
+        let message = ServerMessage::Refused {
+            req: 2,
+            code: RefusalCode::NotOwner,
+        };
+        let decoded = ServerMessage::decode(&message.encode()).unwrap();
+        let json = serde_json::to_value(ServerDto::from(decoded)).unwrap();
+        assert_eq!(json["code"], "notOwner");
     }
 
     #[test]
@@ -370,5 +436,16 @@ mod tests {
         assert_eq!(json["type"], "ready");
         assert_eq!(json["permission"], "retired");
         assert_eq!(json["retired"], 3);
+
+        let message = ServerMessage::Commit {
+            epoch: 4,
+            commit: vec![1],
+            envelope: None,
+            owner_key: Some([7; 32]),
+        };
+        let decoded = ServerMessage::decode(&message.encode()).unwrap();
+        let json = serde_json::to_value(ServerDto::from(decoded)).unwrap();
+        assert_eq!(json["type"], "commit");
+        assert_eq!(json["ownerKey"], serde_json::to_value([7u8; 32]).unwrap());
     }
 }

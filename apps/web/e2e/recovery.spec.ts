@@ -42,10 +42,19 @@ test("a recovery key brings a new browser back as the owner and revokes the old 
   await expect(devices.getByText("Revoked", { exact: true })).toBeVisible();
   await expect(devices.getByText("Recovery", { exact: true })).toBeVisible();
 
-  // The old browser lost its place in the project.
+  // The old browser lost its place in the project: the recovery key opened
+  // the owner key, which lets the new browser remove it and rotate.
   await expect(
     page.getByRole("heading", { name: "You were removed from this project" }),
   ).toBeVisible({ timeout: 30_000 });
+  await fresh.keyboard.press("Escape");
+  await fresh.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(members).toHaveCount(1);
+  await expect(
+    fresh
+      .getByRole("dialog", { name: "Share project" })
+      .getByRole("button", { name: "Reset links" }),
+  ).toBeEnabled();
 
   await fresh.context().close();
 });

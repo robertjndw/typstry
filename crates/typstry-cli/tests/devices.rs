@@ -67,10 +67,32 @@ async fn revoking_a_device_removes_it_from_owned_and_edited_projects() {
     assert!(devices.contains("Tester"), "{devices}");
     let out = run_as(&own, &holder_cfg, &["devices", "revoke", "Tester"]).await;
     let text = stdout(&out);
-    assert_eq!(text.matches("Cleaned").count(), 2, "{text}");
+    // Only the owner rotates: the edited project gets the revoke in this
+    // device's leaf and waits for its owner.
+    assert_eq!(text.matches("Cleaned").count(), 1, "{text}");
+    assert!(text.contains("Cleaned own"), "{text}");
+    assert!(
+        text.contains("theirs: 1 revoked device(s) left for the owner to remove"),
+        "{text}"
+    );
     assert!(!stderr(&out).contains("Not reached"), "{}", stderr(&out));
     let devices = stdout(&run_as(&own, &holder_cfg, &["devices"]).await);
     assert!(devices.contains("revoked"), "{devices}");
+    // Until the owner opens it, the editor is told the device is still there.
+    let out = run_as(&edited, &holder_cfg, &["pull"]).await;
+    stdout(&out);
+    assert!(
+        stderr(&out).contains("1 revoked device(s) are still in the project"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_as(&theirs, &other_cfg, &["pull"]).await;
+    stdout(&out);
+    assert!(
+        stderr(&out).contains("removed 1 revoked device(s)"),
+        "{}",
+        stderr(&out)
+    );
 
     // The revoked device is out of both groups.
     let listing = stdout(&run_as(&own, &holder_cfg, &["members"]).await);
@@ -214,6 +236,12 @@ async fn a_recovery_key_takes_the_account_back_after_every_device_is_lost() {
     let out = recover(&work, &fresh_cfg, &link, &words, &[]).await;
     let text = stdout(&out);
     assert!(text.contains("Revoked 1 device"), "{text}");
+    // The lost device left a share of the owner key for the recovery key,
+    // or the recovered device could never remove it.
+    assert!(
+        text.contains("took the project's owner key along"),
+        "{text}"
+    );
     assert!(text.contains("typstry clone"), "{text}");
     let devices = stdout(&run_as(&work, &fresh_cfg, &["devices"]).await);
     assert_eq!(devices.matches("revoked").count(), 1, "{devices}");

@@ -11,6 +11,9 @@
 //!   leaf key and the person graph that says whether that device counts,
 //!   sealed under the identity key. A leaf keeps its device for its whole
 //!   life; a commit copies the identity unchanged or extends the graph.
+//! - `0xff03` on a leaf: shares of the project's owner key for the owner's
+//!   other devices and recovery keys, see [`super::owner_share`]. Only an
+//!   owner's leaf counts, and no rule of the policy depends on it.
 //! - `0xff10` in the GroupContext: the policy, i.e. the attestation public
 //!   key of every generation and the owner tag. The tag stands for the
 //!   owner's person (see [`crate::crypto::Keyring::owner_tag`]); an owner is
@@ -25,12 +28,14 @@
 use loro_protocol::{BytesReader, BytesWriter};
 use openmls::prelude::*;
 
+use super::owner_share::OwnerShares;
 use crate::codec::plausible_count;
 use crate::crypto::{Attestation, KEY_LEN, PublicKey, SIGNATURE_LEN};
 
 pub const EXT_EDITOR: u16 = 0xff00;
 pub const EXT_PROFILE: u16 = 0xff01;
 pub const EXT_IDENTITY: u16 = 0xff02;
+pub const EXT_OWNER_SHARES: u16 = 0xff03;
 pub const EXT_POLICY: u16 = 0xff10;
 
 /// X25519, AES-128-GCM, SHA-256, Ed25519: the suite every MLS client has to
@@ -184,6 +189,7 @@ pub fn capabilities() -> Capabilities {
             ExtensionType::Unknown(EXT_EDITOR),
             ExtensionType::Unknown(EXT_PROFILE),
             ExtensionType::Unknown(EXT_IDENTITY),
+            ExtensionType::Unknown(EXT_OWNER_SHARES),
             ExtensionType::Unknown(EXT_POLICY),
         ])
         .build()
@@ -191,19 +197,24 @@ pub fn capabilities() -> Capabilities {
 
 /// The extensions of a leaf: `editor` only for editors, `profile` already
 /// sealed. `sealed_identity` is the sealed leaf identity, for members that
-/// have a person.
+/// have a person, and `owner_shares` the encoded owner key shares of a
+/// device that holds the owner key.
 pub fn leaf_extensions(
     editor: Option<&EditorInfo>,
     sealed_profile: Vec<u8>,
     sealed_identity: Option<Vec<u8>>,
+    owner_shares: Option<Vec<u8>>,
 ) -> Result<Extensions<LeafNode>, String> {
-    let mut exts = Vec::with_capacity(3);
+    let mut exts = Vec::with_capacity(4);
     if let Some(editor) = editor {
         exts.push(unknown(EXT_EDITOR, editor.encode()));
     }
     exts.push(unknown(EXT_PROFILE, sealed_profile));
     if let Some(identity) = sealed_identity {
         exts.push(unknown(EXT_IDENTITY, identity));
+    }
+    if let Some(shares) = owner_shares {
+        exts.push(unknown(EXT_OWNER_SHARES, shares));
     }
     Extensions::from_vec(exts).map_err(|e| e.to_string())
 }
@@ -212,10 +223,16 @@ pub fn leaf_parameters(
     editor: Option<&EditorInfo>,
     sealed_profile: Vec<u8>,
     sealed_identity: Option<Vec<u8>>,
+    owner_shares: Option<Vec<u8>>,
 ) -> Result<LeafNodeParameters, String> {
     Ok(LeafNodeParameters::builder()
         .with_capabilities(capabilities())
-        .with_extensions(leaf_extensions(editor, sealed_profile, sealed_identity)?)
+        .with_extensions(leaf_extensions(
+            editor,
+            sealed_profile,
+            sealed_identity,
+            owner_shares,
+        )?)
         .build())
 }
 
@@ -258,6 +275,13 @@ pub fn read_leaf(leaf: &LeafNode) -> LeafInfo {
         sealed_profile: leaf.extensions().unknown(EXT_PROFILE).map(|e| e.0.clone()),
         sealed_identity: leaf.extensions().unknown(EXT_IDENTITY).map(|e| e.0.clone()),
     }
+}
+
+/// A leaf's owner key shares. `None` also when they do not parse, which
+/// costs the recipients their share and nobody anything else.
+pub fn read_owner_shares(leaf: &LeafNode) -> Option<OwnerShares> {
+    let ext = leaf.extensions().unknown(EXT_OWNER_SHARES)?;
+    OwnerShares::decode(&ext.0).ok()
 }
 
 #[cfg(test)]

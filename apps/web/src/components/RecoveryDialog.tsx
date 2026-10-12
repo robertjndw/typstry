@@ -12,7 +12,21 @@ import {
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { toError } from "@/lib/errors";
 import { createRecoveryKey } from "@/mls/recovery";
+import { cleanProjects } from "@/mls/revoke";
 import { defaultBackend } from "@/persist/local-doc-store";
+
+async function createAndSpread(): Promise<string> {
+  const backend = await defaultBackend();
+  const words = await createRecoveryKey(backend);
+  // A recovered device can only remove the lost ones with the owner key,
+  // which it reads from the shares the owner's devices seal to the recovery
+  // key. Those go in with a refresh of their leaf, so the projects are
+  // opened for it now instead of whenever they next see a commit.
+  cleanProjects(backend).catch((error: unknown) =>
+    console.warn("could not bring the recovery key into the projects", error),
+  );
+  return words;
+}
 
 /**
  * Explains the recovery key and makes one. The words are shown once and the
@@ -22,7 +36,7 @@ import { defaultBackend } from "@/persist/local-doc-store";
 export function RecoveryDialog({
   open,
   onOpenChange,
-  create = async () => createRecoveryKey(await defaultBackend()),
+  create = createAndSpread,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;

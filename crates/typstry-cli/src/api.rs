@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use typstry_wire::owner::OwnerKey;
 use typstry_wire::relay::RELAY_API_PATH;
 use typstry_wire::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 
@@ -70,6 +71,18 @@ pub struct Bootstrap {
     pub incarnation: u64,
     pub group_info: Vec<u8>,
     pub keyring: Vec<u8>,
+    /// The owner key the server holds.
+    pub owner_key: OwnerKey,
+}
+
+impl Bootstrap {
+    pub fn as_mls(&self) -> typstry_wire::mls::Bootstrap<'_> {
+        typstry_wire::mls::Bootstrap {
+            group_info: &self.group_info,
+            keyring: &self.keyring,
+            owner_key: &self.owner_key,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -78,6 +91,7 @@ struct BootstrapBody {
     incarnation: u64,
     group_info: String,
     keyring: String,
+    owner_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,6 +292,9 @@ impl Api {
             incarnation: body.incarnation,
             group_info: decode("group info", &body.group_info)?,
             keyring: decode("keyring", &body.keyring)?,
+            owner_key: decode("owner key", &body.owner_key)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("the server sent an unreadable owner key"))?,
         })
     }
 

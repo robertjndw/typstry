@@ -21,6 +21,12 @@ export type ProjectRevokeResult =
   | { status: "cleaned"; removed: number }
   /** Reached, and no leaf of the revoked device was in it. */
   | { status: "clean" }
+  /**
+   * Reached and told, but only an owner device with the owner key can
+   * remove a device: the revoke is in this device's leaf for it to act on
+   * the next time it opens the project.
+   */
+  | { status: "left-to-owner" }
   | { status: "unreached"; reason: string };
 
 export interface ProjectRevoke {
@@ -54,9 +60,10 @@ export async function revokeInGraph(
 /**
  * Applies the graph to every project this browser has a group for: each is
  * opened headless like a project page would, which merges the graph into
- * its leaf and, for an editor, removes the revoked device's leaves and
- * rotates the links. A viewer cannot commit, and a project that was never
- * opened here has no group state to act from; both are reported, not hidden.
+ * its leaf and, with the owner key, removes the revoked device's leaves and
+ * rotates the links. In a project someone else owns the owner does the
+ * removing. A viewer cannot commit, and a project that was never opened
+ * here has no group state to act from; both are reported, not hidden.
  * Projects that fail now are cleaned the next time they are opened, since
  * every open runs the same step.
  */
@@ -117,15 +124,24 @@ async function clean(
   await session.start(target);
   if (!(await session.untilSynced(REACH_MS)))
     return { status: "unreached", reason: "the server did not answer" };
-  const { phase } = session.getSnapshot();
-  if (phase !== "active")
+  if (session.getSnapshot().phase !== "active")
     return { status: "unreached", reason: "you are no longer a member" };
   const done = await session.syncIdentity();
   if (!done.canCommit)
     return { status: "unreached", reason: "you can only view it" };
-  return session.removedLeaves > 0
-    ? { status: "cleaned", removed: session.removedLeaves }
-    : { status: "clean" };
+  if (session.removedLeaves > 0)
+    return { status: "cleaned", removed: session.removedLeaves };
+  const { members, holdsOwnerKey } = session.getSnapshot();
+  if (holdsOwnerKey || !members.some((m) => m.deviceRevoked))
+    return { status: "clean" };
+  // The person's own project, opened on a device the owner key has not
+  // reached yet: another of their devices has to do it.
+  if (members.find((m) => m.isSelf)?.role === "owner")
+    return {
+      status: "unreached",
+      reason: "this device does not have the project's owner key yet",
+    };
+  return { status: "left-to-owner" };
 }
 
 function headlessSession(

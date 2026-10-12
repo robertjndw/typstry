@@ -4,41 +4,112 @@
 use super::*;
 use crate::crypto::{Attestation, IDENTITY_SEAL_CONTEXT, RecordSigner, SIGNATURE_LEN};
 use crate::identity::EntryKind;
+use crate::owner::verify_rotation;
 
 struct Ds {
     log: Vec<(u64, Vec<u8>, Option<Vec<u8>>)>,
+    /// The owner key each entry of `log` moved the server on to, as the
+    /// real server sends it along with the commit.
+    log_keys: Vec<Option<OwnerKey>>,
     group_id: Vec<u8>,
     group_info: Vec<u8>,
     keyring: Vec<u8>,
+    owner_key: OwnerKey,
     edit_token: Option<String>,
     view_token: Option<String>,
     retired: Vec<String>,
+}
+
+/// Why the fake server turned a submission down.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    Conflict(u64),
+    NotOwner,
 }
 
 impl Ds {
     fn init(payload: InitPayload) -> Self {
         Self {
             log: Vec::new(),
+            log_keys: Vec::new(),
             group_id: payload.group_id,
             group_info: payload.group_info,
             keyring: payload.keyring,
+            owner_key: payload.owner_key,
             edit_token: None,
             view_token: None,
             retired: Vec::new(),
         }
     }
 
+    /// The server after `payload` reset the group: a new log, the same
+    /// owner key.
+    fn after_reset(&self, payload: &ResetPayload) -> Self {
+        Self::init(InitPayload {
+            group_id: payload.group_id.clone(),
+            group_info: payload.group_info.clone(),
+            keyring: payload.keyring.clone(),
+            owner_key: self.owner_key,
+        })
+    }
+
     fn head(&self) -> u64 {
         self.log.len() as u64
     }
 
-    /// `Err(head)` is a Conflict.
+    /// What `GET /api/p/{token}/mls` answers.
+    fn boot(&self) -> Bootstrap<'_> {
+        Bootstrap {
+            group_info: &self.group_info,
+            keyring: &self.keyring,
+            owner_key: &self.owner_key,
+        }
+    }
+
+    /// `Err(head)` is a Conflict. Checks a rotation's owner proof like the
+    /// real server, and panics on a refusal.
     fn submit(&mut self, payload: SubmitPayload) -> Result<(), u64> {
+        match self.submit_checked(payload) {
+            Ok(()) => Ok(()),
+            Err(Refused::Conflict(head)) => Err(head),
+            Err(Refused::NotOwner) => panic!("the server refuses a rotation without the owner key"),
+        }
+    }
+
+    fn submit_checked(&mut self, payload: SubmitPayload) -> Result<(), Refused> {
+        if payload.epoch != self.head() {
+            return Err(Refused::Conflict(self.head()));
+        }
+        if let Some(rotate) = &payload.rotate {
+            let claim = RotationClaim {
+                group_id: &self.group_id,
+                epoch: payload.epoch,
+                commit: &payload.commit,
+                group_info: &payload.group_info,
+                keyring: payload.keyring.as_deref().unwrap_or_default(),
+                envelope: payload.envelope.as_deref().unwrap_or_default(),
+                edit_token: &rotate.edit_token,
+                view_token: &rotate.view_token,
+                next_owner_key: &rotate.next_owner_key,
+            };
+            if !verify_rotation(&self.owner_key, &claim, &rotate.owner_proof) {
+                return Err(Refused::NotOwner);
+            }
+            self.owner_key = rotate.next_owner_key;
+        }
+        self.submit_unchecked(payload).map_err(Refused::Conflict)
+    }
+
+    /// What a server that checks nothing but the epoch would take, to see
+    /// that the members refuse what the server should have.
+    fn submit_unchecked(&mut self, payload: SubmitPayload) -> Result<(), u64> {
         if payload.epoch != self.head() {
             return Err(self.head());
         }
         self.log
             .push((payload.epoch, payload.commit, payload.envelope));
+        self.log_keys
+            .push(payload.rotate.as_ref().map(|r| r.next_owner_key));
         self.group_info = payload.group_info;
         if let Some(keyring) = payload.keyring {
             self.keyring = keyring;
@@ -64,12 +135,18 @@ impl Client {
     fn sync(&mut self, ds: &Ds) -> Vec<Outcome> {
         let mut outcomes = Vec::new();
         while self.g.is_active() {
-            let Some((epoch, commit, envelope)) = ds.log.get(self.g.epoch() as usize) else {
+            let at = self.g.epoch() as usize;
+            let Some((epoch, commit, envelope)) = ds.log.get(at) else {
                 break;
             };
             let outcome = self
                 .g
-                .process_commit(*epoch, commit, envelope.as_deref())
+                .process_commit(
+                    *epoch,
+                    commit,
+                    envelope.as_deref(),
+                    ds.log_keys.get(at).copied().flatten().as_ref(),
+                )
                 .unwrap();
             let stop = matches!(outcome, Outcome::Invalid(_) | Outcome::Removed { .. });
             outcomes.push(outcome);
@@ -110,15 +187,8 @@ impl Client {
 }
 
 fn join(ds: &mut Ds, link: &LinkSecret, name: &'static str) -> Client {
-    let (mut g, payload) = ProjectGroup::join_external(
-        link,
-        &ds.group_info,
-        &ds.keyring,
-        name.as_bytes(),
-        None,
-        None,
-    )
-    .unwrap();
+    let (mut g, payload) =
+        ProjectGroup::join_external(link, ds.boot(), name.as_bytes(), None, None).unwrap();
     ds.submit(payload).expect("accepted");
     g.confirm_pending().unwrap();
     Client { name, g }
@@ -140,6 +210,14 @@ fn project_with(name: &'static str, identity: &LocalIdentity) -> (Ds, Client, Li
     let link = LinkSecret::generate_edit();
     let (g, payload) = ProjectGroup::create(&link, name.as_bytes(), identity).unwrap();
     (Ds::init(payload), Client { name, g }, link)
+}
+
+/// `secrets`, newest first, as copies a device kept.
+fn held(secrets: impl IntoIterator<Item = OwnerSecret>) -> OwnerSecrets {
+    secrets
+        .into_iter()
+        .map(|secret| (secret, Origin::Received))
+        .collect()
 }
 
 fn view_of(link: &LinkSecret) -> LinkSecret {
@@ -250,11 +328,9 @@ fn presence_follows_the_epoch() {
 fn concurrent_joins_conflict_and_retry() {
     let (mut ds, mut alice, link) = project();
     let (mut bob, bob_join) =
-        ProjectGroup::join_external(&link, &ds.group_info, &ds.keyring, b"bob", None, None)
-            .unwrap();
+        ProjectGroup::join_external(&link, ds.boot(), b"bob", None, None).unwrap();
     let (mut carol, carol_join) =
-        ProjectGroup::join_external(&link, &ds.group_info, &ds.keyring, b"carol", None, None)
-            .unwrap();
+        ProjectGroup::join_external(&link, ds.boot(), b"carol", None, None).unwrap();
 
     ds.submit(bob_join).unwrap();
     bob.confirm_pending().unwrap();
@@ -263,7 +339,7 @@ fn concurrent_joins_conflict_and_retry() {
     carol.discard_pending().unwrap();
     assert!(!carol.is_active());
     assert!(matches!(
-        carol.process_commit(0, &ds.log[0].1, None),
+        carol.process_commit(0, &ds.log[0].1, None, None),
         Err(MlsError::NotActive)
     ));
 
@@ -375,7 +451,7 @@ fn removing_a_viewer_rotates_the_links() {
     ));
     assert!(dave.g.presence_key().is_err());
     assert!(matches!(
-        ProjectGroup::join_external(&old, &ds.group_info, &ds.keyring, b"dave", None, None),
+        ProjectGroup::join_external(&old, ds.boot(), b"dave", None, None),
         Err(MlsError::Crypto(_))
     ));
 
@@ -428,9 +504,7 @@ fn removing_a_viewer_rotates_the_links() {
     ));
 
     // New joiners need the new links; the old edit link no longer works.
-    assert!(
-        ProjectGroup::join_external(&old, &ds.group_info, &ds.keyring, b"x", None, None).is_err()
-    );
+    assert!(ProjectGroup::join_external(&old, ds.boot(), b"x", None, None).is_err());
     let erin = join(&mut ds, &view_of(&new_link), "erin");
     assert_eq!(erin.roster().len(), 4);
     assert_eq!(ds.retired.len(), 0, "the fake server had no earlier tokens");
@@ -527,7 +601,7 @@ fn forged_editor_leaves_are_rejected() {
         let (_g, payload) = ProjectGroup::join_with(
             LeafKeys::generate(),
             &view,
-            &ds.group_info,
+            ds.boot(),
             Keyring::open_verified(&view, &ds.keyring).unwrap(),
             b"mallory",
             JoinOptions {
@@ -536,16 +610,7 @@ fn forged_editor_leaves_are_rejected() {
             },
         )
         .unwrap();
-        let mut scratch = Ds {
-            log: ds.log.clone(),
-            group_id: Vec::new(),
-            group_info: Vec::new(),
-            keyring: Vec::new(),
-            edit_token: None,
-            view_token: None,
-            retired: Vec::new(),
-        };
-        scratch.submit(payload).unwrap();
+        let scratch = with_commit(&ds, payload);
         let outcomes = alice.sync(&scratch);
         let [Outcome::Invalid(why)] = &outcomes[..] else {
             panic!("{outcomes:?}");
@@ -602,7 +667,7 @@ fn rotations_need_their_envelope() {
     // from the saved state. A refused commit is final for its epoch.
     let attempt = |envelope: Option<&[u8]>| {
         let mut bob = ProjectGroup::import_state(&saved).unwrap();
-        let outcome = bob.process_commit(epoch, &commit, envelope).unwrap();
+        let outcome = bob.process_commit(epoch, &commit, envelope, None).unwrap();
         (outcome, bob.epoch())
     };
     let (outcome, after) = attempt(None);
@@ -682,11 +747,12 @@ fn resync_replaces_the_old_leaf() {
         let (mut g, payload) = ProjectGroup::join_external_as(
             device.duplicate(),
             &link,
-            &ds.group_info,
-            &ds.keyring,
+            ds.boot(),
             b"bob",
             None,
             None,
+            None,
+            &OwnerSecrets::default(),
         )
         .unwrap();
         ds.submit(payload).unwrap();
@@ -775,9 +841,7 @@ fn saved_state_is_versioned_and_checked() {
 
     // A join the server never confirmed has no group to come back to.
     let (ds, _, link) = project();
-    let (g, _payload) =
-        ProjectGroup::join_external(&link, &ds.group_info, &ds.keyring, b"bob", None, None)
-            .unwrap();
+    let (g, _payload) = ProjectGroup::join_external(&link, ds.boot(), b"bob", None, None).unwrap();
     assert!(matches!(
         ProjectGroup::import_state(&g.export_state()),
         Err(MlsError::Unconfirmed)
@@ -796,6 +860,10 @@ fn a_stuck_group_restarts_under_a_new_incarnation() {
     let (fresh, payload) = alice.g.reset(b"alice", None).unwrap();
     assert_eq!(payload.incarnation, 0);
     assert_eq!(fresh.incarnation(), 1);
+    // The server keeps its owner key through a reset, and so does the owner.
+    assert!(alice.g.owner_secret().is_some());
+    assert_eq!(fresh.owner_secret(), alice.g.owner_secret());
+    assert!(fresh.holds_owner_key());
     assert_ne!(payload.group_id, ds.group_id);
     assert_eq!(payload.group_id[..16], ds.group_id[..16]);
     assert_eq!(fresh.members().unwrap().len(), 1);
@@ -805,11 +873,12 @@ fn a_stuck_group_restarts_under_a_new_incarnation() {
     let (mut joined, payload) = ProjectGroup::join_external_as(
         bob.g.device().duplicate(),
         &link,
-        &payload.group_info,
-        &payload.keyring,
+        ds.after_reset(&payload).boot(),
         b"bob",
         None,
         None,
+        Some(&bob.g),
+        &OwnerSecrets::default(),
     )
     .unwrap();
     joined.confirm_pending().unwrap();
@@ -832,8 +901,17 @@ fn groups_with_another_generation_than_their_keyring_are_refused() {
     // New group info but the old keyring: a server mixing generations.
     let view = view_of(alice.g.link());
     assert!(
-        ProjectGroup::join_external(&view, &ds.group_info, &stale_keyring, b"x", None, None)
-            .is_err()
+        ProjectGroup::join_external(
+            &view,
+            Bootstrap {
+                keyring: &stale_keyring,
+                ..ds.boot()
+            },
+            b"x",
+            None,
+            None
+        )
+        .is_err()
     );
 }
 
@@ -860,7 +938,7 @@ fn a_removed_editor_cannot_rejoin_as_an_editor_with_an_old_attestation() {
     let (_g, payload) = ProjectGroup::join_with(
         bob_device,
         &view2,
-        &ds.group_info,
+        ds.boot(),
         Keyring::open_verified(&view2, &ds.keyring).unwrap(),
         b"bob",
         JoinOptions {
@@ -931,6 +1009,12 @@ fn a_rotation_whose_accept_was_lost_is_confirmed_by_the_log() {
     assert_eq!(alice.g.link().to_base64url(), rotation.link.to_base64url());
     assert_eq!(alice.g.doc_keys().generation(), 2);
     assert!(!alice.g.needs_keyring());
+    // The next owner key was saved with the commit and is adopted with it.
+    assert_eq!(
+        alice.g.owner_secret().map(OwnerSecret::public),
+        Some(rotate.next_owner_key)
+    );
+    assert!(alice.g.holds_owner_key());
 
     // Bob reads the same link from the envelope.
     let outcomes = bob.sync(&ds);
@@ -972,7 +1056,9 @@ fn a_pending_commit_does_not_confirm_on_a_later_epoch() {
     // hers was not the one at the epoch before.
     let (epoch, commit, envelope) = ds.log[alice.g.epoch() as usize + 1].clone();
     assert!(matches!(
-        alice.g.process_commit(epoch, &commit, envelope.as_deref()),
+        alice
+            .g
+            .process_commit(epoch, &commit, envelope.as_deref(), None),
         Err(MlsError::Epoch { .. })
     ));
     assert!(alice.g.has_pending());
@@ -981,9 +1067,7 @@ fn a_pending_commit_does_not_confirm_on_a_later_epoch() {
 #[test]
 fn a_join_whose_accept_was_lost_is_confirmed_by_the_log() {
     let (mut ds, mut alice, link) = project();
-    let (bob, payload) =
-        ProjectGroup::join_external(&link, &ds.group_info, &ds.keyring, b"bob", None, None)
-            .unwrap();
+    let (bob, payload) = ProjectGroup::join_external(&link, ds.boot(), b"bob", None, None).unwrap();
     assert_eq!(bob.pending_submit(), Some(&payload));
     ds.submit(payload).unwrap();
     // No Accepted reply. A later commit extending the join proves it landed.
@@ -1006,16 +1090,14 @@ fn a_join_whose_accept_was_lost_is_confirmed_by_the_log() {
 fn a_join_that_lost_the_epoch_is_spent() {
     let (mut ds, _alice, link) = project();
     let (mut bob, bob_join) =
-        ProjectGroup::join_external(&link, &ds.group_info, &ds.keyring, b"bob", None, None)
-            .unwrap();
+        ProjectGroup::join_external(&link, ds.boot(), b"bob", None, None).unwrap();
     let (_carol, carol_join) =
-        ProjectGroup::join_external(&link, &ds.group_info, &ds.keyring, b"carol", None, None)
-            .unwrap();
+        ProjectGroup::join_external(&link, ds.boot(), b"carol", None, None).unwrap();
     ds.submit(carol_join).unwrap();
     assert!(ds.submit(bob_join).is_err());
     let (epoch, commit, envelope) = ds.log[0].clone();
     assert!(matches!(
-        bob.process_commit(epoch, &commit, envelope.as_deref()),
+        bob.process_commit(epoch, &commit, envelope.as_deref(), None),
         Err(MlsError::NotActive)
     ));
     assert!(!bob.has_pending() && !bob.is_active());
@@ -1031,7 +1113,7 @@ fn editors_with_unusable_hpke_keys_are_rejected_at_the_join() {
         let (_g, payload) = ProjectGroup::join_with(
             device.duplicate(),
             &link,
-            &ds.group_info,
+            ds.boot(),
             Keyring::open_verified(&link, &ds.keyring).unwrap(),
             b"mallory",
             JoinOptions {
@@ -1040,13 +1122,7 @@ fn editors_with_unusable_hpke_keys_are_rejected_at_the_join() {
             },
         )
         .unwrap();
-        let mut scratch = Ds::init(InitPayload {
-            group_id: Vec::new(),
-            group_info: Vec::new(),
-            keyring: Vec::new(),
-        });
-        scratch.log = ds.log.clone();
-        scratch.submit(payload).unwrap();
+        let scratch = with_commit(&ds, payload);
         let outcomes = alice.sync(&scratch);
         assert!(
             matches!(&outcomes[..], [Outcome::Invalid(why)] if why.contains("without proof")),
@@ -1067,25 +1143,20 @@ fn group_ids_must_have_the_expected_shape() {
         short,
         b"mallory",
         None,
+        (OwnerSecrets::default(), None),
     )
     .map(|(g, info, keyring)| {
         let payload = InitPayload {
             group_id: g.group_id.clone(),
             group_info: info,
             keyring,
+            owner_key: [0; 32],
         };
         (g, payload)
     })
     .unwrap();
     assert!(matches!(
-        ProjectGroup::join_external(
-            &link,
-            &payload.group_info,
-            &payload.keyring,
-            b"bob",
-            None,
-            None
-        ),
+        ProjectGroup::join_external(&link, Ds::init(payload.clone()).boot(), b"bob", None, None),
         Err(MlsError::Mismatch(_))
     ));
     assert!(matches!(
@@ -1123,15 +1194,9 @@ fn local(key: &DeviceKey, graph: &PersonGraph) -> LocalIdentity {
 }
 
 fn join_as(ds: &mut Ds, link: &LinkSecret, name: &'static str, identity: &LocalIdentity) -> Client {
-    let (mut g, payload) = ProjectGroup::join_external(
-        link,
-        &ds.group_info,
-        &ds.keyring,
-        name.as_bytes(),
-        Some(identity),
-        None,
-    )
-    .unwrap();
+    let (mut g, payload) =
+        ProjectGroup::join_external(link, ds.boot(), name.as_bytes(), Some(identity), None)
+            .unwrap();
     ds.submit(payload).expect("accepted");
     g.confirm_pending().unwrap();
     Client { name, g }
@@ -1254,8 +1319,7 @@ fn a_device_the_graph_does_not_list_cannot_join() {
     let graph = PersonGraph::genesis(&listed);
     let result = ProjectGroup::join_external(
         &link,
-        &ds.group_info,
-        &ds.keyring,
+        ds.boot(),
         b"mallory",
         Some(&local(&stranger, &graph)),
         None,
@@ -1284,7 +1348,7 @@ fn a_binding_for_another_leaf_is_unverified() {
         let (mut g, payload) = ProjectGroup::join_with(
             LeafKeys::generate(),
             &view,
-            &ds.group_info,
+            ds.boot(),
             Keyring::open_verified(&view, &ds.keyring).unwrap(),
             name.as_bytes(),
             JoinOptions {
@@ -1318,7 +1382,7 @@ fn a_binding_for_another_leaf_is_unverified() {
     let (mut g, payload) = ProjectGroup::join_with(
         leaf,
         &view,
-        &ds.group_info,
+        ds.boot(),
         keyring,
         b"outsider",
         JoinOptions {
@@ -1364,13 +1428,7 @@ fn a_member_cannot_swap_its_device_or_person() {
     ];
     for identity in &swapped {
         let payload = commit_identity(&mut laptop, identity);
-        let mut scratch = Ds::init(InitPayload {
-            group_id: Vec::new(),
-            group_info: Vec::new(),
-            keyring: Vec::new(),
-        });
-        scratch.log = ds.log.clone();
-        scratch.submit(payload).unwrap();
+        let scratch = with_commit(&ds, payload);
         for client in [&mut alice, &mut phone] {
             let outcomes = client.sync(&scratch);
             let [Outcome::Invalid(why)] = &outcomes[..] else {
@@ -1476,7 +1534,7 @@ fn a_revocation_carried_by_one_leaf_marks_the_persons_other_leaf() {
         .append(&robert.laptop, revoke(&robert.phone))
         .unwrap();
 
-    assert!(laptop.g.revoked_own_leaves().is_empty());
+    assert!(laptop.g.revoked_leaves().is_empty());
     let payload = laptop.g.self_update(b"laptop", Some(&revoked)).unwrap();
     commit(&mut ds, &mut laptop, payload);
     for client in [&mut alice, &mut phone] {
@@ -1505,11 +1563,12 @@ fn a_revocation_carried_by_one_leaf_marks_the_persons_other_leaf() {
             .unwrap()
             .contains(&phone.g.own_leaf())
     );
-    assert_eq!(laptop.g.revoked_own_leaves(), vec![phone.g.own_leaf()]);
-    // Alice is nobody's person here, and the revoked device itself has none
-    // to speak for.
-    assert!(alice.g.revoked_own_leaves().is_empty());
-    assert!(phone.g.revoked_own_leaves().is_empty());
+    // Everyone sees it, whoever's person they are, and the revoked device
+    // itself is not counted for its own sake.
+    for observer in [&alice, &laptop] {
+        assert_eq!(observer.g.revoked_leaves(), vec![phone.g.own_leaf()]);
+    }
+    assert!(phone.g.revoked_leaves().is_empty());
     assert_eq!(alice.g.person_graph(&id), Some(revoked));
 }
 
@@ -1666,9 +1725,10 @@ fn with_commit(ds: &Ds, payload: SubmitPayload) -> Ds {
         group_id: Vec::new(),
         group_info: Vec::new(),
         keyring: Vec::new(),
+        owner_key: [0; 32],
     });
     scratch.log = ds.log.clone();
-    scratch.submit(payload).unwrap();
+    scratch.submit_unchecked(payload).unwrap();
     scratch
 }
 
@@ -1722,16 +1782,17 @@ fn only_the_owner_can_remove_or_reset_links() {
     assert!(matches!(bob.g.reset_links(), Err(MlsError::NotOwner)));
     assert!(matches!(
         bob.g.remove_revoked().map(|r| r.submit),
-        Err(MlsError::NothingRevoked)
+        Err(MlsError::NotOwner)
     ));
     assert!(!bob.g.has_pending());
     // Viewers are told they cannot edit at all.
     assert!(matches!(carol.g.reset_links(), Err(MlsError::NotEditor)));
 
-    // What a modified client would send. Every member refuses it for what
-    // it is.
+    // What a modified client would send. The server refuses it, as bob has
+    // no owner key to sign it with, and so would every member.
     let payload = bob.g.rotate(&[carol_leaf]).unwrap();
-    ds.submit(payload).unwrap();
+    assert_eq!(ds.submit_checked(payload.clone()), Err(Refused::NotOwner));
+    ds.submit_unchecked(payload).unwrap();
     for client in [&mut alice, &mut carol, &mut dave] {
         let outcomes = client.sync(&ds);
         let [Outcome::Invalid(why)] = &outcomes[..] else {
@@ -1744,7 +1805,7 @@ fn only_the_owner_can_remove_or_reset_links() {
 }
 
 #[test]
-fn a_paired_device_of_the_owner_is_the_owner_without_any_key() {
+fn a_paired_device_of_the_owner_is_the_owner_and_gets_the_key_from_a_holder() {
     let (mut ds, [mut laptop, mut phone, mut alice, mut bob], _, robert) = robert_owns();
     let id = robert.graph.id();
     for observer in [&laptop, &phone, &alice, &bob] {
@@ -1764,7 +1825,49 @@ fn a_paired_device_of_the_owner_is_the_owner_without_any_key() {
         assert_eq!(observer.g.owner_person(), Some(id), "{}", observer.name);
     }
 
+    // The phone is an owner, but the owner key is still only the laptop's.
     let bob_leaf = phone.leaf_of("bob");
+    assert!(!phone.g.holds_owner_key());
+    assert!(matches!(
+        phone.g.remove_and_rotate(&[bob_leaf]),
+        Err(MlsError::NoOwnerKey)
+    ));
+    assert!(
+        laptop
+            .g
+            .identity_step(&robert.graph)
+            .unwrap()
+            .share_owner_key
+    );
+    // Nobody else has a key to hand over.
+    for client in [&phone, &alice] {
+        assert!(
+            !client
+                .g
+                .identity_step(&robert.graph)
+                .unwrap()
+                .share_owner_key
+        );
+    }
+    let payload = laptop.g.self_update(b"laptop", None).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    for client in [&mut phone, &mut alice, &mut bob] {
+        assert!(matches!(client.sync(&ds)[..], [Outcome::Advanced]));
+    }
+    assert!(phone.g.holds_owner_key());
+    assert_eq!(phone.g.owner_secret(), laptop.g.owner_secret());
+    assert!(!alice.g.holds_owner_key() && alice.g.owner_secret().is_none());
+    // Handed over, there is nothing left to share, for either of them.
+    for client in [&laptop, &phone] {
+        assert!(
+            !client
+                .g
+                .identity_step(&robert.graph)
+                .unwrap()
+                .share_owner_key
+        );
+    }
+
     let payload = phone.g.remove_and_rotate(&[bob_leaf]).unwrap();
     commit(&mut ds, &mut phone, payload).unwrap();
     for client in [&mut laptop, &mut alice] {
@@ -1851,7 +1954,8 @@ fn a_revoked_owner_device_loses_the_role_as_soon_as_any_leaf_carries_the_revoke(
     // A modified client in its place is refused by everyone.
     let epoch = alice.g.epoch();
     let payload = phone.g.rotate(&[phone.leaf_of("bob")]).unwrap();
-    ds.submit(payload).unwrap();
+    assert_eq!(ds.submit_checked(payload.clone()), Err(Refused::NotOwner));
+    ds.submit_unchecked(payload).unwrap();
     for client in [&mut laptop, &mut alice, &mut bob] {
         let outcomes = client.sync(&ds);
         assert!(
@@ -1910,7 +2014,7 @@ fn a_mutual_revoke_leaves_no_owner() {
     // Neither device is valid, so neither can clear out the other either.
     assert!(matches!(
         laptop.g.remove_revoked().map(|r| r.submit),
-        Err(MlsError::NothingRevoked)
+        Err(MlsError::NotOwner)
     ));
 }
 
@@ -1953,7 +2057,7 @@ fn forged_owners_cannot_act_as_owner() {
         let (g, payload) = ProjectGroup::join_with(
             device,
             &link,
-            &ds.group_info,
+            ds.boot(),
             keyring,
             b"mallory",
             JoinOptions {
@@ -1976,7 +2080,8 @@ fn forged_owners_cannot_act_as_owner() {
 
         let epoch = alice.g.epoch();
         let payload = mallory.g.rotate(&[mallory.leaf_of("bob")]).unwrap();
-        ds.submit(payload).unwrap();
+        assert_eq!(ds.submit_checked(payload.clone()), Err(Refused::NotOwner));
+        ds.submit_unchecked(payload).unwrap();
         let outcomes = alice.sync(&ds);
         assert!(
             matches!(&outcomes[..], [Outcome::Invalid(why)] if why.contains("only the owner")),
@@ -2028,6 +2133,146 @@ fn a_revoked_device_cannot_pad_its_stale_graph_past_the_caps() {
 }
 
 #[test]
+fn a_revoked_device_cannot_backdate_revokes_to_take_the_project() {
+    let (mut ds, [mut laptop, mut phone, mut alice, mut bob], _, robert) = robert_owns();
+    let recovery_key = DeviceKey::generate();
+    let mut with_key = robert.graph.clone();
+    with_key
+        .append(
+            &robert.laptop,
+            EntryKind::AddDevice {
+                device: recovery_key.public(),
+                flags: crate::identity::FLAG_RECOVERY,
+            },
+        )
+        .unwrap();
+    let payload = laptop.g.self_update(b"laptop", Some(&with_key)).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    let mut revoked = with_key.clone();
+    revoked
+        .append(&recovery_key, revoke(&robert.phone))
+        .unwrap();
+    let payload = laptop.g.self_update(b"laptop", Some(&revoked)).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    for client in [&mut phone, &mut alice, &mut bob] {
+        client.sync(&ds);
+    }
+
+    // The stolen phone signs revokes of everything else on the head it knew
+    // before its own revoke and carries them in its leaf.
+    let mut backdated = with_key;
+    backdated
+        .append(&robert.phone, revoke(&robert.laptop))
+        .unwrap();
+    backdated
+        .append(&robert.phone, revoke(&recovery_key))
+        .unwrap();
+    let leaf_pub = phone.g.device().signer_pub();
+    let identity = LeafIdentity {
+        binding: LeafBinding::new(&robert.phone, &leaf_pub),
+        graph: backdated,
+    };
+    let payload = commit_identity(&mut phone, &identity);
+    if ds.submit(payload).is_ok() {
+        for client in [&mut laptop, &mut alice, &mut bob] {
+            client.sync(&ds);
+        }
+    }
+    let id = robert.graph.id();
+    let tree = alice.g.person_graph(&id).unwrap();
+    assert_eq!(
+        tree.device_state(&robert.laptop.public()),
+        DeviceState::Valid
+    );
+    assert_eq!(
+        tree.device_state(&recovery_key.public()),
+        DeviceState::Valid
+    );
+    assert_eq!(
+        tree.device_state(&robert.phone.public()),
+        DeviceState::Revoked
+    );
+    for observer in [&laptop, &alice, &bob] {
+        assert_eq!(
+            role_of(observer, "laptop"),
+            Role::Owner,
+            "{}",
+            observer.name
+        );
+    }
+    let step = laptop.g.identity_step(&revoked).unwrap();
+    let stored = step.merged.unwrap_or(revoked);
+    assert_eq!(
+        stored.device_state(&robert.laptop.public()),
+        DeviceState::Valid
+    );
+    let payload = laptop.g.remove_revoked().map(|r| r.submit).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    assert!(matches!(alice.sync(&ds)[..], [Outcome::Rotated(_)]));
+    assert_eq!(role_of(&alice, "laptop"), Role::Owner);
+}
+
+#[test]
+fn an_unverified_leaf_adds_nothing_to_the_persons_graph() {
+    let (mut ds, [mut alice, mut laptop, mut phone], link, robert) = two_devices();
+    let id = robert.graph.id();
+    // A copy of robert's graph filled up to the cap. An outsider could only
+    // pad it with entries signed by keys of its own, which no graph takes,
+    // so this signs them with robert's own laptop to get one that decodes.
+    let mut padded = robert.graph.clone();
+    while padded.len() < crate::identity::MAX_GRAPH_ENTRIES {
+        padded
+            .append(&robert.laptop, add(&DeviceKey::generate()))
+            .unwrap();
+    }
+    let view = view_of(&link);
+    let outsider = DeviceKey::generate();
+    let leaf = LeafKeys::generate();
+    let identity = LeafIdentity {
+        binding: LeafBinding::new(&outsider, &leaf.signer_pub()),
+        graph: padded,
+    };
+    let keyring = Keyring::open_verified(&view, &ds.keyring).unwrap();
+    let sealed = keyring
+        .identity_key()
+        .seal(&identity.encode(), IDENTITY_SEAL_CONTEXT);
+    let (mut g, payload) = ProjectGroup::join_with(
+        leaf,
+        &view,
+        ds.boot(),
+        keyring,
+        b"outsider",
+        JoinOptions {
+            identity: Some(sealed),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    ds.submit(payload).unwrap();
+    g.confirm_pending().unwrap();
+    for client in [&mut alice, &mut laptop, &mut phone] {
+        client.sync(&ds);
+    }
+    assert_eq!(person_of(&alice, "outsider"), Person::Unverified);
+    assert_eq!(alice.g.person_graph(&id), Some(robert.graph.clone()));
+    let graphs = graphs_in_group_info(&link, &ds.group_info, &ds.keyring).unwrap();
+    assert_eq!(graphs.iter().find(|g| g.id() == id), Some(&robert.graph));
+
+    // Robert's devices store nothing new and can still revoke.
+    let step = laptop.g.identity_step(&robert.graph).unwrap();
+    assert!(step.merged.is_none());
+    assert!(!step.needs_refresh);
+    let revoked = phone_revoked(&robert);
+    let payload = laptop.g.self_update(b"laptop", Some(&revoked)).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    assert!(matches!(alice.sync(&ds)[..], [Outcome::Advanced]));
+    assert_eq!(
+        person_of(&alice, "phone"),
+        verified(id, &robert.phone, true)
+    );
+}
+
+#[test]
 fn an_owner_whose_graphs_do_not_merge_has_no_owner_powers() {
     let (a, b, _, left, right) = forks();
     let (mut ds, mut creator, link) = project_with("a", &local(&a, &left));
@@ -2045,25 +2290,37 @@ fn an_owner_whose_graphs_do_not_merge_has_no_owner_powers() {
 }
 
 #[test]
-fn an_editor_removes_its_own_revoked_device_and_the_others_accept() {
+fn an_editor_leaves_its_revoked_device_to_the_owner() {
     let (mut ds, [mut alice, mut laptop, mut phone], _, robert) = two_devices();
     let revoked = phone_revoked(&robert);
-    assert!(matches!(
-        laptop.g.remove_revoked().map(|r| r.submit),
-        Err(MlsError::NothingRevoked)
-    ));
     let payload = laptop.g.self_update(b"laptop", Some(&revoked)).unwrap();
     commit(&mut ds, &mut laptop, payload);
-    for client in [&mut alice, &mut phone] {
-        client.sync(&ds);
-    }
+    alice.sync(&ds);
+    phone.sync(&ds);
     assert_eq!(role_of(&alice, "laptop"), Role::Editor);
 
-    let payload = laptop.g.remove_revoked().map(|r| r.submit).unwrap();
-    assert!(payload.envelope.is_some());
-    let rotation = commit(&mut ds, &mut laptop, payload).unwrap();
-    assert!(rotation.tokens.edit.is_some());
-    assert!(matches!(alice.sync(&ds)[..], [Outcome::Rotated(_)]));
+    // The revoke is in the tree, but robert is no owner here.
+    let step = laptop.g.identity_step(&revoked).unwrap();
+    assert!(step.revoked.is_empty() && !step.needs_refresh);
+    assert!(matches!(
+        laptop.g.remove_revoked().map(|r| r.submit),
+        Err(MlsError::NotOwner)
+    ));
+    // What it would send without asking is no owner's rotation.
+    let payload = laptop.g.rotate(&[phone.g.own_leaf()]).unwrap();
+    assert_eq!(ds.submit_checked(payload.clone()), Err(Refused::NotOwner));
+    laptop.g.discard_pending().unwrap();
+
+    // Alice owns the project and removes it, along with any other revoked
+    // device she sees. Her own graph has nothing to do with it.
+    let step = alice
+        .g
+        .identity_step(&PersonGraph::genesis(&DeviceKey::generate()));
+    assert_eq!(step.unwrap().revoked, vec![phone.g.own_leaf()]);
+    let removal = alice.g.remove_revoked().unwrap();
+    assert_eq!(removal.removed, vec![phone.g.own_leaf()]);
+    commit(&mut ds, &mut alice, removal.submit).unwrap();
+    assert!(matches!(laptop.sync(&ds)[..], [Outcome::Rotated(_)]));
     // The phone cannot follow the group any more, so this is how it hears
     // that it was revoked.
     assert!(matches!(
@@ -2074,17 +2331,15 @@ fn an_editor_removes_its_own_revoked_device_and_the_others_accept() {
         assert_eq!(observer.g.generation().unwrap(), 2);
         assert_eq!(observer.roster().len(), 2);
     }
-    assert_eq!(role_of(&alice, "alice"), Role::Owner);
-    assert_eq!(role_of(&alice, "laptop"), Role::Editor);
     assert!(matches!(
-        laptop.g.remove_revoked().map(|r| r.submit),
+        alice.g.remove_revoked().map(|r| r.submit),
         Err(MlsError::NothingRevoked)
     ));
 }
 
 #[test]
-fn an_editor_can_carry_the_revoke_in_the_commit_that_removes() {
-    let (mut ds, [mut alice, mut laptop, mut phone], _, robert) = two_devices();
+fn an_owner_can_carry_the_revoke_in_the_commit_that_removes() {
+    let (mut ds, [mut laptop, mut phone, mut alice, _], _, robert) = robert_owns();
     let revoked = phone_revoked(&robert);
     let identity = laptop.g.extended_identity(&revoked).unwrap();
     let phone_leaf = phone.g.own_leaf();
@@ -2122,7 +2377,8 @@ fn an_editor_cannot_remove_what_its_person_has_not_revoked() {
         Err(MlsError::NotOwner)
     ));
     let payload = laptop.g.rotate(&[phone.g.own_leaf()]).unwrap();
-    ds.submit(payload).unwrap();
+    assert_eq!(ds.submit_checked(payload.clone()), Err(Refused::NotOwner));
+    ds.submit_unchecked(payload).unwrap();
     refused(&ds, &mut [&mut alice]);
 
     // A revoked device of somebody else.
@@ -2146,7 +2402,8 @@ fn an_editor_cannot_remove_what_its_person_has_not_revoked() {
         verified(sara.2.id(), &sara.1, true)
     );
     let payload = laptop.g.rotate(&[s2.g.own_leaf()]).unwrap();
-    ds.submit(payload).unwrap();
+    assert_eq!(ds.submit_checked(payload.clone()), Err(Refused::NotOwner));
+    ds.submit_unchecked(payload).unwrap();
     refused(&ds, &mut [&mut alice, &mut s1]);
 }
 
@@ -2244,26 +2501,25 @@ fn a_reset_keeps_the_owner_tag_and_the_owner_comes_back_as_owner() {
     let (fresh, payload) = bob.g.reset(b"bob", None).unwrap();
     assert_eq!(fresh.policy().unwrap().owner_tag, tag);
     assert_eq!(fresh.owner_person(), None, "nobody of the owner is in yet");
-    let mut ds = Ds::init(InitPayload {
-        group_id: payload.group_id.clone(),
-        group_info: payload.group_info.clone(),
-        keyring: payload.keyring.clone(),
-    });
+    assert!(fresh.owner_secret().is_none());
+    let mut ds = ds.after_reset(&payload);
     let mut bob = Client {
         name: "bob",
         g: fresh,
     };
 
-    // The owner rejoins with the same device and the pin it made at the
-    // start. Nothing but its identity makes it the owner again.
+    // The owner rejoins with the same device, the pin it made at the start
+    // and the owner key it held. Nothing but its identity makes it the
+    // owner again, and nothing but the key lets it rotate.
     let (mut joined, join) = ProjectGroup::join_external_as(
         alice.g.device().duplicate(),
         &link,
-        &ds.group_info,
-        &ds.keyring,
+        ds.boot(),
         b"alice",
         Some(&local(&owner.device, &owner.graph)),
         Some(pinned),
+        Some(&alice.g),
+        &OwnerSecrets::default(),
     )
     .unwrap();
     ds.submit(join).unwrap();
@@ -2276,6 +2532,7 @@ fn a_reset_keeps_the_owner_tag_and_the_owner_comes_back_as_owner() {
     assert_eq!(role_of(&bob, "alice"), Role::Owner);
     assert_eq!(role_of(&bob, "bob"), Role::Editor);
     assert_eq!(alice.g.owner_person(), Some(pinned));
+    assert!(alice.g.holds_owner_key());
 
     // And rejoined, it can still remove people and rotate.
     let bob_leaf = alice.leaf_of("bob");
@@ -2301,17 +2558,23 @@ fn groups_of_another_owner_than_the_pinned_one_are_refused() {
         group_id_of(&[7; PROJECT_ID_LEN], 1),
         b"mallory",
         Some(sealed),
+        (OwnerSecrets::default(), None),
     )
     .unwrap();
     let join = |pinned: Option<PersonId>| {
         ProjectGroup::join_external_as(
             alice.g.device().duplicate(),
             &link,
-            &info,
-            &keyring,
+            Bootstrap {
+                group_info: &info,
+                keyring: &keyring,
+                owner_key: &ds.owner_key,
+            },
             b"alice",
             None,
             pinned,
+            None,
+            &OwnerSecrets::default(),
         )
     };
     // A reset-looking group whose owner is somebody else.
@@ -2325,17 +2588,7 @@ fn groups_of_another_owner_than_the_pinned_one_are_refused() {
     assert!(join(Some(mallory.graph.id())).is_ok());
 
     // The real group takes the real pin.
-    assert!(
-        ProjectGroup::join_external(
-            &link,
-            &ds.group_info,
-            &ds.keyring,
-            b"bob",
-            None,
-            Some(pinned)
-        )
-        .is_ok()
-    );
+    assert!(ProjectGroup::join_external(&link, ds.boot(), b"bob", None, Some(pinned)).is_ok());
 }
 
 #[test]
@@ -2356,13 +2609,28 @@ fn saved_state_keeps_a_rotation_waiting_for_the_server() {
     let mut reloaded = ProjectGroup::import_state(&alice.g.export_state()).unwrap();
     assert_eq!(reloaded.pending_submit(), Some(&staged));
     assert_eq!(reloaded.export_state(), alice.g.export_state());
+    assert_eq!(reloaded.owner_secret(), alice.g.owner_secret());
+    let next_key = staged.rotate.as_ref().unwrap().next_owner_key;
     ds.submit(staged).unwrap();
     let rotation = reloaded.confirm_pending().unwrap().unwrap();
     assert_eq!(reloaded.link().to_base64url(), rotation.link.to_base64url());
     assert_eq!(reloaded.owner_person(), alice.g.owner_person());
+    assert_eq!(
+        reloaded.owner_secret().map(OwnerSecret::public),
+        Some(next_key)
+    );
 
     let again = ProjectGroup::import_state(&reloaded.export_state()).unwrap();
     assert_eq!(again.generation().unwrap(), 2);
+    assert_eq!(again.owner_secret(), reloaded.owner_secret());
+    assert!(again.holds_owner_key());
+    // A member without the key saves none.
+    assert!(
+        ProjectGroup::import_state(&bob.g.export_state())
+            .unwrap()
+            .owner_secret()
+            .is_none()
+    );
 }
 
 /// A person with a laptop and a recovery device, and the profile "Ada".
@@ -2409,14 +2677,7 @@ fn a_recovery_device_cannot_create_or_join() {
 
     let (ds, alice, link) = project_with("laptop", &laptop);
     assert!(matches!(
-        ProjectGroup::join_external(
-            &link,
-            &ds.group_info,
-            &ds.keyring,
-            b"recovery",
-            Some(&as_recovery),
-            None,
-        ),
+        ProjectGroup::join_external(&link, ds.boot(), b"recovery", Some(&as_recovery), None,),
         Err(MlsError::Identity(GraphError::NotValid))
     ));
     assert!(ds.log.is_empty());
@@ -2447,7 +2708,7 @@ fn a_leaf_bound_to_a_recovery_device_is_unverified_and_never_owner() {
     let (g, payload) = ProjectGroup::join_with(
         device,
         &link,
-        &ds.group_info,
+        ds.boot(),
         keyring,
         b"recovery",
         JoinOptions {
@@ -2507,8 +2768,7 @@ fn graphs_are_read_from_a_group_info_without_joining() {
         name: "laptop",
         g: ProjectGroup::join_external(
             &link,
-            &ds.group_info,
-            &ds.keyring,
+            ds.boot(),
             b"laptop",
             Some(&local(&robert.laptop, &longer)),
             None,
@@ -2536,10 +2796,19 @@ fn graphs_are_read_from_a_group_info_without_joining() {
 
 #[test]
 fn the_identity_step_refreshes_then_removes_the_revoked_leaves() {
-    let (mut ds, [mut alice, mut laptop, mut phone], _, robert) = two_devices();
+    let (mut ds, [mut laptop, mut phone, mut alice, _], _, robert) = robert_owns();
     let id = robert.graph.id();
     let revoked = phone_revoked(&robert);
     let phone_leaf = phone.g.own_leaf();
+    // Catch the laptop's leaf up and hand the phone the key first, so only
+    // the revoke is left to do.
+    let payload = laptop
+        .g
+        .self_update(b"laptop", Some(&robert.graph))
+        .unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    phone.sync(&ds);
+    alice.sync(&ds);
 
     let step = laptop.g.identity_step(&robert.graph).unwrap();
     assert_eq!(
@@ -2548,7 +2817,8 @@ fn the_identity_step_refreshes_then_removes_the_revoked_leaves() {
             merged: None,
             needs_refresh: false,
             rejoin: false,
-            revoked_own: Vec::new(),
+            revoked: Vec::new(),
+            share_owner_key: false,
         }
     );
 
@@ -2556,7 +2826,7 @@ fn the_identity_step_refreshes_then_removes_the_revoked_leaves() {
     let step = laptop.g.identity_step(&revoked).unwrap();
     assert_eq!(step.merged, None);
     assert!(step.needs_refresh);
-    assert!(step.revoked_own.is_empty());
+    assert!(step.revoked.is_empty());
     let payload = laptop.g.self_update(b"laptop", Some(&revoked)).unwrap();
     commit(&mut ds, &mut laptop, payload);
     for client in [&mut alice, &mut phone] {
@@ -2565,33 +2835,30 @@ fn the_identity_step_refreshes_then_removes_the_revoked_leaves() {
 
     let step = laptop.g.identity_step(&revoked).unwrap();
     assert!(!step.needs_refresh);
-    assert_eq!(step.revoked_own, vec![phone_leaf]);
-    assert_eq!(laptop.g.revoked_own_leaves(), vec![phone_leaf]);
+    assert_eq!(step.revoked, vec![phone_leaf]);
+    // A revoked device is no owner and gets no share, so there is nothing
+    // to hand over.
+    assert!(!step.share_owner_key);
 
     // The phone learns of its own revoke from the tree, and has nobody to
-    // remove, not being valid itself.
+    // remove, being no owner any more, though it still holds the old key.
     let step = phone.g.identity_step(&robert.graph).unwrap();
     assert_eq!(step.merged.as_ref(), Some(&revoked));
     assert!(step.needs_refresh);
-    assert!(step.revoked_own.is_empty());
-    // A member without a person has nothing to do, whatever it is handed.
+    assert!(step.revoked.is_empty());
+    assert!(phone.g.owner_secret().is_some() && !phone.g.holds_owner_key());
+    // An editor sees the revoked leaf too, but leaves it to the owner.
+    assert_eq!(alice.g.revoked_leaves(), vec![phone_leaf]);
     let step = alice.g.identity_step(&revoked).unwrap();
     assert_eq!(step.merged, None);
     assert!(!step.needs_refresh);
-    assert!(step.revoked_own.is_empty());
+    assert!(step.revoked.is_empty());
 
     let removal = laptop.g.remove_revoked().unwrap();
     assert_eq!(removal.removed, vec![phone_leaf]);
     commit(&mut ds, &mut laptop, removal.submit);
     assert!(matches!(phone.sync(&ds)[..], [Outcome::Removed { .. }]));
-    assert!(
-        laptop
-            .g
-            .identity_step(&revoked)
-            .unwrap()
-            .revoked_own
-            .is_empty()
-    );
+    assert!(laptop.g.identity_step(&revoked).unwrap().revoked.is_empty());
     assert!(matches!(
         laptop.g.remove_revoked(),
         Err(MlsError::NothingRevoked)
@@ -2656,11 +2923,12 @@ fn a_device_that_switched_persons_rejoins_as_the_new_one() {
     let (mut g, payload) = ProjectGroup::join_external_as(
         desk.g.device().duplicate(),
         &link,
-        &ds.group_info,
-        &ds.keyring,
+        ds.boot(),
         b"desk",
         Some(&local(&desk_key, &paired)),
         None,
+        Some(&desk.g),
+        &OwnerSecrets::default(),
     )
     .unwrap();
     ds.submit(payload).unwrap();
@@ -2682,4 +2950,793 @@ fn a_device_that_switched_persons_rejoins_as_the_new_one() {
     }
     assert!(!rejoined.g.identity_step(&paired).unwrap().rejoin);
     assert!(matches!(desk.sync(&ds)[..], [Outcome::Removed { .. }]));
+}
+
+// The owner key: what the server checks rotations against, and how it gets
+// from one owner device to the next.
+
+/// Robert owns the project and has three devices in it: the laptop that
+/// created it and holds the owner key, and a phone and a tablet paired
+/// later, which have been handed the key. Alice edits. All caught up.
+fn robert_with_tablet() -> (Ds, [Client; 4], LinkSecret, Robert, DeviceKey) {
+    let (mut ds, [mut laptop, mut phone, mut alice, _bob], link, mut robert) = robert_owns();
+    let tablet_key = DeviceKey::generate();
+    robert
+        .graph
+        .append(&robert.laptop, add(&tablet_key))
+        .unwrap();
+    let mut tablet = join_as(&mut ds, &link, "tablet", &local(&tablet_key, &robert.graph));
+    for client in [&mut laptop, &mut phone, &mut alice] {
+        client.sync(&ds);
+    }
+    let payload = laptop
+        .g
+        .self_update(b"laptop", Some(&robert.graph))
+        .unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    for client in [&mut phone, &mut alice, &mut tablet] {
+        client.sync(&ds);
+    }
+    for client in [&laptop, &phone, &tablet] {
+        assert!(client.g.holds_owner_key(), "{}", client.name);
+    }
+    (ds, [laptop, phone, tablet, alice], link, robert, tablet_key)
+}
+
+/// The owner key shares in `observer`'s view of `name`'s leaf.
+fn shares_of(observer: &Client, name: &str) -> Option<OwnerShares> {
+    let leaf = observer.leaf_of(name);
+    read_owner_shares(
+        observer
+            .g
+            .group
+            .public_group()
+            .leaf(LeafNodeIndex::new(leaf))?,
+    )
+}
+
+#[test]
+fn the_creator_holds_the_owner_key_the_server_is_given() {
+    let link = LinkSecret::generate_edit();
+    let me = person();
+    let (g, payload) = ProjectGroup::create(&link, b"me", &me).unwrap();
+    let owner = g.owner_secret().unwrap();
+    assert_eq!(payload.owner_key, owner.public());
+    assert_eq!(g.owner_key(), Some(owner.public()));
+    assert!(g.holds_owner_key());
+    assert!(matches!(
+        payload.into_message(1),
+        ClientMessage::Init { owner_key, .. } if owner_key == owner.public()
+    ));
+    // Both survive a save.
+    let loaded = ProjectGroup::import_state(&g.export_state()).unwrap();
+    assert_eq!(loaded.owner_key(), g.owner_key());
+    assert_eq!(loaded.owner_secret(), g.owner_secret());
+    assert!(loaded.holds_owner_key());
+}
+
+#[test]
+fn rotations_are_signed_with_the_current_key_and_chain() {
+    let (mut ds, [mut alice, mut bob, ..], _) = team();
+    let first = alice.g.owner_secret().unwrap().clone();
+    assert_eq!(bob.g.owner_key(), Some(first.public()));
+
+    // A rotation that loses the epoch keeps the key it would have replaced.
+    let payload = alice.g.reset_links().unwrap();
+    alice.g.discard_pending().unwrap();
+    assert_eq!(alice.g.owner_secret(), Some(&first));
+    assert_eq!(alice.g.owner_key(), Some(first.public()));
+    assert_eq!(ds.owner_key, first.public());
+    let rotate = payload.rotate.unwrap();
+    assert_ne!(rotate.next_owner_key, first.public());
+
+    let payload = alice.g.reset_links().unwrap();
+    let rotate = payload.rotate.clone().unwrap();
+    let claim = RotationClaim {
+        group_id: &ds.group_id,
+        epoch: payload.epoch,
+        commit: &payload.commit,
+        group_info: &payload.group_info,
+        keyring: payload.keyring.as_deref().unwrap(),
+        envelope: payload.envelope.as_deref().unwrap(),
+        edit_token: &rotate.edit_token,
+        view_token: &rotate.view_token,
+        next_owner_key: &rotate.next_owner_key,
+    };
+    assert!(verify_rotation(
+        &first.public(),
+        &claim,
+        &rotate.owner_proof
+    ));
+    commit(&mut ds, &mut alice, payload).unwrap();
+    let second = alice.g.owner_secret().unwrap().clone();
+    assert_eq!(second.public(), rotate.next_owner_key);
+    assert_eq!(ds.owner_key, second.public());
+    assert_eq!(alice.g.owner_key(), Some(second.public()));
+    // A member that follows the log learns the new key from the server.
+    bob.sync(&ds);
+    assert_eq!(bob.g.owner_key(), Some(second.public()));
+
+    // The next one is signed with the second key, which the fake server,
+    // like the real one, now expects.
+    let payload = alice.g.reset_links().unwrap();
+    commit(&mut ds, &mut alice, payload).unwrap();
+    assert_eq!(alice.g.owner_key(), Some(ds.owner_key));
+    assert_ne!(ds.owner_key, second.public());
+
+    // A device that kept the first key cannot sign with it any more.
+    let mut stale = ProjectGroup::import_state(&alice.g.export_state()).unwrap();
+    stale.owner = held([first]);
+    assert!(!stale.holds_owner_key());
+    assert!(matches!(stale.reset_links(), Err(MlsError::NoOwnerKey)));
+    let forged = stale.rotate(&[]).unwrap();
+    assert_eq!(ds.submit_checked(forged), Err(Refused::NotOwner));
+}
+
+#[test]
+fn concurrent_owner_rotations_leave_the_loser_with_the_winners_key() {
+    let (mut ds, [mut laptop, mut phone, mut tablet, mut alice], ..) = robert_with_tablet();
+    let a = laptop.g.reset_links().unwrap();
+    let b = phone.g.reset_links().unwrap();
+    commit(&mut ds, &mut laptop, a).unwrap();
+    assert_eq!(ds.submit_checked(b), Err(Refused::Conflict(ds.head())));
+    // The loser hears of the winner before or instead of the Conflict.
+    assert!(matches!(phone.sync(&ds)[..], [Outcome::Rotated(_)]));
+    for client in [&mut tablet, &mut alice] {
+        client.sync(&ds);
+    }
+    for client in [&phone, &tablet] {
+        assert!(client.g.holds_owner_key(), "{}", client.name);
+        assert_eq!(client.g.owner_secret(), laptop.g.owner_secret());
+    }
+    assert!(alice.g.owner_secret().is_none());
+    let payload = phone.g.reset_links().unwrap();
+    commit(&mut ds, &mut phone, payload).unwrap();
+}
+
+#[test]
+fn a_rotation_hands_the_next_key_to_the_remaining_owner_devices_only() {
+    let (mut ds, [mut laptop, mut phone, mut tablet, mut alice], _, robert, tablet_key) =
+        robert_with_tablet();
+    // The tablet is revoked, but its leaf is still in the tree.
+    let mut revoked = robert.graph.clone();
+    revoked.append(&robert.laptop, revoke(&tablet_key)).unwrap();
+    let payload = laptop.g.self_update(b"laptop", Some(&revoked)).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    for client in [&mut phone, &mut tablet, &mut alice] {
+        client.sync(&ds);
+    }
+    let shares = shares_of(&alice, "laptop").unwrap();
+    assert!(shares.covers_leaf(&phone.g.device().signer_pub()));
+    assert!(!shares.covers_leaf(&tablet.g.device().signer_pub()));
+
+    // A link reset leaves the revoked tablet out of the next key.
+    let first = laptop.g.owner_secret().cloned();
+    let payload = laptop.g.reset_links().unwrap();
+    commit(&mut ds, &mut laptop, payload).unwrap();
+    for client in [&mut phone, &mut tablet, &mut alice] {
+        assert!(matches!(client.sync(&ds)[..], [Outcome::Rotated(_)]));
+    }
+    assert!(phone.g.holds_owner_key());
+    assert_eq!(phone.g.owner_secret(), laptop.g.owner_secret());
+    // The tablet keeps the one it had, which signs nothing any more.
+    let first = first.unwrap();
+    assert!(tablet.g.owner_secret().is_none());
+    assert_eq!(tablet.g.owner_secrets().find(&first.public()), Some(&first));
+    assert!(!tablet.g.holds_owner_key());
+
+    // Removing the phone leaves it no share of the key after.
+    let second = laptop.g.owner_secret().cloned();
+    let payload = laptop.g.remove_and_rotate(&[phone.g.own_leaf()]).unwrap();
+    commit(&mut ds, &mut laptop, payload).unwrap();
+    assert!(matches!(phone.sync(&ds)[..], [Outcome::Removed { .. }]));
+    alice.sync(&ds);
+    let shares = shares_of(&alice, "laptop");
+    assert!(shares.is_none_or(|s| !s.covers_leaf(&phone.g.device().signer_pub())));
+    let second = second.unwrap();
+    assert!(phone.g.owner_secret().is_none());
+    assert_eq!(phone.g.owner_secrets().iter().next(), Some(&second));
+    assert_ne!(laptop.g.owner_secret(), Some(&second));
+}
+
+/// Owner key shares from `client`'s leaf for `to`, of `secret`.
+fn forged_shares(client: &Client, secret: &OwnerSecret, to: &Client) -> Vec<u8> {
+    let scope = ShareScope {
+        group_id: &client.g.group_id,
+        sender: &client.g.device().signer_pub(),
+    };
+    let recipient = Recipient {
+        signer: to.g.device().signer_pub(),
+        hpke_pub: to.g.device().hpke_pub().to_vec(),
+    };
+    OwnerShares::seal(
+        client.g.provider.crypto(),
+        &scope,
+        secret,
+        std::slice::from_ref(&recipient),
+        &[],
+    )
+    .encode()
+}
+
+/// `client` commits its own leaf again, with `shares` in place of the ones
+/// it would put there.
+fn commit_shares(ds: &mut Ds, client: &mut Client, link: &LinkSecret, shares: Vec<u8>) {
+    let generation = client.g.generation().unwrap();
+    let editor = editor_info(client.g.device(), link, generation).unwrap();
+    let identity = client.g.own_identity();
+    let payload = client
+        .g
+        .commit_leaf_with(Some(editor), client.name.as_bytes(), identity, Some(shares))
+        .unwrap();
+    commit(ds, client, payload);
+}
+
+#[test]
+fn shares_of_a_key_the_server_does_not_hold_are_ignored() {
+    let (mut ds, [mut laptop, mut phone, mut alice, _], link, _) = robert_owns();
+
+    // Alice is an editor and hands the phone a key of her own making.
+    let shares = forged_shares(&alice, &OwnerSecret::generate(), &phone);
+    commit_shares(&mut ds, &mut alice, &link, shares);
+    for client in [&mut laptop, &mut phone] {
+        assert!(matches!(client.sync(&ds)[..], [Outcome::Advanced]));
+    }
+    assert!(phone.g.owner_secret().is_none());
+
+    // The laptop is an owner, but what it puts in is not the server's key.
+    let shares = forged_shares(&laptop, &OwnerSecret::generate(), &phone);
+    commit_shares(&mut ds, &mut laptop, &link, shares);
+    for client in [&mut alice, &mut phone] {
+        assert!(matches!(client.sync(&ds)[..], [Outcome::Advanced]));
+    }
+    assert!(phone.g.owner_secret().is_none());
+    // Neither stops the real share from getting through.
+    assert!(
+        laptop
+            .g
+            .identity_step(&laptop_graph(&laptop))
+            .unwrap()
+            .share_owner_key
+    );
+    let payload = laptop.g.self_update(b"laptop", None).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    phone.sync(&ds);
+    assert!(phone.g.holds_owner_key());
+}
+
+#[test]
+fn a_stolen_owner_device_cannot_plant_a_key_of_its_own() {
+    let (mut ds, [mut laptop, mut phone, mut tablet, mut alice], link, mut robert, _) =
+        robert_with_tablet();
+    // A desk is paired and joins; nobody has handed it the key yet.
+    let desk_key = DeviceKey::generate();
+    robert.graph.append(&robert.laptop, add(&desk_key)).unwrap();
+    let mut desk = join_as(&mut ds, &link, "desk", &local(&desk_key, &robert.graph));
+    for client in [&mut laptop, &mut phone, &mut tablet, &mut alice] {
+        client.sync(&ds);
+    }
+    assert_eq!(role_of(&alice, "desk"), Role::Owner);
+    assert!(!desk.g.holds_owner_key());
+
+    // The tablet, in a thief's hands but not yet revoked, gets there first
+    // with a key of its own making.
+    let fake = OwnerSecret::generate();
+    let shares = forged_shares(&tablet, &fake, &desk);
+    commit_shares(&mut ds, &mut tablet, &link, shares);
+    for client in [&mut laptop, &mut phone, &mut desk, &mut alice] {
+        assert!(matches!(client.sync(&ds)[..], [Outcome::Advanced]));
+    }
+    assert!(desk.g.owner_secret().is_none());
+
+    // Even a device that somehow came to hold the fake one takes the real
+    // key over it once an owner device hands that over.
+    desk.g.owner = held([fake.clone()]);
+    assert!(!desk.g.holds_owner_key());
+    let payload = laptop.g.self_update(b"laptop", None).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    desk.sync(&ds);
+    assert!(desk.g.holds_owner_key());
+    assert_eq!(desk.g.owner_secret(), laptop.g.owner_secret());
+    let payload = desk.g.reset_links().unwrap();
+    commit(&mut ds, &mut desk, payload).unwrap();
+}
+
+/// The graph a client's own leaf carries.
+fn laptop_graph(client: &Client) -> PersonGraph {
+    client.g.own_identity_open().unwrap().graph
+}
+
+#[test]
+fn a_rejoining_owner_device_keeps_or_finds_its_key() {
+    let (mut ds, [mut laptop, phone, mut tablet, mut alice], link, robert, tablet_key) =
+        robert_with_tablet();
+    // Without the key, after losing its state: the share the laptop sealed
+    // to the same leaf key is still in the tree.
+    let (mut g, payload) = ProjectGroup::join_external_as(
+        tablet.g.device().duplicate(),
+        &link,
+        ds.boot(),
+        b"tablet",
+        Some(&local(&tablet_key, &robert.graph)),
+        None,
+        None,
+        &OwnerSecrets::default(),
+    )
+    .unwrap();
+    assert!(g.holds_owner_key());
+    ds.submit(payload).unwrap();
+    g.confirm_pending().unwrap();
+    assert_eq!(g.owner_secret(), phone.g.owner_secret());
+    assert!(matches!(tablet.sync(&ds)[..], [Outcome::Removed { .. }]));
+    for client in [&mut laptop, &mut alice] {
+        client.sync(&ds);
+    }
+
+    // With the key it held, as a client passes it on from a copy beside its
+    // state. Of the keys it brings, the one the server holds is taken. Its
+    // new leaf carries no shares, so a holder that sees the others
+    // uncovered hands the key out again.
+    let stale = OwnerSecret::generate();
+    let (mut g, payload) = ProjectGroup::join_external_as(
+        laptop.g.device().duplicate(),
+        &link,
+        ds.boot(),
+        b"laptop",
+        Some(&local(&robert.laptop, &robert.graph)),
+        None,
+        None,
+        &held([stale, laptop.g.owner_secret().cloned().unwrap()]),
+    )
+    .unwrap();
+    ds.submit(payload).unwrap();
+    g.confirm_pending().unwrap();
+    assert!(g.holds_owner_key());
+    assert_eq!(g.owner_secret(), laptop.g.owner_secret());
+    assert!(matches!(laptop.sync(&ds)[..], [Outcome::Removed { .. }]));
+}
+
+#[test]
+fn the_recovery_key_opens_its_share_and_throws_the_lost_devices_out() {
+    let (laptop_id, recovery_key) = person_with_recovery();
+    let (mut ds, mut laptop, link) = project_with("laptop", &laptop_id);
+    let mut alice = join(&mut ds, &link, "alice");
+    laptop.sync(&ds);
+    // Nobody has sealed anything to the recovery key yet.
+    assert_eq!(
+        owner_share_for_recovery(&link, ds.boot(), &recovery_key).unwrap(),
+        None
+    );
+    let step = laptop.g.identity_step(&laptop_id.graph).unwrap();
+    assert!(step.share_owner_key);
+    let payload = laptop.g.self_update(b"laptop", None).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    alice.sync(&ds);
+    assert!(
+        !laptop
+            .g
+            .identity_step(&laptop_id.graph)
+            .unwrap()
+            .share_owner_key
+    );
+    // Only the recovery key opens it, and only for the key the server holds.
+    assert_eq!(
+        owner_share_for_recovery(&link, ds.boot(), &DeviceKey::generate()).unwrap(),
+        None
+    );
+    let elsewhere = OwnerSecret::generate().public();
+    assert_eq!(
+        owner_share_for_recovery(
+            &link,
+            Bootstrap {
+                owner_key: &elsewhere,
+                ..ds.boot()
+            },
+            &recovery_key
+        )
+        .unwrap(),
+        None
+    );
+
+    // The laptop is lost. A new device recovers with the words, which
+    // revokes the laptop, and takes the key along into the project.
+    let fresh = DeviceKey::generate();
+    let graphs = graphs_in_group_info(&link, &ds.group_info, &ds.keyring).unwrap();
+    let recovered = crate::identity::recover(
+        &graphs,
+        &recovery_key,
+        &fresh.public(),
+        None,
+        crate::identity::RecoverOptions::default(),
+    )
+    .unwrap();
+    let owner = owner_share_for_recovery(&link, ds.boot(), &recovery_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(&owner), laptop.g.owner_secret());
+    let (mut g, payload) = ProjectGroup::join_external_as(
+        LeafKeys::generate(),
+        &link,
+        ds.boot(),
+        b"fresh",
+        Some(&local(&fresh, &recovered.graph)),
+        laptop.g.owner_person(),
+        None,
+        &held([owner]),
+    )
+    .unwrap();
+    ds.submit(payload).unwrap();
+    g.confirm_pending().unwrap();
+    let mut fresh_client = Client { name: "fresh", g };
+    alice.sync(&ds);
+    assert_eq!(role_of(&alice, "fresh"), Role::Owner);
+    assert_eq!(role_of(&alice, "laptop"), Role::Editor);
+    assert!(fresh_client.g.holds_owner_key());
+    let step = fresh_client.g.identity_step(&recovered.graph).unwrap();
+    let laptop_leaf = fresh_client.leaf_of("laptop");
+    assert_eq!(step.revoked, vec![laptop_leaf]);
+    let removal = fresh_client.g.remove_revoked().unwrap();
+    commit(&mut ds, &mut fresh_client, removal.submit).unwrap();
+    assert!(matches!(alice.sync(&ds)[..], [Outcome::Rotated(_)]));
+    assert!(matches!(
+        laptop.sync(&ds)[..],
+        [Outcome::Advanced, Outcome::Removed { .. }]
+    ));
+    // The lost laptop's key is the old one, which signs nothing now.
+    assert_ne!(laptop.g.owner_secret(), fresh_client.g.owner_secret());
+}
+
+// What an editor can do with a reset: replace the GroupInfo and keyring
+// with any it can seal and sign under the current link.
+
+/// A reset by `resetter` to `keyring` (plain, as `Keyring::export` writes
+/// it, and not necessarily one `Keyring` accepts) and a GroupInfo whose
+/// policy has its attestation keys and `owner_tag`.
+fn forged_reset(
+    resetter: &Client,
+    link: &LinkSecret,
+    plain: &[u8],
+    attest_pubs: Vec<PublicKey>,
+    owner_tag: [u8; KEY_LEN],
+) -> ResetPayload {
+    let policy = Policy {
+        attest_pubs,
+        owner_tag,
+    };
+    let (fresh, info, _) = ProjectGroup::start(
+        resetter.g.device().duplicate(),
+        link,
+        resetter.g.doc_keys().keyring().clone(),
+        policy,
+        group_id_of(&resetter.g.project_id(), resetter.g.incarnation() + 1),
+        b"mallory",
+        None,
+        (OwnerSecrets::default(), None),
+    )
+    .unwrap();
+    ResetPayload {
+        incarnation: u64::from(resetter.g.incarnation()),
+        group_id: fresh.group_id.clone(),
+        group_info: info,
+        keyring: Keyring::seal_signed_plain(link, plain),
+    }
+}
+
+/// A plain keyring of `(doc key, attestation key)` generations.
+fn plain_keyring(generations: &[([u8; KEY_LEN], PublicKey)]) -> Vec<u8> {
+    let mut plain = vec![crate::crypto::KEYRING_VERSION];
+    plain.extend_from_slice(&(generations.len() as u32).to_be_bytes());
+    for (key, attest_pub) in generations {
+        plain.extend_from_slice(key);
+        plain.extend_from_slice(attest_pub);
+    }
+    plain
+}
+
+/// The keyring's generations, read back from its export.
+fn generations_of(keyring: &Keyring) -> Vec<([u8; KEY_LEN], PublicKey)> {
+    keyring.export()[5..]
+        .chunks(2 * KEY_LEN)
+        .map(|g| {
+            (
+                g[..KEY_LEN].try_into().unwrap(),
+                g[KEY_LEN..].try_into().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_editor_cannot_reset_the_owner_out_of_rotating() {
+    // The newest generation repeated makes a keyring one generation ahead of
+    // every owner key secret, which would lock the owner out if the two had
+    // to match.
+    let (ds, [alice, bob, ..], link) = team();
+    let owner = alice.g.owner_person().unwrap();
+    let mut generations = generations_of(bob.g.doc_keys().keyring());
+    generations.push(*generations.last().unwrap());
+    let attest_pubs = generations.iter().map(|(_, a)| *a).collect();
+    let tag = bob.g.policy().unwrap().owner_tag;
+    let payload = forged_reset(&bob, &link, &plain_keyring(&generations), attest_pubs, tag);
+    let ds = ds.after_reset(&payload);
+    // Nobody takes it, whether they knew the project or not.
+    for previous in [Some(&alice.g), None] {
+        let joined = ProjectGroup::join_external_as(
+            alice.g.device().duplicate(),
+            &link,
+            ds.boot(),
+            b"alice",
+            None,
+            Some(owner),
+            previous,
+            &OwnerSecrets::default(),
+        );
+        assert!(
+            matches!(
+                joined,
+                Err(MlsError::Crypto(CryptoError::MalformedKeyring(_)))
+            ),
+            "{joined:?}"
+        );
+    }
+}
+
+#[test]
+fn a_reset_that_rewrites_the_keyring_is_refused_by_those_who_knew_it() {
+    let (ds, [laptop, _phone, alice, _bob], link, robert) = robert_owns();
+    let pinned = laptop.g.owner_person().unwrap();
+    // A history of alice's making that still ends in the link's own key,
+    // and the owner's tag recomputed under it so the pin still fits.
+    let generations = [
+        (random(), DeviceKey::generate().public()),
+        (random(), link.attest_pub()),
+    ];
+    let plain = plain_keyring(&generations);
+    let tag = Keyring::import(&plain).unwrap().owner_tag(&pinned);
+    let attest_pubs = generations.iter().map(|(_, a)| *a).collect();
+    let payload = forged_reset(&alice, &link, &plain, attest_pubs, tag);
+    let mut ds = ds.after_reset(&payload);
+    let identity = local(&robert.laptop, &robert.graph);
+    let rejoin = ProjectGroup::join_external_as(
+        laptop.g.device().duplicate(),
+        &link,
+        ds.boot(),
+        b"laptop",
+        Some(&identity),
+        Some(pinned),
+        Some(&laptop.g),
+        &OwnerSecrets::default(),
+    );
+    assert!(matches!(&rejoin, Err(MlsError::Rewritten)), "{rejoin:?}");
+
+    // A device that lost its state cannot tell. But the owner key is the
+    // server's, which the reset did not touch: brought along, it still
+    // signs, whatever generation the group claims to be at.
+    let (mut g, payload) = ProjectGroup::join_external_as(
+        laptop.g.device().duplicate(),
+        &link,
+        ds.boot(),
+        b"laptop",
+        Some(&identity),
+        Some(pinned),
+        None,
+        &held([laptop.g.owner_secret().cloned().unwrap()]),
+    )
+    .unwrap();
+    ds.submit(payload).unwrap();
+    g.confirm_pending().unwrap();
+    let mut laptop = Client { name: "laptop", g };
+    assert!(laptop.g.holds_owner_key());
+    let payload = laptop.g.reset_links().unwrap();
+    commit(&mut ds, &mut laptop, payload).unwrap();
+}
+
+#[test]
+fn a_reset_that_changes_the_owner_is_refused_by_those_who_knew_it() {
+    let (ds, [alice, bob, ..], link) = team();
+    let keyring = bob.g.doc_keys().keyring();
+    let mallory = person();
+    let generations = generations_of(keyring);
+    let attest_pubs = generations.iter().map(|(_, a)| *a).collect();
+    let tag = keyring.owner_tag(&mallory.graph.id());
+    let payload = forged_reset(&bob, &link, &plain_keyring(&generations), attest_pubs, tag);
+    let ds = ds.after_reset(&payload);
+    // No pin to go by, as on a device that never pinned, but the state it
+    // rejoins from knows the owner.
+    let rejoin = ProjectGroup::join_external_as(
+        alice.g.device().duplicate(),
+        &link,
+        ds.boot(),
+        b"alice",
+        None,
+        None,
+        Some(&alice.g),
+        &OwnerSecrets::default(),
+    );
+    assert!(
+        matches!(rejoin, Err(MlsError::OwnerChanged(_))),
+        "{rejoin:?}"
+    );
+}
+
+/// What the log holds at `epoch`.
+fn logged(ds: &Ds, epoch: u64) -> (u64, Vec<u8>, Option<Vec<u8>>) {
+    ds.log[epoch as usize].clone()
+}
+
+#[test]
+fn a_forged_owner_key_with_the_echo_of_a_rotation_costs_no_secret() {
+    let me = person();
+    let (mut ds, mut alice, _) = project_with("alice", &me);
+    // The server takes the rotation, but the reply is lost and the echo
+    // names a key of the server's making.
+    let payload = alice.g.reset_links().unwrap();
+    let epoch = payload.epoch;
+    ds.submit(payload).unwrap();
+    let real = ds.owner_key;
+    let forged = OwnerSecret::generate().public();
+    let (_, commit, envelope) = logged(&ds, epoch);
+    let outcome = alice
+        .g
+        .process_commit(epoch, &commit, envelope.as_deref(), Some(&forged))
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Rotated(_)));
+    // The key is the one the device signed for.
+    assert_eq!(alice.g.owner_key(), Some(real));
+    assert!(alice.g.holds_owner_key());
+
+    // A rejoin from a bootstrap that names the forged key still takes the
+    // real secret along, though it cannot use it.
+    let link = alice.g.link().clone();
+    let lying = Bootstrap {
+        owner_key: &forged,
+        ..ds.boot()
+    };
+    let (mut lied_to, join) = ProjectGroup::join_external_as(
+        alice.g.device().duplicate(),
+        &link,
+        lying,
+        b"alice",
+        Some(&me),
+        alice.g.owner_person(),
+        Some(&alice.g),
+        &OwnerSecrets::default(),
+    )
+    .unwrap();
+    assert!(!lied_to.holds_owner_key());
+    assert!(lied_to.owner_secrets().find(&real).is_some());
+    ds.submit(join).unwrap();
+    lied_to.confirm_pending().unwrap();
+    let saved = ProjectGroup::import_state(&lied_to.export_state()).unwrap();
+    assert!(saved.owner_secrets().find(&real).is_some());
+
+    // Once the server tells the truth again, the device rotates with it.
+    let (mut honest, join) = ProjectGroup::join_external_as(
+        saved.device().duplicate(),
+        &link,
+        ds.boot(),
+        b"alice",
+        Some(&me),
+        saved.owner_person(),
+        Some(&saved),
+        &OwnerSecrets::default(),
+    )
+    .unwrap();
+    ds.submit(join).unwrap();
+    honest.confirm_pending().unwrap();
+    assert!(honest.holds_owner_key());
+    let payload = honest.reset_links().unwrap();
+    assert_eq!(ds.submit_checked(payload), Ok(()));
+}
+
+#[test]
+fn a_stale_owner_key_named_by_the_server_does_not_replace_the_current_one() {
+    let (mut ds, [mut laptop, mut phone, mut alice, _], _, robert) = robert_owns();
+    let first = laptop.g.owner_secret().unwrap().clone();
+    let payload = laptop.g.self_update(b"laptop", None).unwrap();
+    commit(&mut ds, &mut laptop, payload);
+    phone.sync(&ds);
+    assert!(phone.g.holds_owner_key());
+
+    // The phone rotates. The laptop is not told where the key moved.
+    let payload = phone.g.reset_links().unwrap();
+    commit(&mut ds, &mut phone, payload).unwrap();
+    let second = phone.g.owner_secret().unwrap().clone();
+    let (epoch, commit_bytes, envelope) = logged(&ds, laptop.g.epoch());
+    laptop
+        .g
+        .process_commit(epoch, &commit_bytes, envelope.as_deref(), None)
+        .unwrap();
+    assert!(!laptop.g.holds_owner_key());
+    alice.sync(&ds);
+
+    // The laptop's leaf carries a share of the first key, which it holds
+    // for real, and the server names that key along with the commit.
+    let shares = forged_shares(&laptop, &first, &phone);
+    let at = ds.head();
+    let rotated = laptop.g.link().clone();
+    commit_shares(&mut ds, &mut laptop, &rotated, shares);
+    let (epoch, commit_bytes, envelope) = logged(&ds, at);
+    let outcome = phone
+        .g
+        .process_commit(
+            epoch,
+            &commit_bytes,
+            envelope.as_deref(),
+            Some(&first.public()),
+        )
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Advanced));
+    // A commit that rotates nothing moves no key on.
+    assert_eq!(phone.g.owner_secret(), Some(&second));
+    assert!(phone.g.holds_owner_key());
+
+    // Even a device that took the stale key for the current one, and opened
+    // its share, keeps the newer one beside it.
+    phone.g.owner_key = Some(first.public());
+    phone.g.absorb_owner_share();
+    assert_eq!(phone.g.owner_secret(), Some(&first));
+    let saved = ProjectGroup::import_state(&phone.g.export_state()).unwrap();
+    assert_eq!(saved.owner_secrets().find(&second.public()), Some(&second));
+    // A self-update seals only what it takes for the current key, and the
+    // real one is still there once the server says so again.
+    let payload = phone.g.self_update(b"phone", None).unwrap();
+    commit(&mut ds, &mut phone, payload);
+    assert_eq!(
+        shares_of(&alice, "phone").map(|s| s.owner_key),
+        Some(second.public())
+    );
+    alice.sync(&ds);
+    assert_eq!(
+        shares_of(&alice, "phone").map(|s| s.owner_key),
+        Some(first.public())
+    );
+    let (mut rejoined, join) = ProjectGroup::join_external_as(
+        phone.g.device().duplicate(),
+        &rotated,
+        ds.boot(),
+        b"phone",
+        Some(&local(&robert.phone, &robert.graph)),
+        phone.g.owner_person(),
+        Some(&phone.g),
+        &OwnerSecrets::default(),
+    )
+    .unwrap();
+    ds.submit(join).unwrap();
+    rejoined.confirm_pending().unwrap();
+    assert_eq!(rejoined.owner_secret(), Some(&second));
+    let payload = rejoined.reset_links().unwrap();
+    assert_eq!(ds.submit_checked(payload), Ok(()));
+}
+
+#[test]
+fn an_owner_key_sent_with_a_commit_that_rotates_nothing_is_ignored() {
+    let (mut ds, [mut alice, mut bob, ..], _) = team();
+    let real = alice.g.owner_key();
+    let forged = OwnerSecret::generate().public();
+
+    // Someone else's commit.
+    let payload = bob.g.self_update(b"bob", None).unwrap();
+    commit(&mut ds, &mut bob, payload);
+    let (epoch, commit_bytes, envelope) = logged(&ds, alice.g.epoch());
+    alice
+        .g
+        .process_commit(epoch, &commit_bytes, envelope.as_deref(), Some(&forged))
+        .unwrap();
+    assert_eq!(alice.g.owner_key(), real);
+    assert!(alice.g.holds_owner_key());
+
+    // The echo of this device's own.
+    let payload = alice.g.self_update(b"alice", None).unwrap();
+    let epoch = payload.epoch;
+    ds.submit(payload).unwrap();
+    let (_, commit_bytes, envelope) = logged(&ds, epoch);
+    alice
+        .g
+        .process_commit(epoch, &commit_bytes, envelope.as_deref(), Some(&forged))
+        .unwrap();
+    assert_eq!(alice.g.owner_key(), real);
+    assert!(alice.g.holds_owner_key());
+    let payload = alice.g.reset_links().unwrap();
+    assert_eq!(ds.submit_checked(payload), Ok(()));
 }

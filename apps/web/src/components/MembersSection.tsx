@@ -10,8 +10,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { errorKind } from "@/lib/errors";
 import { peopleOf, type RosterPerson } from "@/mls/members";
-import type { MlsSession } from "@/mls/session";
+import { NO_OWNER_KEY, type MlsSession } from "@/mls/session";
 import { useMlsSnapshot } from "@/mls/useMlsSnapshot";
 
 const NOT_OWNER = "Only the owner can remove members.";
@@ -25,12 +26,17 @@ type Pending =
  * owner may do. Both replace the links, so they are confirmed first.
  */
 export function MembersSection({ mls }: { mls: MlsSession | null }) {
-  const { phase, members, canCommit, stalled } = useMlsSnapshot(mls);
+  const { phase, members, canCommit, holdsOwnerKey, stalled } =
+    useMlsSnapshot(mls);
   const [pending, setPending] = useState<Pending>(null);
   const [busy, setBusy] = useState(false);
   const people = useMemo(() => peopleOf(members), [members]);
   // Only the owner removes members and resets links; editors just edit.
   const isOwner = canCommit && members.find((m) => m.isSelf)?.role === "owner";
+  // An owner device that was not handed the owner key yet sees the buttons,
+  // so it knows the owner can do this, but cannot use them: the server
+  // would refuse the rotation.
+  const waitingForKey = isOwner && !holdsOwnerKey;
 
   // Nothing to show for a project whose group cannot be reached; the links
   // above still work.
@@ -53,12 +59,15 @@ export function MembersSection({ mls }: { mls: MlsSession | null }) {
       }
     } catch (error) {
       console.error(error);
+      const known: Record<string, string> = {
+        NotOwner: NOT_OWNER,
+        NoOwnerKey: NO_OWNER_KEY,
+      };
       toast.error(
-        (error as { kind?: unknown } | null)?.kind === "NotOwner"
-          ? NOT_OWNER
-          : error instanceof Error
+        known[errorKind(error) ?? ""] ??
+          (error instanceof Error
             ? `Could not change the members: ${error.message}`
-            : "Could not change the members.",
+            : "Could not change the members."),
       );
     } finally {
       setBusy(false);
@@ -81,7 +90,7 @@ export function MembersSection({ mls }: { mls: MlsSession | null }) {
           <Button
             variant="ghost"
             size="sm"
-            disabled={busy}
+            disabled={busy || waitingForKey}
             onClick={() => setPending({ kind: "reset" })}
           >
             <RefreshCwIcon />
@@ -119,7 +128,7 @@ export function MembersSection({ mls }: { mls: MlsSession | null }) {
                     <Button
                       variant="ghost"
                       size="icon-sm"
-                      disabled={busy}
+                      disabled={busy || waitingForKey}
                       aria-label={`Remove ${nameOf(person)}`}
                       onClick={() => setPending({ kind: "remove", person })}
                     >
@@ -135,6 +144,9 @@ export function MembersSection({ mls }: { mls: MlsSession | null }) {
       )}
       {canCommit && !isOwner && members.length > 0 && (
         <p className="text-xs text-muted-foreground">{NOT_OWNER}</p>
+      )}
+      {waitingForKey && (
+        <p className="text-xs text-muted-foreground">{NO_OWNER_KEY}</p>
       )}
       {stalled && (
         <p role="status" className="text-xs text-muted-foreground">

@@ -3,6 +3,7 @@
 // with a new code, which is also what the protocol enforces.
 import {
   Pairing,
+  deviceFingerprint,
   fitGrantProjects,
   relayCloseReasons,
   type PairingCode,
@@ -30,9 +31,9 @@ export type PairFailure =
 export type PairState =
   | { status: "waitingForPeer" }
   | { status: "verifying" }
-  | { status: "awaitingApproval"; deviceName: string }
+  | { status: "awaitingApproval"; deviceName: string; fingerprint: string }
   /** The holder's user said yes and the grant is being built and sent. */
-  | { status: "approving"; deviceName: string }
+  | { status: "approving"; deviceName: string; fingerprint: string }
   | { status: "done"; projects: PairedProject[] }
   | { status: "rejected" }
   | { status: "failed"; reason: PairFailure; detail?: string };
@@ -114,6 +115,15 @@ export class PairSession {
     return this.current;
   }
 
+  /**
+   * The new device's own fingerprint, for the user to compare with what the
+   * holder shows. Null for a holder, which has nothing to prove.
+   */
+  get ownFingerprint(): string | null {
+    const { role } = this.opts;
+    return role.kind === "new" ? deviceFingerprint(role.devicePub) : null;
+  }
+
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -165,7 +175,11 @@ export class PairSession {
       return;
     // Set before the first await, so a second click or a reject that comes
     // while the grant is built finds the verdict already taken.
-    this.set({ status: "approving", deviceName: requester.name });
+    this.set({
+      status: "approving",
+      deviceName: requester.name,
+      fingerprint: deviceFingerprint(requester.pub),
+    });
     try {
       const grant = await this.holderRole().grant(requester);
       if (this.over) return;
@@ -229,6 +243,9 @@ export class PairSession {
           this.set({
             status: "awaitingApproval",
             deviceName: event.deviceName,
+            // The name is whatever the joining device chose to call itself;
+            // the key is what the user can check against that device.
+            fingerprint: deviceFingerprint(event.devicePub),
           });
           break;
         case "granted":

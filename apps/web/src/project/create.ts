@@ -69,6 +69,15 @@ export async function createLocalProject(
     identity.deviceSeed,
     identity.graph,
   );
+  // Kept before the server learns the public key: if the tab dies after the
+  // init lands, this is the only copy of the secret that can ever rotate.
+  await backend.saveMls(created.projectId, {
+    state: null,
+    device: null,
+    removed: false,
+    rotation: null,
+    ownerSecrets: group.ownerSecrets(),
+  });
   await createGroup(created.editToken, message, opts.ds);
 
   const doc = new LoroDoc();
@@ -82,6 +91,7 @@ export async function createLocalProject(
     removed: false,
     rotation: null,
     ownerPerson: group.ownerPerson(),
+    ownerSecrets: group.ownerSecrets(),
   });
   const store = new LocalDocStore(created.projectId, doc, backend);
   // Load first: the store only writes what changed after it loaded.

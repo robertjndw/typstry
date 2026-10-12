@@ -80,6 +80,11 @@ describe("DevicesDialog", () => {
             reason: "you can only view it",
           },
         },
+        {
+          projectId: "p3",
+          title: "Slides",
+          result: { status: "left-to-owner" },
+        },
       ]),
     );
     fireEvent.click(
@@ -95,8 +100,12 @@ describe("DevicesDialog", () => {
     await waitFor(() => expect(revoke).toHaveBeenCalledWith(phone));
     expect(await screen.findByText("Phone was revoked.")).toBeInTheDocument();
     expect(
-      screen.getByText("Removed from 1 of 2 projects."),
+      screen.getByText("Removed from 1 of 3 projects."),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Left for the owner to remove/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Slides")).toBeInTheDocument();
     expect(screen.getByText("Notes")).toBeInTheDocument();
     expect(screen.getByText(/you can only view it/)).toBeInTheDocument();
   });

@@ -56,6 +56,7 @@ function renderProject(
             epoch: 0,
             groupInfo: "",
             keyring: toBase64(keys.signed),
+            ownerKey: toBase64(new Uint8Array(32)),
           })
         : Response.json({ projectId, permission }, { status: 200 }),
     ),

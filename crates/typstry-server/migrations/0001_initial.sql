@@ -40,7 +40,11 @@ CREATE TABLE mls_groups (
     -- Describes `head_epoch`: every commit brings the GroupInfo of the epoch
     -- it creates.
     group_info        BLOB NOT NULL,
-    keyring           BLOB NOT NULL
+    keyring           BLOB NOT NULL,
+    -- The public Ed25519 owner key a rotation has to be signed with before
+    -- the tokens are swapped. Set by Init, replaced only by a rotation
+    -- signed with the key before it, never by a reset.
+    owner_key         BLOB NOT NULL CHECK (length(owner_key) = 32)
 ) STRICT;
 
 -- The commit that extended `epoch`. The primary key is what makes the first
@@ -51,6 +55,9 @@ CREATE TABLE mls_commits (
     epoch        INTEGER NOT NULL,
     data         BLOB NOT NULL,
     envelope     BLOB,
+    -- The owner key a rotation moved the group on to, NULL for any other
+    -- commit. Members learn the current owner key from it in log order.
+    owner_key    BLOB CHECK (owner_key IS NULL OR length(owner_key) = 32),
     created_at   INTEGER NOT NULL,
     PRIMARY KEY (project_id, incarnation, epoch)
 ) STRICT;

@@ -15,7 +15,7 @@ const GRAPH_VERSION: u8 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
     Valid,
-    /// An effective revoke targets it, for good.
+    /// A counting revoke targets it, for good.
     Revoked,
     /// Nothing in the graph counts it as a device of the person.
     Unknown,
@@ -48,7 +48,8 @@ impl PersonGraph {
     }
 
     /// Checks everything a replica must not take on trust: the caps, the
-    /// single genesis, every signature and the parent links.
+    /// single genesis, every signature, the parent links and that every
+    /// entry is authorized.
     fn from_entries(entries: BTreeMap<Hash, Entry>) -> Result<Self, GraphError> {
         let id = Self::genesis_of(&entries)?;
         for entry in entries.values() {
@@ -83,7 +84,8 @@ impl PersonGraph {
         Ok(*id)
     }
 
-    /// Checks the parent links and the byte cap.
+    /// Checks the parent links, that every entry is authorized and the byte
+    /// cap.
     fn with_validity(id: PersonId, entries: BTreeMap<Hash, Entry>) -> Result<Self, GraphError> {
         let validity = Validity::compute(&entries)?;
         let graph = Self {
@@ -142,6 +144,12 @@ impl PersonGraph {
         } else {
             DeviceState::Unknown
         }
+    }
+
+    /// Whether the genesis or a counting add introduced the device, whether
+    /// or not it was revoked since.
+    pub fn introduces(&self, device: &PublicKey) -> bool {
+        self.validity.introduced.contains(device)
     }
 
     /// Whether a counting add flagged the device as recovery. Such a device
@@ -217,8 +225,8 @@ impl PersonGraph {
     }
 
     /// Extends the graph on top of every current head. Only a device that
-    /// counts as valid may speak for the person; the entries of a revoked
-    /// one would be ignored anyway, and refusing is the clearer answer.
+    /// counts as valid may speak for the person: the entry of any other
+    /// would not be authorized, and no graph takes that in.
     pub fn append(&mut self, signer: &DeviceKey, kind: EntryKind) -> Result<Hash, GraphError> {
         if kind == EntryKind::Genesis {
             return Err(GraphError::Genesis);
@@ -230,8 +238,7 @@ impl PersonGraph {
             EntryKind::SetProfile { profile } if profile.len() > MAX_PROFILE_LEN => {
                 return Err(GraphError::TooLarge);
             }
-            // Its entries would be ignored, so refuse rather than spend a
-            // slot of the cap on nothing.
+            // Not authorized, see above.
             EntryKind::SetProfile { .. } if self.is_recovery(&signer.public()) => {
                 return Err(GraphError::NotValid);
             }
@@ -317,12 +324,13 @@ impl PersonGraph {
     }
 
     /// Adds an entry without any of the checks `append` makes, to build the
-    /// graphs a misbehaving device would.
+    /// graphs a misbehaving device would. On error nothing changes.
     #[cfg(test)]
-    fn push_unchecked(&mut self, entry: Entry) {
+    fn push_unchecked(&mut self, entry: Entry) -> Result<(), GraphError> {
         let mut entries = self.entries.clone();
         entries.insert(entry.hash(), entry);
-        *self = Self::from_entries(entries).unwrap();
+        *self = Self::from_entries(entries)?;
+        Ok(())
     }
 }
 
@@ -447,8 +455,227 @@ mod tests {
         assert!(by_a.valid_devices().is_empty());
     }
 
+    /// `p` made the person and added laptop `l`, recovery key `k` and `t`,
+    /// which is then stolen.
+    fn household() -> (DeviceKey, DeviceKey, DeviceKey, DeviceKey, PersonGraph) {
+        let (p, l, mut g) = pair();
+        let (k, t) = (DeviceKey::generate(), DeviceKey::generate());
+        g.append(&p, recovery(&k)).unwrap();
+        g.append(&p, add(&t)).unwrap();
+        (p, l, k, t, g)
+    }
+
+    /// Merged both ways, which must agree.
+    fn merged(a: &PersonGraph, b: &PersonGraph) -> PersonGraph {
+        let (mut ab, mut ba) = (a.clone(), b.clone());
+        ab.merge(b).unwrap();
+        ba.merge(a).unwrap();
+        assert_eq!(ab, ba);
+        ab
+    }
+
     #[test]
-    fn revoked_devices_later_entries_are_ignored() {
+    fn backdated_revokes_of_a_revoked_device_spare_third_parties() {
+        let (p, l, k, t, base) = household();
+        let mut owner = base.clone();
+        owner.append(&p, revoke(&t)).unwrap();
+        // Long after, the thief signs revokes on the head it last knew.
+        let mut thief = base;
+        for victim in [&p, &l, &k] {
+            thief.append(&t, revoke(victim)).unwrap();
+        }
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &t), DeviceState::Revoked);
+        // p and t revoked each other concurrently, so neither is trusted.
+        assert_eq!(state(&g, &p), DeviceState::Revoked);
+        assert_eq!(state(&g, &l), DeviceState::Valid);
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+
+        let fresh = DeviceKey::generate();
+        let out = crate::identity::recover(
+            std::slice::from_ref(&g),
+            &k,
+            &fresh.public(),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(state(&out.graph, &fresh), DeviceState::Valid);
+        assert_eq!(state(&out.graph, &t), DeviceState::Revoked);
+    }
+
+    #[test]
+    fn revokes_of_a_device_added_on_a_stale_head_do_not_count() {
+        let (p, l, k, t, base) = household();
+        let mut owner = base.clone();
+        owner.append(&p, revoke(&t)).unwrap();
+        // The thief brings in a device of its own that nobody revokes and
+        // has it sign the revokes instead.
+        let c = DeviceKey::generate();
+        let mut thief = base;
+        thief.append(&t, add(&c)).unwrap();
+        for victim in [&p, &l, &k] {
+            thief.append(&c, revoke(victim)).unwrap();
+        }
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &c), DeviceState::Unknown);
+        assert_eq!(state(&g, &t), DeviceState::Revoked);
+        // Through c, t and p revoked each other, a tie like a direct one.
+        assert_eq!(state(&g, &p), DeviceState::Revoked);
+        assert_eq!(state(&g, &l), DeviceState::Valid);
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+    }
+
+    #[test]
+    fn a_tie_through_a_new_device_reads_the_same_either_way_round() {
+        // The mirror of the case above, which the graph cannot tell from
+        // it: t revokes p while p adds c and c revokes t.
+        let (p, l, k, t, base) = household();
+        let c = DeviceKey::generate();
+        let mut one = base.clone();
+        one.append(&p, add(&c)).unwrap();
+        one.append(&c, revoke(&t)).unwrap();
+        let mut two = base;
+        two.append(&t, revoke(&p)).unwrap();
+        two.append(&t, revoke(&l)).unwrap();
+        two.append(&t, revoke(&k)).unwrap();
+        let g = merged(&one, &two);
+        assert_eq!(state(&g, &p), DeviceState::Revoked);
+        assert_eq!(state(&g, &t), DeviceState::Revoked);
+        assert_eq!(state(&g, &c), DeviceState::Unknown);
+        assert_eq!(state(&g, &l), DeviceState::Valid);
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+    }
+
+    #[test]
+    fn the_recovery_key_wins_a_mutual_revoke() {
+        let (p, _, k, t, base) = household();
+        let mut owner = base.clone();
+        owner.append(&k, revoke(&t)).unwrap();
+        let mut thief = base;
+        thief.append(&t, revoke(&k)).unwrap();
+        thief.append(&t, revoke(&p)).unwrap();
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+        assert_eq!(state(&g, &t), DeviceState::Revoked);
+        assert_eq!(state(&g, &p), DeviceState::Valid);
+    }
+
+    /// The owner recovers with `k`: a new device, and every other one
+    /// revoked.
+    fn recovered(
+        p: &DeviceKey,
+        l: &DeviceKey,
+        k: &DeviceKey,
+        t: &DeviceKey,
+        base: &PersonGraph,
+    ) -> (DeviceKey, PersonGraph) {
+        let n = DeviceKey::generate();
+        let mut owner = base.clone();
+        owner.append(k, add(&n)).unwrap();
+        for d in [p, l, t] {
+            owner.append(k, revoke(d)).unwrap();
+        }
+        (n, owner)
+    }
+
+    #[test]
+    fn a_recovery_device_the_thief_adds_on_a_stale_head_cannot_undo_a_recovery() {
+        let (p, l, k, t, base) = household();
+        let (n, owner) = recovered(&p, &l, &k, &t, &base);
+        let r = DeviceKey::generate();
+        let mut thief = base;
+        thief.append(&t, recovery(&r)).unwrap();
+        thief.append(&r, revoke(&k)).unwrap();
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+        assert_eq!(state(&g, &n), DeviceState::Valid);
+        for d in [&p, &l, &t] {
+            assert_eq!(state(&g, d), DeviceState::Revoked);
+        }
+        assert_eq!(state(&g, &r), DeviceState::Unknown);
+    }
+
+    #[test]
+    fn a_thief_flagging_itself_as_recovery_cannot_undo_a_recovery() {
+        let (p, l, k, t, base) = household();
+        let (n, owner) = recovered(&p, &l, &k, &t, &base);
+        let mut thief = base;
+        thief.append(&t, recovery(&t)).unwrap();
+        thief.append(&t, revoke(&k)).unwrap();
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+        assert_eq!(state(&g, &n), DeviceState::Valid);
+        for d in [&p, &l, &t] {
+            assert_eq!(state(&g, d), DeviceState::Revoked);
+        }
+    }
+
+    #[test]
+    fn a_device_older_than_the_recovery_key_can_only_tie_with_it() {
+        // t joined before k was made a recovery key, so t can sign on a head
+        // that does not know k is one, where k's revoke is no better than
+        // its own. Revoking k's introducer there would tie anyway.
+        let (p, l, mut base) = pair();
+        let (t, k) = (DeviceKey::generate(), DeviceKey::generate());
+        base.append(&p, add(&t)).unwrap();
+        let stale = base.clone();
+        base.append(&p, recovery(&k)).unwrap();
+        let (n, owner) = recovered(&p, &l, &k, &t, &base);
+        let mut thief = stale;
+        thief.append(&t, revoke(&k)).unwrap();
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &k), DeviceState::Revoked);
+        assert_eq!(state(&g, &t), DeviceState::Revoked);
+        assert_eq!(state(&g, &n), DeviceState::Unknown);
+        assert_eq!(state(&g, &p), DeviceState::Valid);
+        assert_eq!(state(&g, &l), DeviceState::Valid);
+    }
+
+    #[test]
+    fn the_recovery_key_settles_a_tie_between_ordinary_devices() {
+        let (p, _, k, t, base) = household();
+        let mut owner = base.clone();
+        owner.append(&p, revoke(&t)).unwrap();
+        let mut thief = base;
+        thief.append(&t, revoke(&p)).unwrap();
+        let mut g = merged(&owner, &thief);
+        assert_eq!(state(&g, &p), DeviceState::Revoked);
+        // A revoke the recovery key has already seen is final.
+        g.append(&k, revoke(&t)).unwrap();
+        assert_eq!(state(&g, &p), DeviceState::Revoked);
+
+        // One it has not seen loses to the key's revoke of its author.
+        let (p, _, k, t, base) = household();
+        let mut owner = base.clone();
+        owner.append(&p, revoke(&t)).unwrap();
+        owner.append(&k, revoke(&t)).unwrap();
+        let mut thief = base;
+        thief.append(&t, revoke(&p)).unwrap();
+        let g = merged(&owner, &thief);
+        assert_eq!(state(&g, &t), DeviceState::Revoked);
+        assert_eq!(state(&g, &p), DeviceState::Valid);
+    }
+
+    #[test]
+    fn a_ring_of_concurrent_revokes_revokes_everyone_in_it() {
+        let (p, l, k, t, base) = household();
+        let mut one = base.clone();
+        one.append(&p, revoke(&l)).unwrap();
+        let mut two = base.clone();
+        two.append(&l, revoke(&t)).unwrap();
+        let mut three = base;
+        three.append(&t, revoke(&p)).unwrap();
+        let g = merged(&merged(&one, &two), &three);
+        assert_eq!(merged(&merged(&three, &one), &two), g);
+        for d in [&p, &l, &t] {
+            assert_eq!(state(&g, d), DeviceState::Revoked);
+        }
+        assert_eq!(state(&g, &k), DeviceState::Valid);
+    }
+
+    #[test]
+    fn revoked_devices_later_entries_are_ignored_or_refused() {
         let (a, b, mut g) = pair();
         let (c, d) = (DeviceKey::generate(), DeviceKey::generate());
         // An add written on a stale head, unaware of the revoke.
@@ -458,12 +685,19 @@ mod tests {
         g.merge(&stale).unwrap();
         assert_eq!(state(&g, &c), DeviceState::Unknown);
 
-        // An add that does build on the revoke, which `append` would refuse.
-        g.push_unchecked(Entry::sign(&b, g.heads(), add(&d)));
+        // An add that does build on the revoke, which `append` would refuse,
+        // is not part of any graph.
+        assert_eq!(
+            g.push_unchecked(Entry::sign(&b, g.heads(), add(&d))),
+            Err(GraphError::Unauthorized)
+        );
         assert_eq!(state(&g, &d), DeviceState::Unknown);
         assert_eq!(g.append(&b, add(&d)), Err(GraphError::NotValid));
-        // A revoke from it does nothing either.
-        g.push_unchecked(Entry::sign(&b, g.heads(), revoke(&a)));
+        // Nor is a revoke from it.
+        assert_eq!(
+            g.push_unchecked(Entry::sign(&b, g.heads(), revoke(&a))),
+            Err(GraphError::Unauthorized)
+        );
         assert_eq!(state(&g, &a), DeviceState::Valid);
     }
 
@@ -623,6 +857,41 @@ mod tests {
             PersonGraph::from_entries(entries),
             Err(GraphError::BadSignature)
         );
+    }
+
+    #[test]
+    fn decode_refuses_an_entry_by_a_device_the_graph_does_not_know() {
+        let (_, _, g) = pair();
+        let stranger = DeviceKey::generate();
+        let junk = Entry::sign(&stranger, g.heads(), add(&DeviceKey::generate()));
+        let mut entries = g.entries.clone();
+        entries.insert(junk.hash(), junk);
+        assert_eq!(
+            PersonGraph::from_entries(entries.clone()),
+            Err(GraphError::Unauthorized)
+        );
+        let mut w = BytesWriter::new();
+        w.push_byte(GRAPH_VERSION);
+        w.push_uleb128(entries.len() as u64);
+        for e in entries.values() {
+            w.push_bytes(&e.encode());
+        }
+        assert_eq!(
+            PersonGraph::decode(&w.finalize()),
+            Err(GraphError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn an_entry_on_a_head_before_its_authors_revoke_still_decodes() {
+        let (a, b, g) = pair();
+        let mut stale = g.clone();
+        stale.append(&b, add(&DeviceKey::generate())).unwrap();
+        stale.append(&b, revoke(&a)).unwrap();
+        let mut owner = g;
+        owner.append(&a, revoke(&b)).unwrap();
+        owner.merge(&stale).unwrap();
+        assert_eq!(PersonGraph::decode(&owner.encode()).unwrap(), owner);
     }
 
     #[test]
@@ -832,7 +1101,10 @@ mod tests {
         g.append(&a, profile("real")).unwrap();
 
         let stranger = DeviceKey::generate();
-        g.push_unchecked(Entry::sign(&stranger, g.heads(), profile("stranger")));
+        assert_eq!(
+            g.push_unchecked(Entry::sign(&stranger, g.heads(), profile("stranger"))),
+            Err(GraphError::Unauthorized)
+        );
         assert_eq!(g.profile(), Some(&b"real"[..]));
         assert_eq!(g.append(&stranger, profile("x")), Err(GraphError::NotValid));
 
@@ -844,7 +1116,10 @@ mod tests {
         assert_eq!(g.profile(), Some(&b"real"[..]));
 
         // Written on top of the revoke, which `append` would refuse.
-        g.push_unchecked(Entry::sign(&b, g.heads(), profile("later thief")));
+        assert_eq!(
+            g.push_unchecked(Entry::sign(&b, g.heads(), profile("later thief"))),
+            Err(GraphError::Unauthorized)
+        );
         assert_eq!(g.profile(), Some(&b"real"[..]));
     }
 
@@ -879,7 +1154,10 @@ mod tests {
         g.append(&a, recovery(&r)).unwrap();
         g.append(&a, profile("mine")).unwrap();
         assert_eq!(g.append(&r, profile("hers")), Err(GraphError::NotValid));
-        g.push_unchecked(Entry::sign(&r, g.heads(), profile("hers")));
+        assert_eq!(
+            g.push_unchecked(Entry::sign(&r, g.heads(), profile("hers"))),
+            Err(GraphError::Unauthorized)
+        );
         assert_eq!(g.profile(), Some(&b"mine"[..]));
     }
 

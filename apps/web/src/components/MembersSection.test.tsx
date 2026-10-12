@@ -5,12 +5,15 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { toast } from "sonner";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { RosterMember } from "@/mls/members";
-import type { MlsSession, MlsSnapshot } from "@/mls/session";
+import { NO_OWNER_KEY, type MlsSession, type MlsSnapshot } from "@/mls/session";
 
 import { MembersSection } from "./MembersSection";
+
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 function member(
   leaf: number,
@@ -39,6 +42,7 @@ function fakeSession(snapshot: Partial<MlsSnapshot>) {
     phase: "active",
     members: [],
     canCommit: false,
+    holdsOwnerKey: true,
     stalled: false,
     error: null,
     ...snapshot,
@@ -198,6 +202,35 @@ describe("MembersSection", () => {
       within(dialog).getByRole("button", { name: "Reset links" }),
     );
     await waitFor(() => expect(session.resetLinks).toHaveBeenCalled());
+  });
+
+  it("tells an owner device without the owner key where to get it", () => {
+    renderSection(
+      fakeSession({ members: roster, canCommit: true, holdsOwnerKey: false }),
+    );
+    expect(screen.getByRole("button", { name: "Remove Carol" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reset links" })).toBeDisabled();
+    expect(
+      screen.getByText(/does not have the project's owner key yet/),
+    ).toBeInTheDocument();
+  });
+
+  it("explains a removal refused for want of the owner key", async () => {
+    const session = fakeSession({ members: roster, canCommit: true });
+    session.resetLinks.mockRejectedValueOnce(
+      Object.assign(new Error("no owner key"), { kind: "NoOwnerKey" }),
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    renderSection(session);
+    fireEvent.click(screen.getByRole("button", { name: "Reset links" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Reset the links?",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Reset links" }),
+    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(NO_OWNER_KEY));
+    error.mockRestore();
   });
 
   it("stays out of the way when the group is not reachable", () => {

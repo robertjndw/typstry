@@ -28,6 +28,7 @@ zeroize = { workspace = true, optional = true }
 # The end-to-end encryption clients do. The server never holds a key, so it
 # leaves this off and does not even link the cipher.
 crypto = [
+    "owner-proof",
     "dep:aes-gcm",
     "dep:base64",
     "dep:ed25519-dalek",
@@ -36,6 +37,9 @@ crypto = [
     "dep:thiserror",
     "dep:zeroize",
 ]
+# Checking that a rotation is signed with a project's owner key, which is all
+# of the owner key the server needs. It verifies and never holds a secret.
+owner-proof = ["dep:ed25519-dalek", "dep:sha2"]
 # MLS group membership on top of the encryption. Clients only, like `crypto`.
 mls = [
     "crypto",

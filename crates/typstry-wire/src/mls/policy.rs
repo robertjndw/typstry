@@ -15,10 +15,10 @@
 //! - a commit by the owner that removes members together with a rotation
 //!   (policy generation plus one, same owner tag), or only rotates. Nobody
 //!   else can remove anyone or rotate, which also means an owner cannot be
-//!   removed by anyone but an owner. The one exception is an editor that
-//!   removes leaves of its own person with a rotation, when each of them is
-//!   a device that person's merged graph shows as revoked and the editor's
-//!   own device is still valid in it.
+//!   removed by anyone but an owner. Not even an editor's own revoked
+//!   devices: a rotation has to be signed with the owner key for the server
+//!   to swap the tokens (see [`crate::owner`]), which an editor does not
+//!   hold, so the owner's devices remove every revoked device they see.
 //! - a commit by an editor or owner that only refreshes its own leaf. Its
 //!   leaf keeps the device and person its identity names and may only extend
 //!   the person graph, and the graph has to merge with what the tree's other
@@ -30,7 +30,7 @@
 //! any commit from a viewer, and any other proposal.
 
 use super::extensions::Policy;
-use crate::identity::{LeafIdentity, PersonId};
+use crate::identity::LeafIdentity;
 
 /// What a leaf's extensions make its holder, judged against the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,9 @@ pub struct LeafFacts {
     pub role: LeafRole,
     pub identity: Option<IdentityFacts>,
     /// Whether the leaf's person graph merges with the other graphs of that
-    /// person in the tree. `true` for a leaf without an identity that opens.
+    /// person in the tree. `true` for a leaf without an identity that opens
+    /// and for one whose graph does not vouch for the leaf, as the tree never
+    /// takes such a graph in.
     pub mergeable: bool,
 }
 
@@ -77,10 +79,6 @@ pub struct LeafFacts {
 pub struct Removal {
     pub leaf: u32,
     pub signer: Vec<u8>,
-    /// The person whose revoked device the leaf is, in the merged graphs
-    /// with the commit's new leaf: `None` when it is no verified device or
-    /// not revoked.
-    pub revoked_person: Option<PersonId>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,10 +88,6 @@ pub struct CommitFacts<'a> {
     pub sender_signer: Option<Vec<u8>>,
     /// The sender's identity before the commit, for members.
     pub sender_identity: Option<IdentityFacts>,
-    /// The person the sender is a valid, not revoked device of, in the
-    /// merged graphs with the commit's new leaf. The new leaf is included so
-    /// that a commit may carry the revoke that justifies its removals.
-    pub sender_person: Option<PersonId>,
     pub before: &'a Policy,
     /// The policy in the commit's GroupContext, `None` when it is missing or
     /// unreadable.
@@ -178,24 +172,6 @@ fn identity_kept(old: Option<&IdentityFacts>, new: Option<&IdentityFacts>) -> bo
     }
 }
 
-/// The editor exception: a rotation that removes leaves, every one of which
-/// is a revoked device of the sender's own person, while the sender's device
-/// is itself still valid. Nothing is removed that the person has not
-/// disowned, and a commit that only rotates stays the owner's.
-fn removes_only_own_revoked(facts: &CommitFacts<'_>) -> bool {
-    let Some(person) = facts.sender_person else {
-        return false;
-    };
-    facts
-        .after
-        .is_some_and(|after| is_rotation(facts.before, after))
-        && !facts.removals.is_empty()
-        && facts
-            .removals
-            .iter()
-            .all(|r| r.revoked_person == Some(person))
-}
-
 /// Checks a staged commit against the policy. `Ok(true)` means it rotates
 /// the keys.
 pub fn check(facts: &CommitFacts<'_>) -> Result<bool, Violation> {
@@ -208,7 +184,6 @@ pub fn check(facts: &CommitFacts<'_>) -> Result<bool, Violation> {
         ..
     } = &facts.sender
         && (rotates || !facts.removals.is_empty())
-        && !removes_only_own_revoked(facts)
     {
         return Err(Violation::NotOwner);
     }
@@ -311,7 +286,6 @@ mod tests {
             sender,
             sender_signer: Some(vec![9]),
             sender_identity: None,
-            sender_person: None,
             before,
             after: Some(after),
             adds: 0,
@@ -328,7 +302,6 @@ mod tests {
         Removal {
             leaf,
             signer: vec![signer],
-            revoked_person: None,
         }
     }
 
@@ -659,70 +632,21 @@ mod tests {
         assert_eq!(check(&f), Err(Violation::BadPolicyChange));
     }
 
-    /// An editor that revokes and removes its own device.
-    fn own_revocation(p: &Policy, next: &Policy) -> CommitFacts<'static> {
-        // The facts borrow their policies, so leak the two for the test.
-        let (p, next) = (
-            Box::leak(Box::new(p.clone())),
-            Box::leak(Box::new(next.clone())),
-        );
-        let mut f = facts(editor(), p, next);
-        f.sender_person = Some([4; 32]);
-        f.removals = vec![Removal {
-            revoked_person: Some([4; 32]),
-            ..removal(2, 7)
-        }];
+    #[test]
+    fn an_editor_cannot_remove_even_its_own_revoked_devices() {
+        // Removing leaves of its own person that it revoked, with a rotation.
+        // The facts do not say whose a removed leaf is, so this is refused
+        // like any other removal by an editor.
+        let (p, next) = (policy(1), policy(2));
+        let mut f = facts(editor(), &p, &next);
+        f.removals = vec![removal(2, 7), removal(3, 8)];
         f.group_context_proposals = 1;
         f.path_leaf = Some(leaf(9, LeafRole::Editor));
-        f
-    }
-
-    #[test]
-    fn an_editor_removes_its_own_revoked_devices_with_a_rotation() {
-        let (p, next) = (policy(1), policy(2));
-        let f = own_revocation(&p, &next);
-        assert_eq!(check(&f), Ok(true));
-
-        let mut two = own_revocation(&p, &next);
-        two.removals.push(Removal {
-            revoked_person: Some([4; 32]),
-            ..removal(3, 8)
-        });
-        assert_eq!(check(&two), Ok(true));
-
-        // One leaf that is not revoked, or is another person's, spoils it.
-        for other in [None, Some([5; 32])] {
-            let mut f = own_revocation(&p, &next);
-            f.removals.push(Removal {
-                revoked_person: other,
-                ..removal(3, 8)
-            });
-            assert_eq!(check(&f), Err(Violation::NotOwner));
-        }
-        let mut f = own_revocation(&p, &next);
-        f.removals[0].revoked_person = None;
         assert_eq!(check(&f), Err(Violation::NotOwner));
-
-        // The sender has to be a valid device itself.
-        let mut f = own_revocation(&p, &next);
-        f.sender_person = None;
-        assert_eq!(check(&f), Err(Violation::NotOwner));
-        let mut f = own_revocation(&p, &next);
-        f.sender_person = Some([5; 32]);
-        assert_eq!(check(&f), Err(Violation::NotOwner));
-
-        // No rotation, or a rotation that is none, or nothing removed.
-        let mut f = own_revocation(&p, &p);
-        f.group_context_proposals = 0;
-        assert_eq!(check(&f), Err(Violation::NotOwner));
-        let bad = Policy {
-            owner_tag: [1; 32],
-            ..next.clone()
-        };
-        let f = own_revocation(&p, &bad);
-        assert_eq!(check(&f), Err(Violation::NotOwner));
-        let mut f = own_revocation(&p, &next);
-        f.removals.clear();
+        // Nor without the rotation, which an owner could not do either.
+        let mut f = facts(editor(), &p, &p);
+        f.removals = vec![removal(2, 7)];
+        f.path_leaf = Some(leaf(9, LeafRole::Editor));
         assert_eq!(check(&f), Err(Violation::NotOwner));
     }
 

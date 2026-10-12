@@ -14,8 +14,10 @@
 //!   member it is for, never whether the commit is valid.
 //!
 //! Both parts are bound to the commit by its digest, so an envelope cannot
-//! be moved onto another commit. Ownership needs nothing here: it follows
-//! the owner's person, not a key that has to be handed on.
+//! be moved onto another commit. The owner role needs nothing here, as it
+//! follows the owner's person. The next owner key, which the server checks
+//! rotations against, travels in the committer's new leaf instead (see
+//! [`super::owner_share`]), where it outlives the commit log.
 
 use loro_protocol::{BytesReader, BytesWriter};
 use openmls_traits::crypto::OpenMlsCrypto;

@@ -27,6 +27,7 @@ use typstry_server::store::projects::Permission as Access;
 use typstry_server::ws::ConnLimits;
 use typstry_wire::ds::{ClientMessage, DS_PATH, Permission, RefusalCode, Rotate, ServerMessage};
 use typstry_wire::elo::{encode_container, encode_delta_header, encode_record};
+use typstry_wire::owner::{OwnerKey, OwnerSecret, RotationClaim};
 
 mod common;
 
@@ -125,6 +126,15 @@ struct Doc {
 }
 
 impl Doc {
+    /// Fails if the server closes the socket within a moment.
+    async fn assert_open(&mut self) {
+        match tokio::time::timeout(Duration::from_millis(200), self.ws.next()).await {
+            Err(_) => {}
+            Ok(Some(Ok(Message::Close(frame)))) => panic!("closed: {frame:?}"),
+            Ok(other) => panic!("unexpected socket event {other:?}"),
+        }
+    }
+
     /// The close code and reason of the next close frame.
     async fn closed(&mut self) -> (u16, String) {
         loop {
@@ -269,28 +279,96 @@ fn submit(req: u64, epoch: u64, commit: Vec<u8>) -> ClientMessage {
     }
 }
 
+/// A fixed owner key per `n`, so a test can name the keys of a chain.
+fn owner(n: u8) -> OwnerSecret {
+    OwnerSecret::import(&[&[1][..], &[n; 32]].concat()).unwrap()
+}
+
 fn init(req: u64) -> ClientMessage {
     ClientMessage::Init {
         req,
         group_id: GROUP.to_vec(),
         group_info: b"gi-0".to_vec(),
         keyring: b"keyring-0".to_vec(),
+        owner_key: owner(1).public(),
     }
 }
 
+/// A rotation from the group's first owner key to the second, as the owner
+/// sends it.
 fn rotation(req: u64, epoch: u64, edit: &str, view: &str) -> ClientMessage {
-    ClientMessage::Submit {
+    signed_rotation(
+        req,
+        GROUP,
+        epoch,
+        (edit, view),
+        &owner(1),
+        &owner(2).public(),
+    )
+}
+
+fn signed_rotation(
+    req: u64,
+    group: &[u8],
+    epoch: u64,
+    (edit, view): (&str, &str),
+    by: &OwnerSecret,
+    next: &OwnerKey,
+) -> ClientMessage {
+    let mut msg = ClientMessage::Submit {
         req,
         epoch,
-        commit: private_commit(GROUP, epoch),
+        commit: private_commit(group, epoch),
         group_info: b"gi-rotated".to_vec(),
         keyring: Some(b"keyring-rotated".to_vec()),
         envelope: Some(b"envelope".to_vec()),
         rotate: Some(Rotate {
             edit_token: edit.to_owned(),
             view_token: view.to_owned(),
+            next_owner_key: *next,
+            owner_proof: [0; 64],
         }),
-    }
+    };
+    sign(&mut msg, group, by, |_| {});
+    msg
+}
+
+/// Signs a rotation with `by`, over its claim as `tweak` leaves it, so a
+/// test can sign something other than what it sends.
+fn sign(
+    msg: &mut ClientMessage,
+    group: &[u8],
+    by: &OwnerSecret,
+    tweak: impl for<'c> FnOnce(&mut RotationClaim<'c>),
+) {
+    let ClientMessage::Submit {
+        epoch,
+        commit,
+        group_info,
+        keyring,
+        envelope,
+        rotate: Some(rotate),
+        ..
+    } = msg
+    else {
+        panic!("not a rotation");
+    };
+    let proof = {
+        let mut claim = RotationClaim {
+            group_id: group,
+            epoch: *epoch,
+            commit,
+            group_info,
+            keyring: keyring.as_deref().unwrap_or_default(),
+            envelope: envelope.as_deref().unwrap_or_default(),
+            edit_token: &rotate.edit_token,
+            view_token: &rotate.view_token,
+            next_owner_key: &rotate.next_owner_key,
+        };
+        tweak(&mut claim);
+        by.sign(&claim)
+    };
+    rotate.owner_proof = proof;
 }
 
 fn accepted(req: u64) -> ServerMessage {
@@ -331,11 +409,30 @@ async fn a_group_is_created_once() {
     );
 
     let mut editor = server.session(&project.edit).await;
+    // Weak owner keys, which some signatures pass for any message.
+    let mut identity = [0; 32];
+    identity[0] = 1;
+    for (req, key) in [(6, identity), (7, [0; 32])] {
+        let mut msg = init(req);
+        if let ClientMessage::Init { owner_key, .. } = &mut msg {
+            *owner_key = key;
+        }
+        assert_eq!(
+            editor.request(msg).await.0,
+            refused(req, RefusalCode::Malformed),
+            "{key:?}"
+        );
+    }
     assert_eq!(editor.request(init(1)).await.0, accepted(1));
     assert_eq!(
         editor.request(init(2)).await.0,
         refused(2, RefusalCode::GroupExists)
     );
+    let group = mls::load_group(&server.state.db, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.owner_key, owner(1).public());
 
     let (status, body) = server.get(&bootstrap).await;
     assert_eq!(status, StatusCode::OK);
@@ -350,6 +447,11 @@ async fn a_group_is_created_once() {
     assert_eq!(
         STANDARD.decode(body["keyring"].as_str().unwrap()).unwrap(),
         b"keyring-0"
+    );
+    // The owner key from Init, which tells a joiner the current secret.
+    assert_eq!(
+        STANDARD.decode(body["ownerKey"].as_str().unwrap()).unwrap(),
+        owner(1).public()
     );
     // View links bootstrap too, and unknown ones do not.
     let (status, _) = server.get(&format!("/api/p/{}/mls", project.view)).await;
@@ -393,6 +495,7 @@ async fn the_first_commit_per_epoch_wins() {
         epoch: 0,
         commit: winner_commit,
         envelope: None,
+        owner_key: None,
     };
     let (mut loser, seen) = if outcomes[0].0 == accepted(10) {
         (b, seen_b)
@@ -489,6 +592,8 @@ async fn view_tokens_may_only_join_with_external_commits() {
                 *rotate = Some(Rotate {
                     edit_token: "a".repeat(22),
                     view_token: "b".repeat(22),
+                    next_owner_key: owner(2).public(),
+                    owner_proof: [0; 64],
                 })
             }
         }
@@ -514,7 +619,8 @@ async fn view_tokens_may_only_join_with_external_commits() {
         ServerMessage::Commit {
             epoch: 0,
             commit: external,
-            envelope: None
+            envelope: None,
+            owner_key: None,
         }
     );
     let (_, body) = server.get(&format!("/api/p/{}/mls", project.view)).await;
@@ -550,10 +656,12 @@ async fn rotation_swaps_the_links_and_retires_the_old_ones() {
     assert_eq!(presence.closed().await, (4401, "link_rotated".to_owned()));
 
     // Delivery sessions are told with the commit and the new status.
+    // The commit carries the owner key the rotation moved the server on to.
     let commit = ServerMessage::Commit {
         epoch: 0,
         commit: private_commit(GROUP, 0),
         envelope: Some(b"envelope".to_vec()),
+        owner_key: Some(owner(2).public()),
     };
     let retired = ServerMessage::Ready {
         incarnation: 0,
@@ -591,6 +699,10 @@ async fn rotation_swaps_the_links_and_retires_the_old_ones() {
     assert_eq!(
         STANDARD.decode(body["keyring"].as_str().unwrap()).unwrap(),
         b"keyring-rotated"
+    );
+    assert_eq!(
+        STANDARD.decode(body["ownerKey"].as_str().unwrap()).unwrap(),
+        owner(2).public()
     );
 
     let (status, share) = server.get(&format!("/api/share/{}", project.edit)).await;
@@ -705,6 +817,7 @@ async fn joiners_catch_up_from_the_epoch_they_are_at() {
         epoch: epoch as u64,
         commit: commits[epoch].clone(),
         envelope: None,
+        owner_key: None,
     };
 
     let mut late = server.ds().await;
@@ -888,6 +1001,8 @@ async fn keyring_and_envelope_only_come_with_a_rotation() {
     let rotate = || Rotate {
         edit_token: common_token('E'),
         view_token: common_token('V'),
+        next_owner_key: owner(2).public(),
+        owner_proof: [0; 64],
     };
     let blob = || Some(b"x".to_vec());
     type Parts = (Option<Rotate>, Option<Vec<u8>>, Option<Vec<u8>>);
@@ -950,15 +1065,18 @@ async fn retired_sessions_read_the_log_only_up_to_their_rotation() {
     );
 
     let commit = |epoch: u64| match epoch {
+        // A rotation's owner key comes back with it from the log too.
         0 => ServerMessage::Commit {
             epoch,
             commit: private_commit(GROUP, 0),
             envelope: Some(b"envelope".to_vec()),
+            owner_key: Some(owner(2).public()),
         },
         _ => ServerMessage::Commit {
             epoch,
             commit: public_commit(GROUP, epoch, From::Member),
             envelope: None,
+            owner_key: None,
         },
     };
     // Already connected: nothing live, and a fetch stops at the rotation.
@@ -1035,6 +1153,7 @@ async fn group_ids_must_name_the_expected_incarnation() {
         group_id: group_id.to_vec(),
         group_info: b"gi".to_vec(),
         keyring: b"k".to_vec(),
+        owner_key: owner(1).public(),
     };
     for (req, id) in [
         (1, b"project-0".as_slice()),
@@ -1252,4 +1371,231 @@ async fn doc_updates_from_connections_that_are_not_peers_are_dropped() {
     let (joined, _outbox4, _rx4) = join_room(&room, 904, &new_edit).await;
     assert!(joined);
     assert_eq!(stored().await.unwrap(), 1);
+}
+
+/// What a refused rotation must leave alone: the head, the log, the owner
+/// key and the tokens.
+async fn assert_untouched(server: &Server, project: &common::Created) {
+    let group = mls::load_group(&server.state.db, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.head_epoch, 0);
+    assert_eq!(group.group_info, b"gi-0");
+    assert_eq!(group.keyring, b"keyring-0");
+    assert_eq!(group.owner_key, owner(1).public());
+    assert!(
+        mls::commits_since(&server.state.db, &project.id, 0, 0, u64::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM retired_tokens")
+        .fetch_one(&server.state.db)
+        .await
+        .unwrap();
+    assert_eq!(retired, 0);
+    let (_, share) = server.get(&format!("/api/share/{}", project.edit)).await;
+    assert_eq!(share["viewToken"], project.view);
+}
+
+#[tokio::test]
+async fn an_editor_without_the_owner_key_cannot_swap_the_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let (project, mut owner_ds) = inited(&server).await;
+    let mut editor = server.session(&project.edit).await;
+    let (mut doc, _) = server.doc(CrdtType::Elo, &project.id, &project.edit).await;
+    let (mut presence, _) = server
+        .doc(CrdtType::LoroEphemeralStore, &project.id, &project.view)
+        .await;
+
+    let (edit, view) = (common_token('E'), common_token('V'));
+    // Unsigned, and signed with a key of the editor's own making.
+    let mut unsigned = rotation(1, 0, &edit, &view);
+    if let ClientMessage::Submit {
+        rotate: Some(r), ..
+    } = &mut unsigned
+    {
+        r.owner_proof = [0; 64];
+    }
+    let own_key = signed_rotation(2, GROUP, 0, (&edit, &view), &owner(9), &owner(2).public());
+    for (req, msg) in [(1, unsigned), (2, own_key)] {
+        let (reply, others) = editor.request(msg).await;
+        assert_eq!(reply, refused(req, RefusalCode::NotOwner));
+        assert!(others.is_empty());
+    }
+    assert_untouched(&server, &project).await;
+    // Nobody was told of a commit or a rotation, and nobody was cut off.
+    owner_ds.assert_quiet().await;
+    doc.assert_open().await;
+    presence.assert_open().await;
+
+    // The epoch is still open, for the owner as for anyone.
+    let (reply, _) = owner_ds.request(rotation(3, 0, &edit, &view)).await;
+    assert_eq!(reply, accepted(3));
+    assert_eq!(doc.closed().await, (4401, "link_rotated".to_owned()));
+}
+
+#[tokio::test]
+async fn an_owner_proof_holds_for_exactly_the_rotation_it_signs() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let (project, mut ds) = inited(&server).await;
+    let (edit, view) = (common_token('E'), common_token('V'));
+    let other_key = owner(3).public();
+    type Tweak = Box<dyn for<'c> Fn(&mut RotationClaim<'c>)>;
+    let tweaks: Vec<Tweak> = vec![
+        Box::new(|c| c.group_id = GROUP_1),
+        Box::new(|c| c.epoch = 1),
+        Box::new(|c| c.commit = b"another commit"),
+        Box::new(|c| c.group_info = b"other gi"),
+        Box::new(|c| c.keyring = b"other keyring"),
+        Box::new(|c| c.envelope = b"other envelope"),
+        Box::new(|c| c.edit_token = "someone-elses-edit-tok"),
+        Box::new(|c| c.view_token = "someone-elses-view-tok"),
+        Box::new(move |c| c.next_owner_key = Box::leak(Box::new(other_key))),
+    ];
+    for (i, tweak) in tweaks.into_iter().enumerate() {
+        let req = i as u64 + 1;
+        let mut msg = rotation(req, 0, &edit, &view);
+        sign(&mut msg, GROUP, &owner(1), tweak);
+        assert_eq!(
+            ds.request(msg).await.0,
+            refused(req, RefusalCode::NotOwner),
+            "case {i}"
+        );
+    }
+    assert_untouched(&server, &project).await;
+}
+
+#[tokio::test]
+async fn the_owner_key_moves_on_with_every_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let (_, mut ds) = inited(&server).await;
+    let (e1, v1) = (common_token('a'), common_token('b'));
+    assert_eq!(ds.request(rotation(1, 0, &e1, &v1)).await.0, accepted(1));
+    let mut ds = server.session(&e1).await;
+
+    // The first key signed its last rotation.
+    let (e2, v2) = (common_token('c'), common_token('d'));
+    let replay = signed_rotation(2, GROUP, 1, (&e2, &v2), &owner(1), &owner(3).public());
+    assert_eq!(
+        ds.request(replay).await.0,
+        refused(2, RefusalCode::NotOwner)
+    );
+    // Naming the current key as the next would let a removed holder keep it.
+    let same = signed_rotation(3, GROUP, 1, (&e2, &v2), &owner(2), &owner(2).public());
+    assert_eq!(ds.request(same).await.0, refused(3, RefusalCode::Malformed));
+    let mut identity = [0; 32];
+    identity[0] = 1;
+    let weak = signed_rotation(4, GROUP, 1, (&e2, &v2), &owner(2), &identity);
+    assert_eq!(ds.request(weak).await.0, refused(4, RefusalCode::Malformed));
+
+    let next = signed_rotation(5, GROUP, 1, (&e2, &v2), &owner(2), &owner(3).public());
+    assert_eq!(ds.request(next).await.0, accepted(5));
+}
+
+#[tokio::test]
+async fn of_two_owner_rotations_for_one_epoch_the_second_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let (project, mut a) = inited(&server).await;
+    let mut b = server.session(&project.edit).await;
+    let first = rotation(1, 0, &common_token('a'), &common_token('b'));
+    assert_eq!(a.request(first).await.0, accepted(1));
+    let tokens = (common_token('c'), common_token('d'));
+    let second = signed_rotation(
+        2,
+        GROUP,
+        0,
+        (&tokens.0, &tokens.1),
+        &owner(1),
+        &owner(3).public(),
+    );
+    // Over the socket the loser's token is retired by then.
+    assert_eq!(
+        b.request(second.clone()).await.0,
+        refused(2, RefusalCode::Retired)
+    );
+    // Underneath, the epoch is checked before the proof: the key it was
+    // signed with was current until the winner's commit, and the loser has
+    // to follow that commit to the new one, not hear that it is no owner.
+    let ClientMessage::Submit {
+        commit,
+        group_info,
+        keyring,
+        envelope,
+        rotate: Some(rotate),
+        ..
+    } = &second
+    else {
+        unreachable!()
+    };
+    let args = mls::SubmitArgs {
+        incarnation: 0,
+        epoch: 0,
+        commit,
+        group_info,
+        keyring: keyring.as_deref(),
+        envelope: envelope.as_deref(),
+        rotate: Some(rotate),
+    };
+    let submitted = mls::submit(&server.state.db, &project.id, &args)
+        .await
+        .unwrap();
+    assert_eq!(submitted, mls::Submitted::Conflict { head: 1 });
+    let group = mls::load_group(&server.state.db, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.owner_key, owner(2).public());
+}
+
+#[tokio::test]
+async fn a_reset_keeps_the_owner_key_and_the_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let (_, mut ds) = inited(&server).await;
+    let (edit, view) = (common_token('a'), common_token('b'));
+    assert_eq!(
+        ds.request(rotation(1, 0, &edit, &view)).await.0,
+        accepted(1)
+    );
+    let mut ds = server.session(&edit).await;
+    let reset = ClientMessage::Reset {
+        req: 2,
+        incarnation: 0,
+        group_id: GROUP_1.to_vec(),
+        group_info: b"gi-fresh".to_vec(),
+        keyring: b"keyring-fresh".to_vec(),
+    };
+    assert_eq!(ds.request(reset).await.0, accepted(2));
+    let (status, share) = server.get(&format!("/api/share/{edit}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(share["viewToken"], view);
+    let project_id = share["projectId"].as_str().unwrap().to_owned();
+    let group = mls::load_group(&server.state.db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((group.incarnation, group.owner_key), (1, owner(2).public()));
+    let (_, body) = server.get(&format!("/api/p/{edit}/mls")).await;
+    assert_eq!(
+        STANDARD.decode(body["ownerKey"].as_str().unwrap()).unwrap(),
+        owner(2).public()
+    );
+
+    // The new incarnation's first rotation still needs the key the chain
+    // arrived at, not the one the project started with.
+    let tokens = (common_token('c'), common_token('d'));
+    let tokens = (tokens.0.as_str(), tokens.1.as_str());
+    let first_key = signed_rotation(3, GROUP_1, 0, tokens, &owner(1), &owner(3).public());
+    assert_eq!(
+        ds.request(first_key).await.0,
+        refused(3, RefusalCode::NotOwner)
+    );
+    let chained = signed_rotation(4, GROUP_1, 0, tokens, &owner(2), &owner(3).public());
+    assert_eq!(ds.request(chained).await.0, accepted(4));
 }

@@ -279,6 +279,12 @@ pub enum SyncError {
     /// does not verify.
     #[error("The project's member group now claims a different owner. Refusing to rejoin.")]
     OwnerChanged,
+    /// The group was reset with a keyring that drops or changes what this
+    /// folder knew, which only someone forging it would do.
+    #[error(
+        "The project's member group was reset with keys that do not match the ones this folder knew. Refusing to rejoin."
+    )]
+    GroupRewritten,
     /// The link was replaced by a rotation and the group did not hand this
     /// folder the new one.
     #[error(

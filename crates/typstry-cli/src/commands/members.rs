@@ -59,10 +59,14 @@ fn list(session: &Session, out: &mut Output) -> anyhow::Result<()> {
         .map(|m| display_name(m).chars().count())
         .max()
         .unwrap_or(0);
+    // An owner device that was paired lately can be one before another one
+    // hands it the key; until then it cannot remove anyone.
+    let keyless = !session.holds_owner_key();
     let device = |out: &mut Output, member: &MemberInfo| {
         let revoked = matches!(member.person, Person::Verified { revoked: true, .. });
+        let keyless = member.is_self && member.role == Role::Owner && keyless;
         out.out(format!(
-            "    #{:<3} {:<width$}  {}{}{}",
+            "    #{:<3} {:<width$}  {}{}{}{}",
             member.leaf,
             display_name(member),
             match member.role {
@@ -71,6 +75,11 @@ fn list(session: &Session, out: &mut Output) -> anyhow::Result<()> {
                 Role::Viewer => "viewer",
             },
             if revoked { "  (revoked)" } else { "" },
+            if keyless {
+                "  (no owner key here yet)"
+            } else {
+                ""
+            },
             if member.is_self {
                 "  (this device)"
             } else {

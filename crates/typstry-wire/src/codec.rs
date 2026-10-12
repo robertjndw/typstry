@@ -41,6 +41,13 @@ pub(crate) fn plausible_count(
     Ok(count)
 }
 
+pub(crate) fn read_array<const N: usize>(reader: &mut BytesReader<'_>) -> Result<[u8; N], String> {
+    Ok(reader
+        .read_bytes(N)?
+        .try_into()
+        .expect("read exactly N bytes"))
+}
+
 pub(crate) fn push_opt(writer: &mut BytesWriter, value: Option<&[u8]>) {
     match value {
         Some(bytes) => {

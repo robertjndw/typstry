@@ -174,10 +174,13 @@ async fn pair(
     device_name: &str,
     yes: bool,
 ) -> anyhow::Result<Outcome> {
+    // The new side's key, which the holder shows before it approves.
+    let mut own_key = None;
     let (mut pairing, first) = match &identity {
         Some(_) => Pairing::start_holder(code),
         None => {
             let device = load_or_create_device()?;
+            own_key = Some(device.public());
             Pairing::start_new(code, device_name, &device.public()).map_err(explain)?
         }
     };
@@ -211,7 +214,13 @@ async fn pair(
         match step.event {
             Some(Event::Verified) => {
                 eprintln!("The code matched.");
-                if identity.is_none() {
+                if let Some(key) = &own_key {
+                    // A code someone overheard matches just as well; the key
+                    // says which device actually used it.
+                    eprintln!(
+                        "This device's key: {}. Approve on the other device only if it shows the same.",
+                        device_fingerprint(key)
+                    );
                     eprintln!(
                         "Approve this device on the existing device to finish (it asks you there)..."
                     );

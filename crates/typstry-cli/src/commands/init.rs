@@ -389,7 +389,7 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     // vouches for.
     let local = crate::user::load_or_create_identity()?;
     let identity = Identity::resolve(ctx.name.as_deref(), None, local.graph.profile(), root);
-    let group = create_group(&link, &identity, &local).await?;
+    let group = create_group(&link, &share.project_id, &identity, &local).await?;
     // Before .typstry/ exists, so the key cannot slip into a commit even if
     // the rest fails halfway.
     if let Some((repo, _)) = &plan.repo {

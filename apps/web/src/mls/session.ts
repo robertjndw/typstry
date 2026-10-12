@@ -21,6 +21,7 @@ import {
   LeafKeys,
   LinkSecret,
   ProjectGroup,
+  mergeOwnerSecrets,
   type DocKeys,
   type Outcome,
   type PresenceKey,
@@ -72,6 +73,12 @@ export interface MlsSnapshot {
   members: readonly RosterMember[];
   /** An editor on a link the server lets commit: may remove and reset. */
   canCommit: boolean;
+  /**
+   * This device holds the project's current owner key, without which the
+   * server swaps no links. An owner device has to be handed it by another
+   * one first.
+   */
+  holdsOwnerKey: boolean;
   /** The group met a commit it refuses; an editor has to reset it. */
   stalled: boolean;
   /** Why `failed`. */
@@ -143,6 +150,22 @@ export interface MlsSessionOptions {
   settleMs?: number;
 }
 
+/**
+ * What an owner device without the owner key is told. The key reaches it
+ * when a device that holds it opens the project and sees it lacks it.
+ */
+export const NO_OWNER_KEY =
+  "This device does not have the project's owner key yet. Open the project on another of your devices that can remove members and it is handed over. If none is left, the links can no longer be reset.";
+
+/** Why the server refused a commit of ours, for people. */
+function refusalText(code: string): string {
+  // The server checks the owner key's signature on every rotation; this is
+  // what a stale or foreign key gets.
+  if (code === "notOwner")
+    return "the server only takes this from a device with the project's owner key";
+  return `the server refused the change: ${code}`;
+}
+
 /** Tries at a commit of our own, or at a join, before giving up. */
 const ATTEMPTS = 5;
 
@@ -159,6 +182,7 @@ export const IDLE: MlsSnapshot = {
   phase: "idle",
   members: [],
   canCommit: false,
+  holdsOwnerKey: false,
   stalled: false,
   error: null,
 };
@@ -230,7 +254,7 @@ function deviceOf(group: ProjectGroup): Uint8Array {
   }
 }
 
-function emptyRecord(): MlsRecord {
+export function emptyRecord(): MlsRecord {
   return { state: null, device: null, removed: false, rotation: null };
 }
 
@@ -292,7 +316,7 @@ export class MlsSession {
   /** The server answered and the group caught up, on the current socket. */
   private synced = false;
   private readonly syncedListeners = new Set<() => void>();
-  /** Leaves of the person's revoked devices this session removed. */
+  /** Leaves of revoked devices, of anyone, this session removed. */
   private removedCount = 0;
   /** The identity refresh that is under way, if any. */
   private identitySync: Promise<IdentitySync> | null = null;
@@ -308,6 +332,7 @@ export class MlsSession {
     epoch: number;
     commit: Uint8Array;
     envelope?: Uint8Array;
+    ownerKey?: Uint8Array;
   }[] = [];
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private profileTimer: ReturnType<typeof setTimeout> | null = null;
@@ -562,6 +587,7 @@ export class MlsSession {
       phase: this.phase(),
       members,
       canCommit: this.mayCommit(members),
+      holdsOwnerKey: active && group!.holdsOwnerKey,
       stalled: this.stalled,
       error: this.terminal?.error ?? null,
     };
@@ -569,6 +595,7 @@ export class MlsSession {
       next.members === prev.members &&
       next.phase === prev.phase &&
       next.canCommit === prev.canCommit &&
+      next.holdsOwnerKey === prev.holdsOwnerKey &&
       next.stalled === prev.stalled &&
       next.error === prev.error
     )
@@ -660,6 +687,13 @@ export class MlsSession {
             ...record,
             ...patch,
             state: group ? group.exportState() : record.state,
+            // Added to the saved copy, never put in its place: a group
+            // that holds none, or one the server lied to about which key
+            // is current, must not cost a secret that may be the only one.
+            ownerSecrets: mergeOwnerSecrets(
+              record.ownerSecrets,
+              group?.ownerSecrets(),
+            ),
             // The device never changes once joined, a reset included.
             device: record.device ?? (group ? deviceOf(group) : null),
           };
@@ -714,6 +748,7 @@ export class MlsSession {
           epoch: message.epoch,
           commit: message.commit,
           envelope: message.envelope,
+          ownerKey: message.ownerKey,
         });
         this.background(() => this.drain());
         return;
@@ -789,7 +824,7 @@ export class MlsSession {
     });
   }
 
-  /** How many leaves of the person's revoked devices this session removed. */
+  /** How many leaves of revoked devices this session removed. */
   get removedLeaves(): number {
     return this.removedCount;
   }
@@ -841,7 +876,7 @@ export class MlsSession {
       const group = tx.group;
       if (!group?.isActive) return found;
       let changed = false;
-      for (const { epoch, commit, envelope } of batch) {
+      for (const { epoch, commit, envelope, ownerKey } of batch) {
         // Another tab applied it already.
         if (epoch < group.epoch) continue;
         if (epoch > group.epoch) {
@@ -854,7 +889,7 @@ export class MlsSession {
         let outcome: Outcome | null = null;
         let failure: unknown = null;
         try {
-          outcome = group.processCommit(epoch, commit, envelope);
+          outcome = group.processCommit(epoch, commit, envelope, ownerKey);
         } catch (error) {
           failure = error;
         }
@@ -982,10 +1017,11 @@ export class MlsSession {
   /**
    * Brings this device's identity in line with its person: merges what the
    * group knows of the person's graph into the one stored here, puts what
-   * the leaf lacks into it, and, for an editor, removes the person's leaves
-   * whose device was revoked. Not through the queue: committing queues its
-   * own turns. Runs after every round of commits and when a revocation is
-   * applied by hand; calls that overlap share one run.
+   * the leaf lacks into it (and seals the owner key to the owner devices
+   * and recovery keys that lack it), and, with the owner key, removes every
+   * leaf whose device was revoked, whoever's it is. Not through the queue:
+   * committing queues its own turns. Runs after every round of commits and
+   * when a revocation is applied by hand; calls that overlap share one run.
    */
   syncIdentity(): Promise<IdentitySync> {
     this.identitySync ??= this.runIdentitySync().finally(() => {
@@ -1025,16 +1061,21 @@ export class MlsSession {
     }
     result.canCommit = this.mayCommit(this.snapshot.members);
     if (!result.canCommit) return result;
-    if (step.needsRefresh) {
+    // The owner key travels in the holder's leaf, sealed to the owner
+    // devices and recovery keys it sees, so handing it over is a refresh of
+    // that leaf.
+    if (step.needsRefresh || step.shareOwnerKey) {
       await this.commit((g) =>
         g.selfUpdate(encodeProfile(this.opts.identity()), graph),
       );
-      // The refresh put our revokes into the tree, which can make more of
-      // the person's leaves read as revoked.
+      // The refresh put our revokes into the tree, which can make more
+      // leaves read as revoked.
       if (!this.group?.isActive) return result;
       step = this.group.identityStep(graph);
     }
-    if (step.revokedOwn.length === 0) return result;
+    // Only filled for a holder of the owner key: anyone else leaves the
+    // removal to an owner device, which reads the revoke from our leaf.
+    if (step.revoked.length === 0) return result;
     let removed = 0;
     try {
       await this.commit((g) => {
@@ -1044,8 +1085,10 @@ export class MlsSession {
       });
       this.removedCount += removed;
     } catch (error) {
-      // Another member removed them first.
-      if (errorKind(error) !== "NothingRevoked") throw error;
+      // Another member removed them first, or another holder's rotation
+      // moved the owner key on before this one was built.
+      const kind = errorKind(error);
+      if (kind !== "NothingRevoked" && kind !== "NoOwnerKey") throw error;
     }
     return result;
   }
@@ -1134,16 +1177,27 @@ export class MlsSession {
         }
         let joined;
         try {
-          joined = ProjectGroup.joinExternalAs(
+          // A rejoin has to bring the owner keys along: the new leaf carries
+          // no share of them, and this may be the only copy. The record's
+          // are what this device kept, recovery's included; the old group's
+          // own come along with them, all of them whichever key the server
+          // names. With the old group, the new one also has to keep its
+          // keyring and owner.
+          const args = [
             device,
             link,
             boot.groupInfo,
             boot.keyring,
+            boot.ownerKey,
             profile,
             identity?.deviceSeed,
             identity?.graph,
             pinned,
-          );
+            tx.record.ownerSecrets,
+          ] as const;
+          joined = tx.group
+            ? tx.group.rejoinAs(...args)
+            : ProjectGroup.joinExternalAs(...args);
         } catch (error) {
           // The sealed parts only open with the project's keys, so this
           // is where a truncated or wrong link shows.
@@ -1156,6 +1210,12 @@ export class MlsSession {
             return this.fail(
               new Error(
                 "This project claims a different owner than before, so it was not opened.",
+              ),
+            );
+          if (kind === "Rewritten")
+            return this.fail(
+              new Error(
+                "This project's members were reset with keys that do not match the ones this device knew, so it was not opened.",
               ),
             );
           if (kind === "KeyMismatch" || kind === "Mismatch")
@@ -1395,7 +1455,7 @@ export class MlsSession {
       group.discardPending();
       this.markSent(message.commit, "discarded");
       await tx.save();
-      throw new Error(`the server refused the change: ${reply.code}`);
+      throw new Error(refusalText(reply.code));
     }
     const rotation = group.confirmPending();
     this.markSent(message.commit, "confirmed");

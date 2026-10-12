@@ -16,6 +16,8 @@
 //! reports.
 
 mod adopt;
+#[cfg(test)]
+mod adversary;
 mod binding;
 mod entry;
 mod graph;
@@ -77,6 +79,11 @@ pub enum GraphError {
     NotValid,
     #[error("that device was revoked for good and cannot be added again")]
     DeviceRevoked,
+    /// An entry whose author was not a valid device in the entry's own past.
+    /// Only a misbehaving or foreign signer writes one, so a graph that holds
+    /// it is refused as a whole rather than carried along.
+    #[error("a person graph entry is signed by a device that could not sign it")]
+    Unauthorized,
 }
 
 /// The key one device signs for a person with. Unlike the project keys it is
@@ -122,6 +129,23 @@ impl DeviceKey {
     pub(crate) fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
         self.key.sign(message).to_bytes()
     }
+
+    /// The X25519 secret that goes with [`x25519_public`] of this key, by the
+    /// conversion libsodium uses. A recovery key is never a leaf, so it has no
+    /// HPKE key of its own to be sent anything to; this is how an owner key
+    /// share reaches it without the graph carrying a second key.
+    #[cfg(feature = "mls")]
+    pub(crate) fn x25519_secret(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(self.key.to_scalar_bytes())
+    }
+}
+
+/// The X25519 public key of a device key, the birational map from Edwards to
+/// Montgomery form. `None` for bytes that are no curve point.
+#[cfg(feature = "mls")]
+pub(crate) fn x25519_public(device: &PublicKey) -> Option<[u8; KEY_LEN]> {
+    let key = VerifyingKey::from_bytes(device).ok()?;
+    (!key.is_weak()).then(|| key.to_montgomery().to_bytes())
 }
 
 /// A short public tag of a person, for people to compare out of band. It is

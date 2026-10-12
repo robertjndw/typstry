@@ -1,7 +1,8 @@
 //! State that belongs to the user rather than to one project folder: this
 //! device's key, the graph of the devices that make up the person, local
-//! names for those devices, and the list of projects they have a folder
-//! for (what pairing hands to a new device).
+//! names for those devices, the list of projects they have a folder for
+//! (what pairing hands to a new device), and the owner keys of the
+//! projects those folders own.
 //!
 //! It lives in `$TYPSTRY_CONFIG_DIR`, else the platform's config directory.
 
@@ -18,11 +19,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use typstry_wire::crypto::PublicKey;
 use typstry_wire::identity::{AdoptError, DeviceKey, DeviceState, PersonGraph, adopt};
-use typstry_wire::mls::LocalIdentity;
+use typstry_wire::mls::{LocalIdentity, OwnerSecrets};
 use typstry_wire::pairing::GrantedProject;
 
 use crate::link::ShareLink;
-use crate::state::{atomic_write, create_private_dir};
+use crate::state::{atomic_write, create_private_dir, merge_owner_keys, read_owner_keys};
 
 const DEVICE_FILE: &str = "device.key";
 const GRAPH_FILE: &str = "person.graph";
@@ -35,6 +36,11 @@ const AVAILABLE_FILE: &str = "available.json";
 /// Guards both project lists. Never held while taking another lock, so it
 /// cannot take part in a deadlock with `identity.lock`.
 const PROJECTS_LOCK: &str = "projects.lock";
+/// The owner keys of the projects this machine's folders own, one file per
+/// project (see [`owner_key`]).
+const OWNER_KEYS_DIR: &str = "owner-keys";
+/// Never held while taking another lock, like `projects.lock`.
+const OWNER_KEYS_LOCK: &str = "owner-keys.lock";
 
 /// A project this user has a folder for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +497,49 @@ fn same_project(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a.origin == b.origin && a.token == b.token,
         _ => a == b,
     }
+}
+
+/// Where this machine keeps the owner key of the project `project_id` at
+/// `server`. Named by a hash because neither part is guaranteed to be a
+/// safe file name.
+fn owner_key_path(config: &Path, server: &str, project_id: &str) -> PathBuf {
+    use sha2::Digest as _;
+    let name = sha2::Sha256::digest(format!("{server}\n{project_id}"));
+    config
+        .join(OWNER_KEYS_DIR)
+        .join(format!("{}.bin", crate::hash::to_hex(&name)))
+}
+
+/// The owner keys this machine's folders held for the project
+/// `project_id` at `server`, or one a recovery took along, newest first. A
+/// folder that joins with them can rotate right away instead of waiting for
+/// another owner device to hand the key over. Unreadable reads as empty:
+/// the group hands the key over again.
+pub fn owner_keys(server: &str, project_id: &str) -> OwnerSecrets {
+    let Ok(config) = config_dir() else {
+        return OwnerSecrets::default();
+    };
+    read_owner_keys(&owner_key_path(&config, server, project_id))
+}
+
+/// Adds `keys` to what the machine keeps of the project's owner keys.
+/// Nothing there is replaced: a folder that has not caught up yet may bring
+/// older keys, and the newer ones must survive that.
+pub fn remember_owner_keys(
+    server: &str,
+    project_id: &str,
+    keys: &OwnerSecrets,
+) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let config = config_dir()?;
+    let _lock = lock_in(&config, OWNER_KEYS_LOCK)?;
+    let dir = config.join(OWNER_KEYS_DIR);
+    if !dir.is_dir() {
+        create_private_dir(&dir)?;
+    }
+    merge_owner_keys(&owner_key_path(&config, server, project_id), keys)
 }
 
 #[cfg(test)]

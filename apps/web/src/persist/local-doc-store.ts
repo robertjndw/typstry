@@ -44,6 +44,15 @@ export interface MlsRecord {
    * create.
    */
   ownerPerson?: Uint8Array;
+  /**
+   * Every owner key secret the device held, as `ProjectGroup.ownerSecrets()`
+   * bytes merged in with `mergeOwnerSecrets` on every save, kept beside the
+   * state: one may be the only copy of the project's owner key, and a
+   * device that has to rejoin (lost or unreadable state) brings them into
+   * the new group. Merged, never replaced, since which one is current is
+   * only what the server says.
+   */
+  ownerSecrets?: Uint8Array;
 }
 
 export interface StoredRotation {
@@ -204,8 +213,9 @@ export class IndexedDbBackend implements DocBackend {
       tx.objectStore(MLS).get(projectId),
     );
     if (!row) return null;
-    const { state, device, removed, rotation, ownerPerson } = row;
-    return { state, device, removed, rotation, ownerPerson };
+    const { state, device, removed, rotation, ownerPerson, ownerSecrets } =
+      row;
+    return { state, device, removed, rotation, ownerPerson, ownerSecrets };
   }
 
   async saveMls(projectId: string, record: MlsRecord): Promise<void> {

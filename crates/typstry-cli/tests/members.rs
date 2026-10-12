@@ -4,7 +4,9 @@
 
 mod common;
 
-use common::{Server, binary, binary_with, clone, failed, read, stderr, stdout, temp, typstry};
+use common::{
+    Server, assert_private, binary, binary_with, clone, failed, read, stderr, stdout, temp, typstry,
+};
 
 use std::fs;
 use std::path::Path;
@@ -44,15 +46,7 @@ async fn clone_joins_the_group_and_members_lists_everyone() {
 
     let state = fs::read(a.join(STATE_DIR).join("mls.bin")).unwrap();
     assert_eq!(state[0], typstry_wire::mls::MLS_STATE_VERSION);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(a.join(STATE_DIR).join("mls.bin"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
+    assert_private(&a.join(STATE_DIR).join("mls.bin"));
 
     // The browser that made the project, the seeding session, the two clones.
     let listing = stdout(&binary(&a, &["members"]).await);
@@ -353,15 +347,7 @@ async fn a_damaged_group_state_rejoins_as_the_same_device() {
     let a = clone(&edit, &work, "a").await;
     let dir = a.join(STATE_DIR);
     let device = fs::read(dir.join("device.bin")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(dir.join("device.bin"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
+    assert_private(&dir.join("device.bin"));
     let before = stdout(&binary(&a, &["members"]).await);
 
     let damaged = fs::read(dir.join("mls.bin")).unwrap();
@@ -513,15 +499,7 @@ async fn clones_are_recorded_in_the_project_list() {
     assert_eq!(projects[0]["dir"], a.to_str().unwrap());
     assert_eq!(projects[0]["link"], edit);
     assert_eq!(projects[0]["title"], "Listed");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(cfg.join("device.key"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
+    assert_private(&cfg.join("device.key"));
 
     // A rotation moves the stored link along. It takes the owner to make one.
     let owner = clone(&edit, &work, "owner").await;
@@ -580,13 +558,19 @@ async fn the_creator_is_the_owner_and_the_person_is_pinned() {
     let (_cfg, cfg) = temp();
     let a = init_as(&server, &work, "a", &cfg).await;
 
-    // No owner key exists any more: ownership is the person.
-    assert!(!cfg.join("owners.json").exists());
-    #[cfg(unix)]
-    for name in ["device.key", "person.graph"] {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(cfg.join(name)).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "{name}");
+    // Ownership is the person. The project's owner key, which the server
+    // wants rotations signed with, is as private as the device key.
+    let owner_keys: Vec<_> = fs::read_dir(cfg.join("owner-keys"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(owner_keys.len(), 1, "{owner_keys:?}");
+    for path in [
+        cfg.join("device.key"),
+        cfg.join("person.graph"),
+        owner_keys[0].clone(),
+    ] {
+        assert_private(&path);
     }
     // The owner person is pinned for later rejoins.
     assert!(config(&a).owner_person.is_some());
@@ -668,4 +652,88 @@ async fn a_damaged_owner_pin_stops_the_join_and_leaves_the_config() {
     let err = typstry(&a, &["pull"]).await.unwrap_err();
     assert!(format!("{err:#}").contains("is damaged"), "{err:#}");
     assert_eq!(fs::read(&path).unwrap(), damaged);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_folder_of_the_same_machine_rotates_without_waiting_for_the_key() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let o = init_as(&server, &work, "o", &cfg).await;
+    let edit = stdout(&as_person(&o, &cfg, &["link", "--edit"]).await);
+
+    // A second leaf of the same device: no other owner device has to hand
+    // it the key first, the machine has it.
+    let again = clone_as(edit.trim(), &work, "again", &cfg).await;
+    let listing = stdout(&as_person(&again, &cfg, &["members"]).await);
+    assert!(!listing.contains("no owner key"), "{listing}");
+    stdout(&as_person(&again, &cfg, &["share", "reset"]).await);
+    stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_group_state_keeps_the_owner_key() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let o = init_as(&server, &work, "o", &cfg).await;
+    let dir = o.join(STATE_DIR);
+    assert_private(&dir.join("owner.bin"));
+
+    // Only the folder's own copy is left to carry the key over.
+    fs::remove_dir_all(cfg.join("owner-keys")).unwrap();
+    let damaged = fs::read(dir.join("mls.bin")).unwrap();
+    fs::write(dir.join("mls.bin"), &damaged[..damaged.len() / 2]).unwrap();
+    stdout(&as_person(&o, &cfg, &["pull"]).await);
+
+    let listing = stdout(&as_person(&o, &cfg, &["members"]).await);
+    assert!(listing.contains("Members (1)"), "{listing}");
+    assert!(!listing.contains("no owner key"), "{listing}");
+    stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_key_survives_a_rejoin_after_the_log_was_pruned() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let (_cfg, cfg) = temp();
+    let o = init_as(&server, &work, "o", &cfg).await;
+    let edit = stdout(&as_person(&o, &cfg, &["link", "--edit"]).await);
+    clone(edit.trim(), &work, "e").await;
+    let f = clone(edit.trim(), &work, "f").await;
+
+    // Two joins later, the server keeps only the newest commit, so o can no
+    // longer follow and has to join again.
+    let state = |dir: &Path| {
+        ProjectGroup::import_state(&fs::read(dir.join(STATE_DIR).join("mls.bin")).unwrap()).unwrap()
+    };
+    let head = state(&f);
+    assert_eq!(state(&o).epoch() + 2, head.epoch());
+    let limits = typstry_server::store::mls::PruneLimits {
+        older_than: 0,
+        keep_last: 1,
+        max_bytes: u64::MAX,
+    };
+    let gone = typstry_server::store::mls::prune_commits(
+        &server.state.db,
+        &config(&o).project_id,
+        u64::from(head.incarnation()),
+        head.epoch(),
+        limits,
+    )
+    .await
+    .unwrap();
+    assert!(gone > 0);
+
+    // Nothing but the old group state holds the key now.
+    fs::remove_dir_all(cfg.join("owner-keys")).unwrap();
+    fs::remove_file(o.join(STATE_DIR).join("owner.bin")).unwrap();
+    stdout(&as_person(&o, &cfg, &["pull"]).await);
+    // The rejoin is the one commit since.
+    assert_eq!(state(&o).epoch(), head.epoch() + 1);
+    assert!(o.join(STATE_DIR).join("owner.bin").exists());
+
+    stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
+    typstry(&f, &["pull"]).await.unwrap();
+    assert_eq!(config(&f).token, config(&o).token);
 }

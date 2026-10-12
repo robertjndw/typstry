@@ -78,7 +78,11 @@ describe("cleanProjects", () => {
         },
         untilSynced: () =>
           new Promise((resolve) => setTimeout(() => resolve(true), delay)),
-        getSnapshot: () => ({ phase: "active" }),
+        getSnapshot: () => ({
+          phase: "active",
+          members: [],
+          holdsOwnerKey: true,
+        }),
         syncIdentity: async () => ({ canCommit: true }),
         removedLeaves: 0,
         stop: () => {
@@ -90,5 +94,52 @@ describe("cleanProjects", () => {
     expect(results.map((r) => r.projectId)).toEqual([...ids].reverse());
     expect(results.every((r) => r.result.status === "clean")).toBe(true);
     expect(most).toBe(4);
+  });
+
+  it("leaves a revoked device in another person's project to its owner", async () => {
+    const backend = new MemoryBackend();
+    const roster = (role: string) => [
+      { isSelf: true, role, deviceRevoked: false },
+      { isSelf: false, role: "editor", deviceRevoked: true },
+    ];
+    const cases = [
+      { id: "theirs", role: "editor", holds: false },
+      { id: "mine", role: "owner", holds: false },
+      { id: "swept", role: "owner", holds: true },
+    ];
+    for (const { id } of cases) {
+      saveProjectKey(id, LinkSecret.generateEdit().toBase64url());
+      rememberProject({ projectId: id, token: `t-${id}`, title: id });
+      await backend.saveMls(id, {
+        state: new Uint8Array([1]),
+        device: null,
+        removed: false,
+        rotation: null,
+      });
+    }
+    const results = await cleanProjects(backend, (projectId) => {
+      const { role, holds } = cases.find((c) => c.id === projectId)!;
+      return {
+        start: async () => {},
+        untilSynced: async () => true,
+        getSnapshot: () => ({
+          phase: "active",
+          members: roster(role),
+          holdsOwnerKey: holds,
+        }),
+        syncIdentity: async () => ({ canCommit: true }),
+        removedLeaves: holds ? 1 : 0,
+        stop: () => {},
+      } as unknown as MlsSession;
+    });
+    const byId = Object.fromEntries(
+      results.map((r) => [r.projectId, r.result]),
+    );
+    expect(byId.theirs).toEqual({ status: "left-to-owner" });
+    expect(byId.mine).toEqual({
+      status: "unreached",
+      reason: "this device does not have the project's owner key yet",
+    });
+    expect(byId.swept).toEqual({ status: "cleaned", removed: 1 });
   });
 });

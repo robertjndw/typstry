@@ -214,7 +214,7 @@ export function DevicesDialog({
       <ConfirmDeleteDialog
         open={pending !== null}
         title={`Revoke ${pending?.name ?? "the device"}?`}
-        description="It stops counting as you. In projects you can edit it is removed and the links are replaced, so it can no longer open them. Projects you can only view are left as they are."
+        description="It stops counting as you. In projects you own it is removed and the links are replaced, so it can no longer open them. In projects you can edit, their owner is told to remove it. Projects you can only view are left as they are."
         confirmLabel="Revoke"
         onCancel={() => setPending(null)}
         onConfirm={() => void confirm()}
@@ -230,6 +230,9 @@ function RevokeReport({
 }) {
   const missed = report.projects.filter((p) => p.result.status === "unreached");
   const cleaned = report.projects.filter((p) => p.result.status === "cleaned");
+  const left = report.projects.filter(
+    (p) => p.result.status === "left-to-owner",
+  );
   return (
     <div role="status" className="flex flex-col gap-2 text-sm">
       <p className="font-medium">{report.name} was revoked.</p>
@@ -240,6 +243,21 @@ function RevokeReport({
           Removed from {cleaned.length} of {report.projects.length}{" "}
           {report.projects.length === 1 ? "project" : "projects"}.
         </p>
+      )}
+      {left.length > 0 && (
+        <>
+          <p className="text-muted-foreground">
+            Left for the owner to remove, the next time they open{" "}
+            {left.length === 1 ? "it" : "them"}:
+          </p>
+          <ul className="flex flex-col gap-1">
+            {left.map((p) => (
+              <li key={p.projectId} className="font-medium">
+                {p.title}
+              </li>
+            ))}
+          </ul>
+        </>
       )}
       {missed.length > 0 && (
         <>

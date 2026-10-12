@@ -170,6 +170,7 @@ describe("MLS group", () => {
       link,
       init.groupInfo,
       init.keyring,
+      init.ownerKey,
       profile,
     );
     expect(submit.type).toBe("submit");

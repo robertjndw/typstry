@@ -51,9 +51,10 @@ pub fn crypto_kind(error: &CryptoError) -> Kind {
 
 pub fn graph_kind(error: &GraphError) -> Kind {
     match error {
-        GraphError::Malformed(_) | GraphError::MissingParent | GraphError::Genesis => {
-            plain("Malformed")
-        }
+        GraphError::Malformed(_)
+        | GraphError::MissingParent
+        | GraphError::Genesis
+        | GraphError::Unauthorized => plain("Malformed"),
         GraphError::NewerVersion(version) => Kind {
             kind: "NewerVersion",
             detail: Some(("version", f64::from(*version))),
@@ -92,12 +93,14 @@ pub fn mls_kind(error: &MlsError) -> Kind {
         MlsError::Envelope(_) => plain("Envelope"),
         MlsError::NotEditor => plain("NotEditor"),
         MlsError::NotOwner => plain("NotOwner"),
+        MlsError::NoOwnerKey => plain("NoOwnerKey"),
         MlsError::NotActive => plain("NotActive"),
         MlsError::Pending => plain("Pending"),
         MlsError::NoPending => plain("NoPending"),
         MlsError::Epoch { .. } => plain("Epoch"),
         MlsError::Mismatch(_) => plain("Mismatch"),
         MlsError::OwnerChanged(_) => plain("OwnerChanged"),
+        MlsError::Rewritten => plain("Rewritten"),
         MlsError::BadLeaf(_) => plain("BadLeaf"),
         MlsError::NewerState(version) => Kind {
             kind: "NewerVersion",

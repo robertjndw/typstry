@@ -272,10 +272,11 @@ describe.each(backends)("pinned owner on %s", (_name, makeBackend) => {
       removed: false,
       rotation: null,
       ownerPerson: new Uint8Array([9]),
+      ownerSecrets: new Uint8Array([7]),
     });
-    expect((await backend.loadMls("p1"))?.ownerPerson).toEqual(
-      new Uint8Array([9]),
-    );
+    const loaded = await backend.loadMls("p1");
+    expect(loaded?.ownerPerson).toEqual(new Uint8Array([9]));
+    expect(loaded?.ownerSecrets).toEqual(new Uint8Array([7]));
   });
 });
 

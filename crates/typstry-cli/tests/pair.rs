@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    Server, Shower, binary_with, clone_as, config_in, failed, init_as, other_leaf, run_as, stdout,
-    temp,
+    Server, Shower, binary_with, clone, clone_as, config_in, failed, init_as, other_leaf, run_as,
+    stderr, stdout, temp, typstry,
 };
 
 use typstry_wire::pairing::Code;
@@ -132,7 +132,7 @@ async fn two_devices_that_are_people_are_a_role_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_paired_device_is_an_owner_without_any_key_transfer() {
+async fn a_paired_device_is_an_owner_that_gets_the_key_from_another_owner_device() {
     let server = Server::start().await;
     let (_work, work) = temp();
     let holder_cfg = config_in(&work, "holder-cfg");
@@ -152,8 +152,6 @@ async fn a_paired_device_is_an_owner_without_any_key_transfer() {
     stdout(&entered);
     let holder = shower.finish().await;
     assert!(holder.status.success());
-    assert!(!new_cfg.join("owners.json").exists());
-    assert!(!holder_cfg.join("owners.json").exists());
 
     let b = work.join("b");
     let cloned = run_as(&work, &new_cfg, &["clone", "1", "b"]).await;
@@ -166,8 +164,28 @@ async fn a_paired_device_is_an_owner_without_any_key_transfer() {
     assert_eq!(owners, 2, "{listing}");
     assert!(listing.contains("(owner)"), "{listing}");
 
-    // So the new device can remove someone, and the first one follows.
+    // An owner by the tree, but the owner key only comes from a device that
+    // holds it, and pairing does not carry it.
+    assert!(listing.contains("(no owner key here yet)"), "{listing}");
     let leaf = other_leaf(&listing, "editor");
+    let before = std::fs::read(b.join(".typstry/config.json")).unwrap();
+    for args in [&["members", "remove", &leaf][..], &["share", "reset"]] {
+        let err = failed(&run_as(&b, &new_cfg, args).await);
+        assert!(
+            err.contains("This device does not have the project's owner key yet."),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(b.join(".typstry/config.json")).unwrap(),
+        before
+    );
+
+    // The first device hands it over the next time it opens the project, so
+    // the new one can remove someone, and the first one follows.
+    stdout(&run_as(&a, &holder_cfg, &["pull"]).await);
+    let listing = stdout(&run_as(&b, &new_cfg, &["members"]).await);
+    assert!(!listing.contains("no owner key"), "{listing}");
     stdout(&run_as(&b, &new_cfg, &["members", "remove", &leaf]).await);
     stdout(&run_as(&a, &holder_cfg, &["members"]).await);
     stdout(&run_as(&a, &holder_cfg, &["share", "reset"]).await);
@@ -303,7 +321,10 @@ async fn a_revoked_device_joins_another_person_without_replace() {
     let out = run_as(&work, &new_cfg, &["clone", "1", "shared"]).await;
     assert!(out.status.success(), "{}", failed(&out));
     stdout(&run_as(&a, &first_cfg, &["devices", "revoke", "Tester"]).await);
-    // It hears of the revoke from the project they share.
+    // The project's owner removes it, and it hears of the revoke from the
+    // project they share.
+    let owner = clone(&edit, &work, "owner").await;
+    typstry(&owner, &["pull"]).await.unwrap();
     failed(&run_as(&work.join("shared"), &new_cfg, &["pull"]).await);
     let first = std::fs::read(first_cfg.join("person.graph")).unwrap();
     assert_eq!(std::fs::read(new_cfg.join("person.graph")).unwrap(), first);
@@ -323,4 +344,42 @@ async fn a_revoked_device_joins_another_person_without_replace() {
         after,
         std::fs::read(second_cfg.join("person.graph")).unwrap()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_new_device_shows_the_key_the_holder_asks_about() {
+    let server = Server::start().await;
+    let (_work, work) = temp();
+    let holder_cfg = config_in(&work, "holder-cfg");
+    let new_cfg = config_in(&work, "new-cfg");
+    let a = init_as(&server, &work, "a", &holder_cfg).await;
+
+    let shower = Shower::start(&a, &holder_cfg, &["--yes"]).await;
+    let entered = run_as(
+        &work,
+        &new_cfg,
+        &["pair", &shower.code, "--server", &server.origin],
+    )
+    .await;
+    stdout(&entered);
+    let holder = shower.finish().await;
+    assert!(holder.status.success(), "{}", stderr(&holder));
+
+    let shown = stderr(&entered);
+    let key = shown
+        .lines()
+        .find_map(|l| l.strip_prefix("This device's key: "))
+        .and_then(|rest| {
+            rest.split_once(". Approve on the other device only if it shows the same.")
+        })
+        .map(|(key, _)| key.to_owned())
+        .unwrap_or_else(|| panic!("{shown}"));
+    let approved = String::from_utf8(holder.stdout).unwrap();
+    assert!(approved.contains(&format!("({key})")), "{approved}");
+    let devices = stdout(&run_as(&work, &new_cfg, &["devices"]).await);
+    let mine = devices
+        .lines()
+        .find(|l| l.contains("(this device)"))
+        .unwrap_or_else(|| panic!("{devices}"));
+    assert!(mine.contains(&key), "{devices}");
 }

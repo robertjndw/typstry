@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { EnterCodeForm } from "@/components/EnterCodeForm";
 import { PageShell } from "@/components/PageShell";
@@ -25,7 +25,6 @@ export function Pair() {
   }, [hash, navigate]);
   const flow = usePairingFlow();
   const { holder, disposable, state, session } = flow;
-  const started = useRef(false);
   // For a browser that only became a person by opening a link before it was
   // paired: whether it joins the other device's person (true) or adds the
   // other device to its own (false). Null until asked.
@@ -41,15 +40,18 @@ export function Pair() {
             ? "switch"
             : "holder";
 
-  // A device with projects has nothing to ask, so it connects right away.
-  // A new one confirms its name first.
-  useEffect(() => {
-    if (mode === "holder" && linkCode && !started.current) {
-      started.current = true;
-      void flow.enterCode(linkCode);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, linkCode]);
+  // Opening a link must not pair by itself: anyone can send one, and a
+  // device that connects on load would let a stranger's code start an
+  // attempt the user never chose. Only a device with projects is asked here;
+  // a new one confirms through its form, which waits for a click too.
+  const [linkTried, setLinkTried] = useState(false);
+  // Kept up while the attempt starts, so the code form does not flash in
+  // before the pairing status replaces it.
+  const confirmLink =
+    mode === "holder" &&
+    linkCode !== "" &&
+    (!linkTried || flow.busy) &&
+    !flow.error;
 
   return (
     <PageShell outside={<ApprovalDialog session={session} state={state} />}>
@@ -66,6 +68,7 @@ export function Pair() {
         <PairingStatus
           state={state}
           holder={mode === "holder"}
+          fingerprint={session?.ownFingerprint}
           onRestart={() => {
             // Ask again rather than repeat a switch: after one, this browser
             // is no longer a person of its own.
@@ -91,9 +94,30 @@ export function Pair() {
             you open them.
           </p>
         </div>
+      ) : confirmLink ? (
+        <div className="flex flex-col gap-3 rounded-md border p-4">
+          <p className="text-sm">
+            This link wants to add another device to your account. That device
+            would get your projects and edit them as you. Only continue if you
+            opened it from a device of your own that is showing this code.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              disabled={flow.busy}
+              onClick={() => {
+                setLinkTried(true);
+                void flow.enterCode(linkCode);
+              }}
+            >
+              Connect to the other device
+            </Button>
+            <Button variant="outline" asChild>
+              <Link to="/">Cancel</Link>
+            </Button>
+          </div>
+        </div>
       ) : (
-        mode !== null &&
-        !(mode === "holder" && linkCode && !flow.error) && (
+        mode !== null && (
           <EnterCodeForm
             initialCode={linkCode}
             deviceName={flow.deviceName}

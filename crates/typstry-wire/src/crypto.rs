@@ -605,7 +605,24 @@ impl Keyring {
         if !rest.is_empty() {
             return Err(bad("trailing bytes"));
         }
+        // Every rotation is to a fresh link, so a key that comes back is a
+        // forged history: repeating the newest one makes a keyring that
+        // `open_verified` takes for a later generation of the same link.
+        let mut seen = std::collections::BTreeSet::new();
+        if !attest_pubs.iter().all(|key| seen.insert(*key)) {
+            return Err(bad("an attestation key appears twice"));
+        }
         Ok(Self { keys, attest_pubs })
+    }
+
+    /// Whether this keyring is `earlier` or a later one of the same
+    /// project: every generation `earlier` has, with the same doc key and
+    /// attestation key, and possibly more after them. Rotations only ever
+    /// append, so anything else rewrites what was there.
+    pub fn extends(&self, earlier: &Keyring) -> bool {
+        self.keys.len() >= earlier.keys.len()
+            && self.keys.iter().zip(&earlier.keys).all(|(a, b)| **a == **b)
+            && self.attest_pubs.starts_with(&earlier.attest_pubs)
     }
 
     /// Seals the keyring under `link`'s keyring key and signs the result
@@ -636,6 +653,18 @@ impl Keyring {
         let signature = link.sign(&[KEYRING_SIGNATURE_CONTEXT, &sealed].concat())?;
         sealed.extend_from_slice(&signature);
         Ok(sealed)
+    }
+
+    /// Seals and signs keyring bytes that [`Self::from_plain`] may refuse,
+    /// the way a hostile editor with the link could.
+    #[cfg(test)]
+    pub(crate) fn seal_signed_plain(link: &LinkSecret, plain: &[u8]) -> Vec<u8> {
+        let mut sealed = link.keyring_key().seal(plain, KEYRING_CONTEXT);
+        let signature = link
+            .sign(&[KEYRING_SIGNATURE_CONTEXT, &sealed].concat())
+            .expect("an edit link signs");
+        sealed.extend_from_slice(&signature);
+        sealed
     }
 
     /// Checks the signature against `link`'s attestation key, opens the
@@ -1654,6 +1683,37 @@ mod tests {
             Keyring::open_verified(&other, &[&sealed[..], &signature].concat()),
             Err(CryptoError::KeyMismatch(_))
         ));
+    }
+
+    #[test]
+    fn a_keyring_never_repeats_an_attestation_key() {
+        let keyring = Keyring::new_with(&link(), [5; 32]);
+        let mut plain = keyring.to_plain().to_vec();
+        plain[1..5].copy_from_slice(&2u32.to_be_bytes());
+        plain.extend_from_slice(&[6; 32]);
+        plain.extend_from_slice(&link().attest_pub);
+        assert!(matches!(
+            Keyring::from_plain(&plain),
+            Err(CryptoError::MalformedKeyring(_))
+        ));
+        let sealed = Keyring::seal_signed_plain(&link(), &plain);
+        assert!(Keyring::open_verified(&link(), &sealed).is_err());
+    }
+
+    #[test]
+    fn keyrings_extend_only_by_appending() {
+        let first = Keyring::new_with(&link(), [5; 32]);
+        let second = first.next(&other_link());
+        assert!(first.extends(&first));
+        assert!(second.extends(&first));
+        assert!(!first.extends(&second));
+        // The same generations under other keys.
+        let other = Keyring::new_with(&link(), [6; 32]);
+        assert!(!other.extends(&first));
+        assert!(!other.next(&other_link()).extends(&first));
+        let mut moved = second.clone();
+        moved.attest_pubs[0] = [9; 32];
+        assert!(!moved.extends(&first));
     }
 
     #[test]

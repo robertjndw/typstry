@@ -42,30 +42,39 @@ const FAILURES: Record<PairFailure, string> = {
 export function PairingStatus({
   state,
   holder,
+  fingerprint,
   onRestart,
 }: {
   state: PairState;
   holder: boolean;
+  /** Of this device when it is the one being added. */
+  fingerprint?: string | null;
   onRestart: () => void;
 }) {
   switch (state.status) {
     case "waitingForPeer":
       return (
-        <Progress>
-          {holder
-            ? "Waiting for the other device to enter the code…"
-            : "Connecting to the other device…"}
-        </Progress>
+        <>
+          <Progress>
+            {holder
+              ? "Waiting for the other device to enter the code…"
+              : "Connecting to the other device…"}
+          </Progress>
+          {!holder && <OwnFingerprint fingerprint={fingerprint} />}
+        </>
       );
     case "verifying":
     case "awaitingApproval":
     case "approving":
       return (
-        <Progress>
-          {holder || state.status === "verifying"
-            ? "Checking the code…"
-            : "Waiting for the other device…"}
-        </Progress>
+        <>
+          <Progress>
+            {holder || state.status === "verifying"
+              ? "Checking the code…"
+              : "Waiting for the other device…"}
+          </Progress>
+          {!holder && <OwnFingerprint fingerprint={fingerprint} />}
+        </>
       );
     case "rejected":
       return (
@@ -124,6 +133,22 @@ export function PairingStatus({
   }
 }
 
+/** What the holder's approval dialog shows for this device, to compare. */
+function OwnFingerprint({ fingerprint }: { fingerprint?: string | null }) {
+  if (!fingerprint) return null;
+  return (
+    <p className="text-sm text-muted-foreground">
+      The other device will show this fingerprint. Approve only if it matches:{" "}
+      <span
+        aria-label="This device's fingerprint"
+        className="font-mono text-foreground select-all"
+      >
+        {fingerprint}
+      </span>
+    </p>
+  );
+}
+
 function Progress({ children }: { children: string }) {
   return (
     <p
@@ -144,10 +169,11 @@ export function ApprovalDialog({
   session: PairSession | null;
   state: PairState | null;
 }) {
-  const device =
+  const requester =
     state?.status === "awaitingApproval" || state?.status === "approving"
-      ? state.deviceName
+      ? state
       : null;
+  const device = requester?.deviceName ?? null;
   const approving = state?.status === "approving";
   return (
     <Dialog
@@ -162,6 +188,16 @@ export function ApprovalDialog({
             approve a device you just set up yourself.
           </DialogDescription>
         </DialogHeader>
+        <p className="text-sm">
+          Its name is only what it calls itself. Check that this fingerprint is
+          the one shown on the device you are adding:
+          <span
+            aria-label="Fingerprint of the joining device"
+            className="mt-1 block rounded-md bg-muted px-3 py-2 font-mono text-sm select-all"
+          >
+            {requester?.fingerprint}
+          </span>
+        </p>
         <DialogFooter>
           <Button
             variant="outline"

@@ -91,6 +91,19 @@ pub async fn typstry(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
 
 /// A temp folder by its canonical path, so paths compare cleanly on macOS
 /// where the temp dir sits behind a symlink.
+/// Fails unless only the owner can read and write `path`. Key material and
+/// group state must never be readable by other local users.
+pub fn assert_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 pub fn temp() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().canonicalize().unwrap();
@@ -226,10 +239,13 @@ pub async fn create_project(origin: &str) -> (ShareLink, ShareLink) {
     let edit = ShareLink::new(origin, &created.edit_token, &secret.to_base64url());
     let view = ShareLink::new(origin, &created.view_token, &secret.view_secret());
     // The browser that creates a project starts its group; everyone else
-    // joins it. This one only stands in for that, it does not sync.
+    // joins it. This one only stands in for that, it does not sync. Like
+    // `typstry init` it leaves the owner key on this machine, so the folders
+    // cloned in-process (the same person) can rotate from the start.
     config_dir();
     typstry_cli::mls::create_group(
         &edit,
+        &created.project_id,
         &Identity::new("Browser"),
         &typstry_cli::user::load_or_create_identity().unwrap(),
     )
@@ -267,6 +283,8 @@ pub async fn seeded_project(origin: &str, title: &str) -> (String, String) {
 pub struct Shower {
     child: Child,
     pub code: String,
+    /// Reads the rest of stdout, so the child never blocks on a full pipe.
+    rest: std::thread::JoinHandle<String>,
 }
 
 impl Shower {
@@ -299,10 +317,16 @@ impl Shower {
                     break code.to_owned();
                 }
             };
-            // Keep draining so the child never blocks on a full pipe; the
-            // rest is read from the final output.
-            std::mem::forget(lines);
-            Self { child, code }
+            let rest = std::thread::spawn(move || {
+                lines
+                    .map_while(Result::ok)
+                    .fold(String::new(), |mut out, line| {
+                        out.push_str(&line);
+                        out.push('\n');
+                        out
+                    })
+            });
+            Self { child, code, rest }
         })
         .await
         .unwrap()
@@ -311,16 +335,16 @@ impl Shower {
     pub async fn finish(self) -> std::process::Output {
         tokio::task::spawn_blocking(move || {
             let mut child = self.child;
-            // stdout was handed to the reader above; stderr carries what
-            // these tests need.
             let status = child.wait().unwrap();
             let mut stderr = Vec::new();
             if let Some(mut pipe) = child.stderr.take() {
                 std::io::Read::read_to_end(&mut pipe, &mut stderr).unwrap();
             }
+            // Everything after the code line.
+            let stdout = self.rest.join().unwrap().into_bytes();
             std::process::Output {
                 status,
-                stdout: Vec::new(),
+                stdout,
                 stderr,
             }
         })

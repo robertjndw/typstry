@@ -291,7 +291,7 @@ impl Session {
                 "could not follow the project's member group ({err:#}); syncing the document goes on, but links will not move over for this folder until this works"
             ));
         }
-        let removed_devices = Box::pin(self.remove_own_revoked_devices()).await;
+        let removed_devices = Box::pin(self.remove_revoked_devices()).await;
         let share = match self.resolved.take() {
             Some(share) => share,
             None => self.api.resolve_share(&self.config.token).await?,

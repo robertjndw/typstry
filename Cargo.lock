@@ -4652,6 +4652,7 @@ dependencies = [
  "typstry-doc",
  "typstry-server",
  "typstry-wire",
+ "zeroize",
 ]
 
 [[package]]
