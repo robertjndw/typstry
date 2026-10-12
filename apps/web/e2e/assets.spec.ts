@@ -6,6 +6,7 @@ import { unzipSync } from "fflate";
 import {
   appendLine,
   createProject,
+  downloadPdf,
   editor,
   expect,
   fileTree,
@@ -95,11 +96,9 @@ test("the compiled document downloads as a PDF", async ({ page }) => {
   await createProject(page, "Printed");
   await expect(preview(page).getByLabel("Up to date")).toBeVisible();
 
-  const download = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download PDF" }).click();
-  const file = await download;
-
-  expect(file.suggestedFilename()).toMatch(/\.pdf$/);
-  const pdf = await readFile(await file.path());
-  expect(pdf.subarray(0, 5).toString()).toBe("%PDF-");
+  const { name } = await downloadPdf(
+    page,
+    page.getByRole("button", { name: "Download PDF" }),
+  );
+  expect(name).toMatch(/\.pdf$/);
 });

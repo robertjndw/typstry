@@ -77,8 +77,11 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # Built up front so Playwright's server start doesn't run into its
-      # timeout while cargo compiles.
+      # timeout while cargo compiles. The CLI is for cli-group-project.spec.ts.
+      # Kept separate: building both at once turns on the CLI's typstry-wire
+      # features in the server too, and `cargo run` would rebuild it.
       - run: cargo build -p typstry-server
+      - run: cargo build -p typstry-cli
       - name: Playwright version
         id: playwright
         run: echo "version=$(pnpm --filter web exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"

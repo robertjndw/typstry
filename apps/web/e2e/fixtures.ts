@@ -1,22 +1,27 @@
+import { readFile } from "node:fs/promises";
 import {
   expect,
   test as base,
   type Browser,
+  type Locator,
   type Page,
 } from "@playwright/test";
 
 export { expect };
 
-export const test = base.extend<{ expectedCspViolations: RegExp[] }>({
+type Identity = { name: string; color: string };
+
+export const test = base.extend<{
+  identity: Identity;
+  expectedCspViolations: RegExp[];
+}>({
+  identity: [{ name: "E2E Tester", color: "#1d4ed8" }, { option: true }],
   // Without a stored identity, opening a project asks for a name first and
   // the dialog covers the workspace.
-  context: async ({ context }, use) => {
-    await context.addInitScript(() => {
-      localStorage.setItem(
-        "typstry:identity",
-        JSON.stringify({ name: "E2E Tester", color: "#1d4ed8" }),
-      );
-    });
+  context: async ({ context, identity }, use) => {
+    await context.addInitScript((identity) => {
+      localStorage.setItem("typstry:identity", JSON.stringify(identity));
+    }, identity);
     await use(context);
   },
   expectedCspViolations: [[], { option: true }],
@@ -135,6 +140,20 @@ export function fileTree(page: Page) {
   return page.getByRole("tree", { name: "Project files" });
 }
 
+/**
+ * Renames an entry through its context menu. `path` is the full path, which
+ * is what the rename input is labelled with.
+ */
+export async function renameEntry(page: Page, path: string, name: string) {
+  await contextMenu(page, path.split("/").pop()!, "Rename");
+  const input = page.getByLabel(`Rename ${path}`);
+  // The input takes focus a frame after mounting and then preselects the
+  // stem, so filling it any earlier can leave a doubled extension.
+  await expect(input).toBeFocused();
+  await input.fill(name);
+  await input.press("Enter");
+}
+
 export async function contextMenu(page: Page, entry: string, item: string) {
   await fileTree(page)
     .getByRole("treeitem", { name: entry })
@@ -146,4 +165,98 @@ export function versions(page: Page) {
   return page
     .getByRole("dialog", { name: "History" })
     .getByRole("list", { name: "Versions" });
+}
+
+export function versionRow(page: Page, name: string) {
+  return versions(page).getByRole("listitem").filter({ hasText: name });
+}
+
+export async function tagVersion(page: Page, name: string) {
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  await page.getByRole("button", { name: "Tag current version" }).click();
+  await page.getByLabel("Tag name").fill(name);
+  await page.getByLabel("Tag name").press("Enter");
+  await expect(versions(page).getByText(name, { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+}
+
+export async function openVersion(page: Page, name: string) {
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  // The row's own button comes first; the tags and actions follow it.
+  await versionRow(page, name).getByRole("button").first().click();
+  await expect(page.getByText(`Viewing ${name}`)).toBeVisible();
+}
+
+/** Clicks a "Download PDF" button and checks that a PDF came out of it. */
+export async function downloadPdf(page: Page, button: Locator) {
+  const download = page.waitForEvent("download");
+  await button.click();
+  const file = await download;
+  const bytes = await readFile(await file.path());
+  expect(bytes.subarray(0, 5).toString()).toBe("%PDF-");
+  return { name: file.suggestedFilename(), bytes };
+}
+
+/**
+ * The whole document as text. The editor's own text also contains the
+ * names on remote carets, so those are cut out of a copy of each line.
+ */
+export function docText(page: Page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll(".cm-content .cm-line")]
+      .map((line) => {
+        const copy = line.cloneNode(true) as Element;
+        copy
+          .querySelectorAll(
+            ".cm-remote-label, .cm-remote-caret, .cm-widgetBuffer",
+          )
+          .forEach((node) => node.remove());
+        return copy.textContent;
+      })
+      .join("\n"),
+  );
+}
+
+/**
+ * Waits until every page shows the same text for its open file and that
+ * text has all the tokens. The order of concurrent edits is arbitrary, so
+ * tokens are checked for presence only.
+ */
+export async function expectConverged(
+  pages: Page[],
+  tokens: string[] = [],
+  timeout = 15_000,
+) {
+  await expect
+    .poll(
+      async () => {
+        const texts = await Promise.all(pages.map(docText));
+        const same = texts.every((text) => text === texts[0]);
+        const missing = tokens.filter((token) => !texts[0]!.includes(token));
+        return same ? missing : texts;
+      },
+      { timeout },
+    )
+    .toEqual([]);
+}
+
+/** Types at the end of the file that is open, without touching its tab. */
+export async function typeAtEnd(page: Page, text: string) {
+  await editor(page).click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.type(text);
+  // Dismisses tinymist's completions so a later Enter can't accept one.
+  await page.keyboard.press("Escape");
+}
+
+export async function openFile(page: Page, name: string) {
+  await fileTree(page).getByRole("treeitem", { name }).click();
+  await expect(tab(page, name)).toHaveAttribute("aria-selected", "true");
+}
+
+export async function newFileIn(page: Page, folder: string, name: string) {
+  await contextMenu(page, folder, "New file");
+  await page.getByLabel("New file name").fill(name);
+  await page.getByLabel("New file name").press("Enter");
+  await expect(tab(page, name)).toHaveAttribute("aria-selected", "true");
 }
