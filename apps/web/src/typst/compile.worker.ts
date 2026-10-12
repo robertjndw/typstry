@@ -12,6 +12,8 @@ import {
 } from "@myriaddreamin/typst.ts/options.init";
 import compilerWasmUrl from "@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm?url";
 
+import { wasmModuleRef } from "./wasm-module";
+
 import { normalizeDiagnostic, type RawDiagnostic } from "./diagnostics";
 import {
   DEFAULT_FONTS,
@@ -130,7 +132,7 @@ function openIncrementalServer(
 async function buildSession(config: FontConfig): Promise<Session> {
   const compiler = createTypstCompiler();
   await compiler.init({
-    getModule: () => compilerWasmUrl,
+    getModule: () => wasmModuleRef(compilerWasmUrl),
     beforeBuild: [
       // loadFonts must be passed explicitly: in typst.ts 0.7 the implicit
       // default font loader is added to a copy of the options and never
