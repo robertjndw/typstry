@@ -84,6 +84,18 @@ export function randomIdentity(random: () => number = Math.random): Identity {
   };
 }
 
+let provisional: Identity | undefined;
+
+/**
+ * The name this page load uses until the user picks one. One value for the
+ * whole load, so the profile a new project's creator is given when the group
+ * is made is the one the project page then shows: a different random name
+ * would send a profile update to the group the moment the project opens.
+ */
+export function provisionalIdentity(): Identity {
+  return (provisional ??= randomIdentity());
+}
+
 export function parseIdentity(value: unknown): Identity | null {
   if (typeof value !== "object" || value === null) return null;
   const { name, color } = value as Partial<Identity>;
@@ -96,6 +108,24 @@ export function loadIdentity(
   storage: Storage | null = getStorage(),
 ): Identity | null {
   return parseIdentity(readJson(IDENTITY_KEY, storage));
+}
+
+/**
+ * The MLS member profile: UTF-8 JSON `{"name", "color"}`, the same bytes the
+ * CLI writes. Sealed under the doc key before it reaches the group.
+ */
+export function encodeProfile(identity: Identity): Uint8Array {
+  return new TextEncoder().encode(
+    JSON.stringify({ name: identity.name, color: identity.color }),
+  );
+}
+
+export function decodeProfile(bytes: Uint8Array): Identity | null {
+  try {
+    return parseIdentity(JSON.parse(new TextDecoder().decode(bytes)));
+  } catch {
+    return null;
+  }
 }
 
 export function saveIdentity(
@@ -153,4 +183,5 @@ export function useStoredIdentity(): Identity | null {
 /** Test hook: forget the cached identity so the next read hits storage. */
 export function resetIdentityCache(): void {
   current = undefined;
+  provisional = undefined;
 }

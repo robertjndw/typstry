@@ -1,7 +1,7 @@
 // Live sync of a project's LoroDoc (and optionally its presence store) with
 // crates/typstry-server over the Loro Protocol. Both rooms share one socket
 // and use the project id as room id; the share token is the join auth.
-// Everything is encrypted with the project key before it leaves the page.
+// Everything is encrypted with the project's keys before it leaves the page.
 import type { EphemeralStore, LoroDoc } from "loro-crdt";
 import {
   LoroWebsocketClient,
@@ -9,11 +9,17 @@ import {
   type LoroWebsocketClientRoom,
   type RoomJoinStatusValue,
 } from "loro-websocket";
-import type { ProjectKey } from "@/crypto/project-key";
 import { toError } from "@/lib/errors";
 
-import { EncryptedDocAdaptor } from "./encrypted-doc-adaptor";
-import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
+import {
+  EncryptedDocAdaptor,
+  type RecordCrypto,
+} from "./encrypted-doc-adaptor";
+import {
+  EphemeralStoreAdaptor,
+  type PresenceCrypto,
+} from "./ephemeral-adaptor";
+import { fetchServerInfo, isOutdated, socketUrl } from "./protocol";
 
 export type SyncStatus = "connecting" | "connected" | "disconnected";
 
@@ -22,11 +28,19 @@ export type SyncNowResult = "synced" | "offline";
 
 const SYNC_NOW_TIMEOUT_MS = 5000;
 
+/**
+ * A failing socket checks /api/info at most this often. Reconnects back off
+ * to 15 s, so that is one request every couple of attempts.
+ */
+const OUTDATED_CHECK_MS = 30_000;
+
+const RETIRED_CHECK_MS = 2000;
+
 export interface ConnectOptions {
-  projectId: string;
+  spaceId: string;
   /** Edit or view token; the server derives the permission from it. */
   token: string;
-  key: ProjectKey;
+  crypto: RecordCrypto & PresenceCrypto;
   /** False for view links, which must not try to upload anything. */
   canWrite: boolean;
   doc: LoroDoc;
@@ -34,11 +48,43 @@ export interface ConnectOptions {
   /** Defaults to `/ws` on the page's origin. */
   url?: string;
   onError?: (error: Error) => void;
-  /** Received data does not decrypt with `key`. */
+  /** Received data does not decrypt with `crypto`. */
   onDecryptError?: (error: Error) => void;
+  /**
+   * Received data is sealed under a key generation `crypto` lacks: the
+   * group rotated, and its new links are what open it.
+   */
+  onUnknownGeneration?: (generation: number) => void;
+  /** The server no longer serves this build. Syncing has already stopped. */
+  onOutdated?: () => void;
+  /** Whether the server refuses this build; replaceable for tests. */
+  checkOutdated?: () => Promise<boolean>;
+  /**
+   * The link was replaced by a rotation, so the server closed the doc
+   * socket for good. Syncing has already stopped; follow the group to find
+   * the new links.
+   */
+  onRetired?: () => void;
+  /**
+   * Whether `token` was retired. The browser does not tell a socket's close
+   * code apart from any other failure, so this asks the server.
+   */
+  checkRetired?: () => Promise<boolean>;
+  /**
+   * Whether the space's doc is what the caller meant to open, asked before
+   * this device uploads anything; see EncryptedDocAdaptorOptions.accept.
+   */
+  accept?: (doc: LoroDoc) => boolean | undefined;
+  /**
+   * `accept` said no. Nothing was uploaded and syncing has already
+   * stopped.
+   */
+  onRefused?: () => void;
+  /** Upload a snapshot right after joining: a rotation just moved the keys. */
+  compactOnJoin?: boolean;
 }
 
-export interface ProjectConnection {
+export interface SpaceConnection {
   getStatus(): SyncStatus;
   /** Calls `listener` with the current status right away, then on change. */
   subscribe(listener: (status: SyncStatus) => void): () => void;
@@ -56,11 +102,20 @@ export interface ProjectConnection {
   close(): void;
 }
 
-export function projectWsUrl(loc: Pick<Location, "protocol" | "host">): string {
-  return `${loc.protocol === "https:" ? "wss:" : "ws:"}//${loc.host}/ws`;
+/**
+ * loro-websocket reports a join sent before the socket is open as an error,
+ * but it also queues the join and sends it once the socket opens. Every
+ * join made while connecting hits this, so there is nothing to report.
+ */
+function isQueuedJoin(error: Error): boolean {
+  return error.message === "WebSocket not open during join";
 }
 
-export function connectProject(opts: ConnectOptions): ProjectConnection {
+export function projectWsUrl(loc: Pick<Location, "protocol" | "host">): string {
+  return socketUrl(loc, "/ws");
+}
+
+export function connectSpace(opts: ConnectOptions): SpaceConnection {
   const url = opts.url ?? projectWsUrl(window.location);
   const auth = new TextEncoder().encode(opts.token);
   const listeners = new Set<(status: SyncStatus) => void>();
@@ -83,20 +138,31 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
     for (const listener of [...listeners]) listener(status);
   };
 
-  const client = new LoroWebsocketClient({ url, onError: opts.onError });
+  const onError = opts.onError;
+  const client = new LoroWebsocketClient({
+    url,
+    onError: onError
+      ? (error) => {
+          if (!isQueuedJoin(error)) onError(error);
+        }
+      : undefined,
+  });
   const docAdaptor = new EncryptedDocAdaptor(opts.doc, {
-    key: opts.key,
+    crypto: opts.crypto,
     canWrite: opts.canWrite,
     onDecryptError: opts.onDecryptError,
+    onUnknownGeneration: opts.onUnknownGeneration,
+    compactOnJoin: opts.compactOnJoin,
+    accept: opts.accept,
+    onRefused: () => {
+      if (finished) return;
+      fail();
+      opts.onRefused?.();
+    },
   });
   const ephemeralAdaptor = opts.ephemeral
-    ? new EphemeralStoreAdaptor(opts.ephemeral, opts.key)
+    ? new EphemeralStoreAdaptor(opts.ephemeral, opts.crypto)
     : undefined;
-
-  const stopSocketStatus = client.onStatusChange((s) => {
-    socket = s;
-    update();
-  });
 
   const fail = () => {
     if (finished) return;
@@ -105,8 +171,57 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
     shutdown();
   };
 
+  // The server answers an outdated client's handshake with a 426, but the
+  // browser reports that as a plain failed socket, same as being offline.
+  // So after a failure we ask /api/info and stop retrying if we're too old.
+  const checkOutdated =
+    opts.checkOutdated ?? (async () => isOutdated(await fetchServerInfo()));
+  let lastCheck = -Infinity;
+  const onDisconnect = () => {
+    const now = Date.now();
+    if (now - lastCheck < OUTDATED_CHECK_MS) return;
+    lastCheck = now;
+    void checkOutdated().then(
+      (outdated) => {
+        if (!outdated || finished) return;
+        fail();
+        opts.onOutdated?.();
+      },
+      () => {},
+    );
+  };
+
+  // The server ends a retired token's doc sockets with a code the page
+  // cannot read, so each drop asks whether that is why. Throttled, since a
+  // flaky connection drops often.
+  let lastRetiredCheck = -Infinity;
+  const checkRetired = opts.checkRetired;
+  const onDropped = () => {
+    if (!checkRetired) return;
+    const now = Date.now();
+    if (now - lastRetiredCheck < RETIRED_CHECK_MS) return;
+    lastRetiredCheck = now;
+    void checkRetired().then(
+      (retired) => {
+        if (!retired || finished) return;
+        fail();
+        opts.onRetired?.();
+      },
+      () => {},
+    );
+  };
+
+  const stopSocketStatus = client.onStatusChange((s) => {
+    socket = s;
+    if (s === "disconnected" && !finished) {
+      onDisconnect();
+      onDropped();
+    }
+    update();
+  });
+
   const docJoin: Promise<LoroWebsocketClientRoom> = client.join({
-    roomId: opts.projectId,
+    roomId: opts.spaceId,
     crdtAdaptor: docAdaptor,
     auth,
     onStatusChange: (s) => {
@@ -122,7 +237,7 @@ export function connectProject(opts: ConnectOptions): ProjectConnection {
   if (ephemeralAdaptor) {
     client
       .join({
-        roomId: opts.projectId,
+        roomId: opts.spaceId,
         crdtAdaptor: ephemeralAdaptor,
         auth,
       })

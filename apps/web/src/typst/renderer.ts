@@ -5,6 +5,7 @@ import {
 import rendererWasmUrl from "@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm?url";
 
 import type { ArtifactUpdate } from "./protocol";
+import { wasmModuleRef } from "./wasm-module";
 
 /** What compiler-client needs from a renderer; tests substitute a fake. */
 export interface PreviewRenderer {
@@ -29,7 +30,7 @@ export interface PreviewRenderer {
  */
 export async function createPreviewRenderer(): Promise<PreviewRenderer> {
   const renderer = createTypstRenderer();
-  await renderer.init({ getModule: () => rendererWasmUrl });
+  await renderer.init({ getModule: () => wasmModuleRef(rendererWasmUrl) });
 
   // runWithSession frees the session when the callback settles; park it so
   // the session lives as long as this renderer.

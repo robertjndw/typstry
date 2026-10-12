@@ -651,10 +651,10 @@ async fn a_wrong_key_stops_sync_instead_of_retrying() {
     let config_path = state.join("config.json");
     let mut config: serde_json::Value =
         serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    let other = typstry_wire::crypto::ProjectKey::generate_raw();
+    let other = typstry_wire::crypto::LinkSecret::generate_edit().to_base64url();
     config["key"] = serde_json::Value::String(other.to_string());
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-    for name in ["doc.bin", "doc.log", "base.json"] {
+    for name in ["doc.bin", "doc.log", "base.json", "mls.bin"] {
         let _ = fs::remove_file(state.join(name));
     }
     fs::remove_file(a.join("main.typ")).unwrap();
@@ -665,5 +665,8 @@ async fn a_wrong_key_stops_sync_instead_of_retrying() {
         .expect("sync kept retrying")
         .unwrap()
         .unwrap_err();
-    assert!(format!("{err:#}").contains("encrypted with key"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("is the link complete"),
+        "{err:#}"
+    );
 }

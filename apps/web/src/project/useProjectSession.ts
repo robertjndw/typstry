@@ -2,40 +2,51 @@ import { EphemeralStore, LoroDoc } from "loro-crdt";
 import {
   useCallback,
   useEffect,
-  useRef,
+  useMemo,
   useState,
   useSyncExternalStore,
 } from "react";
 
 import { projectAssets, type ProjectAssets } from "@/assets/project-assets";
+import { isEditSecret } from "@/crypto/secret";
+import type { SpaceCrypto } from "@/crypto/space-crypto";
 import {
-  importProjectKey,
-  isEditSecret,
-  isProjectSecret,
-  type ProjectKey,
-} from "@/crypto/project-key";
-import { ProjectDoc, SCHEMA_VERSION } from "@/doc/schema";
-import { defaultBackend, LocalDocStore } from "@/persist/local-doc-store";
-import { resolveShare, type ShareInfo } from "@/sync/api";
+  recordAdopted,
+  recordOpened,
+  recordResolved,
+  recordRetired,
+  recordRotation,
+  recordStatus,
+  recordTitle,
+} from "@/directory/record";
 import {
-  connectProject,
-  type SyncNowResult,
-  type SyncStatus,
-} from "@/sync/connection";
+  DOC_KIND,
+  docKind,
+  isForeignKind,
+  isSchemaTooNew,
+  migrate,
+  ProjectDoc,
+} from "@/doc/schema";
+import type { MlsSession } from "@/mls/session";
+import {
+  loadIdentity,
+  provisionalIdentity,
+  type Identity,
+} from "@/presence/identity";
+import { loadShareLinks, loadSpaceKey } from "@/space/space-links";
+import {
+  LINK_REPLACED,
+  SpaceSession,
+  TOO_NEW,
+  type FollowedLinks,
+} from "@/space/space-session";
+import type { ShareInfo } from "@/sync/api";
+import type { SyncNowResult, SyncStatus } from "@/sync/connection";
 
-import {
-  forgetShare,
-  loadProjectKey,
-  loadShare,
-  rememberProject,
-  rememberShare,
-  saveProjectKey,
-  updateRecentTitle,
-} from "./recent";
+export const NOT_A_PROJECT = "This link does not open a project.";
 
 /** Matches the server's presence timeout. */
 export const EPHEMERAL_TIMEOUT_MS = 30_000;
-const SLOW_SYNC_MS = 15_000;
 
 export type SessionPhase =
   | { phase: "resolving" }
@@ -45,13 +56,15 @@ export type SessionPhase =
   /** Synced, but nobody has uploaded the project's first version yet. */
   | { phase: "empty"; share: ShareInfo }
   | { phase: "error"; message: string }
+  /** The group removed this device. Its links stopped working. */
+  | { phase: "removed" }
   | { phase: "syncing"; share: ShareInfo; slow: boolean }
   | {
       phase: "ready";
       share: ShareInfo;
       assets: ProjectAssets;
       /** Holds the secrets share links are built from. */
-      key: ProjectKey;
+      crypto: SpaceCrypto;
       /**
        * An edit token with only the view secret can reach the server but
        * not sign, so it is read-only too.
@@ -59,41 +72,19 @@ export type SessionPhase =
       canWrite: boolean;
     };
 
+export type { FollowedLinks };
+
 export interface ProjectSession {
   state: SessionPhase;
   status: SyncStatus;
   project: ProjectDoc;
   ephemeral: EphemeralStore;
+  /** The project's member group; null until the share is known. */
+  mls: MlsSession | null;
+  /** Set after a rotation: navigate to these, keeping the session. */
+  following: FollowedLinks | null;
   /** Saves locally and pushes pending edits to the server right away. */
   syncNow: () => Promise<SyncNowResult>;
-}
-
-const WRONG_KEY =
-  "This link's key does not match the project. Check that the link was copied completely, including the part after #.";
-const TOO_NEW =
-  "This project was saved by a newer version of typstry. Reload the page to update.";
-
-function sameShare(a: ShareInfo | null | undefined, b: ShareInfo | null) {
-  if (!a || !b) return a === b;
-  return (
-    a.projectId === b.projectId &&
-    a.permission === b.permission &&
-    a.viewToken === b.viewToken
-  );
-}
-
-/**
- * Imports the link's secret. A creator who opens their own view link (to
- * check what others see) keeps the edit secret this browser already holds,
- * instead of being downgraded to read-only for good.
- */
-async function openKey(projectId: string, raw: string): Promise<ProjectKey> {
-  const key = await importProjectKey(raw);
-  if (key.sign) return key;
-  const stored = loadProjectKey(projectId);
-  if (!stored || !isEditSecret(stored)) return key;
-  const editor = await importProjectKey(stored);
-  return editor.viewSecret === key.viewSecret ? editor : key;
 }
 
 /**
@@ -107,184 +98,167 @@ async function openKey(projectId: string, raw: string): Promise<ProjectKey> {
 export function useProjectSession(
   token: string,
   linkKey: string | null,
+  opts: { identity?: Identity } = {},
 ): ProjectSession {
   const [resources] = useState(() => ({
     project: new ProjectDoc(new LoroDoc()),
     ephemeral: new EphemeralStore(EPHEMERAL_TIMEOUT_MS),
   }));
   const { project, ephemeral } = resources;
-  const [share, setShare] = useState<ShareInfo | null | undefined>(
-    () => loadShare(token) ?? undefined,
+  const [fallbackIdentity] = useState(
+    () => loadIdentity() ?? provisionalIdentity(),
   );
-  const [error, setError] = useState<string | null>(null);
-  const [assets, setAssets] = useState<ProjectAssets | null>(null);
-  const [projectKey, setProjectKey] = useState<ProjectKey | null>(null);
-  const [loadedLocally, setLoadedLocally] = useState(false);
-  const [synced, setSynced] = useState(false);
-  const [slow, setSlow] = useState(false);
-  const [status, setStatus] = useState<SyncStatus>("connecting");
-  const syncRef = useRef<(() => Promise<SyncNowResult>) | null>(null);
+  const identity = opts.identity ?? fallbackIdentity;
+  const [session] = useState(
+    () =>
+      new SpaceSession({
+        token,
+        linkKey,
+        doc: project.doc,
+        ephemeral,
+        identity,
+        // Undecided until the kind arrives: a fresh link starts from an empty doc.
+        accept: (doc) => {
+          const kind = docKind(doc);
+          return kind === null ? undefined : kind === DOC_KIND.project;
+        },
+        refusedMessage: NOT_A_PROJECT,
+        onRotated: (rotation, spaceId, replaced) =>
+          void recordRotation(spaceId, rotation, replaced),
+      }),
+  );
+  const snap = useSyncExternalStore(session.subscribe, session.snapshot);
+  const { share, crypto, opened, synced, mls, followed } = snap;
+
   const schema = useSyncExternalStore(
     useCallback((onChange) => project.meta.subscribe(onChange), [project]),
     () => project.schemaVersion,
   );
 
-  const key =
-    linkKey && isProjectSecret(linkKey)
-      ? linkKey
-      : share
-        ? loadProjectKey(share.projectId)
-        : null;
+  const foreign = useSyncExternalStore(
+    useCallback((onChange) => project.meta.subscribe(onChange), [project]),
+    () => isForeignKind(project),
+  );
 
   useEffect(() => {
-    const abort = new AbortController();
-    const cached = loadShare(token);
-    resolveShare(token, { signal: abort.signal }).then(
-      (info) => {
-        if (info) rememberShare(token, info);
-        else forgetShare(token);
-        setShare((prev) => (sameShare(prev, info) ? prev : info));
-      },
-      (err) => {
-        if (abort.signal.aborted) return;
-        // Offline with a project seen before: carry on from local data.
-        if (cached) return;
-        console.error(err);
-        setError("The server could not be reached.");
-      },
-    );
-    return () => abort.abort();
-  }, [token]);
+    session.setIdentity(identity);
+  });
 
   useEffect(() => {
-    if (!share || !key) return;
-    let active = true;
-    let local: LocalDocStore | null = null;
-    let close: (() => void) | null = null;
+    session.setTarget(token, linkKey);
+  }, [session, token, linkKey]);
 
-    (async () => {
-      const [projectKey, backend] = await Promise.all([
-        openKey(share.projectId, key),
-        defaultBackend(),
-      ]);
-      local = new LocalDocStore(share.projectId, project.doc, backend);
-      const found = await local.load();
-      if (!active) return;
-      local.start();
-      setAssets(projectAssets(token, projectKey));
-      setProjectKey(projectKey);
-      if (found) setLoadedLocally(true);
+  useEffect(() => {
+    session.start();
+    return () => session.stop();
+  }, [session]);
 
-      const conn = connectProject({
-        projectId: share.projectId,
+  useEffect(() => {
+    session.updateProfile();
+  }, [session, mls, identity.name, identity.color]);
+
+  const assets = useMemo(
+    () => (crypto ? projectAssets(token, crypto) : null),
+    [token, crypto],
+  );
+
+  useEffect(() => {
+    if (!opened || !share || !crypto || schema === null || foreign) return;
+    if (!session.keepSecret()) return;
+    const secret = loadSpaceKey(share.spaceId);
+    if (!secret) return;
+    const title = project.title || "Untitled";
+    void recordOpened(
+      share.spaceId,
+      {
         token,
-        key: projectKey,
-        canWrite: share.permission === "write" && projectKey.sign !== null,
-        doc: project.doc,
-        ephemeral,
-        // A StrictMode remount closes the first socket mid-join; that is noise.
-        onError: (err) => {
-          if (active) console.warn("sync:", err);
-        },
-        onDecryptError: (err) => {
-          console.error(err);
-          if (active) setError(WRONG_KEY);
-        },
-      });
-      const stopStatus = conn.subscribe((s) => setStatus(s));
-      const store = local;
-      syncRef.current = async () => {
-        await store.flush();
-        return conn.syncNow();
-      };
-      const slowTimer = setTimeout(() => setSlow(true), SLOW_SYNC_MS);
-      conn.synced.then(
-        () => {
-          clearTimeout(slowTimer);
-          if (active) setSynced(true);
-        },
-        (err: unknown) => {
-          console.error(err);
-          if (active) setError("The server refused to open this project.");
-        },
-      );
-      close = () => {
-        clearTimeout(slowTimer);
-        stopStatus();
-        conn.close();
-      };
-    })().catch((err: unknown) => {
-      console.error(err);
-      if (active) setError("This project could not be opened.");
-    });
-
-    return () => {
-      active = false;
-      syncRef.current = null;
-      close?.();
-      void local?.stop();
-    };
-  }, [share, key, token, project, ephemeral]);
-
-  const opened = synced || loadedLocally;
-
-  useEffect(() => {
-    if (!opened || !share || !projectKey || schema === null) return;
-    // Only now is the key likely to fit, but local data is stored in plain
-    // text, so loading it proves nothing about the key. A view key that
-    // reaches this point did not match the stored edit secret (see openKey),
-    // and letting it replace that secret would let any crafted link take
-    // edit access away from this browser for good. The same goes for any
-    // other key replacing a stored one: until the server's records decrypted
-    // with it, it may just be a wrong link, and saving it would lose the
-    // working key.
-    const secret = projectKey.editSecret ?? projectKey.viewSecret;
-    const stored = loadProjectKey(share.projectId);
-    const proven = synced || stored === null || stored === secret;
-    if (proven && (projectKey.editSecret || !stored || !isEditSecret(stored))) {
-      saveProjectKey(share.projectId, secret);
-    }
-    rememberProject({
-      projectId: share.projectId,
-      token,
-      title: project.title || "Untitled",
-    });
-  }, [opened, synced, share, projectKey, schema, token, project]);
-
-  useEffect(() => {
-    if (!opened || !share) return;
-    return project.meta.subscribe(() =>
-      updateRecentTitle(share.projectId, project.title || "Untitled"),
+        secret,
+        edit: share.permission === "write" && isEditSecret(secret),
+      },
+      title,
     );
-  }, [opened, share, project]);
+    // Someone who opens the view link of their own project (to see what
+    // others see) keeps the edit link as the one the list opens.
+    const editToken = loadShareLinks(share.spaceId)?.editToken;
+    if (editToken && editToken !== token && isEditSecret(secret))
+      void recordAdopted(
+        share.spaceId,
+        { token: editToken, secret, edit: true },
+        title,
+      );
+  }, [opened, synced, share, crypto, schema, foreign, token, project, session]);
+
+  useEffect(() => {
+    if (!opened || !share || foreign) return;
+    return project.meta.subscribe(
+      () => void recordTitle(share.spaceId, project.title || "Untitled"),
+    );
+  }, [opened, share, foreign, project]);
+
+  const spaceId = share?.spaceId;
+  useEffect(() => {
+    if (spaceId) void recordResolved(token, spaceId);
+  }, [spaceId, token]);
+
+  const p = snap.phase;
+
+  // What this link turned out to be, for the project list. A token the
+  // directory never saw open is ignored, so a mistyped link leaves no trace.
+  const retired = share?.retired === true;
+  const lost = p.phase === "error" && p.message === LINK_REPLACED;
+  useEffect(() => {
+    if (retired) void recordRetired(token);
+  }, [retired, token]);
+  useEffect(() => {
+    if (p.phase === "removed") void recordStatus(token, "removed");
+    else if (p.phase === "not-found" || lost) void recordStatus(token, "gone");
+  }, [p.phase, lost, token]);
 
   let state: SessionPhase;
-  if (error) state = { phase: "error", message: error };
-  else if (schema !== null && schema > SCHEMA_VERSION)
-    state = { phase: "error", message: TOO_NEW };
-  else if (share === undefined) state = { phase: "resolving" };
-  else if (share === null) state = { phase: "not-found" };
-  else if (!key) state = { phase: "missing-key" };
-  else if (!opened || !assets || !projectKey)
-    state = { phase: "syncing", share, slow };
+  if (p.phase === "removed" || p.phase === "error") state = p;
+  else if (foreign) state = { phase: "error", message: NOT_A_PROJECT };
+  else if (isSchemaTooNew(schema)) state = { phase: "error", message: TOO_NEW };
+  else if (
+    p.phase === "resolving" ||
+    p.phase === "not-found" ||
+    p.phase === "missing-key"
+  )
+    state = p;
+  else if (p.phase === "syncing" || !assets)
+    state = { phase: "syncing", share: p.share, slow: snap.slow };
   else if (schema === null)
     state = synced
-      ? { phase: "empty", share }
-      : { phase: "syncing", share, slow };
+      ? { phase: "empty", share: p.share }
+      : { phase: "syncing", share: p.share, slow: snap.slow };
   else
     state = {
       phase: "ready",
-      share,
+      share: p.share,
       assets,
-      key: projectKey,
-      canWrite: share.permission === "write" && projectKey.sign !== null,
+      crypto: p.crypto,
+      canWrite: p.share.permission === "write" && p.crypto.canWrite,
     };
 
-  const syncNow = useCallback(
-    async (): Promise<SyncNowResult> =>
-      (await syncRef.current?.()) ?? "offline",
-    [],
-  );
+  // Only after the initial sync: a doc loaded from this browser alone may
+  // lack ops the server has, and migrating that would work on a partial
+  // project. A newer doc or another kind never gets here, they are the errors above.
+  const canMigrate = synced && state.phase === "ready" && state.canWrite;
+  useEffect(() => {
+    // migrate() itself skips a doc that is already current. schema is a
+    // dependency so the effect runs again once a pull changes it.
+    if (canMigrate) migrate(project);
+  }, [canMigrate, schema, project]);
 
-  return { state, status, project, ephemeral, syncNow };
+  // The page has followed once its token is the new one.
+  const following = followed && followed.token !== token ? followed : null;
+
+  return {
+    state,
+    status: snap.status,
+    project,
+    ephemeral,
+    mls,
+    following,
+    syncNow: session.syncNow,
+  };
 }

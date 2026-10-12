@@ -99,6 +99,46 @@ async fn app_pages_carry_a_strict_csp() {
 }
 
 #[tokio::test]
+async fn hashed_assets_are_cached_for_good_and_precompressed() {
+    let dir = tempfile::tempdir().unwrap();
+    let dist = dir.path().join("dist");
+    std::fs::create_dir_all(dist.join("assets")).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html>app").unwrap();
+    std::fs::write(dist.join("assets/app-Ab1_x.wasm"), "plain").unwrap();
+    std::fs::write(dist.join("assets/app-Ab1_x.wasm.br"), "brotli").unwrap();
+    let pool = common::open_db(dir.path()).await;
+    let app = router(AppState::new(pool, BlobStore::new(dir.path())), &dist);
+
+    let get = |path: &str, encoding: &str| {
+        let req = Request::get(path)
+            .header("accept-encoding", encoding)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req)
+    };
+
+    let res = get("/assets/app-Ab1_x.wasm", "gzip, br").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(res.headers()["content-encoding"], "br");
+    assert_eq!(to_bytes(res.into_body(), 1024).await.unwrap(), "brotli");
+
+    let res = get("/assets/app-Ab1_x.wasm", "identity").await.unwrap();
+    assert!(res.headers().get("content-encoding").is_none());
+    assert_eq!(to_bytes(res.into_body(), 1024).await.unwrap(), "plain");
+
+    // Pages, and the index.html a missing asset falls back to, must be
+    // revalidated, or a deploy would never reach the browser.
+    for path in ["/", "/p/sometoken", "/assets/gone-Zz9.js"] {
+        let res = get(path, "br").await.unwrap();
+        assert_eq!(res.headers()["cache-control"], "no-cache", "{path}");
+    }
+}
+
+#[tokio::test]
 async fn migrations_create_schema_in_wal_mode() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
@@ -111,7 +151,15 @@ async fn migrations_create_schema_in_wal_mode() {
     .unwrap();
     assert_eq!(
         tables,
-        ["blobs", "doc_records", "project_blobs", "projects"]
+        [
+            "blobs",
+            "doc_records",
+            "mls_commits",
+            "mls_groups",
+            "retired_tokens",
+            "space_blobs",
+            "spaces"
+        ]
     );
 
     let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -126,7 +174,7 @@ async fn backup_writes_a_readable_copy() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
     let state = AppState::new(pool.clone(), BlobStore::new(dir.path()));
-    common::create_project(common::app(state, dir.path())).await;
+    common::create_space(common::app(state, dir.path())).await;
 
     let dest = dir.path().join("backup.db");
     db::backup(&pool, &dest).await.unwrap();
@@ -134,11 +182,11 @@ async fn backup_writes_a_readable_copy() {
     assert!(db::backup(&pool, &dest).await.is_err());
 
     let copy = db::open(&dest).await.unwrap();
-    let projects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects")
+    let spaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM spaces")
         .fetch_one(&copy)
         .await
         .unwrap();
-    assert_eq!(projects, 1);
+    assert_eq!(spaces, 1);
     let check: String = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_one(&copy)
         .await
@@ -147,7 +195,7 @@ async fn backup_writes_a_readable_copy() {
 }
 
 #[tokio::test]
-async fn create_project_ignores_any_body() {
+async fn create_space_ignores_any_body() {
     let dir = tempfile::tempdir().unwrap();
     let pool = common::open_db(dir.path()).await;
     let app = common::app(
@@ -161,7 +209,7 @@ async fn create_project_ignores_any_body() {
         (Some("application/json"), "{}"),
         (Some("application/json"), r#"{"title":"Paper"}"#),
     ] {
-        let mut req = Request::post("/api/projects");
+        let mut req = Request::post("/api/spaces");
         if let Some(ct) = content_type {
             req = req.header("content-type", ct);
         }
@@ -173,16 +221,15 @@ async fn create_project_ignores_any_body() {
         assert_eq!(res.status(), StatusCode::CREATED, "{body:?}");
         let created: serde_json::Value =
             serde_json::from_slice(&to_bytes(res.into_body(), 1024).await.unwrap()).unwrap();
-        for key in ["projectId", "editToken", "viewToken"] {
+        for key in ["spaceId", "editToken", "viewToken"] {
             assert_eq!(created[key].as_str().unwrap().len(), 22, "{key}");
         }
     }
     // Nothing is seeded server side; the first client writes the doc.
-    let (projects, records): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM projects), (SELECT COUNT(*) FROM doc_records)",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!((projects, records), (3, 0));
+    let (spaces, records): (i64, i64) =
+        sqlx::query_as("SELECT (SELECT COUNT(*) FROM spaces), (SELECT COUNT(*) FROM doc_records)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((spaces, records), (3, 0));
 }

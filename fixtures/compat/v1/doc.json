@@ -1,0 +1,100 @@
+{
+  "deletedVersions": [
+    {
+      "deletedAt": 1700000000004,
+      "id": "179@7",
+      "index": 1,
+      "name": "Scrapped"
+    }
+  ],
+  "dirs": [
+    "chapters",
+    "figures"
+  ],
+  "files": [
+    {
+      "kind": "text",
+      "path": "chapters/intro.typ",
+      "text": "= Introduction\n\nWritten at format v1.\nEdited by a second peer.\n"
+    },
+    {
+      "hash": "sha256:283bc32e08dab7b828f184226eaa649140124907e2165670d743c0c837f66697",
+      "kind": "asset",
+      "mime": "image/png",
+      "path": "figures/logo.png",
+      "size": 48
+    },
+    {
+      "kind": "text",
+      "path": "main.typ",
+      "text": "#set document(title: \"Compat v1\")\n#set page(paper: \"a4\")\n\n= Compat v1\n\nHello, Typst!\n\n#include \"chapters/intro.typ\"\n"
+    }
+  ],
+  "mainFile": "main.typ",
+  "peers": {
+    "7": {
+      "color": "#3366cc",
+      "name": "Ada"
+    },
+    "9": {
+      "color": "#cc6633",
+      "name": "Grace"
+    }
+  },
+  "schema": 1,
+  "title": "Compat v1",
+  "versions": [
+    {
+      "author": "7",
+      "createdAt": 1700000000001,
+      "files": [
+        {
+          "kind": "text",
+          "path": "chapters/intro.typ",
+          "text": "= Introduction\n\nWritten at format v1.\n"
+        },
+        {
+          "hash": "sha256:283bc32e08dab7b828f184226eaa649140124907e2165670d743c0c837f66697",
+          "kind": "asset",
+          "mime": "image/png",
+          "path": "figures/logo.png",
+          "size": 48
+        },
+        {
+          "kind": "text",
+          "path": "main.typ",
+          "text": "#set document(title: \"Compat v1\")\n#set page(paper: \"a4\")\n\n= Compat v1\n\nHello, Typst!\n"
+        }
+      ],
+      "id": "147@7",
+      "index": 0,
+      "name": "First draft"
+    },
+    {
+      "author": "7",
+      "createdAt": 1700000000003,
+      "files": [
+        {
+          "kind": "text",
+          "path": "chapters/intro.typ",
+          "text": "= Introduction\n\nWritten at format v1.\nEdited by a second peer.\n"
+        },
+        {
+          "hash": "sha256:283bc32e08dab7b828f184226eaa649140124907e2165670d743c0c837f66697",
+          "kind": "asset",
+          "mime": "image/png",
+          "path": "figures/logo.png",
+          "size": 48
+        },
+        {
+          "kind": "text",
+          "path": "main.typ",
+          "text": "#set document(title: \"Compat v1\")\n#set page(paper: \"a4\")\n\n= Compat v1\n\nHello, Typst!\n\n#include \"chapters/intro.typ\"\n"
+        }
+      ],
+      "id": "180@7",
+      "index": 2,
+      "name": "Final"
+    }
+  ]
+}

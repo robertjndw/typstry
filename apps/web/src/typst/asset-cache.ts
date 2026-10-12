@@ -1,16 +1,14 @@
-import { ownBuffer } from "@/crypto/project-key";
-import { ApiError, blobUrl } from "@/sync/api";
+import { ownBuffer, toHex } from "@/crypto/bytes";
+import { apiFetch, ApiError, blobUrl } from "@/sync/api";
 
-export const BLOB_CACHE = "typstry-blobs-v1";
+import { BLOB_CACHE } from "./cache-names";
 
 /** `sha256:<hex>`, the server's name for a blob. */
 export async function contentHash(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(
     await crypto.subtle.digest("SHA-256", ownBuffer(bytes)),
   );
-  let hex = "";
-  for (const b of digest) hex += b.toString(16).padStart(2, "0");
-  return `sha256:${hex}`;
+  return `sha256:${toHex(digest)}`;
 }
 
 // Assets go up to 25 MB each, so a count bound alone could pin hundreds of
@@ -116,8 +114,10 @@ export class AssetCache {
     const cached = await store?.match(key).catch(() => undefined);
     if (cached) return new Uint8Array(await cached.arrayBuffer());
 
-    const res = await this.fetchFn(
+    const res = await apiFetch(
       blobUrl(token, hash, { baseUrl: this.baseUrl }),
+      {},
+      this.fetchFn,
     );
     if (!res.ok) {
       throw new ApiError(

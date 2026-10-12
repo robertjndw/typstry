@@ -1,22 +1,24 @@
 import { LoroDoc } from "loro-crdt";
 
 import { projectAssets, type ProjectAssets } from "@/assets/project-assets";
-import { generateEditSecret, importProjectKey } from "@/crypto/project-key";
+import { SpaceCrypto } from "@/crypto/space-crypto";
+import { ownerSecretList } from "@/crypto/wasm";
 import { initProject, type ProjectDoc } from "@/doc/schema";
 import {
   defaultBackend,
   LocalDocStore,
   type DocBackend,
 } from "@/persist/local-doc-store";
-import { createProject, type ApiOptions } from "@/sync/api";
+import type { DsClientOptions } from "@/mls/ds-client";
+import type { ApiOptions } from "@/sync/api";
 
 import {
-  forgetProject,
-  rememberProject,
-  rememberShare,
-  saveProjectKey,
-  saveShareLinks,
-} from "./recent";
+  recordForgotten,
+  recordOpened,
+  recordOwnerSecret,
+} from "@/directory/record";
+import { createSpaceGroup } from "@/space/create-space";
+import { forgetSpace, rememberCreatedSpace } from "@/space/space-links";
 
 export interface NewProject {
   projectId: string;
@@ -36,27 +38,30 @@ export type ProjectSeed = (
 
 /**
  * Registers a project with the server and seeds its doc in this browser.
- * The server only hands out ids and tokens; the title and files are written
- * locally and reach it encrypted when the project is first opened. Without
- * a `seed`, the project starts with the starter main.typ.
+ * The server hands out ids and tokens and stores the project's MLS group and
+ * keyring, which are created here and reach it sealed; the title and files
+ * are written locally and reach it encrypted when the project is first
+ * opened. Without a `seed`, the project starts with the starter main.typ.
  */
 export async function createLocalProject(
   title: string,
-  opts: ApiOptions & { backend?: DocBackend; seed?: ProjectSeed } = {},
+  opts: ApiOptions & {
+    backend?: DocBackend;
+    seed?: ProjectSeed;
+    ds?: Pick<DsClientOptions, "url" | "createSocket" | "retry">;
+  } = {},
 ): Promise<NewProject> {
-  const created = await createProject(opts);
-  const key = generateEditSecret();
+  const { created, key, link, group, backend } = await createSpaceGroup(opts);
 
   const doc = new LoroDoc();
-  const backend = opts.backend ?? (await defaultBackend());
-  const store = new LocalDocStore(created.projectId, doc, backend);
+  const store = new LocalDocStore(created.spaceId, doc, backend);
   // Load first: the store only writes what changed after it loaded.
   await store.load();
   const project = initProject(doc, { title, starter: !opts.seed });
   if (opts.seed) {
     const assets = projectAssets(
       created.editToken,
-      await importProjectKey(key),
+      new SpaceCrypto(link, group.docKeys(), group.signer()),
       { baseUrl: opts.baseUrl },
     );
     await opts.seed(project, assets);
@@ -64,23 +69,19 @@ export async function createLocalProject(
   await store.flush();
 
   // Only remembered once seeding worked, so a failed import leaves no
-  // half-filled project behind in the recent list.
-  saveShareLinks(created.projectId, created);
-  saveProjectKey(created.projectId, key);
-  rememberShare(created.editToken, {
-    projectId: created.projectId,
-    permission: "write",
-  });
-  rememberShare(created.viewToken, {
-    projectId: created.projectId,
-    permission: "read",
-  });
-  rememberProject({
-    projectId: created.projectId,
-    token: created.editToken,
+  // half-filled project behind in the project list.
+  rememberCreatedSpace(created, key);
+  await recordOpened(
+    created.spaceId,
+    { token: created.editToken, secret: key, edit: true },
     title,
-  });
-  return { projectId: created.projectId, editToken: created.editToken, key };
+  );
+  // A fresh group holds exactly the one key the server was given.
+  await recordOwnerSecret(
+    created.spaceId,
+    ownerSecretList(group.ownerSecrets())[0],
+  );
+  return { projectId: created.spaceId, editToken: created.editToken, key };
 }
 
 /** Counterpart to createLocalProject. Leaves the server copy alone. */
@@ -88,6 +89,7 @@ export async function deleteLocalProject(
   projectId: string,
   opts: { backend?: DocBackend } = {},
 ): Promise<void> {
-  forgetProject(projectId);
+  forgetSpace(projectId);
+  await recordForgotten(projectId);
   await (opts.backend ?? (await defaultBackend())).remove(projectId);
 }

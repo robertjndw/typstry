@@ -81,7 +81,7 @@ struct BeforeSnapshot {
     gapped: HashSet<PeerId>,
 }
 
-/// What the room holds for one project, mirroring the `doc_records` rows.
+/// What the room holds for one space, mirroring the `doc_records` rows.
 #[derive(Debug, Default)]
 pub struct DocIndex {
     snapshot: Option<StoredSnapshot>,

@@ -1,6 +1,9 @@
 pub mod assets;
 mod error;
-pub mod projects;
+pub mod mls;
+pub mod protocol;
+pub mod relay;
+pub mod spaces;
 
 use std::path::Path;
 use std::time::Duration;
@@ -80,34 +83,72 @@ async fn app_csp(req: Request, next: Next) -> Response {
     res
 }
 
+/// Vite puts a content hash in every file name under `/assets/`, so those
+/// files never change and the browser can keep them forever. The compiler and
+/// tinymist wasm are tens of megabytes, too big to revalidate on every visit.
+/// Pages are always revalidated, otherwise a deploy keeps serving the old
+/// `index.html` with its stale asset names.
+async fn cache_control(req: Request, next: Next) -> Response {
+    let hashed = req.uri().path().starts_with("/assets/");
+    let mut res = next.run(req).await;
+    // A missing asset falls back to index.html with a 200; caching that
+    // forever would pin the page under the asset's name.
+    let is_html = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+    let policy = if hashed && res.status() == StatusCode::OK && !is_html {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    res
+}
+
 /// Small database lookups; anything slower than this is stuck.
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn router(state: AppState, web_dist: &Path) -> Router {
     let api = Router::new()
-        .route("/api/projects", post(projects::create))
-        .route("/api/share/{token}", get(projects::share))
+        .route("/api/spaces", post(spaces::create))
+        .route("/api/share/{token}", get(spaces::share))
+        .route(typstry_wire::relay::RELAY_API_PATH, post(relay::allocate))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             API_TIMEOUT,
         ));
     // Uploads get no timeout: a 25 MB body on a slow link legitimately
     // takes minutes, and the size cap already bounds what one can cost.
+    let gated = Router::new()
+        .merge(api)
+        .route("/api/s/{token}/assets", post(assets::upload))
+        .route("/api/s/{token}/blobs/{hash}", get(assets::blob))
+        .route("/api/s/{token}/mls", get(mls::bootstrap))
+        .route("/ws", get(ws::handler))
+        .route(typstry_wire::ds::DS_PATH, get(ws::mls::handler))
+        .route(typstry_wire::relay::RELAY_WS_PATH, get(ws::relay::handler))
+        .layer(middleware::from_fn(protocol::gate));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
-        .merge(api)
-        .route("/api/p/{token}/assets", post(assets::upload))
-        .route("/api/p/{token}/blobs/{hash}", get(assets::blob))
-        .route("/ws", get(ws::handler));
+        .route("/api/info", get(protocol::info))
+        .merge(gated);
 
     // In dev the Vite server serves the frontend, so a missing dist is normal.
     if web_dist.is_dir() {
         let index = web_dist.join("index.html");
-        let pages = ServeDir::new(web_dist).fallback(ServeFile::new(index));
+        // The build writes .br and .gz next to each compressible asset (see
+        // vite.config.ts); the wasm shrinks to about a third.
+        let pages = ServeDir::new(web_dist)
+            .precompressed_br()
+            .precompressed_gzip()
+            .fallback(ServeFile::new(index));
         app = app.fallback_service(
             Router::new()
                 .fallback_service(pages)
-                .layer(middleware::from_fn(app_csp)),
+                .layer(middleware::from_fn(app_csp))
+                .layer(middleware::from_fn(cache_control)),
         );
     } else {
         tracing::info!(path = %web_dist.display(), "web dist not found, static serving disabled");

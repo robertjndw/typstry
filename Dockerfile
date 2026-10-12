@@ -1,12 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.98-slim-trixie AS tinymist
+FROM rust:1.98-slim-trixie AS wasm-tools
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo install wasm-pack --locked --version 0.15.0
 WORKDIR /src
+
+FROM wasm-tools AS tinymist
 COPY apps/web/scripts/build-tinymist.sh apps/web/scripts/
 # The checkout and its build cache live in target/, a cache mount; only the
 # wasm output in apps/web/vendor ends up in the layer.
@@ -14,6 +16,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cache/.wasm-pack \
     apps/web/scripts/build-tinymist.sh
+
+FROM wasm-tools AS typstry-wasm
+# Only what the wasm build reads, so server or CLI edits keep this stage
+# cached. The workspace globs crates/*, so it does not mind the other crates
+# being absent. rust-toolchain.toml is left out, like in the server stage.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/typstry-wire crates/typstry-wire
+COPY crates/typstry-wasm crates/typstry-wasm
+COPY apps/web/scripts/build-wasm.sh apps/web/scripts/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/root/.cache/.wasm-pack \
+    apps/web/scripts/build-wasm.sh
 
 FROM node:26-slim AS web
 WORKDIR /src
@@ -26,6 +41,7 @@ RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile --filter web...
 COPY apps/web apps/web
 COPY --from=tinymist /src/apps/web/vendor/tinymist apps/web/vendor/tinymist
+COPY --from=typstry-wasm /src/apps/web/vendor/typstry-wasm apps/web/vendor/typstry-wasm
 RUN pnpm --filter web build
 
 FROM rust:1.98-slim-trixie AS chef

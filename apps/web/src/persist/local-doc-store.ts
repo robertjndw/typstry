@@ -6,6 +6,7 @@
 // browser (sync encrypts on its own).
 import { VersionVector, decodeImportBlobMeta, type LoroDoc } from "loro-crdt";
 
+import { sameBytes } from "@/crypto/bytes";
 import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
@@ -20,9 +21,56 @@ function blobsOf(stored: StoredDoc): Uint8Array[] {
     : stored.updates;
 }
 
+/**
+ * What this browser keeps of a project's MLS group. The device is stored
+ * apart from the group state so a device that has to rejoin (lost or
+ * outdated state) comes back as itself instead of leaving a ghost leaf.
+ */
+export interface MlsRecord {
+  /** `SpaceGroup.exportState()`; null while only the device exists. */
+  state: Uint8Array | null;
+  /** `Device.export()`. */
+  device: Uint8Array | null;
+  /** The group removed this device. Kept so a reload still says so. */
+  removed: boolean;
+  /**
+   * The links of the latest rotation this device went through, so a tab
+   * that missed it (asleep, or opened later) can still follow it.
+   */
+  rotation: StoredRotation | null;
+  /**
+   * The person id of the project's first owner, pinned so a later group
+   * that starts with another owner is refused. Set on the first join or
+   * create.
+   */
+  ownerPerson?: Uint8Array;
+  /**
+   * Every owner key secret the device held, as `SpaceGroup.ownerSecrets()`
+   * bytes merged in with `mergeOwnerSecrets` on every save, kept beside the
+   * state: one may be the only copy of the project's owner key, and a
+   * device that has to rejoin (lost or unreadable state) brings them into
+   * the new group. Merged, never replaced, since which one is current is
+   * only what the server says.
+   */
+  ownerSecrets?: Uint8Array;
+}
+
+export interface StoredRotation {
+  /** The secret to put in the URL fragment. */
+  link: string;
+  /** The token to open the project with: the edit token for editors. */
+  token: string;
+  /** The view token, for members who got the edit link. */
+  viewToken: string | null;
+  canEdit: boolean;
+}
+
 export interface DocBackend {
-  load(projectId: string): Promise<StoredDoc>;
-  append(projectId: string, update: Uint8Array): Promise<void>;
+  load(spaceId: string): Promise<StoredDoc>;
+  loadMls(spaceId: string): Promise<MlsRecord | null>;
+  /** Callers serialize writers themselves (see mls/session.ts). */
+  saveMls(spaceId: string, record: MlsRecord): Promise<void>;
+  append(spaceId: string, update: Uint8Array): Promise<void>;
   /**
    * Replaces everything stored for the project with the snapshot `build`
    * returns. `build` gets what is stored right then and runs inside the same
@@ -30,18 +78,48 @@ export interface DocBackend {
    * instead of being deleted unseen.
    */
   compact(
-    projectId: string,
+    spaceId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void>;
+  /** The `DeviceKey.export` bytes of this browser, if it has made one. */
+  loadDeviceKey(): Promise<Uint8Array | null>;
+  /**
+   * Stores the device key unless one exists, and returns the one that is
+   * stored. First write wins, so tabs that race to create the key all end up
+   * with the same one.
+   */
+  saveDeviceKey(key: Uint8Array): Promise<Uint8Array>;
+  /** The `PersonGraph.encode` bytes of this browser's person, if any. */
+  loadGraph(): Promise<Uint8Array | null>;
+  /**
+   * Replaces the stored graph with what `merge` makes of it and `incoming`,
+   * inside one transaction, and returns the result. `merge` runs on the
+   * stored bytes as they are right then, so tabs that merge at once all
+   * keep each other's entries; it throws to refuse (a graph of another
+   * person), which leaves the store as it was.
+   */
+  mergeGraph(
+    incoming: Uint8Array,
+    merge: (stored: Uint8Array | null, incoming: Uint8Array) => Uint8Array,
+  ): Promise<Uint8Array>;
+  /** Names this browser gave devices of its person, by hex device key. */
+  loadLabels(): Promise<Record<string, string>>;
+  /** Sets the names given, by hex device key, keeping the others. */
+  saveLabels(labels: Record<string, string>): Promise<void>;
   /** Drops everything stored for the project. */
-  remove(projectId: string): Promise<void>;
+  remove(spaceId: string): Promise<void>;
 }
 
 const DB_NAME = "typstry";
 const DB_VERSION = 1;
 const SNAPSHOTS = "snapshots";
 const UPDATES = "updates";
-const BY_PROJECT = "projectId";
+const MLS = "mls";
+const PERSON = "person";
+const DEVICE_ROW = "device";
+const GRAPH_ROW = "graph";
+const LABELS_ROW = "labels";
+const BY_SPACE = "spaceId";
 
 function request<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -62,9 +140,20 @@ function done(tx: IDBTransaction): Promise<void> {
 }
 
 interface Row {
-  projectId: string;
+  spaceId: string;
   data: Uint8Array;
 }
+
+/** The PERSON store holds a few rows of its own: device, graph, labels. */
+type PersonRow =
+  | { id: typeof DEVICE_ROW | typeof GRAPH_ROW; key: Uint8Array }
+  | { id: typeof LABELS_ROW; labels: Record<string, string> };
+
+function keyOf(row: PersonRow | undefined): Uint8Array | null {
+  return row && "key" in row ? row.key : null;
+}
+
+type MlsRow = MlsRecord & { spaceId: string };
 
 export class IndexedDbBackend implements DocBackend {
   private readonly db: IDBDatabase;
@@ -77,26 +166,39 @@ export class IndexedDbBackend implements DocBackend {
     factory: IDBFactory = indexedDB,
   ): Promise<IndexedDbBackend> {
     const req = factory.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    // Each schema change appends an `oldVersion < n` step and bumps
+    // DB_VERSION; never edit an earlier step, since browsers that already
+    // ran it skip it and would end up with a different schema.
+    req.onupgradeneeded = (event) => {
       const db = req.result;
-      db.createObjectStore(SNAPSHOTS, { keyPath: "projectId" });
-      const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
-      updates.createIndex(BY_PROJECT, "projectId");
+      const oldVersion = event.oldVersion;
+      if (oldVersion < 1) {
+        db.createObjectStore(SNAPSHOTS, { keyPath: "spaceId" });
+        const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
+        updates.createIndex(BY_SPACE, "spaceId");
+        db.createObjectStore(MLS, { keyPath: "spaceId" });
+        db.createObjectStore(PERSON, { keyPath: "id" });
+      }
     };
+    // Fires while another tab still holds an older connection. Those tabs
+    // close on versionchange, so the open normally goes through moments
+    // later; rejecting here would drop to memory for a transient delay.
+    req.onblocked = () =>
+      console.warn("local persistence upgrade waiting on another tab");
     const db = await request(req);
     // Another tab upgrading the schema would wait on us forever otherwise.
     db.onversionchange = () => db.close();
     return new IndexedDbBackend(db);
   }
 
-  async load(projectId: string): Promise<StoredDoc> {
+  async load(spaceId: string): Promise<StoredDoc> {
     const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readonly");
     const snapshot = request<Row | undefined>(
-      tx.objectStore(SNAPSHOTS).get(projectId),
+      tx.objectStore(SNAPSHOTS).get(spaceId),
     );
     // Auto-increment keys keep the index in append order.
     const updates = request<Row[]>(
-      tx.objectStore(UPDATES).index(BY_PROJECT).getAll(projectId),
+      tx.objectStore(UPDATES).index(BY_SPACE).getAll(spaceId),
     );
     const [snap, rows] = await Promise.all([snapshot, updates]);
     return {
@@ -105,29 +207,121 @@ export class IndexedDbBackend implements DocBackend {
     };
   }
 
-  async append(projectId: string, update: Uint8Array): Promise<void> {
+  async loadMls(spaceId: string): Promise<MlsRecord | null> {
+    const tx = this.db.transaction(MLS, "readonly");
+    const row = await request<MlsRow | undefined>(
+      tx.objectStore(MLS).get(spaceId),
+    );
+    if (!row) return null;
+    const { state, device, removed, rotation, ownerPerson, ownerSecrets } = row;
+    return { state, device, removed, rotation, ownerPerson, ownerSecrets };
+  }
+
+  async saveMls(spaceId: string, record: MlsRecord): Promise<void> {
+    const tx = this.db.transaction(MLS, "readwrite");
+    tx.objectStore(MLS).put({ ...record, spaceId } satisfies MlsRow);
+    await done(tx);
+  }
+
+  private async loadKeyRow(id: typeof DEVICE_ROW | typeof GRAPH_ROW) {
+    const tx = this.db.transaction(PERSON, "readonly");
+    const row = await request<PersonRow | undefined>(
+      tx.objectStore(PERSON).get(id),
+    );
+    return keyOf(row);
+  }
+
+  loadDeviceKey(): Promise<Uint8Array | null> {
+    return this.loadKeyRow(DEVICE_ROW);
+  }
+
+  async saveDeviceKey(key: Uint8Array): Promise<Uint8Array> {
+    const tx = this.db.transaction(PERSON, "readwrite");
+    const store = tx.objectStore(PERSON);
+    const existing = await request<PersonRow | undefined>(
+      store.get(DEVICE_ROW),
+    );
+    // The get and the put share one readwrite transaction, which browsers
+    // run one at a time per store, so a racing tab sees our key or we see
+    // theirs.
+    if (!existing) store.put({ id: DEVICE_ROW, key } satisfies PersonRow);
+    await done(tx);
+    return keyOf(existing) ?? key;
+  }
+
+  loadGraph(): Promise<Uint8Array | null> {
+    return this.loadKeyRow(GRAPH_ROW);
+  }
+
+  async mergeGraph(
+    incoming: Uint8Array,
+    merge: (stored: Uint8Array | null, incoming: Uint8Array) => Uint8Array,
+  ): Promise<Uint8Array> {
+    const tx = this.db.transaction(PERSON, "readwrite");
+    const committed = done(tx);
+    const store = tx.objectStore(PERSON);
+    const stored = keyOf(
+      await request<PersonRow | undefined>(store.get(GRAPH_ROW)),
+    );
+    let key: Uint8Array;
+    try {
+      key = merge(stored, incoming);
+    } catch (error) {
+      tx.abort();
+      await committed.catch(() => {});
+      throw error;
+    }
+    // Most merges add nothing, and a write still costs a transaction commit.
+    if (!stored || !sameBytes(stored, key))
+      store.put({ id: GRAPH_ROW, key } satisfies PersonRow);
+    await committed;
+    return key;
+  }
+
+  async loadLabels(): Promise<Record<string, string>> {
+    const tx = this.db.transaction(PERSON, "readonly");
+    const row = await request<PersonRow | undefined>(
+      tx.objectStore(PERSON).get(LABELS_ROW),
+    );
+    return row && "labels" in row ? row.labels : {};
+  }
+
+  async saveLabels(labels: Record<string, string>): Promise<void> {
+    const tx = this.db.transaction(PERSON, "readwrite");
+    const committed = done(tx);
+    const store = tx.objectStore(PERSON);
+    const row = await request<PersonRow | undefined>(store.get(LABELS_ROW));
+    const stored = row && "labels" in row ? row.labels : {};
+    store.put({
+      id: LABELS_ROW,
+      labels: { ...stored, ...labels },
+    } satisfies PersonRow);
+    await committed;
+  }
+
+  async append(spaceId: string, update: Uint8Array): Promise<void> {
     const tx = this.db.transaction(UPDATES, "readwrite");
     tx.objectStore(UPDATES).add({
-      projectId,
+      spaceId,
       data: update,
     } satisfies Row);
     await done(tx);
   }
 
   async compact(
-    projectId: string,
+    spaceId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void> {
     const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readwrite");
     const committed = done(tx);
     const snapshots = tx.objectStore(SNAPSHOTS);
-    const index = tx.objectStore(UPDATES).index(BY_PROJECT);
+    const index = tx.objectStore(UPDATES).index(BY_SPACE);
     // No other awaits in between: a transaction commits as soon as a task
     // ends without pending requests, and `build` must run while it is live.
     const [snap, rows, keys] = await Promise.all([
-      request<Row | undefined>(snapshots.get(projectId)),
-      request<Row[]>(index.getAll(projectId)),
-      request<IDBValidKey[]>(index.getAllKeys(projectId)),
+      request<Row | undefined>(snapshots.get(spaceId)),
+      request<Row[]>(index.getAll(spaceId)),
+      request<IDBValidKey[]>(index.getAllKeys(spaceId)),
     ]);
     let data: Uint8Array;
     try {
@@ -140,18 +334,19 @@ export class IndexedDbBackend implements DocBackend {
       await committed.catch(() => {});
       throw error;
     }
-    snapshots.put({ projectId, data } satisfies Row);
+    snapshots.put({ spaceId, data } satisfies Row);
     const updates = tx.objectStore(UPDATES);
     for (const key of keys) updates.delete(key);
     await committed;
   }
 
-  async remove(projectId: string): Promise<void> {
-    const tx = this.db.transaction([SNAPSHOTS, UPDATES], "readwrite");
+  async remove(spaceId: string): Promise<void> {
+    const tx = this.db.transaction([SNAPSHOTS, UPDATES, MLS], "readwrite");
     const committed = done(tx);
-    tx.objectStore(SNAPSHOTS).delete(projectId);
+    tx.objectStore(SNAPSHOTS).delete(spaceId);
+    tx.objectStore(MLS).delete(spaceId);
     const updates = tx.objectStore(UPDATES);
-    const keys = await request(updates.index(BY_PROJECT).getAllKeys(projectId));
+    const keys = await request(updates.index(BY_SPACE).getAllKeys(spaceId));
     for (const key of keys) updates.delete(key);
     await committed;
   }
@@ -160,35 +355,77 @@ export class IndexedDbBackend implements DocBackend {
 /** For browsers without usable IndexedDB: survives navigation, not reloads. */
 export class MemoryBackend implements DocBackend {
   private readonly docs = new Map<string, StoredDoc>();
+  private readonly groups = new Map<string, MlsRecord>();
+  private device: Uint8Array | null = null;
+  private graph: Uint8Array | null = null;
+  private labels: Record<string, string> = {};
 
-  private entry(projectId: string): StoredDoc {
-    let entry = this.docs.get(projectId);
+  private entry(spaceId: string): StoredDoc {
+    let entry = this.docs.get(spaceId);
     if (!entry) {
       entry = { snapshot: null, updates: [] };
-      this.docs.set(projectId, entry);
+      this.docs.set(spaceId, entry);
     }
     return entry;
   }
 
-  async load(projectId: string): Promise<StoredDoc> {
-    const entry = this.entry(projectId);
+  async load(spaceId: string): Promise<StoredDoc> {
+    const entry = this.entry(spaceId);
     return { snapshot: entry.snapshot, updates: [...entry.updates] };
   }
 
-  async append(projectId: string, update: Uint8Array): Promise<void> {
-    this.entry(projectId).updates.push(update);
+  async loadMls(spaceId: string): Promise<MlsRecord | null> {
+    return this.groups.get(spaceId) ?? null;
+  }
+
+  async saveMls(spaceId: string, record: MlsRecord): Promise<void> {
+    this.groups.set(spaceId, record);
+  }
+
+  async loadDeviceKey(): Promise<Uint8Array | null> {
+    return this.device;
+  }
+
+  async saveDeviceKey(key: Uint8Array): Promise<Uint8Array> {
+    this.device ??= key;
+    return this.device;
+  }
+
+  async loadGraph(): Promise<Uint8Array | null> {
+    return this.graph;
+  }
+
+  async mergeGraph(
+    incoming: Uint8Array,
+    merge: (stored: Uint8Array | null, incoming: Uint8Array) => Uint8Array,
+  ): Promise<Uint8Array> {
+    this.graph = merge(this.graph, incoming);
+    return this.graph;
+  }
+
+  async loadLabels(): Promise<Record<string, string>> {
+    return { ...this.labels };
+  }
+
+  async saveLabels(labels: Record<string, string>): Promise<void> {
+    this.labels = { ...this.labels, ...labels };
+  }
+
+  async append(spaceId: string, update: Uint8Array): Promise<void> {
+    this.entry(spaceId).updates.push(update);
   }
 
   async compact(
-    projectId: string,
+    spaceId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void> {
-    const snapshot = build(await this.load(projectId));
-    this.docs.set(projectId, { snapshot, updates: [] });
+    const snapshot = build(await this.load(spaceId));
+    this.docs.set(spaceId, { snapshot, updates: [] });
   }
 
-  async remove(projectId: string): Promise<void> {
-    this.docs.delete(projectId);
+  async remove(spaceId: string): Promise<void> {
+    this.docs.delete(spaceId);
+    this.groups.delete(spaceId);
   }
 }
 
@@ -235,7 +472,7 @@ export interface LocalDocStoreOptions {
  * happens, and `stop()` to flush and let go.
  */
 export class LocalDocStore {
-  private readonly projectId: string;
+  private readonly spaceId: string;
   private readonly doc: LoroDoc;
   private readonly backend: DocBackend;
   private readonly flushDelayMs: number;
@@ -260,12 +497,12 @@ export class LocalDocStore {
   private stopListening: (() => void) | null = null;
 
   constructor(
-    projectId: string,
+    spaceId: string,
     doc: LoroDoc,
     backend: DocBackend,
     options: LocalDocStoreOptions = {},
   ) {
-    this.projectId = projectId;
+    this.spaceId = spaceId;
     this.doc = doc;
     this.backend = backend;
     this.flushDelayMs = options.flushDelayMs ?? 300;
@@ -276,7 +513,7 @@ export class LocalDocStore {
 
   /** Imports what is stored. Returns false when nothing was. */
   async load(): Promise<boolean> {
-    const stored = await this.backend.load(this.projectId);
+    const stored = await this.backend.load(this.spaceId);
     const blobs = blobsOf(stored);
     if (blobs.length > 0) this.doc.importBatch(blobs);
     this.persisted = this.doc.oplogVersion();
@@ -338,7 +575,7 @@ export class LocalDocStore {
     const version = this.doc.oplogVersion();
     if (version.compare(this.persisted) === 0) return;
     const update = this.doc.export({ mode: "update", from: this.persisted });
-    await this.backend.append(this.projectId, update);
+    await this.backend.append(this.spaceId, update);
     this.persisted = version;
     this.logBytes += update.length;
     const limit = Math.max(
@@ -351,7 +588,7 @@ export class LocalDocStore {
   private async compact(): Promise<void> {
     let version = this.persisted;
     let size = 0;
-    await this.backend.compact(this.projectId, (stored) => {
+    await this.backend.compact(this.spaceId, (stored) => {
       // Another tab may have stored ops this doc has never seen; importing
       // them is what keeps the new snapshot from dropping them. Most rows
       // are this tab's own or arrived here through sync too, and importing

@@ -16,7 +16,16 @@ import {
   disambiguatedName,
   type PathIndex,
 } from "./paths";
-import { DEFAULT_MAIN_FILE, initProject, SCHEMA_VERSION } from "./schema";
+import {
+  DEFAULT_MAIN_FILE,
+  DOC_KIND,
+  initProject,
+  isForeignKind,
+  isSchemaTooNew,
+  META,
+  migrate,
+  SCHEMA_VERSION,
+} from "./schema";
 import { fork, newProject, sync } from "./test-utils";
 
 function paths(index: PathIndex): [string, string][] {
@@ -53,6 +62,54 @@ describe("initProject", () => {
     initProject(project.doc, { title: "Other" });
     expect(project.title).toBe("Thesis");
     expect(project.fs.getNodes()).toHaveLength(1);
+  });
+});
+
+describe("doc kind", () => {
+  it("marks a project and refuses another kind", () => {
+    const project = newProject(1);
+    expect(isForeignKind(project)).toBe(false);
+    initProject(project, { title: "T" });
+    expect(project.meta.get(META.kind)).toBe(DOC_KIND.project);
+    expect(isForeignKind(project)).toBe(false);
+    expect(isForeignKind(project.doc)).toBe(false);
+    project.meta.set(META.kind, DOC_KIND.directory);
+    expect(isForeignKind(project)).toBe(true);
+    expect(isForeignKind(project.doc)).toBe(true);
+    project.meta.set(META.kind, 5);
+    expect(isForeignKind(project)).toBe(false);
+  });
+});
+
+describe("schema version", () => {
+  it("refuses a newer schema", () => {
+    const project = newProject(1);
+    expect(isSchemaTooNew(project.schemaVersion)).toBe(false);
+    initProject(project, { title: "T" });
+    expect(isSchemaTooNew(project.schemaVersion)).toBe(false);
+    project.meta.set(META.schema, SCHEMA_VERSION + 1);
+    expect(isSchemaTooNew(project.schemaVersion)).toBe(true);
+  });
+
+  it("migrate leaves a current doc alone", () => {
+    const project = newProject(1);
+    expect(migrate(project)).toBe(false);
+    expect(project.schemaVersion).toBeNull();
+
+    initProject(project, { title: "T" });
+    const before = project.doc.oplogVersion();
+    expect(migrate(project)).toBe(false);
+    expect(project.doc.oplogVersion().compare(before)).toBe(0);
+    expect(project.schemaVersion).toBe(SCHEMA_VERSION);
+  });
+
+  it("migrate leaves a newer doc alone", () => {
+    const project = newProject(1);
+    initProject(project, { title: "T" });
+    project.meta.set(META.schema, SCHEMA_VERSION + 1);
+    project.doc.commit();
+    expect(migrate(project)).toBe(false);
+    expect(project.schemaVersion).toBe(SCHEMA_VERSION + 1);
   });
 });
 

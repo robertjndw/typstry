@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use typstry_doc::materialize::FileContent;
-use typstry_wire::crypto::BLOB_CONTEXT;
+use typstry_wire::crypto::CryptoError;
 
 use crate::hash::{BlobHash, Digest};
 use crate::worktree::{LocalFile, MAX_ASSET_BYTES, mime_for};
@@ -25,7 +25,8 @@ impl Session {
             .iter()
             .copied()
             .filter(|hash| {
-                self.state
+                self.core
+                    .state
                     .blob_path(hash)
                     .is_none_or(|path| !path.is_file())
             })
@@ -39,8 +40,8 @@ impl Session {
         let downloads: Vec<_> = missing
             .into_iter()
             .map(|hash| {
-                let api = self.api.clone();
-                let token = self.config.token.clone();
+                let api = self.core.api.clone();
+                let token = self.core.config.token.clone();
                 let hash = hash.to_owned();
                 async move {
                     let sealed = api.get_blob(&token, &hash).await;
@@ -51,18 +52,44 @@ impl Session {
         let mut downloads =
             futures_util::stream::iter(downloads).buffer_unordered(PARALLEL_DOWNLOADS);
         while let Some((hash, sealed)) = downloads.next().await {
-            self.store_asset(&hash, &sealed?)?;
+            self.store_asset_fetching_keys(&hash, &sealed?).await?;
         }
         Ok(())
+    }
+
+    /// [`Self::store_asset`], fetching the keyring once if the blob is
+    /// from a key generation newer than ours.
+    async fn store_asset_fetching_keys(
+        &mut self,
+        hash: &str,
+        sealed: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        match self.store_asset(hash, sealed) {
+            Err(err)
+                if matches!(
+                    err.downcast_ref::<CryptoError>(),
+                    Some(CryptoError::UnknownGeneration(_))
+                ) && self.refresh_keyring().await? =>
+            {
+                self.store_asset(hash, sealed)
+            }
+            other => other,
+        }
     }
 
     /// Decrypts a downloaded asset into the cache.
     fn store_asset(&mut self, hash: &str, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
         let bytes = self
-            .key
-            .open(sealed, BLOB_CONTEXT)
-            .with_context(|| format!("asset {hash} does not decrypt with this project's key"))?;
-        self.state.write_blob(hash, &bytes)?;
+            .doc_keys()?
+            .open_blob(sealed)
+            .map_err(|err| match err {
+                CryptoError::UnknownGeneration(_) => anyhow::Error::new(err),
+                CryptoError::NewerVersion(_) => anyhow::anyhow!("asset {hash} was {err}"),
+                err => anyhow::Error::new(err).context(format!(
+                    "asset {hash} does not decrypt with this project's key"
+                )),
+            })?;
+        self.core.state.write_blob(hash, &bytes)?;
         self.base
             .assets
             .insert(BlobHash::from(hash), Digest::of(&bytes));
@@ -74,7 +101,7 @@ impl Session {
     pub fn cached_content_bytes(&self, content: &FileContent) -> anyhow::Result<Vec<u8>> {
         match content {
             FileContent::Text(text) => Ok(text.as_bytes().to_vec()),
-            FileContent::Asset { hash, .. } => self.state.read_blob(hash).with_context(|| {
+            FileContent::Asset { hash, .. } => self.core.state.read_blob(hash).with_context(|| {
                 format!("asset {hash} of this version is not cached; run without --offline")
             }),
         }
@@ -83,7 +110,7 @@ impl Session {
     /// The plaintext of the asset with ciphertext `hash`, from the cache or
     /// the server. Records its digest in the base's asset map.
     pub async fn asset_bytes(&mut self, hash: &str) -> anyhow::Result<Vec<u8>> {
-        if let Some(bytes) = self.state.read_blob(hash) {
+        if let Some(bytes) = self.core.state.read_blob(hash) {
             // Assets run to megabytes; hash them only when the digest is
             // not known yet.
             if !self.base.assets.contains_key(hash) {
@@ -93,8 +120,12 @@ impl Session {
             }
             return Ok(bytes);
         }
-        let sealed = self.api.get_blob(&self.config.token, hash).await?;
-        self.store_asset(hash, &sealed)
+        let sealed = self
+            .core
+            .api
+            .get_blob(&self.core.config.token, hash)
+            .await?;
+        self.store_asset_fetching_keys(hash, &sealed).await
     }
 
     /// The bytes a doc entry stands for on disk.
@@ -164,9 +195,13 @@ impl Session {
                 if bytes.len() > MAX_ASSET_BYTES {
                     bail!("{path} is too large to upload");
                 }
-                let sealed = self.key.seal(&bytes, BLOB_CONTEXT);
-                let stored = self.api.upload_blob(&self.config.token, sealed).await?;
-                self.state.write_blob(stored.hash.as_str(), &bytes)?;
+                let sealed = self.doc_keys()?.seal_blob(&bytes);
+                let stored = self
+                    .core
+                    .api
+                    .upload_blob(&self.core.config.token, sealed)
+                    .await?;
+                self.core.state.write_blob(stored.hash.as_str(), &bytes)?;
                 self.base
                     .assets
                     .insert(stored.hash.clone(), file.digest.clone());

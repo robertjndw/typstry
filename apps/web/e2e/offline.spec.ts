@@ -65,7 +65,9 @@ test("a project opens from local storage without the server", async ({
   // The page itself still loads, but the API and sync socket are gone, as
   // if the server were down.
   await context.route("**/api/**", (route) => route.abort());
-  await context.routeWebSocket("**/ws", (ws) => ws.close());
+  // A regex, since the socket URL carries a query a glob ending in /ws
+  // would not match.
+  await context.routeWebSocket(/\/ws(\?|$)/, (ws) => ws.close());
   await page.reload();
 
   await expect(editor(page)).toContainText("Kept in this browser");

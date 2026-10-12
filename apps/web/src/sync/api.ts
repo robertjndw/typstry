@@ -1,10 +1,12 @@
-// HTTP helpers for the project endpoints served by crates/typstry-server.
-// Nothing sent here is readable by the server: project content only ever
+// HTTP helpers for the space endpoints served by crates/typstry-server.
+// Nothing sent here is readable by the server: a space's content only ever
 // travels encrypted, so these calls carry tokens and ciphertext alone.
-import { ownBuffer } from "@/crypto/project-key";
+import { fromBase64, ownBuffer } from "@/crypto/bytes";
 
-export interface CreatedProject {
-  projectId: string;
+import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
+
+export interface CreatedSpace {
+  spaceId: string;
   editToken: string;
   viewToken: string;
 }
@@ -12,10 +14,16 @@ export interface CreatedProject {
 export type SharePermission = "write" | "read";
 
 export interface ShareInfo {
-  projectId: string;
+  spaceId: string;
   permission: SharePermission;
   /** Only present for edit tokens; view tokens never learn the edit link. */
   viewToken?: string;
+  /**
+   * The token was replaced when the links rotated. It still names the
+   * project, but only the group's commit log can be read with it: that is
+   * how a member finds the new links.
+   */
+  retired?: boolean;
 }
 
 export class ApiError extends Error {
@@ -28,6 +36,27 @@ export class ApiError extends Error {
   }
 }
 
+/** 426: the server no longer serves this build of the page. */
+export class OutdatedClientError extends ApiError {
+  constructor() {
+    super(426, RELOAD_MESSAGE);
+    this.name = "OutdatedClientError";
+  }
+}
+
+/** fetch with the protocol header, turning a 426 into OutdatedClientError. */
+export async function apiFetch(
+  url: string,
+  init: RequestInit = {},
+  fetchFn: typeof fetch = (...args) => fetch(...args),
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set(PROTOCOL_HEADER, String(PROTOCOL_VERSION));
+  const res = await fetchFn(url, { ...init, headers });
+  if (res.status === 426) throw new OutdatedClientError();
+  return res;
+}
+
 export interface ApiOptions {
   /** Origin to talk to; empty means same origin (the Vite proxy in dev). */
   baseUrl?: string;
@@ -35,19 +64,19 @@ export interface ApiOptions {
 }
 
 /**
- * Registers an empty project. The title and starter files are content, so
+ * Registers an empty space. The title and starter files are content, so
  * the creator seeds the doc locally and it reaches the server encrypted.
  */
-export async function createProject(
+export async function createSpace(
   opts: ApiOptions = {},
-): Promise<CreatedProject> {
-  const res = await fetch(`${opts.baseUrl ?? ""}/api/projects`, {
+): Promise<CreatedSpace> {
+  const res = await apiFetch(`${opts.baseUrl ?? ""}/api/spaces`, {
     method: "POST",
     signal: opts.signal,
   });
   if (!res.ok)
     throw new ApiError(res.status, `creating project failed: ${res.status}`);
-  return (await res.json()) as CreatedProject;
+  return (await res.json()) as CreatedSpace;
 }
 
 /** Looks up a share token. Returns null when the token is unknown. */
@@ -55,7 +84,7 @@ export async function resolveShare(
   token: string,
   opts: ApiOptions = {},
 ): Promise<ShareInfo | null> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${opts.baseUrl ?? ""}/api/share/${encodeURIComponent(token)}`,
     { signal: opts.signal },
   );
@@ -68,6 +97,65 @@ export async function resolveShare(
   return share;
 }
 
+/** What a newcomer needs to open a project and join its MLS group. */
+export interface MlsBootstrap {
+  incarnation: number;
+  /** The epoch the GroupInfo describes; it can trail the group's head. */
+  epoch: number;
+  /** Sealed under the link; opens only with it. */
+  groupInfo: Uint8Array;
+  /** Sealed under the link and signed by an editor. */
+  keyring: Uint8Array;
+  /**
+   * The public owner key the server holds, 32 bytes: which owner key
+   * secret is the current one, which the group itself cannot tell.
+   */
+  ownerKey: Uint8Array;
+}
+
+/**
+ * The sealed GroupInfo and keyring of a project. Null when the token is
+ * unknown or the project has no group, which only a project that was never
+ * opened by its creator can lack.
+ */
+export async function fetchMlsBootstrap(
+  token: string,
+  opts: ApiOptions = {},
+): Promise<MlsBootstrap | null> {
+  const res = await apiFetch(
+    `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/mls`,
+    { signal: opts.signal, cache: "no-store" },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok)
+    throw new ApiError(
+      res.status,
+      `fetching the keyring failed: ${res.status}`,
+    );
+  const body = (await res.json()) as Record<string, unknown>;
+  const groupInfo =
+    typeof body.groupInfo === "string" ? fromBase64(body.groupInfo) : null;
+  const keyring =
+    typeof body.keyring === "string" ? fromBase64(body.keyring) : null;
+  const ownerKey =
+    typeof body.ownerKey === "string" ? fromBase64(body.ownerKey) : null;
+  if (
+    !groupInfo ||
+    !keyring ||
+    ownerKey?.length !== 32 ||
+    typeof body.incarnation !== "number" ||
+    typeof body.epoch !== "number"
+  )
+    throw new ApiError(res.status, "the keyring response was malformed");
+  return {
+    incarnation: body.incarnation,
+    epoch: body.epoch,
+    groupInfo,
+    keyring,
+    ownerKey,
+  };
+}
+
 /**
  * Checks an untrusted value (a response body, a cached copy) against the
  * `ShareInfo` shape, dropping fields of the wrong type.
@@ -75,12 +163,13 @@ export async function resolveShare(
 export function parseShareInfo(value: unknown): ShareInfo | null {
   const v = value as Partial<ShareInfo> | null;
   if (
-    typeof v?.projectId !== "string" ||
+    typeof v?.spaceId !== "string" ||
     (v.permission !== "write" && v.permission !== "read")
   )
     return null;
-  const share: ShareInfo = { projectId: v.projectId, permission: v.permission };
+  const share: ShareInfo = { spaceId: v.spaceId, permission: v.permission };
   if (typeof v.viewToken === "string") share.viewToken = v.viewToken;
+  if (v.retired === true) share.retired = true;
   return share;
 }
 
@@ -104,8 +193,8 @@ export async function uploadBlob(
   name: string,
   opts: ApiOptions = {},
 ): Promise<StoredBlob> {
-  const res = await fetch(
-    `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/assets`,
+  const res = await apiFetch(
+    `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/assets`,
     {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
@@ -130,5 +219,5 @@ export function blobUrl(
   hash: string,
   opts: Pick<ApiOptions, "baseUrl"> = {},
 ): string {
-  return `${opts.baseUrl ?? ""}/api/p/${encodeURIComponent(token)}/blobs/${encodeURIComponent(hash)}`;
+  return `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/blobs/${encodeURIComponent(hash)}`;
 }

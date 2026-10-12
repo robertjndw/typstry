@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 loro.workspace = true
@@ -23,13 +24,18 @@ tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-typstry-wire.workspace = true
+# Only the check of the owner's signature on a rotation; the server never
+# holds a key, so the encryption stays out.
+typstry-wire = { workspace = true, features = ["owner-proof"] }
 
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
+# Tests sign rotations the way the owner's client does.
+typstry-wire = { workspace = true, features = ["crypto"] }
 
 [lints]
 workspace = true

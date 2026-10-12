@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
+use crate::relay::{RelayConfig, RelayRegistry};
 use crate::room::{RoomConfig, RoomRegistry};
 use crate::store::blobs::BlobStore;
 use crate::ws::ConnLimits;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub rooms: RoomRegistry,
     pub blobs: BlobStore,
     pub limits: ConnLimits,
+    pub relay: RelayRegistry,
     /// Cancelled when the server starts shutting down; open WebSockets
     /// close with "going away" so clients reconnect elsewhere or later.
     pub shutdown: CancellationToken,
@@ -25,21 +27,43 @@ pub struct AppState {
 impl AppState {
     /// State with the default limits, for tests and embedding.
     pub fn new(db: SqlitePool, blobs: BlobStore) -> Self {
-        Self::build(db, blobs, RoomConfig::default(), ConnLimits::default())
+        Self::build(
+            db,
+            blobs,
+            RoomConfig::default(),
+            ConnLimits::default(),
+            RelayConfig::default(),
+        )
     }
 
     pub fn from_config(db: SqlitePool, config: &Config) -> Self {
         let blobs = BlobStore::new(&config.data_dir).with_max_size(config.max_upload_bytes);
-        Self::build(db, blobs, config.rooms.clone(), config.limits.clone())
+        Self::build(
+            db,
+            blobs,
+            config.rooms.clone(),
+            config.limits.clone(),
+            config.relay.clone(),
+        )
     }
 
-    fn build(db: SqlitePool, blobs: BlobStore, rooms: RoomConfig, limits: ConnLimits) -> Self {
+    fn build(
+        db: SqlitePool,
+        blobs: BlobStore,
+        rooms: RoomConfig,
+        limits: ConnLimits,
+        relay: RelayConfig,
+    ) -> Self {
+        let shutdown = CancellationToken::new();
+        let relay = RelayRegistry::new(relay);
+        relay.spawn_sweeper(shutdown.clone());
         Self {
             rooms: RoomRegistry::new(db.clone(), rooms),
             db,
             blobs,
             limits,
-            shutdown: CancellationToken::new(),
+            relay,
+            shutdown,
             connections: TaskTracker::new(),
         }
     }

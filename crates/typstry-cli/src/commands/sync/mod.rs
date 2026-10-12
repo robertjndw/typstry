@@ -12,8 +12,10 @@ use anyhow::bail;
 use loro::Frontiers;
 use tokio::sync::mpsc;
 
+use crate::directory::PASS_BUDGET;
 use crate::engine::{Flush, Mode, Reconciled, RemoteEvent, Report, Scope, Session, SyncError};
 use crate::mailbox::Mailbox;
+use crate::space::sync_pass;
 use crate::state::remove_if_exists;
 use crate::watch::{Change, Seen, Synced, Watcher};
 
@@ -46,6 +48,9 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const ERROR_RETRY: Duration = Duration::from_secs(5);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the project directory is synced while this runs.
+const DIRECTORY_EVERY: Duration = Duration::from_secs(60);
 
 /// Keep the folder and the project in sync, live, until Ctrl+C.
 ///
@@ -286,6 +291,8 @@ struct Live {
     /// When to look for requests from other commands next. The watcher
     /// moves it up when one arrives.
     next_mailbox_poll: Instant,
+    /// When the person's project directory is synced next.
+    next_directory: Instant,
     warned: BTreeSet<String>,
     /// Something retrying cannot fix; the loop stops with it.
     fatal: Option<SyncError>,
@@ -316,6 +323,7 @@ impl Live {
             last_save: now,
             next_git_poll: now,
             next_mailbox_poll: now,
+            next_directory: now,
             warned: BTreeSet::new(),
             fatal: None,
         }
@@ -375,7 +383,12 @@ impl Live {
         ]
         .into_iter()
         .flatten()
-        .fold(self.next_git_poll.min(self.next_mailbox_poll), Instant::min)
+        .fold(
+            self.next_git_poll
+                .min(self.next_mailbox_poll)
+                .min(self.next_directory),
+            Instant::min,
+        )
     }
 
     fn on_change(&mut self, change: Change) {
@@ -482,6 +495,9 @@ impl Live {
             self.next_mailbox_poll = Instant::now() + MAILBOX_POLL;
             self.answer_requests().await;
         }
+        if now >= self.next_directory {
+            self.sync_directory().await;
+        }
         if !self.session.is_connected() && self.reconnect.at.is_some_and(|t| t <= now) {
             self.reconnect().await;
         }
@@ -505,6 +521,19 @@ impl Live {
             self.save();
         }
         print_warnings(&mut Output::terminal(), &mut self.session);
+    }
+
+    /// Syncs the person's project directory on this project's server. The
+    /// loop waits for it, which is why a pass is bounded; a warning is
+    /// printed once, not every minute.
+    async fn sync_directory(&mut self) {
+        let server = self.session.config.server.clone();
+        for warning in sync_pass(&server, PASS_BUDGET).await {
+            if self.warned.insert(warning.clone()) {
+                eprintln!("warning: {warning}");
+            }
+        }
+        self.next_directory = Instant::now() + DIRECTORY_EVERY;
     }
 
     /// Whether the doc holds remote changes the folder does not have yet,

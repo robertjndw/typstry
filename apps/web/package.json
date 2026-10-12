@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "fixtures": "TYPSTRY_WRITE_FIXTURES=1 vitest run src/doc/fixture.test.ts src/crypto/fixture.test.ts"
+    "fixtures": "TYPSTRY_WRITE_FIXTURES=1 vitest run src/doc/fixture.test.ts src/directory/fixture.test.ts",
+    "wasm": "bash scripts/build-wasm.sh"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
@@ -42,7 +43,8 @@
     "react-dom": "19.3.0",
     "react-resizable-panels": "4.14.3",
     "react-router": "8.4.0",
-    "sonner": "2.0.8"
+    "sonner": "2.0.8",
+    "uqr": "0.1.3"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

@@ -1,6 +1,6 @@
 //! Content-addressed blob store for uploaded assets. Files live on disk at
-//! `<data>/blobs/ab/cd/<hex>`; the `blobs` and `project_blobs` tables hold
-//! their metadata and which projects may read them.
+//! `<data>/blobs/ab/cd/<hex>`; the `blobs` and `space_blobs` tables hold
+//! their metadata and which spaces may read them.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -186,21 +186,16 @@ pub fn parse_hash(hash: &str) -> Option<&str> {
     (hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then_some(hex)
 }
 
-/// Registers the blob and grants `project_id` access to it.
-pub async fn record(
-    pool: &SqlitePool,
-    project_id: &str,
-    hash: &str,
-    size: u64,
-) -> sqlx::Result<()> {
+/// Registers the blob and grants `space_id` access to it.
+pub async fn record(pool: &SqlitePool, space_id: &str, hash: &str, size: u64) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("INSERT OR IGNORE INTO blobs (hash, size) VALUES (?, ?)")
         .bind(hash)
         .bind(size as i64)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT OR IGNORE INTO project_blobs (project_id, hash) VALUES (?, ?)")
-        .bind(project_id)
+    sqlx::query("INSERT OR IGNORE INTO space_blobs (space_id, hash) VALUES (?, ?)")
+        .bind(space_id)
         .bind(hash)
         .execute(&mut *tx)
         .await?;
@@ -208,13 +203,13 @@ pub async fn record(
     Ok(())
 }
 
-/// The blob's size, or None when the project has no access to it.
-pub async fn lookup(pool: &SqlitePool, project_id: &str, hash: &str) -> sqlx::Result<Option<i64>> {
+/// The blob's size, or None when the space has no access to it.
+pub async fn lookup(pool: &SqlitePool, space_id: &str, hash: &str) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar(
-        "SELECT b.size FROM project_blobs pb JOIN blobs b ON b.hash = pb.hash \
-         WHERE pb.project_id = ? AND pb.hash = ?",
+        "SELECT b.size FROM space_blobs pb JOIN blobs b ON b.hash = pb.hash \
+         WHERE pb.space_id = ? AND pb.hash = ?",
     )
-    .bind(project_id)
+    .bind(space_id)
     .bind(hash)
     .fetch_optional(pool)
     .await

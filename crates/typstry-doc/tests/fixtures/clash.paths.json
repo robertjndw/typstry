@@ -1,7 +1,7 @@
 [
   {
     "path": ".gitignore",
-    "id": "102@10",
+    "id": "103@10",
     "kind": "text",
     "renamed": false
   },
@@ -13,7 +13,7 @@
   },
   {
     "path": "Makefile",
-    "id": "112@10",
+    "id": "113@10",
     "kind": "dir",
     "renamed": false
   },
@@ -25,7 +25,7 @@
   },
   {
     "path": "chapters",
-    "id": "84@10",
+    "id": "85@10",
     "kind": "dir",
     "renamed": false
   },
@@ -42,14 +42,14 @@
     "renamed": true
   },
   {
-    "path": "chapters/notes~98@10.typ",
-    "id": "98@10",
+    "path": "chapters/notes~99@10.typ",
+    "id": "99@10",
     "kind": "text",
     "renamed": true
   },
   {
     "path": "images",
-    "id": "91@10",
+    "id": "92@10",
     "kind": "dir",
     "renamed": false
   },
@@ -61,7 +61,7 @@
   },
   {
     "path": "introduction.typ",
-    "id": "87@10",
+    "id": "88@10",
     "kind": "text",
     "renamed": false
   },
@@ -78,8 +78,8 @@
     "renamed": false
   },
   {
-    "path": "refs~108@10.bib",
-    "id": "108@10",
+    "path": "refs~109@10.bib",
+    "id": "109@10",
     "kind": "text",
     "renamed": true
   }

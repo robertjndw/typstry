@@ -2,6 +2,7 @@
 
 use loro::{ExportMode, LoroDoc, LoroText, TreeID};
 
+use crate::materialize::FileContent;
 use crate::{FileKind, node, root};
 
 /// A doc with a fixed peer id. Fractional indexes are off so sibling order
@@ -34,4 +35,17 @@ pub fn add(doc: &LoroDoc, parent: Option<TreeID>, name: &str, kind: FileKind) ->
     }
     doc.commit();
     id
+}
+
+/// How the compat fixtures' `doc.json` describes a file, both when the CLI
+/// writes a fixture and when this crate checks one.
+pub fn file_json(path: &str, content: &FileContent) -> serde_json::Value {
+    match content {
+        FileContent::Text(text) => {
+            serde_json::json!({ "path": path, "kind": "text", "text": &**text })
+        }
+        FileContent::Asset { hash, size, mime } => serde_json::json!({
+            "path": path, "kind": "asset", "hash": hash, "size": size, "mime": mime,
+        }),
+    }
 }

@@ -4,7 +4,6 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
-use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use typstry_server::http::AppState;
@@ -12,12 +11,14 @@ use typstry_server::store::blobs::BlobStore;
 
 mod common;
 
+use common::json;
+
 struct Harness {
     dir: TempDir,
     state: AppState,
 }
 
-struct Project {
+struct Space {
     edit: String,
     view: String,
 }
@@ -44,9 +45,9 @@ impl Harness {
         self.app().oneshot(req).await.unwrap()
     }
 
-    async fn project(&self) -> Project {
-        let created = common::create_project(self.app()).await;
-        Project {
+    async fn space(&self) -> Space {
+        let created = common::create_space(self.app()).await;
+        Space {
             edit: created.edit,
             view: created.view,
         }
@@ -54,7 +55,7 @@ impl Harness {
 
     async fn upload(&self, token: &str, data: &[u8]) -> Response {
         self.send(
-            Request::post(format!("/api/p/{token}/assets"))
+            Request::post(format!("/api/s/{token}/assets"))
                 .body(Body::from(data.to_vec()))
                 .unwrap(),
         )
@@ -63,7 +64,7 @@ impl Harness {
 
     async fn fetch(&self, token: &str, hash: &str) -> Response {
         self.send(
-            Request::get(format!("/api/p/{token}/blobs/{hash}"))
+            Request::get(format!("/api/s/{token}/blobs/{hash}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -101,10 +102,6 @@ impl Harness {
     }
 }
 
-async fn json(res: Response) -> Value {
-    serde_json::from_slice(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap()
-}
-
 /// Stands in for an encrypted asset; the server never looks inside.
 const CIPHERTEXT: &[u8] = b"\x89PNG\r\n\x1a\nnot really a png";
 const CIPHERTEXT_SHA256: &str =
@@ -113,7 +110,7 @@ const CIPHERTEXT_SHA256: &str =
 #[tokio::test]
 async fn upload_then_fetch_roundtrip() {
     let h = Harness::new(None).await;
-    let p = h.project().await;
+    let p = h.space().await;
 
     let res = h.upload(&p.edit, CIPHERTEXT).await;
     assert_eq!(res.status(), StatusCode::CREATED);
@@ -160,11 +157,11 @@ async fn upload_then_fetch_roundtrip() {
 #[tokio::test]
 async fn upload_content_type_is_ignored() {
     let h = Harness::new(None).await;
-    let p = h.project().await;
+    let p = h.space().await;
 
     let res = h
         .send(
-            Request::post(format!("/api/p/{}/assets?name=a.svg", p.edit))
+            Request::post(format!("/api/s/{}/assets?name=a.svg", p.edit))
                 .header(header::CONTENT_TYPE, "image/svg+xml")
                 .body(Body::from(CIPHERTEXT.to_vec()))
                 .unwrap(),
@@ -186,8 +183,8 @@ async fn upload_content_type_is_ignored() {
 #[tokio::test]
 async fn identical_content_is_stored_once() {
     let h = Harness::new(None).await;
-    let a = h.project().await;
-    let b = h.project().await;
+    let a = h.space().await;
+    let b = h.space().await;
 
     let first = json(h.upload(&a.edit, CIPHERTEXT).await).await;
     let again = json(h.upload(&a.edit, CIPHERTEXT).await).await;
@@ -198,13 +195,13 @@ async fn identical_content_is_stored_once() {
     assert_eq!(h.blob_files().len(), 1);
     assert_eq!(h.tmp_files(), 0);
     assert_eq!(h.count("SELECT COUNT(*) FROM blobs").await, 1);
-    assert_eq!(h.count("SELECT COUNT(*) FROM project_blobs").await, 2);
+    assert_eq!(h.count("SELECT COUNT(*) FROM space_blobs").await, 2);
 }
 
 #[tokio::test]
 async fn rejects_uploads_over_the_limit() {
     let h = Harness::new(Some(16)).await;
-    let p = h.project().await;
+    let p = h.space().await;
 
     let res = h.upload(&p.edit, &[7u8; 17]).await;
     assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -214,7 +211,7 @@ async fn rejects_uploads_over_the_limit() {
         (0..4).map(|_| Ok(Bytes::from_static(&[1u8; 8]))).collect();
     let res = h
         .send(
-            Request::post(format!("/api/p/{}/assets", p.edit))
+            Request::post(format!("/api/s/{}/assets", p.edit))
                 .body(Body::from_stream(futures_util::stream::iter(chunks)))
                 .unwrap(),
         )
@@ -232,7 +229,7 @@ async fn rejects_uploads_over_the_limit() {
 #[tokio::test]
 async fn upload_requires_write_access() {
     let h = Harness::new(None).await;
-    let p = h.project().await;
+    let p = h.space().await;
 
     let res = h.upload(&p.view, CIPHERTEXT).await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -244,10 +241,10 @@ async fn upload_requires_write_access() {
 }
 
 #[tokio::test]
-async fn blobs_are_scoped_to_their_project() {
+async fn blobs_are_scoped_to_their_space() {
     let h = Harness::new(None).await;
-    let a = h.project().await;
-    let b = h.project().await;
+    let a = h.space().await;
+    let b = h.space().await;
     let hash = json(h.upload(&a.edit, CIPHERTEXT).await).await["hash"]
         .as_str()
         .unwrap()
@@ -275,7 +272,7 @@ async fn blobs_are_scoped_to_their_project() {
 #[tokio::test]
 async fn honors_if_none_match() {
     let h = Harness::new(None).await;
-    let p = h.project().await;
+    let p = h.space().await;
     let hash = json(h.upload(&p.edit, CIPHERTEXT).await).await["hash"]
         .as_str()
         .unwrap()
@@ -283,7 +280,7 @@ async fn honors_if_none_match() {
 
     let res = h
         .send(
-            Request::get(format!("/api/p/{}/blobs/{hash}", p.view))
+            Request::get(format!("/api/s/{}/blobs/{hash}", p.view))
                 .header(header::IF_NONE_MATCH, format!("\"{hash}\""))
                 .body(Body::empty())
                 .unwrap(),
@@ -295,7 +292,7 @@ async fn honors_if_none_match() {
 
     let res = h
         .send(
-            Request::get(format!("/api/p/{}/blobs/{hash}", p.view))
+            Request::get(format!("/api/s/{}/blobs/{hash}", p.view))
                 .header(header::IF_NONE_MATCH, "\"sha256:other\"")
                 .body(Body::empty())
                 .unwrap(),
@@ -307,7 +304,7 @@ async fn honors_if_none_match() {
 #[tokio::test]
 async fn rejects_malformed_hashes() {
     let h = Harness::new(None).await;
-    let p = h.project().await;
+    let p = h.space().await;
     for bad in [
         "sha256:..%2F..%2F..%2Ftest.db",
         "..%2Ftest.db",

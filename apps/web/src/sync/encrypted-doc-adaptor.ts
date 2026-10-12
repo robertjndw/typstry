@@ -11,11 +11,9 @@ import {
 } from "loro-protocol";
 
 import {
-  decryptRecord,
-  encryptDelta,
-  encryptSnapshot,
-  type ProjectKey,
-} from "@/crypto/project-key";
+  UnknownGenerationError,
+  type SpaceCrypto,
+} from "@/crypto/space-crypto";
 import { toError } from "@/lib/errors";
 import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
@@ -29,11 +27,17 @@ interface Span {
   end: number;
 }
 
+/** What the doc adaptor needs of a space's keys. */
+export type RecordCrypto = Pick<
+  SpaceCrypto,
+  "canWrite" | "encryptDelta" | "encryptSnapshot" | "decryptRecord"
+>;
+
 export interface EncryptedDocAdaptorOptions {
-  key: ProjectKey;
+  crypto: RecordCrypto;
   /**
    * View links never send: the server refuses their doc updates, and
-   * without the signing key other clients would too.
+   * without an editor's attestation other clients would too.
    */
   canWrite: boolean;
   /**
@@ -55,8 +59,34 @@ export interface EncryptedDocAdaptorOptions {
   pushDelayMs?: number;
   /** Delay before resending spans the server refused for a passing reason. */
   retryMs?: number;
+  /**
+   * Upload a snapshot as soon as the backfill is in, whatever the log
+   * length. For a connection opened right after a rotation: the keys are
+   * new, and a joiner should find a snapshot sealed under them first.
+   */
+  compactOnJoin?: boolean;
+  /**
+   * Decides whether this device may upload into the space: a link or
+   * binding can point at a space of another kind, and the local history
+   * must not end up there. Asked after every import until it answers;
+   * `undefined` means it cannot tell yet (the doc's kind has not arrived),
+   * which counts as yes once the doc has caught up with the server. Until
+   * it answers local commits only queue. Asking early matters: a record
+   * that never decrypts keeps the doc from catching up, and must not keep
+   * this device from sending for good.
+   */
+  accept?: (doc: LoroDoc) => boolean | undefined;
+  /** `accept` said no. Nothing local was or will be sent. */
+  onRefused?: () => void;
   /** A record could not be decrypted: wrong key, unsigned or tampered. */
   onDecryptError?: (error: Error) => void;
+  /**
+   * A record is sealed under a key generation this keyring does not reach:
+   * the group rotated, and the new keys come with the new link, which the
+   * member group delivers. The record is skipped here; it arrives again on
+   * the connection that link opens.
+   */
+  onUnknownGeneration?: (generation: number) => void;
 }
 
 // Each send is one stored record, so at the default push throttle steady
@@ -104,7 +134,6 @@ function raise(map: Counters, peer: PeerID, end: number) {
   if ((map.get(peer) ?? 0) < end) map.set(peer, end);
 }
 
-const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /** Server-provided `{"deltas": n}`; anything unexpected reads as 0. */
@@ -120,7 +149,7 @@ function storedDeltas(extra: Uint8Array | undefined): number {
 
 /**
  * Syncs a LoroDoc over the `%ELO` CRDT type of the Loro Protocol: every op
- * leaves this client encrypted and signed (see `crypto/project-key.ts`),
+ * leaves this client encrypted and signed (see `crypto/space-crypto.ts`),
  * and the server only sees which op
  * ranges (peer, counter span) a record covers so it can store, dedupe and
  * backfill without reading anything.
@@ -135,9 +164,15 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
 
   private readonly doc: LoroDoc;
   private readonly options: Required<
-    Omit<EncryptedDocAdaptorOptions, "onDecryptError">
+    Omit<
+      EncryptedDocAdaptorOptions,
+      "onDecryptError" | "onUnknownGeneration" | "accept" | "onRefused"
+    >
   > &
-    Pick<EncryptedDocAdaptorOptions, "onDecryptError">;
+    Pick<
+      EncryptedDocAdaptorOptions,
+      "onDecryptError" | "onUnknownGeneration" | "accept" | "onRefused"
+    >;
   private ctx?: CrdtAdaptorContext;
   private unsubscribe?: () => void;
   private destroyed = false;
@@ -151,6 +186,9 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
   /** The server's coverage at the latest join; "synced" means reaching it. */
   private target: VersionVector | null = null;
   private targetReached = false;
+  /** `accept` ran and allowed it; sticky across reconnects. */
+  private accepted = false;
+  private refused = false;
   private serverDeltas = 0;
   private snapshotSent = false;
   /** When the last compaction was started, for `compactIntervalMs`. */
@@ -159,6 +197,12 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
   private queuedPushes = 0;
   /** Set once the server refused a snapshot for a reason that will not pass. */
   private compactionRefused = false;
+  /**
+   * The keys are new, so a snapshot sealed under them is due whatever the
+   * log length: until one is stored, a joiner finds history only under keys
+   * the removed members hold.
+   */
+  private generationDue = false;
   private retry: ReturnType<typeof setTimeout> | null = null;
   private pushTimer: ReturnType<typeof setTimeout> | null = null;
   private stopPageListeners?: () => void;
@@ -173,14 +217,19 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     // Spelled out instead of spread over defaults: an option passed as
     // `undefined` would otherwise replace its default.
     this.options = {
-      key: options.key,
-      canWrite: options.canWrite && options.key.sign !== null,
+      crypto: options.crypto,
+      canWrite: options.canWrite && options.crypto.canWrite,
       compactAfterDeltas: options.compactAfterDeltas ?? 200,
       compactIntervalMs: options.compactIntervalMs ?? COMPACT_INTERVAL_MS,
       pushDelayMs: options.pushDelayMs ?? 150,
       retryMs: options.retryMs ?? 2000,
+      compactOnJoin: options.compactOnJoin ?? false,
       onDecryptError: options.onDecryptError,
+      onUnknownGeneration: options.onUnknownGeneration,
+      accept: options.accept,
+      onRefused: options.onRefused,
     };
+    this.generationDue = this.options.compactOnJoin && this.options.canWrite;
     this.synced = new Promise((resolve) => {
       this.resolveSynced = resolve;
     });
@@ -216,7 +265,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
    */
   get hasPendingPush(): boolean {
     if (this.pushTimer !== null || this.queuedPushes > 0) return true;
-    if (this.destroyed || !this.joined || !this.options.canWrite) return false;
+    if (!this.mayPush()) return false;
     return missingSpans(this.doc.oplogVersion(), this.server).length > 0;
   }
 
@@ -262,9 +311,35 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     // snapshotSent stays as it is: a compaction queued before the
     // reconnect still runs, and clears it once it is done.
     this.joined = true;
+    this.judge(false);
     // Edits made offline (or before a reconnect) go up first.
     await this.enqueuePush();
     this.checkReached();
+  }
+
+  /** Nothing local goes up before `accept` allowed it, or after it said no. */
+  private mayPush(): boolean {
+    return (
+      !this.destroyed &&
+      this.joined &&
+      this.options.canWrite &&
+      this.accepted &&
+      !this.refused
+    );
+  }
+
+  /** Asks `accept` until it answers; see there. */
+  private judge(reached: boolean): void {
+    if (this.accepted || this.refused) return;
+    const verdict = this.options.accept ? this.options.accept(this.doc) : true;
+    if (verdict === false) {
+      this.refused = true;
+      // Left unresolved: the doc is not what the caller asked to open.
+      this.options.onRefused?.();
+    } else if (verdict === true || reached) {
+      this.accepted = true;
+      void this.enqueuePush();
+    }
   }
 
   waitForReachingServerVersion(): Promise<void> {
@@ -338,7 +413,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
    * Commits landing while it encrypts are left to the next push.
    */
   private async push(): Promise<void> {
-    if (this.destroyed || !this.joined || !this.options.canWrite) return;
+    if (!this.mayPush()) return;
     const spans = missingSpans(this.doc.oplogVersion(), this.server);
     if (spans.length === 0) return;
 
@@ -356,8 +431,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     };
     for (const span of spans) {
       for (const [piece, plaintext] of this.exportSpan(span)) {
-        const record = await encryptDelta(this.options.key, piece, plaintext);
-        if (this.destroyed) return;
+        const record = this.options.crypto.encryptDelta(piece, plaintext);
         if (size + record.length > CONTAINER_BUDGET) flush();
         batch.push(record);
         size += record.length;
@@ -406,21 +480,21 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     const received: Counters = new Map();
     for (const record of decodeEloContainer(container)) {
       try {
-        const out = await decryptRecord(this.options.key, record);
+        const out = this.options.crypto.decryptRecord(record);
         plaintexts.push(out.plaintext);
-        if (out.kind === EloRecordKind.DeltaSpan) {
-          raise(
-            received,
-            decoder.decode(out.header.peerId) as PeerID,
-            out.header.end,
-          );
+        if (out.kind === "delta") {
+          raise(received, out.peer as PeerID, out.end);
         } else {
-          for (const { peerId, counter } of out.header.vv) {
-            raise(received, decoder.decode(peerId) as PeerID, counter);
+          for (const { peer, counter } of out.vv) {
+            raise(received, peer as PeerID, counter);
           }
         }
       } catch (error) {
-        this.options.onDecryptError?.(toError(error));
+        if (error instanceof UnknownGenerationError) {
+          this.options.onUnknownGeneration?.(error.generation);
+        } else {
+          this.options.onDecryptError?.(toError(error));
+        }
       }
     }
     if (this.destroyed || plaintexts.length === 0) return;
@@ -431,6 +505,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       return;
     }
     for (const [peer, end] of received) raise(this.server, peer, end);
+    this.judge(false);
     this.checkReached();
   }
 
@@ -439,26 +514,35 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     const cmp = this.doc.oplogVersion().compare(this.target);
     if (cmp === undefined || cmp < 0) return;
     this.targetReached = true;
+    this.judge(true);
+    if (this.refused) return;
     this.resolveSynced();
+    void this.enqueuePush();
     this.maybeCompact(true);
   }
 
   private maybeCompact(afterJoin: boolean): void {
     if (
-      !this.options.canWrite ||
+      !this.mayPush() ||
       // Before the backfill is in, a snapshot would miss ops the server
       // holds, and the server would drop it.
       !this.targetReached ||
       this.compactionRefused ||
       this.snapshotSent ||
-      this.serverDeltas < this.options.compactAfterDeltas
+      (!this.generationDue &&
+        this.serverDeltas < this.options.compactAfterDeltas)
     )
       return;
     const now = Date.now();
-    if (!afterJoin && now - this.lastCompactAt < this.options.compactIntervalMs)
+    if (
+      !afterJoin &&
+      !this.generationDue &&
+      now - this.lastCompactAt < this.options.compactIntervalMs
+    )
       return;
     this.lastCompactAt = now;
     this.snapshotSent = true;
+    this.generationDue = false;
     void this.enqueue(() => this.sendSnapshot());
   }
 
@@ -493,14 +577,14 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
         break;
       if (round + 1 >= SNAPSHOT_PUSH_ROUNDS) return;
     }
-    const vv = [...this.doc.oplogVersion().toJSON()]
-      // The protocol wants entries sorted by peer id bytes; peer ids are
-      // ASCII digits, so string order is byte order.
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([peer, counter]) => ({ peerId: encoder.encode(peer), counter }));
+    // Unsorted on purpose: the wasm sorts the header's entries by peer id
+    // bytes.
+    const vv = [...this.doc.oplogVersion().toJSON()].map(([peer, counter]) => ({
+      peer,
+      counter,
+    }));
     const snapshot = this.doc.export({ mode: "snapshot" });
-    const record = await encryptSnapshot(this.options.key, vv, snapshot);
-    if (this.destroyed) return;
+    const record = this.options.crypto.encryptSnapshot(vv, snapshot);
     this.ctx?.send([encodeEloContainer([record])]);
     this.serverDeltas = 0;
   }

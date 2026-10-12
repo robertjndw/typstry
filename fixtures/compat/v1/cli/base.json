@@ -1,0 +1,16 @@
+{
+  "assets": {
+    "sha256:283bc32e08dab7b828f184226eaa649140124907e2165670d743c0c837f66697": "sha256:43940bd3bf7ffff28083d28171b51d18cbc33315aad2b257026c0170c373de6b"
+  },
+  "frontiers": "AQfqAg",
+  "git": {
+    "branch": "main",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "reflog": 3
+  },
+  "lastSync": 1700000000005,
+  "pins": {
+    "main.typ": "AQekAg"
+  },
+  "version": 1
+}

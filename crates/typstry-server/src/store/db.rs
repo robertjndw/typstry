@@ -24,7 +24,7 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
 /// exist yet. Safe while the server runs: `VACUUM INTO` reads inside one
 /// transaction, and WAL mode keeps writers going meanwhile.
 ///
-/// This covers projects, documents and blob metadata but not the blob files
+/// This covers spaces, documents and blob metadata but not the blob files
 /// under `<data>/blobs`. Those are content-addressed and never modified, so
 /// a plain `cp -R` or `rsync` of that directory is a valid backup. Copy it
 /// after the database: a blob file is written before its row, so every hash

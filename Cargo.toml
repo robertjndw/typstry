@@ -19,6 +19,7 @@ anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+dirs = "6.0.0"
 ed25519-dalek = "3.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
@@ -29,11 +30,25 @@ loro = "1.16.2"
 loro-protocol = "=0.3.0"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
+# openmls is 0.x and its group state format is not stable, so the whole
+# family is pinned exactly. They pull older aes-gcm, ed25519-dalek, sha2 and
+# getrandom alongside ours, which is accepted for now.
+openmls = "=0.9.1"
+openmls_basic_credential = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+openmls_traits = "=0.6.0"
+tls_codec = { version = "=0.5.0", features = ["derive"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 # Only ring is compiled in, so rustls never has to guess a crypto provider
 # and nothing needs the aws-lc C toolchain.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# spake2 0.4 draws from rand_core 0.6; its getrandom feature stays off so
+# the pairing code feeds it from our own getrandom.
+rand_core = { version = "0.6", default-features = false }
+# spake2 is unaudited, so it is pinned exactly and only the pairing code
+# touches it. A new release gets reviewed before the pin moves.
+spake2 = { version = "=0.4.0", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

@@ -15,12 +15,14 @@ export function ConfirmDeleteDialog({
   open,
   title,
   description,
+  confirmLabel = "Delete",
   onCancel,
   onConfirm,
 }: {
   open: boolean;
   title: ReactNode;
   description: ReactNode;
+  confirmLabel?: string;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -36,7 +38,7 @@ export function ConfirmDeleteDialog({
             <Button variant="outline">Cancel</Button>
           </DialogClose>
           <Button variant="destructive" onClick={onConfirm}>
-            Delete
+            {confirmLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

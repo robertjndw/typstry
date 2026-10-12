@@ -6,31 +6,28 @@
 import { EphemeralStore, LoroDoc } from "loro-crdt";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  generateEditSecret,
-  importProjectKey,
-  type ProjectKey,
-} from "@/crypto/project-key";
+import type { SpaceCrypto } from "@/crypto/space-crypto";
+import { newProject, viewerOf } from "@/crypto/test-utils";
 import { getText } from "@/doc/fs-ops";
 import { ProjectDoc, initProject, starterContent } from "@/doc/schema";
 
-import { createProject, resolveShare } from "./api";
-import { connectProject, type ProjectConnection } from "./connection";
+import { createSpace, resolveShare } from "./api";
+import { connectSpace, type SpaceConnection } from "./connection";
 
 const enabled = process.env.TYPSTRY_E2E === "1";
 const baseUrl = process.env.TYPSTRY_E2E_URL ?? "http://127.0.0.1:8787";
 const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws`;
 
-const open: ProjectConnection[] = [];
+const open: SpaceConnection[] = [];
 
 afterEach(() => {
   for (const conn of open.splice(0)) conn.close();
 });
 
 function connect(
-  projectId: string,
+  spaceId: string,
   token: string,
-  key: ProjectKey,
+  crypto: SpaceCrypto,
   opts: {
     canWrite?: boolean;
     ephemeral?: EphemeralStore;
@@ -39,10 +36,10 @@ function connect(
   } = {},
 ) {
   const doc = opts.doc ?? new LoroDoc();
-  const conn = connectProject({
-    projectId,
+  const conn = connectSpace({
+    spaceId,
     token,
-    key,
+    crypto,
     canWrite: opts.canWrite ?? true,
     doc,
     ephemeral: opts.ephemeral,
@@ -55,11 +52,11 @@ function connect(
 
 /** What the creator's browser does: register, then seed the doc locally. */
 async function create(title: string) {
-  const created = await createProject({ baseUrl });
-  const key = await importProjectKey(generateEditSecret());
+  const created = await createSpace({ baseUrl });
+  const project = newProject();
   const seed = new LoroDoc();
   initProject(seed, { title });
-  return { ...created, key, seed };
+  return { ...created, project, key: project.crypto, seed };
 }
 
 function mainText(project: ProjectDoc) {
@@ -85,17 +82,17 @@ describe.skipIf(!enabled)("sync against a running server", () => {
   it("two JS clients converge through the Rust server", async () => {
     const created = await create("E2E");
     expect(await resolveShare(created.editToken, { baseUrl })).toEqual({
-      projectId: created.projectId,
+      spaceId: created.spaceId,
       permission: "write",
       viewToken: created.viewToken,
     });
 
     // The creator uploads the seed on first connect.
-    const a = connect(created.projectId, created.editToken, created.key, {
+    const a = connect(created.spaceId, created.editToken, created.key, {
       doc: created.seed,
     });
     await a.conn.synced;
-    const b = connect(created.projectId, created.editToken, created.key);
+    const b = connect(created.spaceId, created.editToken, created.key);
     await b.conn.synced;
     await eventually(() => expect(a.conn.getStatus()).toBe("connected"));
     await eventually(() => expect(b.project.title).toBe("E2E"));
@@ -121,9 +118,14 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     });
 
     // A late joiner loads the persisted state.
-    const c = connect(created.projectId, created.viewToken, created.key, {
-      canWrite: false,
-    });
+    const c = connect(
+      created.spaceId,
+      created.viewToken,
+      viewerOf(created.project),
+      {
+        canWrite: false,
+      },
+    );
     await c.conn.synced;
     await eventually(() => expect(c.doc.toJSON()).toEqual(a.doc.toJSON()));
   });
@@ -132,15 +134,20 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     const created = await create("Viewer");
     const editorStore = new EphemeralStore(30_000);
     const viewerStore = new EphemeralStore(30_000);
-    const editor = connect(created.projectId, created.editToken, created.key, {
+    const editor = connect(created.spaceId, created.editToken, created.key, {
       ephemeral: editorStore,
       doc: created.seed,
     });
     await editor.conn.synced;
-    const viewer = connect(created.projectId, created.viewToken, created.key, {
-      ephemeral: viewerStore,
-      canWrite: false,
-    });
+    const viewer = connect(
+      created.spaceId,
+      created.viewToken,
+      viewerOf(created.project),
+      {
+        ephemeral: viewerStore,
+        canWrite: false,
+      },
+    );
     await viewer.conn.synced;
     await eventually(() => expect(viewer.project.mainFile).not.toBeNull());
 
@@ -157,7 +164,7 @@ describe.skipIf(!enabled)("sync against a running server", () => {
       expect(mainText(viewer.project).toString()).toContain("editor edit"),
     );
 
-    const fresh = connect(created.projectId, created.editToken, created.key);
+    const fresh = connect(created.spaceId, created.editToken, created.key);
     await fresh.conn.synced;
     await eventually(() => expect(fresh.project.mainFile).not.toBeNull());
     const text = mainText(fresh.project).toString();
@@ -169,15 +176,15 @@ describe.skipIf(!enabled)("sync against a running server", () => {
 
   it("a wrong key cannot read the project", async () => {
     const created = await create("Secret");
-    const owner = connect(created.projectId, created.editToken, created.key, {
+    const owner = connect(created.spaceId, created.editToken, created.key, {
       doc: created.seed,
     });
     await owner.conn.synced;
     await new Promise((r) => setTimeout(r, 200));
 
     const onDecryptError = vi.fn();
-    const wrongKey = await importProjectKey(generateEditSecret());
-    const intruder = connect(created.projectId, created.viewToken, wrongKey, {
+    const wrongKey = newProject().crypto;
+    const intruder = connect(created.spaceId, created.viewToken, wrongKey, {
       canWrite: false,
       onDecryptError,
     });
@@ -190,11 +197,7 @@ describe.skipIf(!enabled)("sync against a running server", () => {
     expect(await resolveShare("0000000000000000000000", { baseUrl })).toBe(
       null,
     );
-    const bad = connect(
-      created.projectId,
-      "0000000000000000000000",
-      created.key,
-    );
+    const bad = connect(created.spaceId, "0000000000000000000000", created.key);
     await expect(bad.conn.synced).rejects.toThrow();
     expect(bad.conn.getStatus()).toBe("disconnected");
   });

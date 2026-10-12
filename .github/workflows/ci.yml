@@ -135,7 +135,7 @@ jobs:
           curl -fsS localhost:8787/healthz
           # The image's HEALTHCHECK runs this, there's no curl inside.
           docker exec typstry typstry-server healthcheck
-          curl -fsS -X POST -H 'content-type: application/json' -d '{"title":"CI"}' localhost:8787/api/projects
+          curl -fsS -X POST localhost:8787/api/spaces
       - name: Server logs
         if: always()
         run: docker logs typstry

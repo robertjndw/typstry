@@ -7,16 +7,15 @@ use anyhow::{Context, bail};
 use typstry_doc::init::{DEFAULT_MAIN_FILE, init_bare_project, set_main_file, starter_content};
 use typstry_doc::names::validate_path;
 use typstry_doc::paths::build_path_index;
-use typstry_wire::crypto::ProjectKey;
 
 use super::{
     Ctx, Output, link::print_links, print_not_applied, print_report_warnings, print_warnings,
     track_branch,
 };
-use crate::api::{Api, Permission, ShareInfo};
-use crate::engine::{Flush, Mode, Scope, Session, set_peer_info};
+use crate::engine::{Flush, Identity, Mode, Scope, Session, set_peer_info};
 use crate::git::{self, Head, Repo};
-use crate::link::{ShareLink, ws_url};
+use crate::link::ws_url;
+use crate::space::{Created, create_space, sync_server};
 use crate::state::{STATE_DIR, StateDir};
 use crate::worktree::{GIT_FILE_REASON, LocalFile, Skipped, Worktree, case_clashes};
 
@@ -128,6 +127,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                 if plan.starter { 1 } else { plan.files.len() }
             );
             print_links(&session.config, None)?;
+            sync_server(&session.config.server).await;
             Ok(())
         }
         Err(err) => {
@@ -358,7 +358,7 @@ fn dirty_count(dir: &Path) -> Option<usize> {
     .map(|out| out.lines().count())
 }
 
-fn confirm(question: &str) -> anyhow::Result<bool> {
+pub(super) fn confirm(question: &str) -> anyhow::Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("not asking for confirmation without a terminal; check the preview and pass --yes");
     }
@@ -370,20 +370,28 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
 }
 
 async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Result<Session> {
-    let api = Api::new(server)?;
-    let created = api.create_project().await?;
-    let link = ShareLink::new(server, &created.edit_token, &ProjectKey::generate_raw());
-    let share = ShareInfo {
-        project_id: created.project_id,
-        permission: Permission::Write,
-        view_token: Some(created.view_token),
-    };
+    let local = crate::user::load_or_create_identity()?;
+    let identity = Identity::resolve(ctx.name.as_deref(), None, local.graph.profile(), root);
+    let Created {
+        link,
+        share,
+        api,
+        group,
+    } = create_space(server, &identity, &local).await?;
+    // The person's other devices need it to reset this project's links.
+    if let Some(current) = group.owner_secret()
+        && let Err(err) =
+            crate::directory::record_owner_keys(&link.origin, &share.space_id, current)
+    {
+        eprintln!("warning: could not share the owner key with your devices: {err:#}");
+    }
     // Before .typstry/ exists, so the key cannot slip into a commit even if
     // the rest fails halfway.
     if let Some((repo, _)) = &plan.repo {
         repo.exclude_state_dir()?;
     }
-    let mut session = Session::create_with_api(root, &link, &share, api, ctx.name.as_deref())?;
+    let mut session =
+        Session::create_with_api(root, &link, &share, api, Some(group), ctx.name.as_deref())?;
     session.connect().await?;
 
     // The seed and the files go out together after the assets, so nobody
@@ -422,6 +430,7 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     session.set_base_to_doc();
     session.push_local().await?;
     session.disconnect().await;
+    session.remember_project();
     print_warnings(&mut out, &mut session);
     session.save()?;
     track_branch(&mut session, &mut out)?;

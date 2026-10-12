@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { IDBFactory } from "fake-indexeddb";
+import { IDBFactory, IDBObjectStore } from "fake-indexeddb";
 import { LoroDoc } from "loro-crdt";
 import { describe, expect, it, vi } from "vitest";
 
@@ -20,9 +20,9 @@ function text(doc: LoroDoc) {
   return doc.getText("t").toString();
 }
 
-async function reopen(backend: DocBackend, projectId = "p1") {
+async function reopen(backend: DocBackend, spaceId = "p1") {
   const doc = new LoroDoc();
-  const found = await new LocalDocStore(projectId, doc, backend).load();
+  const found = await new LocalDocStore(spaceId, doc, backend).load();
   return { doc, found };
 }
 
@@ -190,5 +190,129 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
     const restored = text((await reopen(backend)).doc);
     expect(restored).toContain("B was offline.");
     expect(restored).toContain("A compacts");
+  });
+});
+
+describe.each(backends)("device key on %s", (_name, makeBackend) => {
+  it("is absent until saved", async () => {
+    expect(await (await makeBackend()).loadDeviceKey()).toBeNull();
+  });
+
+  it("keeps the first key when two writers race", async () => {
+    const backend = await makeBackend();
+    const [a, b] = await Promise.all([
+      backend.saveDeviceKey(new Uint8Array([1])),
+      backend.saveDeviceKey(new Uint8Array([2])),
+    ]);
+    expect(a).toEqual(b);
+    expect(await backend.loadDeviceKey()).toEqual(a);
+  });
+});
+
+// Stands in for a graph merge: a sorted set of bytes, so a lost update shows
+// as a missing byte.
+const union = (stored: Uint8Array | null, incoming: Uint8Array) =>
+  Uint8Array.from(new Set([...(stored ?? []), ...incoming]).values()).sort();
+
+describe.each(backends)("person graph on %s", (_name, makeBackend) => {
+  it("is absent until merged, then holds the merge", async () => {
+    const backend = await makeBackend();
+    expect(await backend.loadGraph()).toBeNull();
+    await backend.mergeGraph(new Uint8Array([1]), union);
+    await backend.mergeGraph(new Uint8Array([2]), union);
+    expect(await backend.loadGraph()).toEqual(new Uint8Array([1, 2]));
+  });
+
+  it("keeps every entry when tabs merge at the same time", async () => {
+    const backend = await makeBackend();
+    await Promise.all(
+      [1, 2, 3, 4, 5].map((n) =>
+        backend.mergeGraph(new Uint8Array([n]), union),
+      ),
+    );
+    expect(await backend.loadGraph()).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+  });
+
+  it("leaves the graph as it was when the merge refuses", async () => {
+    const backend = await makeBackend();
+    await backend.mergeGraph(new Uint8Array([1]), union);
+    await expect(
+      backend.mergeGraph(new Uint8Array([9]), () => {
+        throw new Error("another person");
+      }),
+    ).rejects.toThrow("another person");
+    expect(await backend.loadGraph()).toEqual(new Uint8Array([1]));
+  });
+
+  it("keeps device labels, the latest name winning", async () => {
+    const backend = await makeBackend();
+    expect(await backend.loadLabels()).toEqual({});
+    await backend.saveLabels({ aa: "Laptop", bb: "Phone" });
+    await backend.saveLabels({ aa: "Work laptop" });
+    expect(await backend.loadLabels()).toEqual({
+      aa: "Work laptop",
+      bb: "Phone",
+    });
+  });
+
+  it("survives removing a project", async () => {
+    const backend = await makeBackend();
+    await backend.mergeGraph(new Uint8Array([1]), union);
+    await backend.remove("p1");
+    expect(await backend.loadGraph()).toEqual(new Uint8Array([1]));
+  });
+});
+
+describe.each(backends)("pinned owner on %s", (_name, makeBackend) => {
+  it("is kept in the group record", async () => {
+    const backend = await makeBackend();
+    await backend.saveMls("p1", {
+      state: null,
+      device: null,
+      removed: false,
+      rotation: null,
+      ownerPerson: new Uint8Array([9]),
+      ownerSecrets: new Uint8Array([7]),
+    });
+    const loaded = await backend.loadMls("p1");
+    expect(loaded?.ownerPerson).toEqual(new Uint8Array([9]));
+    expect(loaded?.ownerSecrets).toEqual(new Uint8Array([7]));
+  });
+});
+
+describe("IndexedDbBackend schema", () => {
+  it("reopens an existing v1 database without recreating stores", async () => {
+    const factory = new IDBFactory();
+    const first = await IndexedDbBackend.open(factory);
+    await first.append("p1", new Uint8Array([1, 2]));
+
+    const second = await IndexedDbBackend.open(factory);
+    const stored = await second.load("p1");
+    expect(stored.updates).toEqual([new Uint8Array([1, 2])]);
+  });
+
+  it("creates the stores on a fresh open", async () => {
+    const backend = await IndexedDbBackend.open(new IDBFactory());
+    await expect(backend.load("none")).resolves.toEqual({
+      snapshot: null,
+      updates: [],
+    });
+  });
+});
+
+describe("person graph writes on IndexedDB", () => {
+  it("skips the write when the merge changes nothing", async () => {
+    const backend = await IndexedDbBackend.open(new IDBFactory());
+    await backend.mergeGraph(new Uint8Array([1]), union);
+    const put = vi.spyOn(IDBObjectStore.prototype, "put");
+    try {
+      await backend.mergeGraph(new Uint8Array([1]), union);
+      expect(put).not.toHaveBeenCalled();
+      await backend.mergeGraph(new Uint8Array([2]), union);
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(await backend.loadGraph()).toEqual(new Uint8Array([1, 2]));
+    } finally {
+      put.mockRestore();
+    }
   });
 });
