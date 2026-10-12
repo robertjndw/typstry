@@ -8,6 +8,10 @@ export function ownBuffer(view: Uint8Array): Uint8Array<ArrayBuffer> {
     : new Uint8Array(view);
 }
 
+export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, i) => byte === b[i]);
+}
+
 export function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

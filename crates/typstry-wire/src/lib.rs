@@ -3,7 +3,8 @@
 //! end-to-end encryption the clients use and, behind `mls`, the MLS group
 //! that authenticates and rotates it. `mls_frame` and `ds`, the delivery
 //! service side of MLS, and `token` need no crypto, so the server uses them
-//! too.
+//! too, and with `owner-proof` the check of `owner` that a rotation is the
+//! owner's.
 //!
 //! Everything here must stay byte-compatible with the web client, which
 //! speaks the same protocol through the npm `loro-protocol` package.
@@ -14,10 +15,19 @@ pub mod crypto;
 pub mod ds;
 pub mod elo;
 pub mod fragment;
+#[cfg(feature = "crypto")]
+pub mod identity;
 #[cfg(feature = "mls")]
 pub mod mls;
 pub mod mls_frame;
+#[cfg(feature = "owner-proof")]
+pub mod owner;
+#[cfg(feature = "pairing")]
+pub mod pairing;
+pub mod relay;
 pub mod token;
+#[cfg(feature = "crypto")]
+mod words;
 
 /// Version of the HTTP and WebSocket contract between clients and the
 /// server. Bump it when a client starts relying on a new endpoint or field,

@@ -1,6 +1,6 @@
 use anyhow::bail;
 
-use super::Ctx;
+use super::{Ctx, Output};
 use crate::api::Permission;
 use crate::state::{Config, StateDir};
 
@@ -66,13 +66,18 @@ pub fn print_links(config: &Config, which: Option<Which>) -> anyhow::Result<()> 
         println!("{}", url(config, which)?);
         return Ok(());
     }
+    write_links(&mut Output::terminal(), config);
+    Ok(())
+}
+
+/// The `Edit: ...` and `View: ...` lines of [`print_links`], to `out`.
+pub fn write_links(out: &mut Output, config: &Config) {
     match url(config, Which::Edit) {
-        Ok(edit) => println!("Edit: {edit}"),
-        Err(err) => eprintln!("note: {err}"),
+        Ok(edit) => out.out(format!("Edit: {edit}")),
+        Err(err) => out.err(format!("note: {err}")),
     }
     match url(config, Which::View) {
-        Ok(view) => println!("View: {view}"),
-        Err(err) => eprintln!("note: {err}"),
+        Ok(view) => out.out(format!("View: {view}")),
+        Err(err) => out.err(format!("note: {err}")),
     }
-    Ok(())
 }

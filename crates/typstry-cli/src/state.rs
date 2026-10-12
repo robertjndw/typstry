@@ -16,7 +16,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use typstry_wire::crypto::LinkSecret;
-use typstry_wire::mls::{Device, MlsError, ProjectGroup};
+use typstry_wire::identity::PersonId;
+use typstry_wire::mls::{LeafKeys, MlsError, OwnerSecrets, ProjectGroup};
 
 use crate::api::Permission;
 use crate::git::GitMark;
@@ -24,6 +25,31 @@ use crate::hash::{BlobHash, Digest};
 use crate::link::ShareLink;
 
 pub const STATE_DIR: &str = ".typstry";
+
+/// The owner keys a store holds, as `owner.bin` and the machine's
+/// per-project files keep them ([`OwnerSecrets::encode`]). A damaged file
+/// reads as empty, like a missing device: the group hands the key over
+/// again if another owner device holds it.
+pub fn read_owner_keys(path: &Path) -> OwnerSecrets {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Adds `held` to the store at `path`, writing only when that changed
+/// anything. Every secret goes in, not just the one the server last named:
+/// which key is current is only the server's word, and a server that names
+/// the wrong one must not get the right one left out of every copy. Nothing
+/// is ever replaced, so a folder that lags behind cannot push out what a
+/// newer one put there either (see [`OwnerSecrets::merge`]).
+pub fn merge_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> {
+    let mut keys = read_owner_keys(path);
+    if keys.merge(held) {
+        atomic_write(path, &keys.encode(), true)?;
+    }
+    Ok(())
+}
 const CONFIG: &str = "config.json";
 const DOC: &str = "doc.bin";
 /// Updates since `doc.bin` was written, see [`StateDir::append_doc`].
@@ -36,6 +62,11 @@ const MLS: &str = "mls.bin";
 /// then rejoins as the same device and replaces its leaf instead of
 /// leaving a ghost member behind.
 const DEVICE: &str = "device.bin";
+/// The project's owner keys this folder held last, kept apart from the group
+/// state for the same reason as the device: a damaged `mls.bin` would
+/// otherwise take the only copy with it, and no other device may be left to
+/// hand it over again. See [`merge_owner_keys`].
+const OWNER: &str = "owner.bin";
 const LOCK: &str = "lock";
 const BLOBS: &str = "blobs";
 const GITIGNORE: &str = ".gitignore";
@@ -79,9 +110,35 @@ pub struct Config {
     /// The git branch typstry syncs on; see [`crate::git`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The person that owned the project when this folder first joined
+    /// (base64url person id). Every rejoin checks the group still names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_person: Option<String>,
 }
 
+/// The pinned owner in a config is present but not a person id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the recorded project owner is damaged")]
+pub struct DamagedPin;
+
 impl Config {
+    /// `None` only when nothing was pinned yet. A value that cannot be
+    /// decoded is an error: reading it as "no pin" would let the next join
+    /// accept, and re-pin, whatever owner the server names.
+    pub fn pinned_owner(&self) -> Result<Option<PersonId>, DamagedPin> {
+        let Some(text) = self.owner_person.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| DamagedPin)?;
+        PersonId::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| DamagedPin)
+    }
+
+    pub fn pin_owner(&mut self, owner: &PersonId) {
+        self.owner_person = Some(URL_SAFE_NO_PAD.encode(owner));
+    }
+
     pub fn link(&self) -> ShareLink {
         ShareLink::new(&self.server, &self.token, &self.key)
     }
@@ -404,23 +461,31 @@ impl StateDir {
         }
     }
 
-    /// Saves the device first: if the state write is interrupted, the
-    /// identity survives for the rejoin.
+    /// Saves the device and the owner key first: if the state write is
+    /// interrupted, both survive for the rejoin.
     pub fn save_mls(&self, group: &ProjectGroup) -> anyhow::Result<()> {
         self.save_device(group.device())?;
+        if !group.owner_secrets().is_empty() {
+            merge_owner_keys(&self.dir.join(OWNER), group.owner_secrets())?;
+        }
         atomic_write(&self.dir.join(MLS), &group.export_state(), true)
     }
 
-    pub fn save_device(&self, device: &Device) -> anyhow::Result<()> {
+    /// The owner keys this folder held, newest first.
+    pub fn load_owner_keys(&self) -> OwnerSecrets {
+        read_owner_keys(&self.dir.join(OWNER))
+    }
+
+    pub fn save_device(&self, device: &LeafKeys) -> anyhow::Result<()> {
         atomic_write(&self.dir.join(DEVICE), &device.export(), true)
     }
 
     /// The identity this folder joined with, if one was saved and is
     /// readable. A damaged file reads as missing: a new identity only
     /// costs a ghost leaf, where failing would block the folder.
-    pub fn load_device(&self) -> Option<Device> {
+    pub fn load_device(&self) -> Option<LeafKeys> {
         let bytes = fs::read(self.dir.join(DEVICE)).ok()?;
-        Device::import(&bytes).ok()
+        LeafKeys::import(&bytes).ok()
     }
 
     pub fn load_base(&self) -> anyhow::Result<Base> {
@@ -870,6 +935,71 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn owner_keys_keep_every_secret_a_group_held() {
+        use typstry_wire::mls::{Origin, OwnerSecret};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.bin");
+        let [old, current, newer] = [(); 3].map(|_| OwnerSecret::generate());
+        // A group whose server named `current` still holds the older one,
+        // and it is kept too.
+        let held: OwnerSecrets = [
+            (current.clone(), Origin::Received),
+            (old.clone(), Origin::Made),
+        ]
+        .into_iter()
+        .collect();
+        merge_owner_keys(&path, &held).unwrap();
+        // A folder that only knows a newer one adds it without dropping any.
+        let other: OwnerSecrets = [(newer.clone(), Origin::Made)].into_iter().collect();
+        merge_owner_keys(&path, &other).unwrap();
+        let stored = read_owner_keys(&path);
+        assert_eq!(stored.iter().collect::<Vec<_>>(), [&newer, &current, &old]);
+        // Nothing new, nothing written.
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        merge_owner_keys(&path, &held).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+
+        fs::write(&path, b"damaged").unwrap();
+        assert!(read_owner_keys(&path).is_empty());
+    }
+
+    #[test]
+    fn a_group_state_saves_the_owner_key_the_server_did_not_name() {
+        use typstry_wire::identity::{DeviceKey, PersonGraph};
+        use typstry_wire::mls::{Bootstrap, LocalIdentity, OwnerSecret};
+        let device = DeviceKey::generate();
+        let graph = PersonGraph::genesis(&device);
+        let me = LocalIdentity { device, graph };
+        let link = LinkSecret::generate_edit();
+        let (group, init) = ProjectGroup::create(&link, b"me", &me).unwrap();
+        let real = group.owner_secret().unwrap().clone();
+        // A server that names a key of its own making when the folder joins
+        // again: the real one is what may be left nowhere else.
+        let forged = OwnerSecret::generate().public();
+        let (joined, _) = ProjectGroup::join_external_as(
+            group.device().duplicate(),
+            &link,
+            Bootstrap {
+                group_info: &init.group_info,
+                keyring: &init.keyring,
+                owner_key: &forged,
+            },
+            b"me",
+            Some(&me),
+            group.owner_person(),
+            Some(&group),
+            &OwnerSecrets::default(),
+        )
+        .unwrap();
+        assert!(joined.owner_secret().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::create(dir.path()).unwrap();
+        state.save_mls(&joined).unwrap();
+        assert_eq!(state.load_owner_keys().find(&real.public()), Some(&real));
+    }
+
+    #[test]
     fn lock_is_exclusive() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::create(dir.path()).unwrap();
@@ -893,6 +1023,7 @@ pub(crate) mod tests {
             view_token: None,
             name: None,
             branch: None,
+            owner_person: None,
         }
     }
 

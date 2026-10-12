@@ -17,7 +17,7 @@
 
 use loro_protocol::{BytesReader, BytesWriter};
 
-use crate::codec::{CodecError, push_opt, read_flag, read_opt};
+use crate::codec::{CodecError, push_opt, read_array, read_flag, read_opt};
 use crate::mls_frame::MAX_GROUP_ID;
 
 /// Where the server serves the delivery service socket.
@@ -77,14 +77,25 @@ impl From<CodecError> for DsError {
     }
 }
 
+/// Length of the owner keys and proofs below, see [`crate::owner`]. Kept as
+/// plain numbers here so the codec builds without the `owner-proof` feature.
+pub const OWNER_KEY_LEN: usize = 32;
+pub const OWNER_PROOF_LEN: usize = 64;
+
 /// The new links of a rotation, as the server needs them: it swaps the
 /// project's tokens in the same transaction as the commit. The rotating
 /// client picks the new tokens at random; the matching secrets travel only
 /// inside the sealed envelope, never to the server.
+///
+/// Only the owner rotates, which the server checks with `owner_proof`, the
+/// signature of the project's current owner key over the whole submission.
+/// `next_owner_key` replaces that key once the rotation is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rotate {
     pub edit_token: String,
     pub view_token: String,
+    pub next_owner_key: [u8; OWNER_KEY_LEN],
+    pub owner_proof: [u8; OWNER_PROOF_LEN],
 }
 
 /// What a connection may do, decided by the token it presented.
@@ -118,6 +129,9 @@ pub enum RefusalCode {
     Internal,
     /// The connection sent messages faster than the server accepts them.
     RateLimited,
+    /// A rotation that is not signed with the project's owner key. Nothing
+    /// was stored.
+    NotOwner,
 }
 
 impl RefusalCode {
@@ -132,6 +146,7 @@ impl RefusalCode {
             Self::Retired => 7,
             Self::Internal => 8,
             Self::RateLimited => 9,
+            Self::NotOwner => 10,
         }
     }
 
@@ -146,6 +161,7 @@ impl RefusalCode {
             7 => Self::Retired,
             8 => Self::Internal,
             9 => Self::RateLimited,
+            10 => Self::NotOwner,
             other => return Err(DsError::UnknownValue("refusal code", other)),
         })
     }
@@ -196,14 +212,18 @@ pub enum ClientMessage {
         envelope: Option<Vec<u8>>,
         rotate: Option<Rotate>,
     },
-    /// Creates the group of a new project.
+    /// Creates the group of a new project. `owner_key` is the public owner
+    /// key the first rotation has to be signed with.
     Init {
         req: u64,
         group_id: Vec<u8>,
         group_info: Vec<u8>,
         keyring: Vec<u8>,
+        owner_key: [u8; OWNER_KEY_LEN],
     },
-    /// Starts over with a new group when the old one is stuck.
+    /// Starts over with a new group when the old one is stuck. It carries
+    /// no owner key: any editor may reset, and a reset leaves the owner key
+    /// and the tokens as they are.
     Reset {
         req: u64,
         incarnation: u64,
@@ -226,10 +246,15 @@ pub enum ServerMessage {
         /// For a retired token, the epoch of the rotation that retired it.
         retired: Option<u64>,
     },
+    /// `owner_key` is the owner key a rotation moved the server on to, and
+    /// is absent for any other commit. It is how a member that follows the
+    /// log knows which owner key is current: the group cannot say, see
+    /// [`crate::owner`].
     Commit {
         epoch: u64,
         commit: Vec<u8>,
         envelope: Option<Vec<u8>>,
+        owner_key: Option<[u8; OWNER_KEY_LEN]>,
     },
     Accepted {
         req: u64,
@@ -273,6 +298,23 @@ fn read_token(reader: &mut BytesReader<'_>) -> Result<String, DsError> {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| DsError::Malformed("token is not UTF-8".into()))
+}
+
+/// Shared with the saved MLS state, which keeps a pending rotation as sent.
+pub(crate) fn push_rotate(w: &mut BytesWriter, rotate: &Rotate) {
+    w.push_var_string(&rotate.edit_token);
+    w.push_var_string(&rotate.view_token);
+    w.push_bytes(&rotate.next_owner_key);
+    w.push_bytes(&rotate.owner_proof);
+}
+
+pub(crate) fn read_rotate(r: &mut BytesReader<'_>) -> Result<Rotate, DsError> {
+    Ok(Rotate {
+        edit_token: read_token(r)?,
+        view_token: read_token(r)?,
+        next_owner_key: read_array(r)?,
+        owner_proof: read_array(r)?,
+    })
 }
 
 fn read_group_id(reader: &mut BytesReader<'_>) -> Result<Vec<u8>, DsError> {
@@ -344,8 +386,7 @@ impl ClientMessage {
                 match rotate {
                     Some(rotate) => {
                         w.push_byte(1);
-                        w.push_var_string(&rotate.edit_token);
-                        w.push_var_string(&rotate.view_token);
+                        push_rotate(&mut w, rotate);
                     }
                     None => w.push_byte(0),
                 }
@@ -355,12 +396,14 @@ impl ClientMessage {
                 group_id,
                 group_info,
                 keyring,
+                owner_key,
             } => {
                 w.push_byte(tag::INIT);
                 w.push_uleb128(*req);
                 w.push_var_bytes(group_id);
                 w.push_var_bytes(group_info);
                 w.push_var_bytes(keyring);
+                w.push_bytes(owner_key);
             }
             Self::Reset {
                 req,
@@ -403,10 +446,7 @@ impl ClientMessage {
                 keyring: read_opt(&mut r)?,
                 envelope: read_opt(&mut r)?,
                 rotate: if read_flag(&mut r)? {
-                    Some(Rotate {
-                        edit_token: read_token(&mut r)?,
-                        view_token: read_token(&mut r)?,
-                    })
+                    Some(read_rotate(&mut r)?)
                 } else {
                     None
                 },
@@ -416,6 +456,7 @@ impl ClientMessage {
                 group_id: read_group_id(&mut r)?,
                 group_info: r.read_var_bytes()?.to_vec(),
                 keyring: r.read_var_bytes()?.to_vec(),
+                owner_key: read_array(&mut r)?,
             },
             tag::RESET => Self::Reset {
                 req: r.read_uleb128()?,
@@ -461,11 +502,19 @@ impl ServerMessage {
                 epoch,
                 commit,
                 envelope,
+                owner_key,
             } => {
                 w.push_byte(tag::COMMIT);
                 w.push_uleb128(*epoch);
                 w.push_var_bytes(commit);
                 push_opt(&mut w, envelope.as_deref());
+                match owner_key {
+                    Some(key) => {
+                        w.push_byte(1);
+                        w.push_bytes(key);
+                    }
+                    None => w.push_byte(0),
+                }
             }
             Self::Accepted { req } => {
                 w.push_byte(tag::ACCEPTED);
@@ -509,6 +558,11 @@ impl ServerMessage {
                 epoch: r.read_uleb128()?,
                 commit: r.read_var_bytes()?.to_vec(),
                 envelope: read_opt(&mut r)?,
+                owner_key: if read_flag(&mut r)? {
+                    Some(read_array(&mut r)?)
+                } else {
+                    None
+                },
             },
             tag::ACCEPTED => Self::Accepted {
                 req: r.read_uleb128()?,
@@ -554,6 +608,8 @@ mod tests {
                 rotate: Some(Rotate {
                     edit_token: "e".into(),
                     view_token: "v".into(),
+                    next_owner_key: [3; 32],
+                    owner_proof: [4; 64],
                 }),
             },
             ClientMessage::Submit {
@@ -570,6 +626,7 @@ mod tests {
                 group_id: b"gid".to_vec(),
                 group_info: vec![1],
                 keyring: vec![2],
+                owner_key: [5; 32],
             },
             ClientMessage::Reset {
                 req: 4,
@@ -600,12 +657,23 @@ mod tests {
                 epoch: 6,
                 commit: vec![9; 10],
                 envelope: Some(vec![1]),
+                owner_key: Some([3; 32]),
+            },
+            ServerMessage::Commit {
+                epoch: 7,
+                commit: vec![9; 10],
+                envelope: None,
+                owner_key: None,
             },
             ServerMessage::Accepted { req: 1 },
             ServerMessage::Conflict { req: 2, head: 7 },
             ServerMessage::Refused {
                 req: 3,
                 code: RefusalCode::Forbidden,
+            },
+            ServerMessage::Refused {
+                req: 4,
+                code: RefusalCode::NotOwner,
             },
             ServerMessage::Reinitialized { incarnation: 8 },
         ]
@@ -634,6 +702,54 @@ mod tests {
             code: RefusalCode::NoGroup,
         };
         assert_eq!(refused.encode(), [0x86, 5, 3]);
+        let not_owner = ServerMessage::Refused {
+            req: 1,
+            code: RefusalCode::NotOwner,
+        };
+        assert_eq!(not_owner.encode(), [0x86, 1, 10]);
+        assert_eq!(
+            ServerMessage::decode(&[0x86, 1, 11]),
+            Err(DsError::UnknownValue("refusal code", 11))
+        );
+
+        // The owner key and proof are fixed-length, with no length prefix.
+        let init = ClientMessage::Init {
+            req: 1,
+            group_id: vec![7],
+            group_info: vec![8],
+            keyring: vec![9],
+            owner_key: [5; 32],
+        };
+        let mut want = vec![4, 1, 1, 7, 1, 8, 1, 9];
+        want.extend([5; 32]);
+        assert_eq!(init.encode(), want);
+        let rotation = ClientMessage::Submit {
+            req: 1,
+            epoch: 2,
+            commit: vec![],
+            group_info: vec![],
+            keyring: None,
+            envelope: None,
+            rotate: Some(Rotate {
+                edit_token: "e".into(),
+                view_token: "v".into(),
+                next_owner_key: [3; 32],
+                owner_proof: [4; 64],
+            }),
+        };
+        let mut want = vec![2, 1, 2, 0, 0, 0, 0, 1, 1, b'e', 1, b'v'];
+        want.extend([3; 32]);
+        want.extend([4; 64]);
+        assert_eq!(rotation.encode(), want);
+        let commit = ServerMessage::Commit {
+            epoch: 2,
+            commit: vec![6],
+            envelope: None,
+            owner_key: Some([3; 32]),
+        };
+        let mut want = vec![0x82, 2, 1, 6, 0, 1];
+        want.extend([3; 32]);
+        assert_eq!(commit.encode(), want);
     }
 
     #[test]
@@ -745,6 +861,7 @@ mod tests {
             group_id: vec![0; MAX_GROUP_ID + 1],
             group_info: vec![],
             keyring: vec![],
+            owner_key: [0; 32],
         };
         assert_eq!(
             ClientMessage::decode(&long_group.encode()),
@@ -776,7 +893,7 @@ mod tests {
                 bytes(),
                 prop::option::of(bytes()),
                 prop::option::of(bytes()),
-                prop::option::of((token(), token())),
+                prop::option::of((token(), token(), any::<[u8; 32]>(), any::<u8>())),
             )
                 .prop_map(
                     |(req, epoch, commit, group_info, keyring, envelope, rotate)| {
@@ -787,19 +904,22 @@ mod tests {
                             group_info,
                             keyring,
                             envelope,
-                            rotate: rotate.map(|(edit_token, view_token)| Rotate {
+                            rotate: rotate.map(|(edit_token, view_token, next, proof)| Rotate {
                                 edit_token,
                                 view_token,
+                                next_owner_key: next,
+                                owner_proof: [proof; 64],
                             }),
                         }
                     }
                 ),
-            (any::<u64>(), bytes(), bytes(), bytes()).prop_map(
-                |(req, group_id, group_info, keyring)| ClientMessage::Init {
+            (any::<u64>(), bytes(), bytes(), bytes(), any::<[u8; 32]>()).prop_map(
+                |(req, group_id, group_info, keyring, owner_key)| ClientMessage::Init {
                     req,
                     group_id,
                     group_info,
-                    keyring
+                    keyring,
+                    owner_key,
                 }
             ),
             (any::<u64>(), any::<u64>(), bytes(), bytes(), bytes()).prop_map(
@@ -835,17 +955,24 @@ mod tests {
                         retired,
                     }
                 }),
-            (any::<u64>(), bytes(), prop::option::of(bytes())).prop_map(
-                |(epoch, commit, envelope)| ServerMessage::Commit {
-                    epoch,
-                    commit,
-                    envelope
-                }
-            ),
+            (
+                any::<u64>(),
+                bytes(),
+                prop::option::of(bytes()),
+                prop::option::of(any::<[u8; OWNER_KEY_LEN]>())
+            )
+                .prop_map(|(epoch, commit, envelope, owner_key)| {
+                    ServerMessage::Commit {
+                        epoch,
+                        commit,
+                        envelope,
+                        owner_key,
+                    }
+                }),
             any::<u64>().prop_map(|req| ServerMessage::Accepted { req }),
             (any::<u64>(), any::<u64>())
                 .prop_map(|(req, head)| ServerMessage::Conflict { req, head }),
-            (any::<u64>(), 1u8..=9).prop_map(|(req, code)| ServerMessage::Refused {
+            (any::<u64>(), 1u8..=10).prop_map(|(req, code)| ServerMessage::Refused {
                 req,
                 code: RefusalCode::from_byte(code).unwrap()
             }),

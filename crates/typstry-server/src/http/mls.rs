@@ -17,6 +17,9 @@ struct Bootstrap {
     epoch: u64,
     group_info: String,
     keyring: String,
+    /// The owner key the server holds, which tells a joiner which owner key
+    /// secret is the current one. Read with the GroupInfo, so the two match.
+    owner_key: String,
 }
 
 /// `GET /api/p/{token}/mls`: what a newcomer needs to join the group with
@@ -37,6 +40,7 @@ pub async fn bootstrap(
         epoch: group.head_epoch,
         group_info: STANDARD.encode(&group.group_info),
         keyring: STANDARD.encode(&group.keyring),
+        owner_key: STANDARD.encode(group.owner_key),
     });
     // The keyring changes with every rotation; a cached copy is a stale key.
     let mut res = body.into_response();

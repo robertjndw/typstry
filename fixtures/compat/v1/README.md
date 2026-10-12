@@ -12,7 +12,9 @@ instead of touching this one.
 
 The v1 set was written for the MLS format. An earlier draft of v1 (one
 project key, no groups) was dropped before any release, so nothing in the
-wild uses it.
+wild uses it. v1 was re-frozen once more before release when device keys,
+the person graph and person-bound ownership replaced the shared person key
+and the owner keys; the sets are regenerated, not migrated.
 
 - `versions.json`: the format versions in force when this was written,
   including `mlsState` (the saved group state) and `ds` (the delivery

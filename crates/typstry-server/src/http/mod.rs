@@ -3,6 +3,7 @@ mod error;
 pub mod mls;
 pub mod projects;
 pub mod protocol;
+pub mod relay;
 
 use std::path::Path;
 use std::time::Duration;
@@ -89,6 +90,7 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
     let api = Router::new()
         .route("/api/projects", post(projects::create))
         .route("/api/share/{token}", get(projects::share))
+        .route(typstry_wire::relay::RELAY_API_PATH, post(relay::allocate))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             API_TIMEOUT,
@@ -102,6 +104,7 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         .route("/api/p/{token}/mls", get(mls::bootstrap))
         .route("/ws", get(ws::handler))
         .route(typstry_wire::ds::DS_PATH, get(ws::mls::handler))
+        .route(typstry_wire::relay::RELAY_WS_PATH, get(ws::relay::handler))
         .layer(middleware::from_fn(protocol::gate));
     let mut app = Router::new()
         .route("/healthz", get(healthz))

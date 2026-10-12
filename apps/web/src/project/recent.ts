@@ -3,8 +3,9 @@
 // opened here, the sealed keyring the server last gave us for it, and what
 // each share token resolved to (so a project opens offline).
 import { fromBase64, toBase64 } from "@/crypto/bytes";
-import { isProjectSecret } from "@/crypto/secret";
+import { isEditSecret, isProjectSecret } from "@/crypto/secret";
 import { getStorage, readJson, writeJson } from "@/lib/storage";
+import type { StoredRotation } from "@/persist/local-doc-store";
 import { parseShareInfo, type ShareInfo } from "@/sync/api";
 
 export const RECENT_KEY = "typstry:recent";
@@ -129,6 +130,42 @@ export function projectUrl(
   return `${origin}/p/${encodeURIComponent(token)}#${key}`;
 }
 
+/** The share token and secret of a project link, or null for anything else. */
+export function parseProjectLink(
+  link: string,
+): { token: string; key: string } | null {
+  try {
+    const url = new URL(link);
+    const [, prefix, token] = url.pathname.split("/");
+    const key = url.hash.slice(1);
+    if (prefix !== "p" || !token || !isProjectSecret(key)) return null;
+    return { token: decodeURIComponent(token), key };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stores a link this browser was handed for a project it may already know,
+ * and puts the project in the recent list.
+ */
+export function adoptProjectLink(
+  link: { token: string; key: string },
+  share: ShareInfo,
+  title: string,
+): void {
+  const existing = loadProjectKey(share.projectId);
+  // Never trade an edit secret this browser has for a view one.
+  if (!existing || (isEditSecret(link.key) && !isEditSecret(existing)))
+    saveProjectKey(share.projectId, link.key);
+  rememberShare(link.token, share);
+  rememberProject({
+    projectId: share.projectId,
+    token: link.token,
+    title: title || "Untitled",
+  });
+}
+
 export function saveProjectKey(
   projectId: string,
   key: string,
@@ -221,4 +258,37 @@ export function forgetProject(
     // Best effort, like every other storage access here.
   }
   for (const token of shares) forgetShare(token, storage);
+}
+
+/**
+ * Stores the links of a rotation where the next visit finds them: the key
+ * for the fragment, the tokens, and what to open from the recent list.
+ */
+export function keepRotation(
+  projectId: string,
+  rotation: StoredRotation,
+  title: string,
+): void {
+  saveProjectKey(projectId, rotation.link);
+  if (rotation.canEdit && rotation.viewToken) {
+    saveShareLinks(projectId, {
+      editToken: rotation.token,
+      viewToken: rotation.viewToken,
+    });
+    rememberShare(rotation.token, {
+      projectId,
+      permission: "write",
+      viewToken: rotation.viewToken,
+    });
+    rememberShare(rotation.viewToken, { projectId, permission: "read" });
+  } else {
+    // Not sent the edit link, e.g. a viewer: there is no other token.
+    clearShareLinks(projectId);
+    rememberShare(rotation.token, { projectId, permission: "read" });
+  }
+  rememberProject({
+    projectId,
+    token: rotation.token,
+    title: title || "Untitled",
+  });
 }

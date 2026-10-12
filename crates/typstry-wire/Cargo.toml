@@ -14,6 +14,8 @@ base64 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 hkdf = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+spake2 = { workspace = true, optional = true }
 openmls = { workspace = true, optional = true }
 openmls_basic_credential = { workspace = true, optional = true }
 openmls_rust_crypto = { workspace = true, optional = true }
@@ -26,6 +28,7 @@ zeroize = { workspace = true, optional = true }
 # The end-to-end encryption clients do. The server never holds a key, so it
 # leaves this off and does not even link the cipher.
 crypto = [
+    "owner-proof",
     "dep:aes-gcm",
     "dep:base64",
     "dep:ed25519-dalek",
@@ -34,15 +37,22 @@ crypto = [
     "dep:thiserror",
     "dep:zeroize",
 ]
+# Checking that a rotation is signed with a project's owner key, which is all
+# of the owner key the server needs. It verifies and never holds a secret.
+owner-proof = ["dep:ed25519-dalek", "dep:sha2"]
 # MLS group membership on top of the encryption. Clients only, like `crypto`.
 mls = [
     "crypto",
+    "pairing",
     "dep:openmls",
     "dep:openmls_basic_credential",
     "dep:openmls_rust_crypto",
     "dep:openmls_traits",
     "dep:tls_codec",
 ]
+# Device pairing over the relay. Clients only, and a separate feature so the
+# unaudited spake2 stays out of builds that do not pair.
+pairing = ["crypto", "dep:rand_core", "dep:spake2"]
 # MLS for wasm, where openmls needs the browser as its random source.
 js = ["mls", "openmls/js"]
 # Exposes the encryption entry points that take a caller-chosen salt and IV,

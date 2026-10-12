@@ -30,7 +30,7 @@ use typstry_doc::configure;
 use typstry_doc::materialize::FileContent;
 use typstry_doc::peers::{PALETTE, normalize_peer_name, set_peer};
 use typstry_wire::crypto::LinkSecret;
-use typstry_wire::mls::ProjectGroup;
+use typstry_wire::mls::{LocalIdentity, ProjectGroup};
 
 use crate::api::{Api, ShareInfo};
 use crate::git::Repo;
@@ -71,9 +71,22 @@ impl Identity {
         }
     }
 
-    /// An explicit name, else the one in the config, else
-    /// `git config user.name`, else "CLI".
-    pub fn resolve(flag: Option<&str>, config: Option<&str>, dir: &Path) -> Self {
+    /// An explicit name, else the one in the config, else the person's
+    /// profile (`person`, the bytes in their graph), else
+    /// `git config user.name`, else "CLI". An explicit name only changes
+    /// this run's leaf, never the person's profile.
+    pub fn resolve(
+        flag: Option<&str>,
+        config: Option<&str>,
+        person: Option<&[u8]>,
+        dir: &Path,
+    ) -> Self {
+        if flag.is_none()
+            && config.is_none()
+            && let Some(identity) = person.and_then(crate::mls::profile_identity)
+        {
+            return identity;
+        }
         let name = flag
             .map(str::to_owned)
             .or_else(|| config.map(str::to_owned))
@@ -203,6 +216,11 @@ pub struct Session {
     /// What the link resolved to a moment ago, for the next connect.
     resolved: Option<ShareInfo>,
     identity: Identity,
+    /// This device's key and person graph, read once per run and replaced
+    /// by what each save of the graph hands back. None while the machine is
+    /// not a person yet, or its files could not be read; whoever needs one
+    /// then reads them again and gets the error.
+    local: Option<LocalIdentity>,
     conn: Option<Conn>,
     /// One warning about undecryptable records is enough per run.
     warned_unreadable: bool,
@@ -257,6 +275,16 @@ pub enum SyncError {
     WrongKey,
     #[error("the server refused this link; it may have been revoked")]
     LinkRefused,
+    /// The group names another owner than the one this folder pinned, or
+    /// does not verify.
+    #[error("The project's member group now claims a different owner. Refusing to rejoin.")]
+    OwnerChanged,
+    /// The group was reset with a keyring that drops or changes what this
+    /// folder knew, which only someone forging it would do.
+    #[error(
+        "The project's member group was reset with keys that do not match the ones this folder knew. Refusing to rejoin."
+    )]
+    GroupRewritten,
     /// The link was replaced by a rotation and the group did not hand this
     /// folder the new one.
     #[error(
@@ -368,7 +396,7 @@ impl Session {
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
         let state = StateDir::create(root)?;
-        let config = Config {
+        let mut config = Config {
             server: link.origin.clone(),
             project_id: share.project_id.clone(),
             token: link.token.clone(),
@@ -377,7 +405,11 @@ impl Session {
             view_token: share.view_token.clone(),
             name: name.map(str::to_owned),
             branch: None,
+            owner_person: None,
         };
+        if let Some(owner) = group.as_ref().and_then(|g| g.owner_person()) {
+            config.pin_owner(&owner);
+        }
         state.save_config(&config)?;
         if let Some(group) = &group {
             state.save_mls(group)?;
@@ -410,7 +442,15 @@ impl Session {
             Some(api) => api,
             None => Api::new(&config.server)?,
         };
-        let identity = Identity::resolve(name, config.name.as_deref(), state.root());
+        // Best effort: a damaged graph only costs the person's profile here,
+        // and what needs the identity itself reads it again to report why.
+        let local = crate::user::load_identity().ok().flatten();
+        let identity = Identity::resolve(
+            name,
+            config.name.as_deref(),
+            local.as_ref().and_then(|l| l.graph.profile()),
+            state.root(),
+        );
         // A fresh peer per run: two runs can never share one, which Loro
         // requires, and nothing needs to be remembered between runs.
         doc.set_peer_id(random_peer())?;
@@ -425,6 +465,7 @@ impl Session {
             api,
             resolved: None,
             identity,
+            local,
             conn: None,
             warned_unreadable: false,
             warnings: Vec::new(),

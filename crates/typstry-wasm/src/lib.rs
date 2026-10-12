@@ -16,4 +16,6 @@ mod ds;
 mod error;
 mod group;
 mod keys;
+mod pairing;
 mod presence;
+mod relay;

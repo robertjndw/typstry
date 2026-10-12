@@ -291,6 +291,7 @@ impl Session {
                 "could not follow the project's member group ({err:#}); syncing the document goes on, but links will not move over for this folder until this works"
             ));
         }
+        let removed_devices = Box::pin(self.remove_revoked_devices()).await;
         let share = match self.resolved.take() {
             Some(share) => share,
             None => self.api.resolve_share(&self.config.token).await?,
@@ -357,6 +358,15 @@ impl Session {
             // migrating needs. The result goes out with the push below.
             typstry_doc::migrate(&self.doc).context("migrating the project")?;
             self.push_local().await?;
+            if removed_devices {
+                // Same as after any other rotation, so the project does not
+                // depend on records under the keys that just retired.
+                if let Err(err) = self.push_snapshot().await {
+                    self.warnings.push(format!(
+                        "could not upload the project under the new keys yet ({err:#}); typstry sync will do it"
+                    ));
+                }
+            }
         }
         Ok(())
     }

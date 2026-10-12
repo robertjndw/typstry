@@ -4,7 +4,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ProjectCrypto } from "@/crypto/project-crypto";
 import { newProject } from "@/crypto/test-utils";
-import { LinkSecret, ProjectGroup } from "@/crypto/wasm";
+import {
+  DeviceKey,
+  LinkSecret,
+  PersonGraph,
+  ProjectGroup,
+} from "@/crypto/wasm";
 
 import { EphemeralStoreAdaptor } from "./ephemeral-adaptor";
 
@@ -92,11 +97,18 @@ describe("EphemeralStoreAdaptor", () => {
     // Two members of one group, each with its own device key.
     const link = LinkSecret.generateEdit();
     const profile = new TextEncoder().encode("{}");
-    const { group: a, message: init } = ProjectGroup.create(link, profile);
+    const seed = DeviceKey.generate().export();
+    const { group: a, message: init } = ProjectGroup.create(
+      link,
+      profile,
+      seed,
+      PersonGraph.genesis(seed).encode(),
+    );
     const { group: b, message: submit } = ProjectGroup.joinExternal(
       link,
       init.groupInfo,
       init.keyring,
+      init.ownerKey,
       profile,
     );
     a.processCommit(submit.epoch, submit.commit);

@@ -30,6 +30,7 @@ const REFUSAL: Record<RefusalCode, number> = {
   retired: 7,
   internal: 8,
   rateLimited: 9,
+  notOwner: 10,
 };
 
 export const frames = {
@@ -48,8 +49,19 @@ export const frames = {
       ...(retired === undefined ? [0] : [1, ...uleb(retired)]),
     ]);
   },
-  commit(epoch: number, commit: Uint8Array): ArrayBuffer {
-    return buffer([0x82, ...uleb(epoch), ...varBytes(commit), 0]);
+  /** A commit without an envelope, with the owner key of a rotation. */
+  commit(
+    epoch: number,
+    commit: Uint8Array,
+    ownerKey?: Uint8Array,
+  ): ArrayBuffer {
+    return buffer([
+      0x82,
+      ...uleb(epoch),
+      ...varBytes(commit),
+      0,
+      ...(ownerKey ? [1, ...ownerKey] : [0]),
+    ]);
   },
   accepted(req: number): ArrayBuffer {
     return buffer([0x84, ...uleb(req)]);

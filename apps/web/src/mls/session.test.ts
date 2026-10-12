@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { LinkSecret, ProjectGroup } from "@/crypto/wasm";
+import {
+  DeviceKey,
+  LinkSecret,
+  PersonGraph,
+  ProjectGroup,
+  RecoveryKey,
+  devicePublicKey,
+  graphsInGroupInfo,
+  mergeOwnerSecrets,
+} from "@/crypto/wasm";
 import {
   MemoryBackend,
   type DocBackend,
@@ -9,6 +18,8 @@ import {
 import { encodeProfile, type Identity } from "@/presence/identity";
 
 import { FakeServer } from "./fake-server";
+import { localIdentity, mergeOwnGraph } from "./identity";
+import { keepOwnerKey, recoverDevice, recoveredOwnerKey } from "./recovery";
 import { MlsSession, type MlsSessionOptions } from "./session";
 
 const EDIT = "edit-1";
@@ -50,13 +61,25 @@ interface Device {
   identity: Identity;
 }
 
-function world() {
+function world({ recovery = false } = {}) {
   const link = LinkSecret.generateEdit();
   const editSecret = link.toBase64url();
   const viewSecret = link.viewSecret();
+  const aliceKey = DeviceKey.generate();
+  const aliceSeed = aliceKey.export();
+  const aliceGraph = PersonGraph.genesis(aliceSeed);
+  const recoveryKey = recovery ? RecoveryKey.generate() : null;
+  if (recoveryKey)
+    aliceGraph.addDevice(
+      aliceSeed,
+      devicePublicKey(recoveryKey.deviceSeed),
+      true,
+    );
   const { group, message } = ProjectGroup.create(
     link,
     encodeProfile({ name: "Alice", color }),
+    aliceSeed,
+    aliceGraph.encode(),
   );
   const server = new FakeServer({ edit: EDIT, view: VIEW });
   server.seed(message);
@@ -88,6 +111,8 @@ function world() {
       jitter: () => 0,
       silenceMs: 100,
       profileDelayMs: 0,
+      localIdentity: () => localIdentity(backend),
+      mergeGraph: (graph) => mergeOwnGraph(backend, graph),
       ...opts.options,
     });
     sessions.push(out.session);
@@ -100,11 +125,15 @@ function world() {
     opts: { bus?: Bus; options?: Partial<MlsSessionOptions> } = {},
   ): Promise<Device> {
     const backend = new MemoryBackend();
+    await backend.saveDeviceKey(aliceSeed);
+    await backend.mergeGraph(aliceGraph.encode(), (_, incoming) => incoming);
     await backend.saveMls("p", {
       state: group.exportState(),
-      device: group.device().export(),
+      device: group.leafKeys().export(),
       removed: false,
       rotation: null,
+      ownerPerson: group.ownerPerson(),
+      ownerSecrets: group.ownerSecrets(),
     });
     const d = device("Alice", { backend, ...opts });
     await d.session.start({ token: EDIT, link: editSecret });
@@ -123,7 +152,41 @@ function world() {
     return d;
   }
 
-  return { server, creator, join, device, editSecret, viewSecret, sessions };
+  /**
+   * A second browser of Alice's: its device key is added to her graph and
+   * both are stored the way pairing leaves them. `backend` is one that
+   * already has a key, e.g. a browser that opened a link before pairing.
+   */
+  async function pairedWithAlice(
+    alice: Device,
+    backend: DocBackend = new MemoryBackend(),
+  ): Promise<{ backend: DocBackend; pub: Uint8Array }> {
+    let seed = await backend.loadDeviceKey();
+    if (!seed) {
+      seed = DeviceKey.generate().export();
+      await backend.saveDeviceKey(seed);
+    }
+    const pub = devicePublicKey(seed);
+    const { graph } = await localIdentity(alice.backend);
+    const next = PersonGraph.decode(graph);
+    next.addDevice(aliceSeed, pub);
+    await mergeOwnGraph(alice.backend, next.encode());
+    await backend.mergeGraph(next.encode(), (_, incoming) => incoming);
+    return { backend, pub };
+  }
+
+  return {
+    server,
+    creator,
+    join,
+    device,
+    editSecret,
+    viewSecret,
+    sessions,
+    aliceSeed,
+    pairedWithAlice,
+    recoveryWords: recoveryKey?.words ?? "",
+  };
 }
 
 const names = (d: Device) =>
@@ -477,15 +540,368 @@ describe("MlsSession", () => {
       expect(alice.session.getSnapshot().members).toHaveLength(2),
     );
 
-    // Bob's reply is lost and his commit never lands; Alice's does.
+    // Alice's reply is lost and her commit never lands; Bob's does.
     server.loseNextReply = { landed: false };
-    const bobs = bob.session.resetLinks();
-    await alice.session.resetLinks();
-    await bobs;
-    // Both rotations happened, one after the other, none twice.
-    expect(server.head).toBe(3);
+    const alices = alice.session.resetLinks();
+    bob.identity = { name: "Robert", color };
+    bob.session.updateProfile();
+    await alices;
+    await vi.waitFor(() => expect(server.head).toBe(3));
+    // Both commits happened, one after the other, none twice.
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("lets only the owner remove members or reset the links", async () => {
+    const { creator, join, sessions } = world();
+    const alice = await creator();
+    const bob = await join("Bob", "edit");
+    await vi.waitFor(() =>
+      expect(bob.session.getSnapshot().canCommit).toBe(true),
+    );
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().members).toHaveLength(2),
+    );
+    const roleOf = (d: Device) =>
+      d.session.getSnapshot().members.find((m) => m.isSelf)?.role;
+    expect(roleOf(alice)).toBe("owner");
+    expect(roleOf(bob)).toBe("editor");
+
+    const alicesSigner = alice.session
+      .getSnapshot()
+      .members.find((m) => m.isSelf)!.signer;
+    await expect(bob.session.resetLinks()).rejects.toMatchObject({
+      kind: "NotOwner",
+    });
+    await expect(
+      bob.session.removeMembers([alicesSigner]),
+    ).rejects.toMatchObject({ kind: "NotOwner" });
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("stays the owner through a reset of the links", async () => {
+    const { creator, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    await alice.session.resetLinks();
+    expect(alice.session.getSnapshot().members[0]!.role).toBe("owner");
+    expect((await alice.backend.loadMls("p"))?.ownerPerson).toBeDefined();
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("makes a paired device of the owner an owner and one person", async () => {
+    const { creator, device, pairedWithAlice, editSecret, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    const { backend } = await pairedWithAlice(alice);
+    const second = device("Alice 2", { backend });
+    await second.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() => expect(names(alice)).toEqual(["Alice", "Alice 2"]));
+    const members = alice.session.getSnapshot().members;
+    expect(members.every((m) => m.role === "owner")).toBe(true);
+    expect(members[0]!.person).not.toBeNull();
+    expect(members[0]!.person).toBe(members[1]!.person);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("joins again as the person it paired into after opening the link first", async () => {
+    const { creator, join, pairedWithAlice, sessions } = world();
+    const alice = await creator();
+    const desk = await join("Desk", "edit");
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().members).toHaveLength(2),
+    );
+    const persons = () =>
+      new Set(alice.session.getSnapshot().members.map((m) => m.person));
+    expect(persons().size).toBe(2);
+
+    // Pairing into Alice's person, the way a grant with `replace` leaves it.
+    await pairedWithAlice(alice, desk.backend);
+
+    await desk.session.syncIdentity();
+    await vi.waitFor(() => {
+      expect(alice.session.getSnapshot().members).toHaveLength(2);
+      expect(persons().size).toBe(1);
+    });
+    expect(desk.errors).toEqual([]);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("does not merge an unchanged group graph into storage again", async () => {
+    const { device, editSecret, sessions } = world();
+    const backend = new MemoryBackend();
+    const merges = vi.fn((graph: Uint8Array) => mergeOwnGraph(backend, graph));
+    const alice = device("Alice", { backend, options: { mergeGraph: merges } });
+    await alice.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().phase).toBe("active"),
+    );
+    await alice.session.syncIdentity();
+    const before = merges.mock.calls.length;
+    await alice.session.syncIdentity();
+    await alice.session.syncIdentity();
+    expect(merges).toHaveBeenCalledTimes(before);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("removes a revoked device of its own person and rotates the links", async () => {
+    const { creator, device, pairedWithAlice, editSecret, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    const { backend, pub } = await pairedWithAlice(alice);
+    const second = device("Alice 2", { backend });
+    await second.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() => expect(names(alice)).toEqual(["Alice", "Alice 2"]));
+    // Offline for both the refresh and the removal, so it only ever sees
+    // the commit that removes it.
+    second.session.stop();
+
+    const { deviceSeed, graph } = await localIdentity(alice.backend);
+    const revoked = PersonGraph.decode(graph);
+    revoked.revoke(deviceSeed, pub);
+    await mergeOwnGraph(alice.backend, revoked.encode());
+
+    const done = await alice.session.syncIdentity();
+    expect(done).toEqual({ canCommit: true });
+    expect(alice.session.getSnapshot().holdsOwnerKey).toBe(true);
+    expect(alice.session.removedLeaves).toBe(1);
+    expect(names(alice)).toEqual(["Alice"]);
+    expect(alice.rotations).toHaveLength(1);
+    await second.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(second.session.getSnapshot().phase).toBe("removed"),
+    );
+    // Being removed is how the revoked device hears of its revoke.
+    await vi.waitFor(async () => {
+      const { graph } = await localIdentity(backend);
+      expect(PersonGraph.decode(graph).deviceState(pub)).toBe("revoked");
+    });
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("hands the owner key to a paired owner device, which can then reset the links", async () => {
+    const { creator, device, pairedWithAlice, editSecret, server, sessions } =
+      world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    const { backend } = await pairedWithAlice(alice);
+    // Away while the second device joins, so nobody hands the key over yet.
+    alice.session.stop();
+    const second = device("Alice 2", { backend });
+    await second.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(second.session.getSnapshot().canCommit).toBe(true),
+    );
+    expect(second.session.getSnapshot().members[0]!.role).toBe("owner");
+    expect(second.session.getSnapshot().holdsOwnerKey).toBe(false);
+    await expect(second.session.resetLinks()).rejects.toMatchObject({
+      kind: "NoOwnerKey",
+    });
+
+    // Opening the project on the device that holds the key hands it over.
+    await alice.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(second.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    expect(
+      (await backend.loadMls("p"))?.ownerSecrets?.length ?? 0,
+    ).toBeGreaterThan(0);
+    await second.session.resetLinks();
+    expect(second.rotations).toHaveLength(1);
+    expect(server.notOwner).toBe(0);
+    // The rotation moved the owner key on, and the other device follows.
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    await alice.session.resetLinks();
+    expect(server.notOwner).toBe(0);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("brings the owner key along when it rejoins after losing its state", async () => {
+    const { creator, device, editSecret, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    alice.session.stop();
+    const record = (await alice.backend.loadMls("p"))!;
+    await alice.backend.saveMls("p", { ...record, state: null });
+
+    const again = device("Alice", { backend: alice.backend });
+    await again.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(again.session.getSnapshot().canCommit).toBe(true),
+    );
+    expect(again.session.getSnapshot().holdsOwnerKey).toBe(true);
+    await again.session.resetLinks();
+    expect(again.rotations).toHaveLength(1);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("keeps the real owner key when the server names another", async () => {
+    const { creator, device, editSecret, server, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    alice.session.stop();
+    const real = server.ownerKey;
+    const kept = (await alice.backend.loadMls("p"))!.ownerSecrets!;
+    // A key this device holds that the server does not name now, as one it
+    // was told was current once would be.
+    const seed = DeviceKey.generate().export();
+    const { group: other } = ProjectGroup.create(
+      LinkSecret.generateEdit(),
+      encodeProfile({ name: "Other", color }),
+      seed,
+      PersonGraph.genesis(seed).encode(),
+    );
+    const extra = other.ownerSecrets()!;
+    other.free();
+    await keepOwnerKey(alice.backend, "p", extra);
+
+    // The server names a key of its own making while the device has to
+    // join again: the device cannot rotate, but loses nothing.
+    server.ownerKey = DeviceKey.generate().publicKey();
+    const record = (await alice.backend.loadMls("p"))!;
+    await alice.backend.saveMls("p", { ...record, state: null });
+    const lied = device("Alice", { backend: alice.backend });
+    await lied.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(lied.session.getSnapshot().canCommit).toBe(true),
+    );
+    expect(lied.session.getSnapshot().holdsOwnerKey).toBe(false);
+    lied.session.stop();
+    const after = (await alice.backend.loadMls("p"))!;
+    expect(mergeOwnerSecrets(after.ownerSecrets, kept)).toEqual(
+      after.ownerSecrets,
+    );
+
+    // Once the server tells the truth again, the key is there to use.
+    server.ownerKey = real;
+    await alice.backend.saveMls("p", { ...after, state: null });
+    const again = device("Alice", { backend: alice.backend });
+    await again.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(again.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    await again.session.resetLinks();
+    expect(server.notOwner).toBe(0);
+    // Every save added to what was kept and dropped none of it.
+    const last = (await alice.backend.loadMls("p"))!.ownerSecrets;
+    for (const held of [kept, extra])
+      expect(mergeOwnerSecrets(last, held)).toEqual(last);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("drops a rotation the server refuses for a wrong owner key", async () => {
+    const { creator, server, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().canCommit).toBe(true),
+    );
+    // As if another device had moved the key on behind this one's back.
+    server.ownerKey = DeviceKey.generate().publicKey();
+    const head = server.head;
+    await expect(alice.session.resetLinks()).rejects.toThrow(/owner key/);
+    expect(server.notOwner).toBe(1);
+    expect(server.head).toBe(head);
+    expect(alice.rotations).toEqual([]);
+    expect(
+      ProjectGroup.importState((await alice.backend.loadMls("p"))!.state!)
+        .hasPendingSubmit,
+    ).toBe(false);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("leaves another person's revoked device to the owner, who removes it", async () => {
+    const { creator, device, join, editSecret, sessions } = world();
+    const alice = await creator();
+    const bob = await join("Bob", "edit");
+    await vi.waitFor(() =>
+      expect(bob.session.getSnapshot().canCommit).toBe(true),
+    );
+    // Bob's second device, paired into his person.
+    const bobs = await localIdentity(bob.backend);
+    const tablet = new MemoryBackend();
+    const tabletSeed = DeviceKey.generate().export();
+    await tablet.saveDeviceKey(tabletSeed);
+    const tabletPub = devicePublicKey(tabletSeed);
+    const paired = PersonGraph.decode(bobs.graph);
+    paired.addDevice(bobs.deviceSeed, tabletPub);
+    await mergeOwnGraph(bob.backend, paired.encode());
+    await tablet.mergeGraph(paired.encode(), (_, incoming) => incoming);
+    const bob2 = device("Bob 2", { backend: tablet });
+    await bob2.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(names(alice)).toEqual(["Alice", "Bob", "Bob 2"]),
+    );
+    bob2.session.stop();
+    // Alice is away while Bob revokes it.
+    alice.session.stop();
+
+    const revoked = PersonGraph.decode(
+      (await localIdentity(bob.backend)).graph,
+    );
+    revoked.revoke(bobs.deviceSeed, tabletPub);
+    await mergeOwnGraph(bob.backend, revoked.encode());
+    const done = await bob.session.syncIdentity();
+    expect(done).toEqual({ canCommit: true });
+    expect(bob.session.getSnapshot().holdsOwnerKey).toBe(false);
+    expect(bob.session.removedLeaves).toBe(0);
+    await vi.waitFor(() =>
+      expect(
+        bob.session.getSnapshot().members.find((m) => m.name === "Bob 2")
+          ?.deviceRevoked,
+      ).toBe(true),
+    );
+
+    // The owner reads the revoke from Bob's leaf and sweeps the device.
+    await alice.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() => expect(names(alice)).toEqual(["Alice", "Bob"]));
+    expect(alice.session.removedLeaves).toBe(1);
+    await vi.waitFor(() => expect(names(bob)).toEqual(["Alice", "Bob"]));
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("lets a device recovered with the recovery key remove the lost devices", async () => {
+    const { creator, device, editSecret, server, sessions, recoveryWords } =
+      world({ recovery: true });
+    const alice = await creator();
+    // Creating the project seals no share to the recovery key yet; opening
+    // it does, in a refresh of the creator's leaf.
+    await vi.waitFor(() => expect(server.head).toBe(1));
+    // The only device is lost.
+    alice.session.stop();
+
+    const backend = new MemoryBackend();
+    const link = LinkSecret.parse(editSecret);
+    const boot = (await server.bootstrap(EDIT))!;
+    const ownerKey = recoveredOwnerKey(recoveryWords, link, boot);
+    expect(ownerKey).toBeDefined();
+    await recoverDevice(backend, {
+      words: recoveryWords,
+      graphs: graphsInGroupInfo(link, boot.groupInfo, boot.keyring),
+    });
+    await keepOwnerKey(backend, "p", ownerKey!);
+
+    const found = device("Found", { backend });
+    await found.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() => expect(names(found)).toEqual(["Found"]));
+    expect(found.session.getSnapshot().holdsOwnerKey).toBe(true);
+    expect(found.session.removedLeaves).toBe(1);
+    expect(found.rotations).toHaveLength(1);
+    expect(server.notOwner).toBe(0);
     sessions.forEach((s) => s.stop());
   });
 

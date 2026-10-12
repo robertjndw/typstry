@@ -1,7 +1,11 @@
 //! The delivery service half of a project's room: sequences MLS commits,
 //! keeps the sealed GroupInfo and keyring, and relays commits to whoever is
 //! subscribed. It never looks inside an MLS message beyond the routing
-//! prefix `mls_frame::inspect` reads, so it needs no crypto.
+//! prefix `mls_frame::inspect` reads, so it needs no MLS and holds no key.
+//! The one signature it checks is the owner's on a rotation, against the
+//! public owner key the project's `Init` gave it (see
+//! [`typstry_wire::owner`]): a rotation swaps the tokens, and only the owner
+//! may lock anyone out.
 //!
 //! Everything runs inside the room actor, which is what serializes
 //! submissions: two commits for the same epoch reach this code one after
@@ -15,6 +19,7 @@ use loro_protocol::CrdtType;
 use sqlx::SqlitePool;
 use typstry_wire::ds::{ClientMessage, Permission, RefusalCode, Rotate, ServerMessage};
 use typstry_wire::mls_frame::{self, ContentType, WireFormat, split_group_id};
+use typstry_wire::owner::{OwnerKey, is_owner_key};
 
 use super::{ConnId, DsConfig, Outbound, Outbox};
 use crate::store::mls::{self, Head, PruneLimits, Reset, SubmitArgs, SubmitError, Submitted};
@@ -211,9 +216,17 @@ impl DsState {
                 group_id,
                 group_info,
                 keyring,
+                owner_key,
             } => (
-                self.init(ctx, permission, req, group_id, &group_info, &keyring)
-                    .await,
+                self.init(
+                    ctx,
+                    permission,
+                    req,
+                    group_id,
+                    (&group_info, &keyring),
+                    &owner_key,
+                )
+                .await,
                 None,
             ),
             ClientMessage::Reset {
@@ -335,6 +348,12 @@ impl DsState {
         if parts.iter().any(|&p| p) != parts.iter().all(|&p| p) {
             return reply(RefusalCode::Malformed);
         }
+        if s.rotate
+            .as_ref()
+            .is_some_and(|r| !is_owner_key(&r.next_owner_key))
+        {
+            return reply(RefusalCode::Malformed);
+        }
 
         let args = SubmitArgs {
             incarnation: head.incarnation,
@@ -343,10 +362,7 @@ impl DsState {
             group_info: &s.group_info,
             keyring: s.keyring.as_deref(),
             envelope: s.envelope.as_deref(),
-            rotate: s
-                .rotate
-                .as_ref()
-                .map(|r| (r.edit_token.as_str(), r.view_token.as_str())),
+            rotate: s.rotate.as_ref(),
         };
         match mls::submit(ctx.db, ctx.project_id, &args).await {
             Ok(Submitted::Accepted { retired }) => {
@@ -357,6 +373,7 @@ impl DsState {
                     epoch: s.epoch,
                     commit: s.commit,
                     envelope: s.envelope,
+                    owner_key: s.rotate.map(|r| r.next_owner_key),
                 };
                 self.broadcast(conn, &relay, false);
                 prune(ctx, head.incarnation, s.epoch + 1).await;
@@ -383,7 +400,13 @@ impl DsState {
                 self.refresh(ctx).await;
                 reply(RefusalCode::WrongIncarnation)
             }
-            Err(SubmitError::Rotate(err)) => {
+            Err(SubmitError::OwnerProof) => {
+                // Not a client bug: an editor or a removed owner device
+                // trying to swap the links, which is worth seeing in the log.
+                tracing::info!(project = %ctx.project_id, "rotation without the owner key refused");
+                reply(RefusalCode::NotOwner)
+            }
+            Err(err @ (SubmitError::Rotate(_) | SubmitError::SameOwnerKey)) => {
                 tracing::debug!(project = %ctx.project_id, %err, "rotation refused");
                 reply(RefusalCode::Malformed)
             }
@@ -401,8 +424,8 @@ impl DsState {
         permission: Permission,
         req: u64,
         group_id: Vec<u8>,
-        group_info: &[u8],
-        keyring: &[u8],
+        (group_info, keyring): (&[u8], &[u8]),
+        owner_key: &OwnerKey,
     ) -> ServerMessage {
         if let Some(code) = write_only(permission) {
             return refuse(req, code);
@@ -410,12 +433,23 @@ impl DsState {
         if self.head.is_some() {
             return refuse(req, RefusalCode::GroupExists);
         }
+        // A weak key would let anyone forge the first rotation.
         if !blobs_ok(ctx, group_info, keyring)
             || split_group_id(&group_id).is_none_or(|(_, incarnation)| incarnation != 0)
+            || !is_owner_key(owner_key)
         {
             return refuse(req, RefusalCode::Malformed);
         }
-        match mls::init_group(ctx.db, ctx.project_id, &group_id, group_info, keyring).await {
+        match mls::init_group(
+            ctx.db,
+            ctx.project_id,
+            &group_id,
+            group_info,
+            keyring,
+            owner_key,
+        )
+        .await
+        {
             Ok(true) => {
                 self.head = Some(Head {
                     incarnation: 0,
@@ -435,6 +469,8 @@ impl DsState {
         }
     }
 
+    /// A reset carries no owner key and leaves the one on record, and the
+    /// tokens, as they are, so any editor may do it.
     async fn reset(
         &mut self,
         ctx: &Ctx<'_>,
@@ -548,6 +584,7 @@ async fn backfill(
             epoch: commit.epoch,
             commit: commit.data,
             envelope: commit.envelope,
+            owner_key: commit.owner_key,
         };
         outbox.push_backfill(&queue, frame(&msg))
     })

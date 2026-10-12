@@ -5,9 +5,12 @@ use typstry_wire::crypto::{
     self as wire, BLOB_OVERHEAD, CryptoError, PRESENCE_CONTEXT, RecordSigner,
 };
 use typstry_wire::elo::Record;
+use typstry_wire::identity;
 use wasm_bindgen::prelude::*;
 
-use crate::error::{from_crypto, from_serde, invalid};
+use crate::error::{
+    from_adopt, from_crypto, from_graph, from_recover, from_recovery, from_serde, invalid,
+};
 
 /// What a share link holds: the view key and the attestation key, and for an
 /// edit link the secret both come from.
@@ -60,6 +63,386 @@ impl LinkSecret {
         self.inner.fingerprint()
     }
 }
+
+/// The key one device signs for a person with. Keep its export on this
+/// device only: it is never sent anywhere, and projects only see bindings
+/// made with it.
+#[wasm_bindgen]
+pub struct DeviceKey {
+    inner: identity::DeviceKey,
+}
+
+#[wasm_bindgen]
+impl DeviceKey {
+    pub fn generate() -> DeviceKey {
+        Self {
+            inner: identity::DeviceKey::generate(),
+        }
+    }
+
+    /// Throws `MalformedKey` for anything but an `export`.
+    pub fn import(bytes: &[u8]) -> Result<DeviceKey, JsValue> {
+        identity::DeviceKey::import(bytes)
+            .map(|inner| Self { inner })
+            .map_err(from_crypto)
+    }
+
+    pub fn export(&self) -> Vec<u8> {
+        self.inner.export().to_vec()
+    }
+
+    #[wasm_bindgen(js_name = publicKey)]
+    pub fn public_key(&self) -> Vec<u8> {
+        self.inner.public().to_vec()
+    }
+}
+
+/// The public half of a `DeviceKey.export` seed, without making a
+/// `DeviceKey` to free again. Throws `MalformedKey`.
+#[wasm_bindgen(js_name = devicePublicKey)]
+pub fn device_public_key(seed: &[u8]) -> Result<Vec<u8>, JsValue> {
+    Ok(device_key(seed)?.public().to_vec())
+}
+
+/// The device key from its `DeviceKey.export` bytes. Bytes rather than the
+/// class, because wasm-bindgen would move the key out of the caller's object.
+pub(crate) fn device_key(seed: &[u8]) -> Result<identity::DeviceKey, JsValue> {
+    identity::DeviceKey::import(seed).map_err(from_crypto)
+}
+
+fn public_key(bytes: &[u8]) -> Result<wire::PublicKey, JsValue> {
+    wire::PublicKey::try_from(bytes).map_err(|_| from_crypto(CryptoError::MalformedKey))
+}
+
+#[derive(Serialize)]
+struct DeviceDto {
+    #[serde(with = "serde_bytes", rename = "pub")]
+    public: Vec<u8>,
+    state: &'static str,
+    recovery: bool,
+}
+
+/// Which device keys make up one person: a hash-linked set of signed entries
+/// that merges by union. Devices sign with the seed they hold; the graph
+/// refuses entries from a device that is not valid in it.
+#[wasm_bindgen]
+pub struct PersonGraph {
+    pub(crate) inner: identity::PersonGraph,
+}
+
+#[wasm_bindgen]
+impl PersonGraph {
+    /// A new person whose first device is the one with `deviceSeed`.
+    pub fn genesis(device_seed: &[u8]) -> Result<PersonGraph, JsValue> {
+        Ok(Self {
+            inner: identity::PersonGraph::genesis(&device_key(device_seed)?),
+        })
+    }
+
+    /// Throws `Malformed`, `BadSignature`, `TooLarge`, or `NewerVersion` for
+    /// a graph a newer typstry wrote.
+    pub fn decode(bytes: &[u8]) -> Result<PersonGraph, JsValue> {
+        identity::PersonGraph::decode(bytes)
+            .map(|inner| Self { inner })
+            .map_err(from_graph)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.inner.encode()
+    }
+
+    /// The person's id, as `ProjectGroup.ownerPerson` returns it.
+    pub fn id(&self) -> Vec<u8> {
+        self.inner.id().to_vec()
+    }
+
+    /// Whether `devicePub` is the only device this person ever had: no
+    /// other device, no recovery key, nothing revoked.
+    #[wasm_bindgen(js_name = onlyEverHad)]
+    pub fn only_ever_had(&self, device_pub: &[u8]) -> Result<bool, JsValue> {
+        Ok(self.inner.only_ever_had(&public_key(device_pub)?))
+    }
+
+    /// Adds a device, signed by `deviceSeed`'s device. `recovery` marks it as
+    /// a recovery device. Throws `NotValid` when the signer is not a valid
+    /// device of the person.
+    #[wasm_bindgen(js_name = addDevice)]
+    pub fn add_device(
+        &mut self,
+        device_seed: &[u8],
+        device_pub: &[u8],
+        recovery: Option<bool>,
+    ) -> Result<(), JsValue> {
+        let flags = if recovery.unwrap_or(false) {
+            identity::FLAG_RECOVERY
+        } else {
+            0
+        };
+        let kind = identity::EntryKind::AddDevice {
+            device: public_key(device_pub)?,
+            flags,
+        };
+        self.inner
+            .append(&device_key(device_seed)?, kind)
+            .map(drop)
+            .map_err(from_graph)
+    }
+
+    /// Vouches for `devicePub` as an ordinary device, signed by
+    /// `deviceSeed`'s device, the way pairing does. Returns whether an entry
+    /// was added: false for a device that is valid already, so a retry does
+    /// not add it twice. Throws `NotValid` when the signer is not valid, even
+    /// with nothing to add, and `DeviceRevoked` for a device revoked before.
+    pub fn vouch(&mut self, device_seed: &[u8], device_pub: &[u8]) -> Result<bool, JsValue> {
+        self.inner
+            .vouch(&device_key(device_seed)?, &public_key(device_pub)?)
+            .map_err(from_graph)
+    }
+
+    /// Revokes a device for good, signed by `deviceSeed`'s device. Throws
+    /// `NotValid` like `addDevice`.
+    pub fn revoke(&mut self, device_seed: &[u8], device_pub: &[u8]) -> Result<(), JsValue> {
+        let kind = identity::EntryKind::RevokeDevice {
+            device: public_key(device_pub)?,
+        };
+        self.inner
+            .append(&device_key(device_seed)?, kind)
+            .map(drop)
+            .map_err(from_graph)
+    }
+
+    /// Sets the person's own profile (the `{"name","color"}` JSON bytes),
+    /// signed by `deviceSeed`'s device. Append one only when the profile
+    /// really changed: entries stay in the graph for good and it holds 48.
+    /// Throws `NotValid` for a signer that is not valid or is a recovery
+    /// device, and `TooLarge` past 256 bytes or the graph's caps.
+    #[wasm_bindgen(js_name = setProfile)]
+    pub fn set_profile(&mut self, device_seed: &[u8], profile: &[u8]) -> Result<(), JsValue> {
+        let kind = identity::EntryKind::SetProfile {
+            profile: profile.to_vec(),
+        };
+        self.inner
+            .append(&device_key(device_seed)?, kind)
+            .map(drop)
+            .map_err(from_graph)
+    }
+
+    /// The person's profile bytes, undefined while none was ever set.
+    pub fn profile(&self) -> Option<Vec<u8>> {
+        self.inner.profile().map(<[u8]>::to_vec)
+    }
+
+    /// The device that added `devicePub`, undefined for the first device.
+    #[wasm_bindgen(js_name = addedBy)]
+    pub fn added_by(&self, device_pub: &[u8]) -> Result<Option<Vec<u8>>, JsValue> {
+        Ok(self
+            .inner
+            .added_by(&public_key(device_pub)?)
+            .map(|device| device.to_vec()))
+    }
+
+    /// The state of a device, `"valid"`, `"revoked"` or `"unknown"`.
+    #[wasm_bindgen(js_name = deviceState)]
+    pub fn device_state(&self, device_pub: &[u8]) -> Result<String, JsValue> {
+        Ok(state_name(self.inner.device_state(&public_key(device_pub)?)).into())
+    }
+
+    /// Every valid or revoked device, sorted by key.
+    #[wasm_bindgen(unchecked_return_type = "GraphDevice[]")]
+    pub fn devices(&self) -> Result<JsValue, JsValue> {
+        let devices: Vec<_> = self
+            .inner
+            .devices()
+            .into_iter()
+            .map(|info| DeviceDto {
+                public: info.device.to_vec(),
+                state: state_name(info.state),
+                recovery: info.recovery,
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&devices).map_err(from_serde)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryDto {
+    #[serde(with = "serde_bytes")]
+    device_seed: Vec<u8>,
+    words: String,
+}
+
+/// A device key spelled as words, to keep on paper instead of a device.
+/// Add it with `addDevice(seed, pub, true)`; it can then add and revoke
+/// devices but never joins a project.
+#[wasm_bindgen]
+pub struct RecoveryKey;
+
+#[wasm_bindgen]
+impl RecoveryKey {
+    #[wasm_bindgen(unchecked_return_type = "GeneratedRecoveryKey")]
+    pub fn generate() -> Result<JsValue, JsValue> {
+        let (key, words) = identity::RecoveryKey::generate();
+        serde_wasm_bindgen::to_value(&RecoveryDto {
+            device_seed: key.export().to_vec(),
+            words,
+        })
+        .map_err(from_serde)
+    }
+
+    /// The `DeviceKey.export` bytes for `words`, in any case and with any
+    /// spacing or hyphens. Throws `BadRecoveryWords` for a typo, a wrong
+    /// count or a failed checksum.
+    #[wasm_bindgen(js_name = fromWords)]
+    pub fn from_words(words: &str) -> Result<Vec<u8>, JsValue> {
+        identity::RecoveryKey::from_words(words)
+            .map(|key| key.export().to_vec())
+            .map_err(from_recovery)
+    }
+}
+
+/// The graph to store when `incoming` (a `PersonGraph.encode`) arrives and
+/// `stored` is what this device holds, `ownPub` being this device's key.
+/// The same person merges; another person replaces the stored graph only
+/// with `replace` or when this device is no longer valid in it, and only if
+/// `incoming` lists this device. Throws `ForeignIdentity`, `NotListed`, or
+/// what decoding or merging throws.
+#[wasm_bindgen(js_name = adoptGraph)]
+pub fn adopt_graph(
+    stored: Option<Vec<u8>>,
+    incoming: &[u8],
+    own_pub: &[u8],
+    replace: bool,
+) -> Result<Vec<u8>, JsValue> {
+    let stored = stored
+        .map(|bytes| identity::PersonGraph::decode(&bytes))
+        .transpose()
+        .map_err(from_graph)?;
+    let incoming = identity::PersonGraph::decode(incoming).map_err(from_graph)?;
+    identity::adopt(stored.as_ref(), &incoming, &public_key(own_pub)?, replace)
+        .map(|graph| graph.encode())
+        .map_err(from_adopt)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RecoverOptionsDto {
+    keep_others: bool,
+    replace: bool,
+}
+
+#[derive(Serialize)]
+struct RecoveredDto {
+    #[serde(with = "serde_bytes")]
+    graph: Vec<u8>,
+    revoked: Vec<serde_bytes::ByteBuf>,
+}
+
+/// Makes the device `ownPub` a device of the person whose recovery key
+/// `recoverySeed` (from `RecoveryKey.fromWords`) is, picked from `graphs`
+/// (as `graphsInGroupInfo` returns them), and unless `keepOthers` revokes
+/// the person's other ordinary devices. `stored` is the graph this device
+/// holds: one of the same person is merged in first, so its revokes count,
+/// and one of another person is left behind as `adoptGraph` allows. Returns
+/// `{ graph, revoked }`, the graph ready to store. Throws
+/// `UnknownRecoveryKey`, `RecoveryKeyRevoked`, `OwnDeviceRevoked` (this
+/// device key can never be the person's again; make a new one),
+/// `ForeignIdentity`, or what decoding or the graph throws.
+#[wasm_bindgen(js_name = recoverIdentity, unchecked_return_type = "RecoveredIdentity")]
+pub fn recover_identity(
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array[]")] graphs: JsValue,
+    recovery_seed: &[u8],
+    own_pub: &[u8],
+    stored: Option<Vec<u8>>,
+    #[wasm_bindgen(unchecked_param_type = "RecoverOptions | undefined")] options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let graphs: Vec<serde_bytes::ByteBuf> =
+        serde_wasm_bindgen::from_value(graphs).map_err(from_serde)?;
+    let graphs = graphs
+        .iter()
+        .map(|bytes| identity::PersonGraph::decode(bytes))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(from_graph)?;
+    let stored = stored
+        .map(|bytes| identity::PersonGraph::decode(&bytes))
+        .transpose()
+        .map_err(from_graph)?;
+    let options: RecoverOptionsDto = if options.is_undefined() || options.is_null() {
+        RecoverOptionsDto::default()
+    } else {
+        serde_wasm_bindgen::from_value(options).map_err(from_serde)?
+    };
+    let recovered = identity::recover(
+        &graphs,
+        &device_key(recovery_seed)?,
+        &public_key(own_pub)?,
+        stored.as_ref(),
+        identity::RecoverOptions {
+            keep_others: options.keep_others,
+            replace: options.replace,
+        },
+    )
+    .map_err(from_recover)?;
+    serde_wasm_bindgen::to_value(&RecoveredDto {
+        graph: recovered.graph.encode(),
+        revoked: recovered
+            .revoked
+            .iter()
+            .map(|device| serde_bytes::ByteBuf::from(device.to_vec()))
+            .collect(),
+    })
+    .map_err(from_serde)
+}
+
+pub(crate) fn state_name(state: identity::DeviceState) -> &'static str {
+    match state {
+        identity::DeviceState::Valid => "valid",
+        identity::DeviceState::Revoked => "revoked",
+        identity::DeviceState::Unknown => "unknown",
+    }
+}
+
+/// The short public tag of a person id read from a roster, for people to
+/// compare out of band. Throws `MalformedKey` for bytes that are not an id.
+#[wasm_bindgen(js_name = personFingerprint)]
+pub fn person_fingerprint(id: &[u8]) -> Result<String, JsValue> {
+    let id =
+        identity::PersonId::try_from(id).map_err(|_| from_crypto(CryptoError::MalformedKey))?;
+    Ok(identity::person_fingerprint(&id))
+}
+
+/// The tag of a device key, the same one the CLI prints. Throws
+/// `MalformedKey` for bytes that are not a public key.
+#[wasm_bindgen(js_name = deviceFingerprint)]
+pub fn device_fingerprint(device: &[u8]) -> Result<String, JsValue> {
+    Ok(identity::device_fingerprint(&public_key(device)?))
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const GRAPH_TYPES: &str = r#"
+export interface GraphDevice {
+  pub: Uint8Array;
+  state: "valid" | "revoked";
+  recovery: boolean;
+}
+export interface RecoverOptions {
+  /** Leave the person's other devices valid. */
+  keepOthers?: boolean;
+  /** Leave behind another person this device is a working device of. */
+  replace?: boolean;
+}
+export interface RecoveredIdentity {
+  /** `PersonGraph.encode` bytes to store, with this device valid. */
+  graph: Uint8Array;
+  /** The device keys the recovery revoked. */
+  revoked: Uint8Array[];
+}
+export interface GeneratedRecoveryKey {
+  deviceSeed: Uint8Array;
+  /** Seventeen words to write down; never stored by typstry. */
+  words: string;
+}
+"#;
 
 /// What a link fragment holds: `"edit"`, `"view"`, `"newer"` for a kind
 /// only a newer typstry knows, or `undefined` for anything unusable.

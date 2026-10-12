@@ -10,6 +10,7 @@ import {
   syncStatus,
   test,
 } from "./fixtures";
+import { pairNewDevice } from "./pair-helpers";
 
 function tokenOf(page: Page): string {
   return new URL(page.url()).pathname.split("/").at(-1)!;
@@ -68,18 +69,117 @@ test("members who join with the edit link are listed with their names", async ({
 
   // The name is typed after the join, so it reaches the roster as a profile
   // update; both sides end up with the same list.
-  for (const [viewer, self, peer] of [
-    [page, "E2E Tester", "Second Tester"],
-    [other, "Second Tester", "E2E Tester"],
+  for (const [viewer, self, peer, peerRole] of [
+    [page, "E2E Tester", "Second Tester", "Editor"],
+    [other, "Second Tester", "E2E Tester", "Owner"],
   ] as const) {
     const list = members(await openShare(viewer));
     await expect(list).toHaveCount(2);
     await expect(list.filter({ hasText: self })).toContainText("you");
-    await expect(list.filter({ hasText: peer })).toContainText("Editor");
+    await expect(list.filter({ hasText: peer })).toContainText(peerRole);
     await closeShare(viewer);
   }
 
   await other.context().close();
+});
+
+test("an editor cannot remove members", async ({ page, browser }) => {
+  await createProject(page, "Owner only");
+  const editorPage = await openElsewhere(
+    browser,
+    await shareLink(page, "Can edit"),
+    "Second Tester",
+  );
+  await expect(editor(editorPage)).toContainText("Hello, Typst!");
+
+  const dialog = await openShare(editorPage);
+  await expect(members(dialog)).toHaveCount(2);
+  await expect(dialog.getByRole("button", { name: /^Remove / })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Reset links" })).toHaveCount(
+    0,
+  );
+  await expect(
+    dialog.getByText("Only the owner can remove members."),
+  ).toBeVisible();
+
+  await editorPage.context().close();
+});
+
+test("the creator can remove an editor", async ({ page, browser }) => {
+  await createProject(page, "Creator removes");
+  const editorPage = await openElsewhere(
+    browser,
+    await shareLink(page, "Can edit"),
+    "Second Tester",
+  );
+  await expect(editor(editorPage)).toContainText("Hello, Typst!");
+
+  await removeMember(page, "Second Tester");
+  await expect(
+    editorPage.getByRole("heading", {
+      name: "You were removed from this project",
+    }),
+  ).toBeVisible();
+  const after = await openShare(page);
+  await expect(members(after)).toHaveCount(1);
+  await expect(members(after)).toContainText("Owner");
+
+  await editorPage.context().close();
+});
+
+test("two devices of one person are one member, removed together", async ({
+  page,
+  browser,
+}) => {
+  await createProject(page, "Devices");
+  const editLink = await shareLink(page, "Can edit");
+
+  // Bob's first device.
+  const bobContext = await browser.newContext();
+  const bob1 = await bobContext.newPage();
+  await bob1.goto(editLink);
+  await bob1.getByLabel("Your name").fill("Bob");
+  await bob1.getByRole("button", { name: "Join" }).click();
+  await expect(syncStatus(bob1)).toHaveText("Connected");
+
+  // His name reaches the group a moment after he joined; leaving before
+  // that would pair a device that is still called by the random name.
+  await expect(
+    members(await openShare(page)).filter({ hasText: "Bob" }),
+  ).toHaveCount(1);
+  await closeShare(page);
+
+  // His second device is another browser, paired with the first.
+  await bob1.goto("/");
+  const bob2 = await pairNewDevice(bob1, browser, { name: "Bob" });
+  const laptopContext = bob2.context();
+  await bob2
+    .getByRole("list", { name: "Projects received" })
+    .getByRole("link", { name: "Devices" })
+    .click();
+  await expect(syncStatus(bob2)).toHaveText("Connected");
+  await bob1.goto("/");
+  await bob1.getByRole("link", { name: /Devices/ }).click();
+  await expect(syncStatus(bob1)).toHaveText("Connected");
+
+  const dialog = await openShare(page);
+  const list = members(dialog);
+  await expect(list).toHaveCount(2);
+  const bob = list.filter({ hasText: "Bob" });
+  await expect(bob).toContainText("2 devices");
+  await expect(bob).not.toContainText("Unverified");
+  await closeShare(page);
+
+  await removeMember(page, "Bob");
+  for (const p of [bob1, bob2]) {
+    await expect(
+      p.getByRole("heading", { name: "You were removed from this project" }),
+    ).toBeVisible();
+  }
+  const after = await openShare(page);
+  await expect(members(after)).toHaveCount(1);
+
+  for (const c of [bobContext, laptopContext]) await c.close();
 });
 
 test("the view link joins as a viewer who cannot change members", async ({

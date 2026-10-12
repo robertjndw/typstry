@@ -41,7 +41,8 @@ use typstry_wire::crypto::{
     PresenceKey, RECORD_VERSION, RecordSigner, SEAL_VERSION, SECRET_EDIT_V1, SECRET_VIEW_V1,
 };
 use typstry_wire::ds::DS_VERSION;
-use typstry_wire::mls::{MLS_STATE_VERSION, ProjectGroup, Role};
+use typstry_wire::identity::{DeviceKey, PersonGraph};
+use typstry_wire::mls::{LocalIdentity, MLS_STATE_VERSION, ProjectGroup, Role};
 use typstry_wire::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 
 #[path = "../../../fixtures/compat/support.rs"]
@@ -149,7 +150,7 @@ fn cli_reads_every_compat_fixture() {
         );
         let members = group.members().unwrap();
         assert_eq!(members.len(), 1, "v{n}");
-        assert_eq!(members[0].role, Role::Editor, "v{n}");
+        assert_eq!(members[0].role, Role::Owner, "v{n}");
         assert_eq!(
             members[0].profile.as_deref(),
             Some(mls["profile"].as_str().unwrap().as_bytes()),
@@ -364,6 +365,7 @@ fn write_fixture(out: &Path) {
             view_token: Some(VIEW_TOKEN.to_owned()),
             name: Some("Ada".to_owned()),
             branch: Some("main".to_owned()),
+            owner_person: None,
         })
         .unwrap();
     let git = GitMark {
@@ -382,7 +384,12 @@ fn write_fixture(out: &Path) {
         .unwrap();
     // A one-member group of this device, the way `typstry init` leaves it.
     // Its keyring is a random one: nothing here reads data through it.
-    let (group, _) = ProjectGroup::create(&link, PROFILE.as_bytes()).unwrap();
+    let device = DeviceKey::generate();
+    let identity = LocalIdentity {
+        graph: PersonGraph::genesis(&device),
+        device,
+    };
+    let (group, _) = ProjectGroup::create(&link, PROFILE.as_bytes(), &identity).unwrap();
     state.save_mls(&group).unwrap();
     state
         .save_doc(&LoroDoc::from_snapshot(&cached).unwrap())

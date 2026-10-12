@@ -6,6 +6,7 @@
 // browser (sync encrypts on its own).
 import { VersionVector, decodeImportBlobMeta, type LoroDoc } from "loro-crdt";
 
+import { sameBytes } from "@/crypto/bytes";
 import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
@@ -37,6 +38,21 @@ export interface MlsRecord {
    * that missed it (asleep, or opened later) can still follow it.
    */
   rotation: StoredRotation | null;
+  /**
+   * The person id of the project's first owner, pinned so a later group
+   * that starts with another owner is refused. Set on the first join or
+   * create.
+   */
+  ownerPerson?: Uint8Array;
+  /**
+   * Every owner key secret the device held, as `ProjectGroup.ownerSecrets()`
+   * bytes merged in with `mergeOwnerSecrets` on every save, kept beside the
+   * state: one may be the only copy of the project's owner key, and a
+   * device that has to rejoin (lost or unreadable state) brings them into
+   * the new group. Merged, never replaced, since which one is current is
+   * only what the server says.
+   */
+  ownerSecrets?: Uint8Array;
 }
 
 export interface StoredRotation {
@@ -65,6 +81,31 @@ export interface DocBackend {
     projectId: string,
     build: (stored: StoredDoc) => Uint8Array,
   ): Promise<void>;
+  /** The `DeviceKey.export` bytes of this browser, if it has made one. */
+  loadDeviceKey(): Promise<Uint8Array | null>;
+  /**
+   * Stores the device key unless one exists, and returns the one that is
+   * stored. First write wins, so tabs that race to create the key all end up
+   * with the same one.
+   */
+  saveDeviceKey(key: Uint8Array): Promise<Uint8Array>;
+  /** The `PersonGraph.encode` bytes of this browser's person, if any. */
+  loadGraph(): Promise<Uint8Array | null>;
+  /**
+   * Replaces the stored graph with what `merge` makes of it and `incoming`,
+   * inside one transaction, and returns the result. `merge` runs on the
+   * stored bytes as they are right then, so tabs that merge at once all
+   * keep each other's entries; it throws to refuse (a graph of another
+   * person), which leaves the store as it was.
+   */
+  mergeGraph(
+    incoming: Uint8Array,
+    merge: (stored: Uint8Array | null, incoming: Uint8Array) => Uint8Array,
+  ): Promise<Uint8Array>;
+  /** Names this browser gave devices of its person, by hex device key. */
+  loadLabels(): Promise<Record<string, string>>;
+  /** Sets the names given, by hex device key, keeping the others. */
+  saveLabels(labels: Record<string, string>): Promise<void>;
   /** Drops everything stored for the project. */
   remove(projectId: string): Promise<void>;
 }
@@ -74,6 +115,10 @@ const DB_VERSION = 1;
 const SNAPSHOTS = "snapshots";
 const UPDATES = "updates";
 const MLS = "mls";
+const PERSON = "person";
+const DEVICE_ROW = "device";
+const GRAPH_ROW = "graph";
+const LABELS_ROW = "labels";
 const BY_PROJECT = "projectId";
 
 function request<T>(req: IDBRequest<T>): Promise<T> {
@@ -97,6 +142,15 @@ function done(tx: IDBTransaction): Promise<void> {
 interface Row {
   projectId: string;
   data: Uint8Array;
+}
+
+/** The PERSON store holds a few rows of its own: device, graph, labels. */
+type PersonRow =
+  | { id: typeof DEVICE_ROW | typeof GRAPH_ROW; key: Uint8Array }
+  | { id: typeof LABELS_ROW; labels: Record<string, string> };
+
+function keyOf(row: PersonRow | undefined): Uint8Array | null {
+  return row && "key" in row ? row.key : null;
 }
 
 type MlsRow = MlsRecord & { projectId: string };
@@ -123,6 +177,7 @@ export class IndexedDbBackend implements DocBackend {
         const updates = db.createObjectStore(UPDATES, { autoIncrement: true });
         updates.createIndex(BY_PROJECT, "projectId");
         db.createObjectStore(MLS, { keyPath: "projectId" });
+        db.createObjectStore(PERSON, { keyPath: "id" });
       }
     };
     // Fires while another tab still holds an older connection. Those tabs
@@ -158,14 +213,91 @@ export class IndexedDbBackend implements DocBackend {
       tx.objectStore(MLS).get(projectId),
     );
     if (!row) return null;
-    const { state, device, removed, rotation } = row;
-    return { state, device, removed, rotation };
+    const { state, device, removed, rotation, ownerPerson, ownerSecrets } =
+      row;
+    return { state, device, removed, rotation, ownerPerson, ownerSecrets };
   }
 
   async saveMls(projectId: string, record: MlsRecord): Promise<void> {
     const tx = this.db.transaction(MLS, "readwrite");
     tx.objectStore(MLS).put({ ...record, projectId } satisfies MlsRow);
     await done(tx);
+  }
+
+  private async loadKeyRow(id: typeof DEVICE_ROW | typeof GRAPH_ROW) {
+    const tx = this.db.transaction(PERSON, "readonly");
+    const row = await request<PersonRow | undefined>(
+      tx.objectStore(PERSON).get(id),
+    );
+    return keyOf(row);
+  }
+
+  loadDeviceKey(): Promise<Uint8Array | null> {
+    return this.loadKeyRow(DEVICE_ROW);
+  }
+
+  async saveDeviceKey(key: Uint8Array): Promise<Uint8Array> {
+    const tx = this.db.transaction(PERSON, "readwrite");
+    const store = tx.objectStore(PERSON);
+    const existing = await request<PersonRow | undefined>(
+      store.get(DEVICE_ROW),
+    );
+    // The get and the put share one readwrite transaction, which browsers
+    // run one at a time per store, so a racing tab sees our key or we see
+    // theirs.
+    if (!existing) store.put({ id: DEVICE_ROW, key } satisfies PersonRow);
+    await done(tx);
+    return keyOf(existing) ?? key;
+  }
+
+  loadGraph(): Promise<Uint8Array | null> {
+    return this.loadKeyRow(GRAPH_ROW);
+  }
+
+  async mergeGraph(
+    incoming: Uint8Array,
+    merge: (stored: Uint8Array | null, incoming: Uint8Array) => Uint8Array,
+  ): Promise<Uint8Array> {
+    const tx = this.db.transaction(PERSON, "readwrite");
+    const committed = done(tx);
+    const store = tx.objectStore(PERSON);
+    const stored = keyOf(
+      await request<PersonRow | undefined>(store.get(GRAPH_ROW)),
+    );
+    let key: Uint8Array;
+    try {
+      key = merge(stored, incoming);
+    } catch (error) {
+      tx.abort();
+      await committed.catch(() => {});
+      throw error;
+    }
+    // Most merges add nothing, and a write still costs a transaction commit.
+    if (!stored || !sameBytes(stored, key))
+      store.put({ id: GRAPH_ROW, key } satisfies PersonRow);
+    await committed;
+    return key;
+  }
+
+  async loadLabels(): Promise<Record<string, string>> {
+    const tx = this.db.transaction(PERSON, "readonly");
+    const row = await request<PersonRow | undefined>(
+      tx.objectStore(PERSON).get(LABELS_ROW),
+    );
+    return row && "labels" in row ? row.labels : {};
+  }
+
+  async saveLabels(labels: Record<string, string>): Promise<void> {
+    const tx = this.db.transaction(PERSON, "readwrite");
+    const committed = done(tx);
+    const store = tx.objectStore(PERSON);
+    const row = await request<PersonRow | undefined>(store.get(LABELS_ROW));
+    const stored = row && "labels" in row ? row.labels : {};
+    store.put({
+      id: LABELS_ROW,
+      labels: { ...stored, ...labels },
+    } satisfies PersonRow);
+    await committed;
   }
 
   async append(projectId: string, update: Uint8Array): Promise<void> {
@@ -225,6 +357,9 @@ export class IndexedDbBackend implements DocBackend {
 export class MemoryBackend implements DocBackend {
   private readonly docs = new Map<string, StoredDoc>();
   private readonly groups = new Map<string, MlsRecord>();
+  private device: Uint8Array | null = null;
+  private graph: Uint8Array | null = null;
+  private labels: Record<string, string> = {};
 
   private entry(projectId: string): StoredDoc {
     let entry = this.docs.get(projectId);
@@ -246,6 +381,35 @@ export class MemoryBackend implements DocBackend {
 
   async saveMls(projectId: string, record: MlsRecord): Promise<void> {
     this.groups.set(projectId, record);
+  }
+
+  async loadDeviceKey(): Promise<Uint8Array | null> {
+    return this.device;
+  }
+
+  async saveDeviceKey(key: Uint8Array): Promise<Uint8Array> {
+    this.device ??= key;
+    return this.device;
+  }
+
+  async loadGraph(): Promise<Uint8Array | null> {
+    return this.graph;
+  }
+
+  async mergeGraph(
+    incoming: Uint8Array,
+    merge: (stored: Uint8Array | null, incoming: Uint8Array) => Uint8Array,
+  ): Promise<Uint8Array> {
+    this.graph = merge(this.graph, incoming);
+    return this.graph;
+  }
+
+  async loadLabels(): Promise<Record<string, string>> {
+    return { ...this.labels };
+  }
+
+  async saveLabels(labels: Record<string, string>): Promise<void> {
+    this.labels = { ...this.labels, ...labels };
   }
 
   async append(projectId: string, update: Uint8Array): Promise<void> {

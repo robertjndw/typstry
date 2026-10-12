@@ -9,7 +9,6 @@ import {
   TagIcon,
 } from "lucide-react";
 
-import { ThemeMenuItems } from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -146,8 +145,6 @@ export function WorkspaceMenu({
             </DropdownMenuGroup>
           </>
         )}
-        <DropdownMenuSeparator />
-        <ThemeMenuItems />
       </DropdownMenuContent>
     </DropdownMenu>
   );

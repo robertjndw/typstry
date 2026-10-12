@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use typstry_wire::identity::person_fingerprint;
 
 use super::init::absolute;
 use super::{Ctx, Output, print_report, print_warnings, track_branch};
@@ -23,7 +24,8 @@ runs, so on shared machines pass it on standard input instead:
 or in the environment, as TYPSTRY_LINK, with the link argument left out.")]
 pub struct Args {
     /// The edit or view link from the share dialog, including the `#key`;
-    /// `-` reads it from standard input.
+    /// `-` reads it from standard input. A number or a project title from
+    /// `typstry list` works too.
     // The link holds the key, so --help must not echo it.
     #[arg(env = "TYPSTRY_LINK", hide_env_values = true)]
     pub link: Option<String>,
@@ -37,7 +39,8 @@ pub struct Args {
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
-    let link = ShareLink::parse(&read_link(args.link.as_deref())?)?;
+    let link = read_link(args.link.as_deref())?;
+    let link = ShareLink::parse(&resolve_listed(&link)?)?;
     let explicit = args.dir.map(|dir| ctx.dir.join(dir));
     // Everything that can fail without the network fails before it.
     let parent = match &explicit {
@@ -78,6 +81,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         );
     }
 
+    // The join below makes this machine a person if it is not one yet,
+    // which is easy to do by accident on a machine meant to be paired.
+    let new_person = crate::user::load_identity()?.is_none();
     let api = Api::new(&link.origin)?;
     let share = api.resolve_share(&link.token).await?;
     if share.retired {
@@ -125,6 +131,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         .await?;
     let mut out = Output::terminal();
     print_report(&mut out, &report);
+    session.remember_project();
+    print_warnings(&mut out, &mut session);
 
     let title = title.unwrap_or_else(|| "untitled".to_owned());
     if args.git {
@@ -144,6 +152,15 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             ""
         }
     );
+    // Only a hint, so a failure to read the identity back must not fail a
+    // clone that worked.
+    if new_person && let Ok(Some(identity)) = crate::user::load_identity() {
+        println!(
+            "This machine is now a new person ({}). Already use typstry on another device? \
+             Run `typstry pair` there and enter the code here; this folder moves over.",
+            person_fingerprint(&identity.graph.id())
+        );
+    }
     Ok(())
 }
 
@@ -179,6 +196,34 @@ fn read_link(arg: Option<&str>) -> anyhow::Result<String> {
         }
         Some(link) => Ok(link.to_owned()),
         None => bail!("pass the link, `-` to read it from standard input, or set TYPSTRY_LINK"),
+    }
+}
+
+/// Turns a number or title from `typstry list` into that project's link;
+/// anything else is passed through as a link.
+fn resolve_listed(input: &str) -> anyhow::Result<String> {
+    let input = input.trim();
+    if input.contains('#') || input.contains("://") {
+        return Ok(input.to_owned());
+    }
+    let catalog = crate::user::catalog()?;
+    let picked = match input.parse::<usize>() {
+        Ok(n) => catalog.get(n.wrapping_sub(1)),
+        Err(_) => {
+            let matches: Vec<_> = catalog
+                .iter()
+                .filter(|e| e.title.eq_ignore_ascii_case(input))
+                .collect();
+            match matches.as_slice() {
+                [one] => Some(*one),
+                [] => None,
+                _ => bail!("several projects are called {input:?}; pick one by number"),
+            }
+        }
+    };
+    match picked {
+        Some(entry) => Ok(entry.link.clone()),
+        None => bail!("{input:?} is neither a link nor a project in `typstry list`"),
     }
 }
 

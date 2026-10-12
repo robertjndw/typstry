@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use anyhow::{Context, bail};
 use typstry_wire::crypto::{CryptoError, LinkSecret};
 use typstry_wire::ds::DS_PATH;
+use typstry_wire::relay::RELAY_WS_PATH;
 use typstry_wire::{PROTOCOL_QUERY, PROTOCOL_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,17 @@ pub fn ws_url(origin: &str) -> anyhow::Result<String> {
 /// The endpoint of the MLS delivery service.
 pub fn ds_url(origin: &str) -> anyhow::Result<String> {
     socket_url(origin, DS_PATH)
+}
+
+/// The pairing relay socket for `channel`. Only the side that allocated the
+/// channel has a `claim`.
+pub fn relay_url(origin: &str, channel: u16, claim: Option<&str>) -> anyhow::Result<String> {
+    let mut url = socket_url(origin, RELAY_WS_PATH)?;
+    let _ = write!(url, "&channel={channel}");
+    if let Some(claim) = claim {
+        let _ = write!(url, "&claim={}", percent_encode(claim));
+    }
+    Ok(url)
 }
 
 fn socket_url(origin: &str, path: &str) -> anyhow::Result<String> {

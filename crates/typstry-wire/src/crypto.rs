@@ -27,6 +27,14 @@
 //! viewers stay read-only even if the server lets their writes through, and
 //! authors are authenticated, not just claimed.
 //!
+//! Who a member is and who owns the project hang off the keyring too. The
+//! identity in a leaf is sealed under [`Keyring::identity_key`], and the
+//! policy names the owner by [`Keyring::owner_tag`], a PRF of the owner's
+//! person id. Both derive from the generation-1 doc key, so they stay the same
+//! through rotations and every member computes the same ones, while no
+//! person has the same tag in two projects. A removed member keeps that key
+//! and so can still test a guessed person id against a tag; see SECURITY.md.
+//!
 //! Every format starts with a version byte (secrets with a kind byte), which
 //! is authenticated along with the rest. A byte this build does not know
 //! means a newer typstry wrote the data, which [`CryptoError::NewerVersion`]
@@ -45,12 +53,16 @@ use zeroize::Zeroizing;
 use crate::elo::{
     IV_LEN, Iv, Record, SealedRecord, encode_delta_header, encode_record, encode_snapshot_header,
 };
+use crate::identity::PersonId;
 
 pub const BLOB_CONTEXT: &str = "typstry:v1:blob";
 pub const PROFILE_CONTEXT: &str = "typstry:v1:profile";
 pub const PRESENCE_CONTEXT: &str = "typstry:v1:presence";
 pub const GROUP_INFO_CONTEXT: &str = "typstry:v1:group-info";
 pub const KEYRING_CONTEXT: &str = "typstry:v1:keyring";
+/// Seals a leaf identity, so the server cannot link a person across
+/// projects.
+pub const IDENTITY_SEAL_CONTEXT: &str = "typstry:v1:identity-seal";
 const RECORD_CONTEXT: &str = "typstry:v1:record";
 const RECORD_SIGNATURE_CONTEXT: &[u8] = b"typstry:v1:record-signature";
 const PRESENCE_SIGNATURE_CONTEXT: &[u8] = b"typstry:v1:presence-signature";
@@ -61,6 +73,9 @@ const ATTEST_INFO: &[u8] = b"typstry:v1:attest";
 const GROUP_INFO_KEY_INFO: &[u8] = b"typstry:v1:group-info-key";
 const KEYRING_KEY_INFO: &[u8] = b"typstry:v1:keyring-key";
 const KEY_ID_INFO: &[u8] = b"typstry:v1:key-id";
+const IDENTITY_KEY_INFO: &[u8] = b"typstry:v1:identity-key";
+const OWNER_TAG_KEY_INFO: &[u8] = b"typstry:v1:owner-tag-key";
+const OWNER_TAG_INFO: &[u8] = b"typstry:v1:owner-tag";
 
 pub const SALT_LEN: usize = 16;
 pub type Salt = [u8; SALT_LEN];
@@ -165,7 +180,7 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
     out
 }
 
-fn hkdf(ikm: &[u8], salt: &[u8], info: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]> {
+pub(crate) fn hkdf(ikm: &[u8], salt: &[u8], info: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]> {
     let mut out = Zeroizing::new([0; KEY_LEN]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
         .expand_multi_info(info, out.as_mut())
@@ -273,6 +288,7 @@ fn check_seal_version(sealed: &[u8]) -> Result<(), CryptoError> {
 /// A symmetric key that seals and opens `version || salt || iv ||
 /// ciphertext+tag`, for the data keyed straight off a link: the group info
 /// and the keyring.
+#[derive(Clone)]
 pub struct SealKey(Zeroizing<[u8; KEY_LEN]>);
 
 impl std::fmt::Debug for SealKey {
@@ -525,6 +541,24 @@ impl Keyring {
         self.keys.get(at).map(|key| &**key)
     }
 
+    /// Seals the identity in every leaf. It comes from generation 1, which
+    /// every member's keyring holds, so the commit policy opens identities the
+    /// same way for a member whose keyring lags as for one that is current.
+    pub fn identity_key(&self) -> SealKey {
+        SealKey(hkdf(&*self.keys[0], &[], &[IDENTITY_KEY_INFO]))
+    }
+
+    /// What the policy holds in place of the owner's person id. The policy
+    /// sits in public GroupContext extensions, so it gets a PRF of the id
+    /// instead (HKDF-Expand under a key from generation 1, which is stable
+    /// through rotations): equal inside this project, unlinkable to the
+    /// person's tag in any other, and only a holder of the keyring can test
+    /// a guess against it.
+    pub fn owner_tag(&self, person: &PersonId) -> [u8; KEY_LEN] {
+        let key = hkdf(&*self.keys[0], &[], &[OWNER_TAG_KEY_INFO]);
+        *hkdf(&*key, &[], &[OWNER_TAG_INFO, person])
+    }
+
     /// The keyring unprotected, for a client's own local state. Anything that
     /// leaves the device goes through [`Self::seal_signed`].
     pub fn export(&self) -> Zeroizing<Vec<u8>> {
@@ -571,7 +605,24 @@ impl Keyring {
         if !rest.is_empty() {
             return Err(bad("trailing bytes"));
         }
+        // Every rotation is to a fresh link, so a key that comes back is a
+        // forged history: repeating the newest one makes a keyring that
+        // `open_verified` takes for a later generation of the same link.
+        let mut seen = std::collections::BTreeSet::new();
+        if !attest_pubs.iter().all(|key| seen.insert(*key)) {
+            return Err(bad("an attestation key appears twice"));
+        }
         Ok(Self { keys, attest_pubs })
+    }
+
+    /// Whether this keyring is `earlier` or a later one of the same
+    /// project: every generation `earlier` has, with the same doc key and
+    /// attestation key, and possibly more after them. Rotations only ever
+    /// append, so anything else rewrites what was there.
+    pub fn extends(&self, earlier: &Keyring) -> bool {
+        self.keys.len() >= earlier.keys.len()
+            && self.keys.iter().zip(&earlier.keys).all(|(a, b)| **a == **b)
+            && self.attest_pubs.starts_with(&earlier.attest_pubs)
     }
 
     /// Seals the keyring under `link`'s keyring key and signs the result
@@ -602,6 +653,18 @@ impl Keyring {
         let signature = link.sign(&[KEYRING_SIGNATURE_CONTEXT, &sealed].concat())?;
         sealed.extend_from_slice(&signature);
         Ok(sealed)
+    }
+
+    /// Seals and signs keyring bytes that [`Self::from_plain`] may refuse,
+    /// the way a hostile editor with the link could.
+    #[cfg(test)]
+    pub(crate) fn seal_signed_plain(link: &LinkSecret, plain: &[u8]) -> Vec<u8> {
+        let mut sealed = link.keyring_key().seal(plain, KEYRING_CONTEXT);
+        let signature = link
+            .sign(&[KEYRING_SIGNATURE_CONTEXT, &sealed].concat())
+            .expect("an edit link signs");
+        sealed.extend_from_slice(&signature);
+        sealed
     }
 
     /// Checks the signature against `link`'s attestation key, opens the
@@ -1623,6 +1686,37 @@ mod tests {
     }
 
     #[test]
+    fn a_keyring_never_repeats_an_attestation_key() {
+        let keyring = Keyring::new_with(&link(), [5; 32]);
+        let mut plain = keyring.to_plain().to_vec();
+        plain[1..5].copy_from_slice(&2u32.to_be_bytes());
+        plain.extend_from_slice(&[6; 32]);
+        plain.extend_from_slice(&link().attest_pub);
+        assert!(matches!(
+            Keyring::from_plain(&plain),
+            Err(CryptoError::MalformedKeyring(_))
+        ));
+        let sealed = Keyring::seal_signed_plain(&link(), &plain);
+        assert!(Keyring::open_verified(&link(), &sealed).is_err());
+    }
+
+    #[test]
+    fn keyrings_extend_only_by_appending() {
+        let first = Keyring::new_with(&link(), [5; 32]);
+        let second = first.next(&other_link());
+        assert!(first.extends(&first));
+        assert!(second.extends(&first));
+        assert!(!first.extends(&second));
+        // The same generations under other keys.
+        let other = Keyring::new_with(&link(), [6; 32]);
+        assert!(!other.extends(&first));
+        assert!(!other.next(&other_link()).extends(&first));
+        let mut moved = second.clone();
+        moved.attest_pubs[0] = [9; 32];
+        assert!(!moved.extends(&first));
+    }
+
+    #[test]
     fn hostile_keyring_counts_are_refused() {
         let mut plain = vec![KEYRING_VERSION];
         plain.extend_from_slice(&u32::MAX.to_be_bytes());
@@ -1680,5 +1774,48 @@ mod tests {
             Err(CryptoError::Truncated)
         ));
         assert!(!format!("{key:?}").contains("8, 8"));
+    }
+
+    #[test]
+    fn the_identity_key_comes_from_generation_one() {
+        let link = LinkSecret::generate_edit();
+        let first = Keyring::new(&link);
+        let later = first.next(&LinkSecret::generate_edit());
+        let sealed = first.identity_key().seal(b"who", IDENTITY_SEAL_CONTEXT);
+        // A member whose keyring lags and one that is current open the same.
+        assert_eq!(
+            later
+                .identity_key()
+                .open(&sealed, IDENTITY_SEAL_CONTEXT)
+                .unwrap(),
+            b"who"
+        );
+        assert!(first.identity_key().open(&sealed, PROFILE_CONTEXT).is_err());
+        assert!(
+            Keyring::new(&link)
+                .identity_key()
+                .open(&sealed, IDENTITY_SEAL_CONTEXT)
+                .is_err()
+        );
+        assert!(
+            link.keyring_key()
+                .open(&sealed, IDENTITY_SEAL_CONTEXT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_owner_tag_is_stable_in_a_project_and_unlinkable_across_them() {
+        let link = LinkSecret::generate_edit();
+        let first = Keyring::new(&link);
+        let later = first.next(&LinkSecret::generate_edit());
+        let person = [4; 32];
+        // Rotations keep it.
+        assert_eq!(first.owner_tag(&person), later.owner_tag(&person));
+        assert_ne!(first.owner_tag(&person), first.owner_tag(&[5; 32]));
+        // Another project, another tag for the same person.
+        let other = Keyring::new(&LinkSecret::generate_edit());
+        assert_ne!(first.owner_tag(&person), other.owner_tag(&person));
+        assert_ne!(first.owner_tag(&person), person);
     }
 }

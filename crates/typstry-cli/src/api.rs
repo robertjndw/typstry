@@ -10,6 +10,8 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use typstry_wire::owner::OwnerKey;
+use typstry_wire::relay::RELAY_API_PATH;
 use typstry_wire::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 
 use crate::engine::SyncError;
@@ -69,6 +71,18 @@ pub struct Bootstrap {
     pub incarnation: u64,
     pub group_info: Vec<u8>,
     pub keyring: Vec<u8>,
+    /// The owner key the server holds.
+    pub owner_key: OwnerKey,
+}
+
+impl Bootstrap {
+    pub fn as_mls(&self) -> typstry_wire::mls::Bootstrap<'_> {
+        typstry_wire::mls::Bootstrap {
+            group_info: &self.group_info,
+            keyring: &self.keyring,
+            owner_key: &self.owner_key,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -77,6 +91,7 @@ struct BootstrapBody {
     incarnation: u64,
     group_info: String,
     keyring: String,
+    owner_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +100,16 @@ pub struct CreatedProject {
     pub project_id: String,
     pub edit_token: String,
     pub view_token: String,
+}
+
+/// A pairing channel the server opened for this device.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayChannel {
+    pub channel: u16,
+    /// Proves this device allocated the channel; it takes the first seat.
+    pub claim: String,
+    pub expires_in: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,6 +227,24 @@ impl Api {
         Ok(res.json().await.map_err(redact)?)
     }
 
+    /// Opens a channel on the relay for pairing two devices.
+    pub async fn allocate_relay(&self) -> anyhow::Result<RelayChannel> {
+        let req = self.http.post(format!("{}{RELAY_API_PATH}", self.origin));
+        let res = self
+            .send(req, || format!("cannot reach {}", self.origin))
+            .await?;
+        match res.status() {
+            s if s.is_success() => Ok(res.json().await.map_err(redact)?),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                bail!("the server has no free pairing channel right now; try again in a minute")
+            }
+            StatusCode::NOT_FOUND => {
+                bail!("this server does not offer pairing; it may be an older typstry server")
+            }
+            s => bail!("opening a pairing channel failed: HTTP {s}"),
+        }
+    }
+
     pub async fn resolve_share(&self, token: &str) -> anyhow::Result<ShareInfo> {
         let req = self.http.get(self.token_url("share", token, ""));
         let res = self
@@ -249,6 +292,9 @@ impl Api {
             incarnation: body.incarnation,
             group_info: decode("group info", &body.group_info)?,
             keyring: decode("keyring", &body.keyring)?,
+            owner_key: decode("owner key", &body.owner_key)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("the server sent an unreadable owner key"))?,
         })
     }
 

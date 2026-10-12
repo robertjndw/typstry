@@ -46,6 +46,7 @@ vi.mock("@/mls/session", () => ({
     phase: "idle",
     members: [],
     canCommit: false,
+    holdsOwnerKey: false,
     stalled: false,
     error: null,
   },
@@ -58,6 +59,7 @@ vi.mock("@/mls/session", () => ({
           phase: "active",
           members: [],
           canCommit: false,
+          holdsOwnerKey: false,
           stalled: false,
           error: null,
         },
@@ -119,6 +121,7 @@ beforeEach(() => {
     epoch: 0,
     groupInfo: new Uint8Array(),
     keyring: keys.signed,
+    ownerKey: new Uint8Array(32),
   });
 });
 

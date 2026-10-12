@@ -21,12 +21,14 @@ import {
 import { Link, useNavigate } from "react-router";
 import { toast } from "sonner";
 
+import { AccountMenu } from "@/components/AccountMenu";
 import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
-import { ThemeToggle } from "@/components/ThemeToggle";
+import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { readDrop, readPicked, type PendingImport } from "@/import/sources";
 import { assertImportable, ImportError, writeImport } from "@/import/import";
+import { provisionalIdentity, useStoredIdentity } from "@/presence/identity";
 import { formatAbsolute, formatRelative } from "@/project/history-items";
 import { createLocalProject, deleteLocalProject } from "@/project/create";
 import { loadRecent, projectUrl, type RecentProject } from "@/project/recent";
@@ -69,6 +71,8 @@ export function Home() {
   const [pendingDelete, setPendingDelete] = useState<RecentProject | null>(
     null,
   );
+  const stored = useStoredIdentity();
+  const [provisional] = useState(() => provisionalIdentity());
   const now = useNow(60_000);
 
   async function deleteProject(project: RecentProject) {
@@ -176,206 +180,203 @@ export function Home() {
   }
 
   return (
-    <div
-      className="flex min-h-svh flex-col"
+    <PageShell
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={onDragOver}
       onDrop={onDrop}
-    >
-      {dragging && !busy && (
-        <div
-          aria-hidden
-          className="pointer-events-none fixed inset-3 z-50 flex items-center justify-center rounded-xl border-2 border-dashed border-primary/60 bg-background/85 backdrop-blur-sm"
-        >
-          <div className="flex flex-col items-center gap-2 px-6 text-center">
-            <ImportIcon className="size-6 text-muted-foreground" />
-            <p className="font-medium">Drop to import</p>
-            <p className="text-sm text-muted-foreground">
-              A zip or a folder becomes a new project.
-            </p>
-          </div>
-        </div>
-      )}
-      <header className="flex h-14 shrink-0 items-center justify-between px-4 sm:px-6">
+      brand={
         <span className="flex items-center gap-2 text-sm font-semibold tracking-tight">
           <LogoMark />
           typstry
         </span>
-        <ThemeToggle />
-      </header>
+      }
+      actions={<AccountMenu identity={stored ?? provisional} />}
+      mainClassName="max-w-xl gap-12 sm:pt-20"
+      outside={
+        <>
+          {dragging && !busy && (
+            <div
+              aria-hidden
+              className="pointer-events-none fixed inset-3 z-50 flex items-center justify-center rounded-xl border-2 border-dashed border-primary/60 bg-background/85 backdrop-blur-sm"
+            >
+              <div className="flex flex-col items-center gap-2 px-6 text-center">
+                <ImportIcon className="size-6 text-muted-foreground" />
+                <p className="font-medium">Drop to import</p>
+                <p className="text-sm text-muted-foreground">
+                  A zip or a folder becomes a new project.
+                </p>
+              </div>
+            </div>
+          )}
+          <ConfirmDeleteDialog
+            open={pendingDelete !== null}
+            title={<>Delete &ldquo;{titleOf(pendingDelete)}&rdquo;?</>}
+            description="It's only removed from this browser. Anyone with the link can still open it, so keep the link if you might want it back."
+            onCancel={() => setPendingDelete(null)}
+            onConfirm={() => {
+              const project = pendingDelete;
+              setPendingDelete(null);
+              if (project) void deleteProject(project);
+            }}
+          />
+        </>
+      }
+    >
+      <section className="flex flex-col gap-8">
+        <div className="flex flex-col gap-3">
+          <h1 className="font-heading text-4xl font-semibold tracking-tight text-balance sm:text-5xl">
+            typstry
+          </h1>
+          <p className="text-lg text-pretty text-muted-foreground">
+            Write Typst documents together, right in the browser. No accounts,
+            just a link.
+          </p>
+        </div>
 
-      <main className="mx-auto flex w-full max-w-xl flex-1 flex-col gap-12 px-4 pt-10 pb-16 sm:pt-20">
-        <section className="flex flex-col gap-8">
-          <div className="flex flex-col gap-3">
-            <h1 className="font-heading text-4xl font-semibold tracking-tight text-balance sm:text-5xl">
-              typstry
-            </h1>
-            <p className="text-lg text-pretty text-muted-foreground">
-              Write Typst documents together, right in the browser. No accounts,
-              just a link.
+        <ul className="grid gap-4 sm:grid-cols-3 sm:gap-6">
+          {FEATURES.map(({ Icon, title, text }) => (
+            <li key={title} className="flex gap-3 sm:flex-col sm:gap-2">
+              <Icon
+                aria-hidden
+                // Lucide glyphs sit inset in their box; the negative
+                // margin lines the stroke up with the text edge below.
+                className="mt-0.5 size-4 shrink-0 text-muted-foreground sm:mt-0 sm:-ml-px"
+              />
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-medium">{title}</span>
+                <span className="text-sm text-muted-foreground">{text}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+
+        <div className="flex flex-col gap-2">
+          <form onSubmit={onSubmit} className="flex flex-col gap-2 sm:flex-row">
+            <Input
+              aria-label="Project title"
+              placeholder="Project title (optional)"
+              value={title}
+              maxLength={TITLE_MAX_LENGTH}
+              onChange={(e) => setTitle(e.target.value)}
+              className="h-9 flex-1"
+            />
+            <Button type="submit" size="lg" disabled={busy}>
+              {creating ? (
+                <Loader2Icon className="animate-spin" />
+              ) : (
+                <PlusIcon />
+              )}
+              New project
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="lg"
+              disabled={busy}
+              title="Import a zip or Typst files"
+              onClick={() => fileInput.current?.click()}
+            >
+              {importing ? (
+                <Loader2Icon className="animate-spin" />
+              ) : (
+                <ImportIcon />
+              )}
+              {importing ? "Importing…" : "Import"}
+            </Button>
+          </form>
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            hidden
+            aria-label="Files to import"
+            onChange={onPick}
+          />
+          {importStatus ? (
+            <p
+              role="status"
+              className="flex items-center gap-2 text-sm text-muted-foreground"
+            >
+              <Loader2Icon aria-hidden className="size-4 animate-spin" />
+              {importStatus}
             </p>
-          </div>
+          ) : (
+            !error && (
+              <p className="text-sm text-muted-foreground">
+                You can also drop a zip or folder anywhere on this page.
+              </p>
+            )
+          )}
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
+        </div>
+      </section>
 
-          <ul className="grid gap-4 sm:grid-cols-3 sm:gap-6">
-            {FEATURES.map(({ Icon, title, text }) => (
-              <li key={title} className="flex gap-3 sm:flex-col sm:gap-2">
-                <Icon
-                  aria-hidden
-                  // Lucide glyphs sit inset in their box; the negative
-                  // margin lines the stroke up with the text edge below.
-                  className="mt-0.5 size-4 shrink-0 text-muted-foreground sm:mt-0 sm:-ml-px"
-                />
-                <div className="flex flex-col gap-0.5">
-                  <span className="text-sm font-medium">{title}</span>
-                  <span className="text-sm text-muted-foreground">{text}</span>
-                </div>
+      {recent.length > 0 ? (
+        <section
+          aria-labelledby="recent-heading"
+          className="flex flex-col gap-3"
+        >
+          <h2
+            id="recent-heading"
+            className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
+          >
+            Recent projects
+          </h2>
+          <ul className="divide-y overflow-hidden rounded-lg border bg-card">
+            {recent.map((p) => (
+              <li
+                key={p.projectId}
+                className="group relative flex items-center transition-colors hover:bg-muted/60"
+              >
+                <Link
+                  to={`/p/${encodeURIComponent(p.token)}`}
+                  className="flex min-w-0 flex-1 items-center gap-3 py-3 pr-1 pl-4 text-sm outline-none focus-visible:bg-muted/60"
+                >
+                  <FileTextIcon
+                    aria-hidden
+                    className="size-4 shrink-0 text-muted-foreground"
+                  />
+                  <span className="min-w-0 flex-1 truncate font-medium">
+                    {titleOf(p)}
+                  </span>
+                  <time
+                    dateTime={new Date(p.visitedAt).toISOString()}
+                    title={formatAbsolute(p.visitedAt)}
+                    className="shrink-0 text-xs text-muted-foreground tabular-nums"
+                  >
+                    {capitalize(formatRelative(p.visitedAt, now))}
+                  </time>
+                </Link>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={`Delete ${titleOf(p)}`}
+                  title="Delete"
+                  // Always visible on touch screens, which have no hover.
+                  className="mr-2 text-muted-foreground hover:text-destructive focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100"
+                  onClick={() => setPendingDelete(p)}
+                >
+                  <Trash2Icon />
+                </Button>
               </li>
             ))}
           </ul>
-
-          <div className="flex flex-col gap-2">
-            <form
-              onSubmit={onSubmit}
-              className="flex flex-col gap-2 sm:flex-row"
-            >
-              <Input
-                aria-label="Project title"
-                placeholder="Project title (optional)"
-                value={title}
-                maxLength={TITLE_MAX_LENGTH}
-                onChange={(e) => setTitle(e.target.value)}
-                className="h-9 flex-1"
-              />
-              <Button type="submit" size="lg" disabled={busy}>
-                {creating ? (
-                  <Loader2Icon className="animate-spin" />
-                ) : (
-                  <PlusIcon />
-                )}
-                New project
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="lg"
-                disabled={busy}
-                title="Import a zip or Typst files"
-                onClick={() => fileInput.current?.click()}
-              >
-                {importing ? (
-                  <Loader2Icon className="animate-spin" />
-                ) : (
-                  <ImportIcon />
-                )}
-                {importing ? "Importing…" : "Import"}
-              </Button>
-            </form>
-            <input
-              ref={fileInput}
-              type="file"
-              multiple
-              hidden
-              aria-label="Files to import"
-              onChange={onPick}
-            />
-            {importStatus ? (
-              <p
-                role="status"
-                className="flex items-center gap-2 text-sm text-muted-foreground"
-              >
-                <Loader2Icon aria-hidden className="size-4 animate-spin" />
-                {importStatus}
-              </p>
-            ) : (
-              !error && (
-                <p className="text-sm text-muted-foreground">
-                  You can also drop a zip or folder anywhere on this page.
-                </p>
-              )
-            )}
-            {error && (
-              <p role="alert" className="text-sm text-destructive">
-                {error}
-              </p>
-            )}
-          </div>
         </section>
-
-        {recent.length > 0 ? (
-          <section
-            aria-labelledby="recent-heading"
-            className="flex flex-col gap-3"
-          >
-            <h2
-              id="recent-heading"
-              className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
-            >
-              Recent projects
-            </h2>
-            <ul className="divide-y overflow-hidden rounded-lg border bg-card">
-              {recent.map((p) => (
-                <li
-                  key={p.projectId}
-                  className="group relative flex items-center transition-colors hover:bg-muted/60"
-                >
-                  <Link
-                    to={`/p/${encodeURIComponent(p.token)}`}
-                    className="flex min-w-0 flex-1 items-center gap-3 py-3 pr-1 pl-4 text-sm outline-none focus-visible:bg-muted/60"
-                  >
-                    <FileTextIcon
-                      aria-hidden
-                      className="size-4 shrink-0 text-muted-foreground"
-                    />
-                    <span className="min-w-0 flex-1 truncate font-medium">
-                      {titleOf(p)}
-                    </span>
-                    <time
-                      dateTime={new Date(p.visitedAt).toISOString()}
-                      title={formatAbsolute(p.visitedAt)}
-                      className="shrink-0 text-xs text-muted-foreground tabular-nums"
-                    >
-                      {capitalize(formatRelative(p.visitedAt, now))}
-                    </time>
-                  </Link>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={`Delete ${titleOf(p)}`}
-                    title="Delete"
-                    // Always visible on touch screens, which have no hover.
-                    className="mr-2 text-muted-foreground hover:text-destructive focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100"
-                    onClick={() => setPendingDelete(p)}
-                  >
-                    <Trash2Icon />
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </section>
-        ) : (
-          <p className="flex items-start gap-2 rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
-            <ArrowRightIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
-            <span>
-              Projects you create or open in this browser will show up here. To
-              collaborate, share the link from inside a project.
-            </span>
-          </p>
-        )}
-      </main>
-
-      <ConfirmDeleteDialog
-        open={pendingDelete !== null}
-        title={<>Delete &ldquo;{titleOf(pendingDelete)}&rdquo;?</>}
-        description="It's only removed from this browser. Anyone with the link can still open it, so keep the link if you might want it back."
-        onCancel={() => setPendingDelete(null)}
-        onConfirm={() => {
-          const project = pendingDelete;
-          setPendingDelete(null);
-          if (project) void deleteProject(project);
-        }}
-      />
-    </div>
+      ) : (
+        <p className="flex items-start gap-2 rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
+          <ArrowRightIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
+          <span>
+            Projects you create or open in this browser will show up here. To
+            collaborate, share the link from inside a project.
+          </span>
+        </p>
+      )}
+    </PageShell>
   );
 }
 

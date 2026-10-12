@@ -106,6 +106,11 @@ export interface MlsBootstrap {
   groupInfo: Uint8Array;
   /** Sealed under the link and signed by an editor. */
   keyring: Uint8Array;
+  /**
+   * The public owner key the server holds, 32 bytes: which owner key
+   * secret is the current one, which the group itself cannot tell.
+   */
+  ownerKey: Uint8Array;
 }
 
 /**
@@ -132,9 +137,12 @@ export async function fetchMlsBootstrap(
     typeof body.groupInfo === "string" ? fromBase64(body.groupInfo) : null;
   const keyring =
     typeof body.keyring === "string" ? fromBase64(body.keyring) : null;
+  const ownerKey =
+    typeof body.ownerKey === "string" ? fromBase64(body.ownerKey) : null;
   if (
     !groupInfo ||
     !keyring ||
+    ownerKey?.length !== 32 ||
     typeof body.incarnation !== "number" ||
     typeof body.epoch !== "number"
   )
@@ -144,6 +152,7 @@ export async function fetchMlsBootstrap(
     epoch: body.epoch,
     groupInfo,
     keyring,
+    ownerKey,
   };
 }
 

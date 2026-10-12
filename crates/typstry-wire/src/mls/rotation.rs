@@ -13,8 +13,11 @@
 //!   than a view link. A failure in this part only ever affects the one
 //!   member it is for, never whether the commit is valid.
 //!
-//! Both are bound to the commit by its digest, so an envelope cannot be
-//! moved onto another commit.
+//! Both parts are bound to the commit by its digest, so an envelope cannot
+//! be moved onto another commit. The owner role needs nothing here, as it
+//! follows the owner's person. The next owner key, which the server checks
+//! rotations against, travels in the committer's new leaf instead (see
+//! [`super::owner_share`]), where it outlives the commit log.
 
 use loro_protocol::{BytesReader, BytesWriter};
 use openmls_traits::crypto::OpenMlsCrypto;
@@ -114,6 +117,22 @@ pub fn seal(
     let mut edit = BytesWriter::new();
     push_links(&mut edit, &link.to_base64url(), &[edit_token, &tokens.view]);
     let edit = edit.finalize();
+    let mut w = BytesWriter::new();
+    w.push_byte(ENVELOPE_VERSION);
+    w.push_var_bytes(&view);
+    push_entries(&mut w, crypto, binding, recipients, &edit);
+    Ok(w.finalize())
+}
+
+/// A list of `(signer, HPKE(plain))`, one for each recipient that can be
+/// sealed to.
+fn push_entries(
+    w: &mut BytesWriter,
+    crypto: &impl OpenMlsCrypto,
+    binding: &Binding<'_>,
+    recipients: &[Recipient],
+    plain: &[u8],
+) {
     let entries: Vec<_> = recipients
         .iter()
         .filter_map(|recipient| {
@@ -123,23 +142,41 @@ pub fn seal(
                     &recipient.hpke_pub,
                     &binding.info(),
                     &recipient.signer,
-                    &edit,
+                    plain,
                 )
                 .ok()?;
             Some((recipient.signer, sealed))
         })
         .collect();
-
-    let mut w = BytesWriter::new();
-    w.push_byte(ENVELOPE_VERSION);
-    w.push_var_bytes(&view);
     w.push_uleb128(entries.len() as u64);
     for (signer, sealed) in entries {
         w.push_bytes(&signer);
         w.push_var_bytes(sealed.kem_output.as_slice());
         w.push_var_bytes(sealed.ciphertext.as_slice());
     }
-    Ok(w.finalize())
+}
+
+/// The entry for `signer` in a list written by [`push_entries`], after
+/// reading the whole list so a framing defect is seen by everyone.
+fn read_entries(
+    r: &mut BytesReader<'_>,
+    signer: &PublicKey,
+) -> Result<Option<HpkeCiphertext>, MlsError> {
+    let bad = |why: String| MlsError::Envelope(why);
+    let count = plausible_count(r, KEY_LEN + 2).map_err(bad)?;
+    let mut mine = None;
+    for _ in 0..count {
+        let who = r.read_bytes(KEY_LEN).map_err(bad)?;
+        let kem_output = r.read_var_bytes().map_err(bad)?;
+        let ciphertext = r.read_var_bytes().map_err(bad)?;
+        if who == signer.as_slice() {
+            mine = Some(HpkeCiphertext {
+                kem_output: kem_output.to_vec().into(),
+                ciphertext: ciphertext.to_vec().into(),
+            });
+        }
+    }
+    Ok(mine)
 }
 
 /// Opens an envelope as the member holding `signer` and `hpke_private`.
@@ -172,19 +209,7 @@ pub fn open(
         }
     }
     let view = r.read_var_bytes().map_err(bad)?;
-    let count = plausible_count(&mut r, KEY_LEN + 2).map_err(bad)?;
-    let mut mine = None;
-    for _ in 0..count {
-        let who = r.read_bytes(KEY_LEN).map_err(bad)?;
-        let kem_output = r.read_var_bytes().map_err(bad)?;
-        let ciphertext = r.read_var_bytes().map_err(bad)?;
-        if who == signer.as_slice() {
-            mine = Some(HpkeCiphertext {
-                kem_output: kem_output.to_vec().into(),
-                ciphertext: ciphertext.to_vec().into(),
-            });
-        }
-    }
+    let mine = read_entries(&mut r, signer)?;
     if r.remaining() != 0 {
         return Err(MlsError::Envelope("trailing bytes".into()));
     }
@@ -253,13 +278,13 @@ mod tests {
     use openmls_traits::crypto::OpenMlsCrypto;
 
     use super::*;
-    use crate::mls::Device;
+    use crate::mls::LeafKeys;
     use crate::token;
 
     #[test]
     fn envelopes_are_bound_to_their_commit_and_recipient() {
         let crypto = RustCrypto::default();
-        let (editor, other) = (Device::generate(), Device::generate());
+        let (editor, other) = (LeafKeys::generate(), LeafKeys::generate());
         let link = LinkSecret::generate_edit();
         let tokens = Tokens {
             edit: Some(token::generate()),
@@ -283,7 +308,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let open_as = |device: &Device, binding: &Binding<'_>, exporter: &[u8; 32]| {
+        let open_as = |device: &LeafKeys, binding: &Binding<'_>, exporter: &[u8; 32]| {
             open(
                 &crypto,
                 exporter,
@@ -322,6 +347,20 @@ mod tests {
             None
         );
 
+        // Framing damage is everyone's problem.
+        let trailing = [envelope.clone(), vec![0]].concat();
+        assert!(
+            open(
+                &crypto,
+                &exporter,
+                &binding,
+                &editor.signer_pub(),
+                editor.hpke_private(),
+                &trailing
+            )
+            .is_err()
+        );
+
         // Nor does anything open without the epoch's exporter secret.
         assert!(open_as(&editor, &binding, &[4; 32]).is_err());
         assert!(
@@ -342,7 +381,7 @@ mod tests {
         crypto: &RustCrypto,
         exporter: &[u8; 32],
         binding: &Binding<'_>,
-        device: &Device,
+        device: &LeafKeys,
         shared: &[u8],
         entry: &[u8],
     ) -> Vec<u8> {
@@ -375,7 +414,7 @@ mod tests {
     #[test]
     fn a_damaged_edit_entry_only_costs_its_owner_the_edit_link() {
         let crypto = RustCrypto::default();
-        let device = Device::generate();
+        let device = LeafKeys::generate();
         let link = LinkSecret::generate_edit();
         let other = LinkSecret::generate_edit();
         let exporter = [3; 32];
@@ -425,7 +464,7 @@ mod tests {
     #[test]
     fn the_shared_part_decides_for_every_member_alike() {
         let crypto = RustCrypto::default();
-        let (editor, viewer) = (Device::generate(), Device::generate());
+        let (editor, viewer) = (LeafKeys::generate(), LeafKeys::generate());
         let link = LinkSecret::generate_edit();
         let exporter = [3; 32];
         let binding = Binding {
@@ -460,7 +499,7 @@ mod tests {
     #[test]
     fn recipients_that_cannot_be_sealed_to_are_skipped() {
         let crypto = RustCrypto::default();
-        let (good, broken) = (Device::generate(), Device::generate());
+        let (good, broken) = (LeafKeys::generate(), LeafKeys::generate());
         let link = LinkSecret::generate_edit();
         let tokens = Tokens {
             edit: Some(token::generate()),
@@ -489,7 +528,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let open_as = |device: &Device| {
+        let open_as = |device: &LeafKeys| {
             open(
                 &crypto,
                 &[3; 32],

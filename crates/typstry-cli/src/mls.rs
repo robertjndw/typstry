@@ -15,12 +15,14 @@ use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message;
 use typstry_wire::crypto::LinkSecret;
 use typstry_wire::ds::{ClientMessage, Permission, RefusalCode, ServerMessage};
-use typstry_wire::mls::{Device, MlsError, ProjectGroup};
+use typstry_wire::identity::PersonId;
+use typstry_wire::mls::{LeafKeys, LocalIdentity, MlsError, OwnerSecrets, ProjectGroup};
 
 use crate::api::Api;
 use crate::client::{Socket, open_socket};
 use crate::engine::{Identity, SyncError};
 use crate::link::{ShareLink, ds_url};
+use crate::user;
 
 /// How long the server may stay silent while an operation waits for it.
 /// The sockets are short lived, so there is no keepalive to speak of.
@@ -156,6 +158,9 @@ pub fn refusal_text(code: RefusalCode) -> &'static str {
         RefusalCode::GroupExists => "the project already has a member group",
         RefusalCode::WrongIncarnation => "the member group was reset meanwhile; try again",
         RefusalCode::RateLimited => "the server is rate limiting this connection; try again soon",
+        RefusalCode::NotOwner => {
+            "only a device that holds the project's owner key can replace its links"
+        }
         RefusalCode::Malformed | RefusalCode::BadCommit | RefusalCode::Internal => {
             "the server could not take the request"
         }
@@ -185,11 +190,41 @@ pub fn profile_name(profile: &[u8]) -> Option<String> {
         .map(|p| p.name)
 }
 
+/// The identity a person's profile bytes describe, if this build can read
+/// them and they hold a name.
+pub fn profile_identity(profile: &[u8]) -> Option<Identity> {
+    let Profile { name, color } = serde_json::from_slice(profile).ok()?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    let identity = Identity::new(&name);
+    // The person's color wins over the one derived from the name, so every
+    // device shows up the same.
+    Some(Identity {
+        color: if color.is_empty() {
+            identity.color
+        } else {
+            color
+        },
+        ..identity
+    })
+}
+
 /// Creates the group of a new project and registers it with the server.
-/// `link` is the project's edit link, whose token is not yet in use.
-pub async fn create_group(link: &ShareLink, identity: &Identity) -> anyhow::Result<ProjectGroup> {
+/// `link` is the project's edit link, whose token is not yet in use, and
+/// `project_id` the project the server made for it. The creator's person
+/// becomes the project's owner.
+pub async fn create_group(
+    link: &ShareLink,
+    project_id: &str,
+    identity: &Identity,
+    local: &LocalIdentity,
+) -> anyhow::Result<ProjectGroup> {
     let secret = LinkSecret::from_base64url(&link.key).context("reading the new link")?;
-    let (group, init) = ProjectGroup::create(&secret, &profile_bytes(identity))?;
+    let (group, init) = ProjectGroup::create(&secret, &profile_bytes(identity), local)?;
+    // Before the server knows the key: if this run dies after the init
+    // lands, the only copy must not die with it.
+    user::remember_owner_keys(&link.origin, project_id, group.owner_secrets())?;
     let mut ds = Ds::connect(&link.origin, &link.token, 0, 0).await?;
     let reply = ds.request(1, &init.into_message(1)).await;
     ds.close().await;
@@ -202,12 +237,20 @@ pub async fn create_group(link: &ShareLink, identity: &Identity) -> anyhow::Resu
 
 /// Joins the group with an external commit as `device`, which replaces its
 /// old leaf if it had one. Retries when another member's commit wins the
-/// epoch.
+/// epoch. `previous` is the folder's old group state, if it has one, which
+/// the new group has to keep up with (see
+/// [`ProjectGroup::join_external_as`]). `owner_keys` are owner keys kept
+/// beside it; the one the server holds is carried into the new state.
+#[allow(clippy::too_many_arguments)]
 pub async fn join_group(
     api: &Api,
     link: &ShareLink,
-    device: Device,
+    device: LeafKeys,
     identity: &Identity,
+    local: &LocalIdentity,
+    pinned_owner: Option<PersonId>,
+    previous: Option<&ProjectGroup>,
+    owner_keys: &OwnerSecrets,
 ) -> anyhow::Result<ProjectGroup> {
     let secret = LinkSecret::from_base64url(&link.key).context("reading the link")?;
     let profile = profile_bytes(identity);
@@ -218,13 +261,18 @@ pub async fn join_group(
         let (mut group, payload) = ProjectGroup::join_external_as(
             device.duplicate(),
             &secret,
-            &boot.group_info,
-            &boot.keyring,
+            boot.as_mls(),
             &profile,
+            Some(local),
+            pinned_owner,
+            previous,
+            owner_keys,
         )
         // The sealed parts only open with the project's keys, so this is
         // where a truncated or wrong link shows.
         .map_err(|err| match err {
+            MlsError::OwnerChanged(_) => anyhow::Error::from(SyncError::OwnerChanged),
+            MlsError::Rewritten => anyhow::Error::from(SyncError::GroupRewritten),
             MlsError::Crypto(_) | MlsError::Mismatch(_) => anyhow::Error::from(SyncError::WrongKey),
             err => err.into(),
         })?;

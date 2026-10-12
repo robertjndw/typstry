@@ -25,9 +25,10 @@ use zeroize::Zeroizing;
 
 use super::rotation::Tokens;
 use super::{MlsError, SubmitPayload};
-use crate::codec::{plausible_count, push_opt, read_flag, read_opt};
+use crate::codec::{plausible_count, push_opt, read_array, read_flag, read_opt};
 use crate::crypto::{KEY_LEN, PublicKey, random};
-use crate::ds::Rotate;
+use crate::ds::{push_rotate, read_rotate};
+use crate::owner::{OwnerKey, OwnerSecret, OwnerSecrets};
 
 /// First byte of a saved group state.
 pub const MLS_STATE_VERSION: u8 = 1;
@@ -49,7 +50,7 @@ pub fn hpke_config() -> HpkeConfig {
 /// The signature key has to outlive the group state. Resyncing replaces the
 /// old leaf only if the new one has the same signature key, and a new key
 /// would leave a ghost leaf of the lost state in the tree.
-pub struct Device {
+pub struct LeafKeys {
     sig_seed: Zeroizing<[u8; KEY_LEN]>,
     hpke_ikm: Zeroizing<[u8; KEY_LEN]>,
     id: [u8; DEVICE_ID_LEN],
@@ -57,15 +58,15 @@ pub struct Device {
     hpke: HpkeKeyPair,
 }
 
-impl std::fmt::Debug for Device {
+impl std::fmt::Debug for LeafKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Device")
+        f.debug_struct("LeafKeys")
             .field("signer", &self.signing.verifying_key().to_bytes())
             .finish_non_exhaustive()
     }
 }
 
-impl Device {
+impl LeafKeys {
     pub fn generate() -> Self {
         Self::from_parts(Zeroizing::new(random()), Zeroizing::new(random()), random())
             .expect("a random seed derives a key pair")
@@ -154,11 +155,13 @@ impl Device {
     }
 }
 
-/// The link, keyring and tokens a saved rotation commit switches to.
+/// The link, keyring, tokens and owner key a saved rotation commit switches
+/// to.
 pub struct SavedNext {
     pub link: Zeroizing<String>,
     pub keyring: Zeroizing<Vec<u8>>,
     pub tokens: Tokens,
+    pub owner: OwnerSecret,
 }
 
 /// A commit that was submitted and not yet confirmed. The reply may have
@@ -173,12 +176,17 @@ pub struct SavedPending {
 /// What [`encode`] saves of a project group and [`decode`] returns.
 pub struct SavedState {
     pub group_id: Vec<u8>,
-    pub device: Device,
+    pub device: LeafKeys,
     /// The link secret, in its shareable form.
     pub link: Zeroizing<String>,
     /// The keyring as [`crate::crypto::Keyring::export`] writes it.
     pub keyring: Zeroizing<Vec<u8>>,
     pub profile: Vec<u8>,
+    /// The project's owner key secrets this device holds. One may be the
+    /// only copy, so they are saved like the link.
+    pub owner: OwnerSecrets,
+    /// The owner key the server holds, as this device last heard.
+    pub owner_key: Option<OwnerKey>,
     /// The join commit was never confirmed by the server, so the group is
     /// not known to exist.
     pub unconfirmed_join: bool,
@@ -196,9 +204,20 @@ pub fn encode(state: &SavedState) -> Zeroizing<Vec<u8>> {
     w.push_var_string(&state.link);
     w.push_var_bytes(&state.keyring);
     w.push_var_bytes(&state.profile);
-    w.push_byte(u8::from(state.unconfirmed_join) | u8::from(state.pending.is_some()) << 1);
+    w.push_byte(
+        u8::from(state.unconfirmed_join)
+            | u8::from(state.pending.is_some()) << 1
+            | u8::from(!state.owner.is_empty()) << 2
+            | u8::from(state.owner_key.is_some()) << 3,
+    );
     if let Some(pending) = &state.pending {
         encode_pending(&mut w, pending);
+    }
+    if !state.owner.is_empty() {
+        w.push_var_bytes(&state.owner.encode());
+    }
+    if let Some(key) = &state.owner_key {
+        w.push_bytes(key);
     }
     w.push_uleb128(state.entries.len() as u64);
     for (key, value) in &state.entries {
@@ -218,8 +237,7 @@ fn encode_pending(w: &mut BytesWriter, pending: &SavedPending) {
     match &submit.rotate {
         Some(rotate) => {
             w.push_byte(1);
-            w.push_var_string(&rotate.edit_token);
-            w.push_var_string(&rotate.view_token);
+            push_rotate(w, rotate);
         }
         None => w.push_byte(0),
     }
@@ -230,6 +248,7 @@ fn encode_pending(w: &mut BytesWriter, pending: &SavedPending) {
             w.push_var_bytes(&next.keyring);
             push_opt(w, next.tokens.edit.as_deref().map(str::as_bytes));
             w.push_var_string(&next.tokens.view);
+            w.push_var_bytes(&next.owner.export());
         }
         None => w.push_byte(0),
     }
@@ -243,10 +262,7 @@ fn decode_pending(r: &mut BytesReader<'_>) -> Result<SavedPending, String> {
     let keyring = read_opt(r)?;
     let envelope = read_opt(r)?;
     let rotate = if read_flag(r)? {
-        Some(Rotate {
-            edit_token: r.read_var_string()?,
-            view_token: r.read_var_string()?,
-        })
+        Some(read_rotate(r).map_err(|e| e.to_string())?)
     } else {
         None
     };
@@ -258,10 +274,12 @@ fn decode_pending(r: &mut BytesReader<'_>) -> Result<SavedPending, String> {
             .transpose()
             .map_err(|e| e.to_string())?;
         let view = r.read_var_string()?;
+        let owner = read_owner(r)?;
         Some(SavedNext {
             link,
             keyring,
             tokens: Tokens { edit, view },
+            owner,
         })
     } else {
         None
@@ -279,6 +297,10 @@ fn decode_pending(r: &mut BytesReader<'_>) -> Result<SavedPending, String> {
         next,
         profile,
     })
+}
+
+fn read_owner(r: &mut BytesReader<'_>) -> Result<OwnerSecret, String> {
+    OwnerSecret::import(r.read_var_bytes()?).map_err(|e| format!("owner key: {e}"))
 }
 
 pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
@@ -310,11 +332,22 @@ pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
     let keyring = Zeroizing::new(r.read_var_bytes().map_err(bad)?.to_vec());
     let profile = r.read_var_bytes().map_err(bad)?.to_vec();
     let flags = r.read_byte().map_err(bad)?;
-    if flags & !0b11 != 0 {
+    if flags & !0b1111 != 0 {
         return Err(bad(format!("unknown flags {flags:#04x}")));
     }
     let pending = if flags & 2 != 0 {
         Some(decode_pending(&mut r).map_err(bad)?)
+    } else {
+        None
+    };
+    let owner = if flags & 4 != 0 {
+        OwnerSecrets::decode(r.read_var_bytes().map_err(bad)?)
+            .map_err(|e| bad(format!("owner keys: {e}")))?
+    } else {
+        OwnerSecrets::default()
+    };
+    let owner_key = if flags & 8 != 0 {
+        Some(read_array(&mut r).map_err(bad)?)
     } else {
         None
     };
@@ -331,10 +364,12 @@ pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
     }
     Ok(SavedState {
         group_id,
-        device: Device::from_parts(seed, ikm, id)?,
+        device: LeafKeys::from_parts(seed, ikm, id)?,
         link,
         keyring,
         profile,
+        owner,
+        owner_key,
         unconfirmed_join: flags & 1 != 0,
         pending,
         entries,
@@ -363,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_device_survives_saving() {
-        let device = Device::generate();
+        let device = LeafKeys::generate();
         let copy = device.duplicate();
         assert_eq!(copy.signer_pub(), device.signer_pub());
         assert_eq!(copy.hpke_pub(), device.hpke_pub());
