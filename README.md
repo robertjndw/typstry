@@ -57,7 +57,13 @@ See [SECURITY.md](SECURITY.md) for what the encryption protects and its known li
 
 ## Working locally with git
 
-The `typstry` CLI links a folder to a project, so you can write in your own editor and keep the files in your own git repository. It encrypts on your machine like the browser does. Install it from a checkout with [Rust](https://rustup.rs) 1.94 or newer:
+The `typstry` CLI links a folder to a project, so you can write in your own editor and keep the files in your own git repository. It encrypts on your machine like the browser does. Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the [releases page](https://github.com/robertjndw/typstry/releases). This installs the right one:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh | sh
+```
+
+It puts `typstry` in `~/.local/bin`. `TYPSTRY_VERSION=nightly` gives you the latest `main` build, or pass a release tag to pin one. To build from a checkout instead you need [Rust](https://rustup.rs) 1.94 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli
