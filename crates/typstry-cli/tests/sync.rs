@@ -175,10 +175,9 @@ impl Live {
             dir: dir.to_path_buf(),
             name: Some("Live".into()),
         };
-        let task =
-            tokio::spawn(
-                async move { sync::run_with(&ctx, args, control_rx, Some(notice_tx)).await },
-            );
+        let task = tokio::spawn(async move {
+            sync::run_with(&ctx, args, control_rx, Some(notice_tx), false).await
+        });
         let mut live = Self {
             control,
             notices,

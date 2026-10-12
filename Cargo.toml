@@ -19,6 +19,9 @@ anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+# event-stream for reading keys inside tokio::select!; the version has to
+# match the one ratatui re-exports so both share one terminal backend.
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "7.0.0"
 ed25519-dalek = "3.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
@@ -38,7 +41,13 @@ openmls_basic_credential = "=0.6.0"
 openmls_rust_crypto = "=0.6.0"
 openmls_traits = "=0.6.0"
 tls_codec = { version = "=0.5.0", features = ["derive"] }
+# Test-only: run the binary in a pseudo terminal and read back what it drew.
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+# unstable-rendered-line-info for Paragraph::line_count, which tells the
+# sync log how many rows a wrapped line takes above the status bar.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "scrolling-regions", "unstable-rendered-line-info"] }
 # Only ring is compiled in, so rustls never has to guess a crypto provider
 # and nothing needs the aws-lc C toolchain.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }

@@ -96,6 +96,18 @@ pub struct CatalogEntry {
     pub state: State,
 }
 
+impl CatalogEntry {
+    /// Why the entry cannot be used, for the ones the server no longer
+    /// offers.
+    pub fn unavailable(&self) -> Option<&'static str> {
+        match self.state {
+            State::Removed => Some("you were removed from this project"),
+            State::Gone => Some("the server no longer knows this project"),
+            State::Listed | State::Forgotten => None,
+        }
+    }
+}
+
 static OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Uses `dir` for the rest of the process instead of the environment.

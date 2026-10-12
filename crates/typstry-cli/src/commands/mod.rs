@@ -54,6 +54,12 @@ pub struct Cli {
     /// `git config user.name`.
     #[arg(long, global = true, value_name = "NAME")]
     pub name: Option<String>,
+    /// Print plain lines instead of the interactive views of `list`,
+    /// `clone`, `sync`, `members`, `devices`, `version list` and `pair`,
+    /// and skip the confirmations. They are plain anyway when not run in
+    /// a terminal.
+    #[arg(long, global = true, env = "TYPSTRY_PLAIN", value_parser = clap::builder::FalseyValueParser::new())]
+    pub plain: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -157,6 +163,7 @@ pub async fn connected<T>(
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    crate::term::set_plain(cli.plain);
     let ctx = Ctx {
         dir: cli.cwd.unwrap_or_else(|| PathBuf::from(".")),
         name: cli.name,
@@ -176,7 +183,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Share(args) => Box::pin(share::run(&ctx, args)).await,
         Command::Open(args) => open::run(&ctx, args),
         Command::Pair(args) => Box::pin(pair::run(&ctx, args)).await,
-        Command::List(args) => Box::pin(list::run(args)).await,
+        Command::List(args) => Box::pin(list::run(&ctx, args)).await,
         Command::Devices(args) => Box::pin(devices::run(&ctx, args)).await,
         Command::Info(args) => Box::pin(info::run(&ctx, args)).await,
         Command::Version(args) => Box::pin(version::run(&ctx, args)).await,
@@ -273,8 +280,11 @@ pub enum Line {
 }
 
 impl Line {
-    pub fn print(&self) {
-        match self {
+    pub fn print(self) {
+        let Err(line) = crate::term::send(self) else {
+            return;
+        };
+        match line {
             Self::Stdout(text) => println!("{text}"),
             Self::Stderr(text) => eprintln!("{text}"),
         }

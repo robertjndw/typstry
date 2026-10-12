@@ -369,6 +369,15 @@ pub(super) fn confirm(question: &str) -> anyhow::Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
+/// [`confirm`] for a destructive step, unless `--yes` was passed. Plain
+/// mode never asks, so scripts keep working without --yes.
+pub(super) fn confirmed(yes: bool, question: &str) -> anyhow::Result<bool> {
+    if yes || !crate::term::interactive() {
+        return Ok(true);
+    }
+    confirm(question)
+}
+
 async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Result<Session> {
     let local = crate::user::load_or_create_identity()?;
     let identity = Identity::resolve(ctx.name.as_deref(), None, local.graph.profile(), root);

@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
 
@@ -35,7 +35,19 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         "Opening the {} link in the browser",
         if args.view { "view" } else { "edit" }
     );
-    let mut command = opener(&url);
+    launch(&url, false)
+}
+
+/// Opens `url` in the browser without printing it. `quiet` keeps the
+/// opener off the terminal, for interactive views it would scribble over.
+pub fn launch(url: &str, quiet: bool) -> anyhow::Result<()> {
+    let mut command = opener(url);
+    if quiet {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
     let status = command
         .status()
         .with_context(|| format!("cannot run {:?}", command.get_program()))?;
@@ -46,6 +58,17 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// [`launch`] off the async runtime, for interactive views: the opener
+/// may wait for the browser to exit, which must not freeze the view. A
+/// failure is printed, so a capturing view shows it.
+pub fn launch_in_background(url: String) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = launch(&url, true) {
+            say_err!("Cannot open the browser: {err:#}");
+        }
+    });
 }
 
 fn opener(url: &str) -> Command {

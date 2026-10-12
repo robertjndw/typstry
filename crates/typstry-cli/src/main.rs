@@ -2,6 +2,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use typstry_cli::commands::{self, Cli};
 use typstry_cli::engine::Conflicts;
+use typstry_cli::term::LogWriter;
 
 #[tokio::main]
 async fn main() {
@@ -14,7 +15,7 @@ async fn main() {
         .add_directive("tokio_tungstenite=info".parse().expect("valid directive"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(LogWriter::default)
         .init();
 
     if let Err(err) = commands::run(Cli::parse()).await {

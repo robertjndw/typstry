@@ -110,7 +110,7 @@ impl Live {
         if elsewhere {
             pause.left_branch = true;
             if pause.shown.as_deref() != Some(line.as_str()) {
-                println!("{line}");
+                say!("{line}");
                 pause.shown = Some(line);
             }
             // Edits made before the switch that were still waiting belong
@@ -118,7 +118,7 @@ impl Live {
             // return looks at.
             self.local.clear();
         } else if pause.shown.is_none() && now >= pause.since + ANNOUNCE_BUSY_AFTER {
-            println!("{line}");
+            say!("{line}");
             pause.shown = Some(line);
         }
         if fresh {
@@ -128,7 +128,7 @@ impl Live {
 
     pub(super) async fn resume(&mut self, pause: Pause) {
         if pause.shown.is_some() {
-            println!("sync: resumed");
+            say!("sync: resumed");
         }
         self.notify(Notice::Resumed);
         if pause.left_branch {
@@ -158,15 +158,16 @@ impl Live {
             Ok(status) if status.local.is_empty() => {}
             Ok(status) => {
                 self.hold(status.local.len());
-                println!(
+                say!(
                     "sync: {} file(s) differ from the last sync after a branch switch or reset; holding back outgoing changes:",
                     status.local.len()
                 );
                 for (path, kind) in &status.local {
-                    println!("  {} {path}", kind.symbol());
+                    say!("  {} {path}", kind.symbol());
                 }
-                println!(
-                    "sync: review them, then type `push` and Enter here to publish (or stop sync and run typstry push --force)"
+                say!(
+                    "sync: review them, then {} here to publish (or stop sync and run typstry push --force)",
+                    self.publish_hint
                 );
             }
             Err(err) => {
@@ -175,8 +176,9 @@ impl Live {
                     _ => 0,
                 };
                 self.hold(count);
-                eprintln!(
-                    "sync: cannot compare the folder with the last sync ({err:#}); holding back outgoing changes until you type `push`"
+                say_err!(
+                    "sync: cannot compare the folder with the last sync ({err:#}); holding back outgoing changes until you {}",
+                    self.publish_hint
                 );
             }
         }
@@ -188,7 +190,7 @@ impl Live {
         self.outbound = Outbound::Holding { count };
         let marker = self.hold_marker();
         if let Err(err) = std::fs::write(&marker, b"") {
-            eprintln!("warning: cannot write {}: {err}", marker.display());
+            say_err!("warning: cannot write {}: {err}", marker.display());
         }
         self.notify(Notice::Holding);
     }
@@ -197,21 +199,21 @@ impl Live {
         self.outbound = Outbound::Open;
         self.blocked = None;
         if let Err(err) = remove_if_exists(&self.hold_marker()) {
-            eprintln!("warning: {err:#}");
+            say_err!("warning: {err:#}");
         }
         self.notify(Notice::Released);
     }
 
     pub(super) fn publish(&mut self) {
         if !self.holding() {
-            println!("sync: nothing is held back");
+            say!("sync: nothing is held back");
             return;
         }
         if self.pause.is_some() {
-            println!("sync: paused; publish once the tracked branch is checked out again");
+            say!("sync: paused; publish once the tracked branch is checked out again");
             return;
         }
-        println!("sync: publishing held changes");
+        say!("sync: publishing held changes");
         self.release();
         self.outbound = Outbound::Published;
         self.local.rescan_now();
@@ -223,15 +225,16 @@ impl Live {
     pub(super) async fn recheck_hold(&mut self) {
         match self.session.status(&Scope::Full).await {
             Ok(status) if status.local.is_empty() => {
-                println!("sync: the folder matches the last sync again; resuming outgoing changes");
+                say!("sync: the folder matches the last sync again; resuming outgoing changes");
                 self.release();
             }
             Ok(status) => {
                 let count = status.local.len();
                 if self.outbound != (Outbound::Holding { count }) {
                     self.outbound = Outbound::Holding { count };
-                    println!(
-                        "sync: holding back {count} changed file(s); type `push` and Enter to publish"
+                    say!(
+                        "sync: holding back {count} changed file(s); {} to publish",
+                        self.publish_hint
                     );
                 }
             }

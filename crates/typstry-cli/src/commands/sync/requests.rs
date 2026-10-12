@@ -26,7 +26,7 @@ impl Live {
             Err(err) => {
                 let line = format!("{err:#}");
                 if self.warned.insert(line.clone()) {
-                    eprintln!("sync: cannot read requests from other commands: {line}");
+                    say_err!("sync: cannot read requests from other commands: {line}");
                 }
                 return;
             }

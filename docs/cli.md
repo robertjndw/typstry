@@ -73,6 +73,21 @@ Without the live mode, the same day is `typstry pull`, edit, then `typstry push`
 
 Every command takes `-C <dir>` to run as if started in another folder, and `--name <name>` to set the author name shown in the project history (defaults to `git config user.name`). `typstry <command> --help` shows all options.
 
+## In a terminal
+
+When run in a terminal, a few commands become interactive:
+
+- **`list`** opens a project picker. Move with the arrow keys or `j`/`k`, filter with `/`, show only projects without a folder here with `m`. `Enter` starts `sync` for a project you have here or clones one you don't, `o` opens it in the browser, `?` shows all keys and `q` quits.
+- **`clone`** without a link opens the same picker, showing only the projects without a folder here.
+- **`sync`** keeps the log of `↑`/`↓` lines and pins a status bar below it: connection state, files sent and received, and when the last change went through. `p` publishes held changes, `o` opens the project in the browser, `l` prints the links and `q` or Ctrl+C stops.
+- **`members`** shows the people and devices as a list. On the project owner's folder, `d` removes the selected device, or all devices of the selected person, after the confirmation below. Elsewhere the list is read-only.
+- **`devices`** shows your devices as a list. `r` revokes the selected one after the confirmation below. This device cannot be selected, since it cannot revoke itself.
+- **`version list`** shows the named versions as a list. `e` or `Enter` exports the selected one to a new folder (you can edit the suggested name next to the project), and `n` saves the current state as a new version.
+- **`pair`** without a code counts down until the code expires. On the new device, it opens the clone picker right after pairing so you can copy a project straight away (`q` skips it).
+- **Confirmations.** `members remove`, `devices revoke` (for a device that is still valid) and `share reset` ask `[y/N]` first, because they replace the project's links or cut a device off. Pass `-y`/`--yes` to skip the question. In plain mode they never ask, so existing scripts keep working.
+
+In a pipe, a script or a terminal with `TERM=dumb`, every command prints plain lines as before. Pass `--plain` (or set `TYPSTRY_PLAIN=1`) to get plain lines in a terminal too.
+
 ## Environment variables
 
 | Variable             | Used for                                                                                                                              |
@@ -81,12 +96,13 @@ Every command takes `-C <dir>` to run as if started in another folder, and `--na
 | `TYPSTRY_SERVER`     | The server for `init` when `--server` is left out                                                                                     |
 | `TYPSTRY_BROWSER`    | The program `open` starts instead of the system default browser                                                                       |
 | `TYPSTRY_LOG`        | Log filter in `RUST_LOG` syntax, `warn` by default                                                                                    |
+| `TYPSTRY_PLAIN`      | Set to `1` for the same effect as `--plain`                                                                                           |
 | `TYPSTRY_CONFIG_DIR` | Where the device key, the person graph, the owner keys and the list of project folders live, instead of the platform config directory |
 
 ## Things to know
 
 - **The tracked branch.** typstry syncs on one git branch, the one checked out when the folder was first linked. On any other branch, or while git is merging or rebasing, `sync` pauses and `pull`/`push` refuse unless you pass `--force`.
-- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then publish by typing `push` in the sync terminal, running `typstry push --force`, or starting `sync` with `--publish`. Committing on the tracked branch before switching avoids this.
+- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then publish by pressing `p` in the sync terminal (typing `push` and Enter with `--plain`), running `typstry push --force`, or starting `sync` with `--publish`. Committing on the tracked branch before switching avoids this.
 - **Commands next to `sync`.** While `sync` runs, `status`, `info`, `version list`, `version save` and `push` in the same folder ask it instead of failing. `version save` and `push` publish what is on disk right away, so a version saved just after a save includes it. Both refuse while `sync` is paused, and need `--force` while it holds back changes after a branch switch, like the one-shot versions. `pull` only says that `sync` already pulls. `track` and `export` refuse to start until `sync` is stopped.
 - **The key lives in `.typstry/`.** That folder holds the link, the owner keys of a project you own and a local cache. It ignores itself with its own `.gitignore` and is also added to `.git/info/exclude`. Never commit it. To keep the link out of your shell history, pass it on standard input (`pbpaste | typstry clone - thesis`) or in `TYPSTRY_LINK`.
 - **Ignored files.** `.gitignore` and an optional `.typstryignore` decide which files are synced, so build output such as PDFs stays local. git's own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`) and `.typstryignore` itself are not synced either; re-include one with a negated pattern in `.typstryignore`, such as `!.gitignore`. An ignored file is never written to the folder, and removing or editing it locally never changes the project. A file the project gets from someone else never replaces a local file that is not synced, or one whose name only differs in case on macOS and Windows.

@@ -15,6 +15,9 @@ use typstry_wire::mls::{
 };
 use typstry_wire::pairing::GrantedSpace;
 
+use ratatui::text::Line as Row;
+
+use super::init::confirmed;
 use super::members::publish_rotation;
 use super::{Ctx, Line, MIN_PREFIX, Output, print_warnings, unique};
 use crate::api::Api;
@@ -24,6 +27,8 @@ use crate::link::ShareLink;
 use crate::mls::{profile_bytes, profile_identity};
 use crate::space::{drop_revoked, ensure_space, join_space, sync_bound, sync_server};
 use crate::state::{Config, StateDir};
+use crate::term;
+use crate::tui::chooser::{Item, Key, choose};
 use crate::user::{
     catalog, catalog_with_forgotten, config_dir, device_key_path, device_labels,
     ensure_valid_device, load_identity, load_or_create_device, merge_graph, owner_keys,
@@ -59,6 +64,10 @@ pub enum Action {
         // Fingerprints are base64url, so one starts with '-' now and then.
         #[arg(allow_hyphen_values = true)]
         device: String,
+        /// Do not ask for confirmation. In a terminal you are asked before
+        /// a device that is still valid is revoked.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Make a recovery key: 17 words that let you take your account back
     /// after losing every device.
@@ -107,10 +116,11 @@ const SPREAD_CONCURRENCY: usize = 4;
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     match args.action {
+        None if term::interactive() => choose_device(ctx).await,
         None => list(),
-        Some(Action::Revoke { device }) => {
+        Some(Action::Revoke { device, yes }) => {
             sync_bound().await;
-            revoke(ctx, &device).await
+            revoke(ctx, &device, yes).await
         }
         Some(Action::Recovery) => recovery(ctx).await,
         Some(Action::Recover {
@@ -168,6 +178,54 @@ fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The interactive `typstry devices`: pick a device to revoke. This device
+/// is shown but cannot be picked, since it cannot revoke itself.
+async fn choose_device(ctx: &Ctx) -> anyhow::Result<()> {
+    let Some(identity) = load_identity()? else {
+        return list();
+    };
+    let labels = device_labels()?;
+    let own = identity.device.public();
+    let items: Vec<_> = identity
+        .graph
+        .devices()
+        .iter()
+        .map(|d| {
+            let name = name_of(&labels, &d.device);
+            let revoked = d.state == DeviceState::Revoked;
+            let this = d.device == own;
+            let mut line = format!("{name}  {}", if revoked { "revoked" } else { "valid" });
+            if d.recovery {
+                line.push_str("  (recovery key)");
+            }
+            if this {
+                line.push_str("  (this device)");
+            }
+            Item {
+                line: Row::from(line),
+                detail: Some(Row::from(format!("  {}", device_fingerprint(&d.device)))),
+                value: (!this).then(|| device_fingerprint(&d.device)),
+            }
+        })
+        .collect();
+    let keys = [Key {
+        key: 'r',
+        label: "revoke",
+    }];
+    let title = format!(
+        "typstry devices (person {})",
+        person_fingerprint(&identity.graph.id())
+    );
+    let note = "This device cannot revoke itself; do it from another one of yours".to_owned();
+    match choose(&title, items, &keys, Some(note)).await? {
+        Some((_, fingerprint)) => {
+            sync_bound().await;
+            revoke(ctx, &fingerprint, false).await
+        }
+        None => Ok(()),
+    }
+}
+
 /// The name this machine gave the device, else its fingerprint.
 fn name_of(labels: &std::collections::BTreeMap<PublicKey, String>, key: &PublicKey) -> String {
     labels
@@ -209,7 +267,7 @@ fn find(graph: &PersonGraph, query: &str) -> anyhow::Result<PublicKey> {
     bail!("no device matches {query:?}; see `typstry devices`")
 }
 
-async fn revoke(ctx: &Ctx, query: &str) -> anyhow::Result<()> {
+async fn revoke(ctx: &Ctx, query: &str, yes: bool) -> anyhow::Result<()> {
     let mut identity = load_identity()?
         .context("this machine is not a person yet, so there are no devices to revoke")?;
     let target = find(&identity.graph, query)?;
@@ -222,6 +280,17 @@ async fn revoke(ctx: &Ctx, query: &str) -> anyhow::Result<()> {
     if identity.graph.device_state(&target) == DeviceState::Revoked {
         out.out(format!("{name} is already revoked; finishing the cleanup."));
     } else {
+        // An already revoked device has nothing left to confirm.
+        if !confirmed(
+            yes,
+            &format!(
+                "Revoke {name}? It is removed from the projects this device can reach, \
+                 and their links are replaced."
+            ),
+        )? {
+            out.out("Nothing revoked.");
+            return Ok(());
+        }
         identity
             .graph
             .append(&identity.device, EntryKind::RevokeDevice { device: target })

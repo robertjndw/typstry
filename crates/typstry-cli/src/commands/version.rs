@@ -6,12 +6,15 @@ use typstry_doc::versions::{
     NamedVersion, named_versions, normalize_version_name, save_version, tag_at,
 };
 
+use super::export;
 use super::{
     Ctx, Fetch, Output, connected, guard_branch, guard_switch, print_report, print_warnings,
 };
 use crate::engine::{Flush, Mode, Report, Scope, Session, set_peer_info};
 use crate::mailbox::Request;
 use crate::state::now_ms;
+use crate::term;
+use crate::tui::versions::{self, Outcome};
 
 /// List or save named versions of the project.
 ///
@@ -26,6 +29,10 @@ pub struct Args {
 #[derive(Debug, clap::Subcommand)]
 pub enum VersionCommand {
     /// Named versions, newest first.
+    ///
+    /// In a terminal this opens an interactive view: e or enter exports
+    /// the selected version, n saves the current state as a new one. Use
+    /// --plain for the plain listing.
     List {
         #[command(flatten)]
         fetch: Fetch,
@@ -57,25 +64,51 @@ async fn list(ctx: &Ctx, fetch: &Fetch) -> anyhow::Result<()> {
     let Some((session, mut out)) = ctx.open_current(Request::VersionList, fetch).await? else {
         return Ok(());
     };
-    print_versions(session.doc(), &mut out);
-    Ok(())
+    if !term::interactive() {
+        print_versions(session.doc(), &mut out);
+        return Ok(());
+    }
+    // Use the root rather than ctx.dir. From a subfolder, `../<name>` would
+    // point back inside the project and export would refuse it.
+    let root = session.root().to_owned();
+    let project = root.file_name().map_or_else(
+        || "project".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let rows = versions::rows(session.doc());
+    let can_write = session.can_write();
+    // The follow-up commands open the folder themselves, and a second
+    // session would meet the first one's lock.
+    drop(session);
+    match versions::choose(rows, can_write, &root, project).await? {
+        Outcome::Quit => Ok(()),
+        Outcome::Save(name) => save(ctx, &name, false).await,
+        Outcome::Export { index, dir } => {
+            let args = export::Args {
+                at: Some(format!("#{index}")),
+                fetch: Fetch {
+                    offline: fetch.offline,
+                },
+                // The view offers the folder relative to the root; an
+                // absolute one typed in replaces it in the join.
+                dir: root.join(dir),
+            };
+            export::run(ctx, args).await
+        }
+    }
 }
 
 /// Named versions, newest first.
 pub fn print_versions(doc: &LoroDoc, out: &mut Output) {
-    let mut versions = named_versions(doc);
-    if versions.is_empty() {
+    let rows = versions::rows(doc);
+    if rows.is_empty() {
         out.out("No named versions yet; save one with typstry version save <name>.");
         return;
     }
-    versions.sort_by_key(|v| std::cmp::Reverse((v.created_at, v.index)));
-    for version in &versions {
+    for row in rows {
         out.out(format!(
             "#{:<3} {}  {}  ({})",
-            version.index,
-            format_ms(version.created_at),
-            version.name,
-            author_name(doc, &version.author)
+            row.index, row.date, row.name, row.author
         ));
     }
 }
