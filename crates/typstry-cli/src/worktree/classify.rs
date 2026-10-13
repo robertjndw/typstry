@@ -70,30 +70,69 @@ pub fn mime_for(path: &str) -> &'static str {
     }
 }
 
-/// Paths that only differ in case, which a case-insensitive file system
-/// stores as one file. One path of each group is kept: the first one
-/// `prefer` accepts, else the first in sorted order. Returns `(kept,
-/// dropped)` pairs.
+/// Paths that a case-insensitive file system stores as one file, because
+/// they, or one of the folders on their way, differ only in case. With
+/// `Fig/a.png` and `fig/b.png` both end up in one folder, so only one
+/// spelling of each name is kept: the first one `prefer` accepts, else the
+/// first in sorted order. Returns `(kept, dropped)` pairs, where `kept` is
+/// the kept file, or the kept folder with a trailing `/` when the clash is
+/// in a folder name.
 pub fn case_clashes<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     prefer: impl Fn(&str) -> bool,
 ) -> Vec<(String, String)> {
-    let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-    for path in paths {
-        groups.entry(path.to_lowercase()).or_default().insert(path);
-    }
+    let mut alive: BTreeSet<&str> = paths.into_iter().collect();
+    let depth = alive
+        .iter()
+        .map(|p| p.split('/').count())
+        .max()
+        .unwrap_or(0);
     let mut clashes = Vec::new();
-    for group in groups.values().filter(|g| g.len() > 1) {
-        let kept = group
-            .iter()
-            .find(|p| prefer(p))
-            .or_else(|| group.first())
-            .expect("groups are not empty");
-        for path in group.iter().filter(|p| *p != kept) {
-            clashes.push(((*kept).to_owned(), (*path).to_owned()));
+    // Shallowest first, so a path under a dropped folder spelling is
+    // reported once, for the folder.
+    for level in 1..=depth {
+        let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+        for path in &alive {
+            if let Some(prefix) = prefix(path, level) {
+                groups
+                    .entry(prefix.to_lowercase())
+                    .or_default()
+                    .insert(prefix);
+            }
+        }
+        let mut dropped = Vec::new();
+        for group in groups.values().filter(|g| g.len() > 1) {
+            let kept = *group
+                .iter()
+                .find(|p| prefer(p))
+                .or_else(|| group.first())
+                .expect("groups are not empty");
+            let shown = if alive.contains(kept) {
+                kept.to_owned()
+            } else {
+                format!("{kept}/")
+            };
+            for path in &alive {
+                if prefix(path, level).is_some_and(|p| p != kept && group.contains(p)) {
+                    clashes.push((shown.clone(), (*path).to_owned()));
+                    dropped.push(*path);
+                }
+            }
+        }
+        for path in dropped {
+            alive.remove(path);
         }
     }
     clashes
+}
+
+/// The first `level` segments of `path`, or None when it has fewer.
+fn prefix(path: &str, level: usize) -> Option<&str> {
+    let mut slashes = path.match_indices('/').map(|(i, _)| i);
+    match slashes.nth(level - 1) {
+        Some(end) => Some(&path[..end]),
+        None => (path.split('/').count() == level).then_some(path),
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +160,34 @@ mod tests {
             case_clashes(["b.typ", "main.typ", "Main.typ"], |p| p == "main.typ"),
             [("main.typ".to_owned(), "Main.typ".to_owned())]
         );
+    }
+
+    #[test]
+    fn finds_case_clashes_in_folder_names() {
+        let pairs = |kept: &str, dropped: &str| (kept.to_owned(), dropped.to_owned());
+        assert_eq!(
+            case_clashes(["Fig/a.png", "fig/b.png", "fig/c.png", "main.typ"], |_| {
+                false
+            }),
+            [pairs("Fig/", "fig/b.png"), pairs("Fig/", "fig/c.png")]
+        );
+        // The spelling already on disk wins, also for folders.
+        assert_eq!(
+            case_clashes(["Fig/a.png", "fig/b.png"], |p| p == "fig"),
+            [pairs("fig/", "Fig/a.png")]
+        );
+        assert_eq!(
+            case_clashes(["a/Fig/x.png", "a/fig/x.png", "a/fig/y.png"], |_| false),
+            [
+                pairs("a/Fig/", "a/fig/x.png"),
+                pairs("a/Fig/", "a/fig/y.png")
+            ]
+        );
+        // A file and a folder of the same name clash too.
+        assert_eq!(
+            case_clashes(["fig", "Fig/a.png"], |_| false),
+            [pairs("Fig/", "fig")]
+        );
+        assert!(case_clashes(["a/x.typ", "b/x.typ"], |_| false).is_empty());
     }
 }

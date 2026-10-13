@@ -7,6 +7,7 @@ use anyhow::{Context, bail};
 use typstry_doc::init::{DEFAULT_MAIN_FILE, init_bare_project, set_main_file, starter_content};
 use typstry_doc::names::validate_path;
 use typstry_doc::paths::build_path_index;
+use typstry_doc::{MAX_TITLE_CHARS, normalize_title};
 
 use super::{
     Ctx, Output, link::print_links, print_not_applied, print_report_warnings, print_warnings,
@@ -42,7 +43,7 @@ const REPO_CLUTTER: &[&str] = &[
 /// own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`)
 /// and `.typstryignore` stay local unless `.typstryignore` re-includes
 /// them with a `!pattern`. Works in a git repository or a subfolder of
-/// one, which keeps working with git as before.
+/// one, and git keeps working as before.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// The folder to share; defaults to the current one.
@@ -109,17 +110,24 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         println!("Dry run: nothing was uploaded.");
         return Ok(());
     };
-    if !args.yes && !confirm(&format!("Create the project on {server} and upload it?"))? {
+    if !args.yes
+        && !confirm(
+            &format!("Create the project on {server} and upload it?"),
+            "not asking for confirmation without a terminal; check the preview and pass --yes",
+        )?
+    {
         bail!("cancelled; nothing was uploaded");
     }
 
-    if !plan.root.exists() {
+    let created_root = !plan.root.exists();
+    if created_root {
         fs::create_dir_all(&plan.root)
             .with_context(|| format!("creating {}", plan.root.display()))?;
     }
     let root = plan.root.canonicalize()?;
     let starter_path = root.join(DEFAULT_MAIN_FILE);
-    match create(ctx, &plan, &root, &server).await {
+    let mut uploaded = false;
+    match create(ctx, &plan, &root, &server, &mut uploaded).await {
         Ok(session) => {
             println!(
                 "Created {:?} with {} file(s).",
@@ -130,13 +138,30 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             sync_server(&session.config.server).await;
             Ok(())
         }
+        // The project is on the server with everyone's files, and
+        // `.typstry/` holds its only key. Removing it would orphan the
+        // project, so the folder stays linked and only the rest is retried.
+        Err(err) if uploaded => {
+            eprintln!(
+                "The project was created and uploaded, and this folder is linked to it, but \
+                 finishing the setup failed (below). Run `typstry sync` to carry on, \
+                 `typstry track <branch>` if `typstry info` shows no tracked branch, and \
+                 `typstry link` for the links. Don't run init again: it would create a \
+                 second project."
+            );
+            Err(err)
+        }
         Err(err) => {
             // Leaves the folder as it was, so init can simply run again. The
             // project created on the server stays behind, unreachable
             // without the key that is gone now.
-            let _ = fs::remove_dir_all(root.join(STATE_DIR));
-            if plan.starter {
-                let _ = fs::remove_file(&starter_path);
+            if created_root {
+                let _ = fs::remove_dir_all(&root);
+            } else {
+                let _ = fs::remove_dir_all(root.join(STATE_DIR));
+                if plan.starter {
+                    let _ = fs::remove_file(&starter_path);
+                }
             }
             Err(err)
         }
@@ -168,17 +193,17 @@ fn plan(root: &Path, args: &Args) -> anyhow::Result<Plan> {
         );
     }
 
-    let title = match &args.title {
-        Some(title) => title.trim().to_owned(),
+    let raw_title = match &args.title {
+        Some(title) => title.as_str(),
         None => root
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("untitled")
-            .to_owned(),
+            .unwrap_or("untitled"),
     };
-    if title.is_empty() {
-        bail!("the title must not be empty");
-    }
+    let Some(title) = normalize_title(raw_title) else {
+        bail!("the title must be 1 to {MAX_TITLE_CHARS} characters");
+    };
+    let title = title.to_owned();
 
     let worktree = Worktree::new(root.clone());
     let scan = if root.exists() {
@@ -287,6 +312,9 @@ fn print_preview(plan: &Plan, server: Option<&str>) {
             plan.files.len() - text,
             human_size(size)
         );
+        for line in listing(plan.files.iter().map(|(p, _)| p.as_str()), PREVIEW_FILES) {
+            println!("    {}", crate::term::printable(&line));
+        }
     }
     match &plan.main {
         Some(main) => println!("  main:    {main}"),
@@ -300,7 +328,7 @@ fn print_preview(plan: &Plan, server: Option<&str>) {
     if !plan.skipped.is_empty() {
         println!("Skipped:");
         for skipped in &plan.skipped {
-            println!("  {skipped}");
+            println!("  {}", crate::term::without_bidi(&skipped.to_string()));
         }
     }
     if let Some(dirty) = plan.repo.as_ref().and_then(|_| dirty_count(&plan.root))
@@ -317,6 +345,20 @@ fn print_preview(plan: &Plan, server: Option<&str>) {
             clutter.join(", ")
         );
     }
+}
+
+/// How many paths the preview lists before it only counts the rest. Enough
+/// to spot a stray folder, few enough to keep the question on screen.
+const PREVIEW_FILES: usize = 30;
+
+/// The first `limit` paths, then how many more there are.
+fn listing<'a>(paths: impl ExactSizeIterator<Item = &'a str>, limit: usize) -> Vec<String> {
+    let total = paths.len();
+    let mut lines: Vec<String> = paths.take(limit).map(str::to_owned).collect();
+    if total > limit {
+        lines.push(format!("... and {} more", total - limit));
+    }
+    lines
 }
 
 /// Top-level entries that look like repository housekeeping.
@@ -358,27 +400,43 @@ fn dirty_count(dir: &Path) -> Option<usize> {
     .map(|out| out.lines().count())
 }
 
-pub(super) fn confirm(question: &str) -> anyhow::Result<bool> {
+/// Asks `question` on the terminal, or fails with `no_terminal` when
+/// standard input is not one, since then nobody can answer. The question
+/// goes to stderr, so it is seen even when stdout is piped somewhere.
+pub(super) fn confirm(question: &str, no_terminal: &str) -> anyhow::Result<bool> {
     if !std::io::stdin().is_terminal() {
-        bail!("not asking for confirmation without a terminal; check the preview and pass --yes");
+        bail!("{no_terminal}");
     }
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 /// [`confirm`] for a destructive step, unless `--yes` was passed. Plain
-/// mode never asks, so scripts keep working without --yes.
+/// mode and redirected output still ask: only a terminal on stdin can
+/// answer, and without one the step needs `--yes` rather than going ahead
+/// unasked.
 pub(super) fn confirmed(yes: bool, question: &str) -> anyhow::Result<bool> {
-    if yes || !crate::term::interactive() {
+    if yes {
         return Ok(true);
     }
-    confirm(question)
+    confirm(
+        question,
+        "not asking for confirmation without a terminal; pass --yes to go ahead",
+    )
 }
 
-async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Result<Session> {
+/// Sets `uploaded` once the files are on the server, from where on a
+/// failure must not throw the key away.
+async fn create(
+    ctx: &Ctx,
+    plan: &Plan,
+    root: &Path,
+    server: &str,
+    uploaded: &mut bool,
+) -> anyhow::Result<Session> {
     let local = crate::user::load_or_create_identity()?;
     let identity = Identity::resolve(ctx.name.as_deref(), None, local.graph.profile(), root);
     let Created {
@@ -423,7 +481,8 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
         .reconcile(&Scope::Paths(paths), Mode::Push, Flush::Now)
         .await?;
     let mut out = Output::terminal();
-    // The preview already listed what goes up, so only what did not.
+    // The preview already listed what goes up (or the first of it), so
+    // only what did not.
     print_not_applied(&mut out, &report.applied, "uploading");
     print_report_warnings(&mut out, &report);
     if let Some(main) = &plan.main {
@@ -438,6 +497,7 @@ async fn create(ctx: &Ctx, plan: &Plan, root: &Path, server: &str) -> anyhow::Re
     // Taken before sending, which may import someone else's ops.
     session.set_base_to_doc();
     session.push_local().await?;
+    *uploaded = true;
     session.disconnect().await;
     session.remember_project();
     print_warnings(&mut out, &mut session);
@@ -502,6 +562,17 @@ mod tests {
                 ".gitignore",
             ]),
             [".gitlab/", "LICENSE", "README.md", "readme.txt"]
+        );
+    }
+
+    #[test]
+    fn lists_the_first_files_and_counts_the_rest() {
+        let paths = ["a.typ", "b.typ", "c.png"];
+        assert_eq!(listing(paths.into_iter(), 5), ["a.typ", "b.typ", "c.png"]);
+        assert_eq!(listing(paths.into_iter(), 3), ["a.typ", "b.typ", "c.png"]);
+        assert_eq!(
+            listing(paths.into_iter(), 2),
+            ["a.typ", "b.typ", "... and 1 more"]
         );
     }
 

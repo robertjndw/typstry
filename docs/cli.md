@@ -4,7 +4,15 @@ The `typstry` CLI links a folder to a project. It encrypts and decrypts on your 
 
 [Devices and accounts](devices-and-accounts.md) explains pairing, the project list and recovery keys, and [Members and owners](members-and-owners.md) explains removing members.
 
-The CLI isn't part of the Docker image. Install it from a checkout with [Rust](https://rustup.rs) 1.94 or newer:
+The CLI isn't part of the Docker image. Install a prebuilt binary for macOS or Linux with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh | sh
+```
+
+For the latest build of `main` instead of the latest release, set the version for `sh`: `curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh | TYPSTRY_VERSION=nightly sh`. `typstry --version` names the commit of a nightly build.
+
+To build it from source, use a checkout and [Rust](https://rustup.rs) 1.99 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli
@@ -48,7 +56,7 @@ typstry version save "sent to supervisor"
 git tag sent-to-supervisor
 ```
 
-Without the live mode, the same day is `typstry pull`, edit, then `typstry push`. `pull` leaves files that changed on both sides alone and lists them. `push` merges your changes with anything edited in the meantime and lists files changed on both sides so you can review them with `git diff`.
+Without the live mode, the same day is `typstry pull`, edit, then `typstry push`. `pull` leaves files that changed on both sides alone, lists them and exits with status 1. `push` merges your changes with anything edited in the meantime and lists files changed on both sides so you can review them with `git diff`.
 
 ## Commands
 
@@ -80,30 +88,35 @@ When run in a terminal, a few commands become interactive:
 - **`list`** opens a project picker. Move with the arrow keys or `j`/`k`, filter with `/`, show only projects without a folder here with `m`. `Enter` starts `sync` for a project you have here or clones one you don't, `o` opens it in the browser, `?` shows all keys and `q` quits.
 - **`clone`** without a link opens the same picker, showing only the projects without a folder here.
 - **`sync`** keeps the log of `↑`/`↓` lines and pins a status bar below it: connection state, files sent and received, and when the last change went through. `p` publishes held changes, `o` opens the project in the browser, `l` prints the links and `q` or Ctrl+C stops.
-- **`members`** shows the people and devices as a list. On the project owner's folder, `d` removes the selected device, or all devices of the selected person, after the confirmation below. Elsewhere the list is read-only.
-- **`devices`** shows your devices as a list. `r` revokes the selected one after the confirmation below. This device cannot be selected, since it cannot revoke itself.
-- **`version list`** shows the named versions as a list. `e` or `Enter` exports the selected one to a new folder (you can edit the suggested name next to the project), and `n` saves the current state as a new version.
+- **`members`** shows the people and devices as a list. On the project owner's folder, `d` removes the selected device, or all devices of the selected person, after the confirmation below. Elsewhere the list is read-only. `Enter` does nothing here, so a habitual keystroke never removes anyone.
+- **`devices`** shows your devices as a list. `r` revokes the selected one after the confirmation below. This device cannot be selected, since it cannot revoke itself. As in `members`, `Enter` does nothing.
+- **`version list`** shows the named versions as a list. `e` or `Enter` exports the selected one to a new folder (you can edit the suggested name next to the project), and `n` saves the current state as a new version. While `sync` runs in the folder, `sync` answers instead and the versions are printed as plain lines, without these keys.
 - **`pair`** without a code counts down until the code expires. On the new device, it opens the clone picker right after pairing so you can copy a project straight away (`q` skips it).
-- **Confirmations.** `members remove`, `devices revoke` (for a device that is still valid) and `share reset` ask `[y/N]` first, because they replace the project's links or cut a device off. Pass `-y`/`--yes` to skip the question. In plain mode they never ask, so existing scripts keep working.
+- **Confirmations.** `members remove`, `devices revoke` (for a device that is still valid) and `share reset` ask `[y/N]` first, because they replace the project's links or cut a device off. They ask whenever standard input is a terminal, also in plain mode or with the output redirected (the question goes to stderr). Without a terminal to answer on they refuse to run unless you pass `-y`/`--yes`, which also skips the question in a terminal.
+- **Ctrl+Z** suspends the interactive views and `sync` like any other program on macOS and Linux, and `fg` brings them back. While suspended, `sync` does not sync.
 
 In a pipe, a script or a terminal with `TERM=dumb`, every command prints plain lines as before. Pass `--plain` (or set `TYPSTRY_PLAIN=1`) to get plain lines in a terminal too.
+
+## Exit status
+
+A command exits with status 0 when it did what was asked and 1 otherwise. Answering no to a question (`init`, `members remove`, `devices revoke`, `share reset`, `pair`) counts as not done and exits with 1, as does `pull` when files changed on both sides. `devices revoke` and `devices recovery` exit with 1 after their summary when a project could not be reached, so a script notices the cleanup is incomplete; run them again once it can be.
 
 ## Environment variables
 
 | Variable             | Used for                                                                                                                              |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `TYPSTRY_LINK`       | The share link for `clone` when the argument is left out                                                                              |
-| `TYPSTRY_SERVER`     | The server for `init` when `--server` is left out                                                                                     |
-| `TYPSTRY_BROWSER`    | The program `open` starts instead of the system default browser                                                                       |
+| `TYPSTRY_LINK`       | The share link for `clone` and `devices recover` when the argument is left out                                                        |
+| `TYPSTRY_SERVER`     | The server for `init` and `pair` when `--server` is left out                                                                          |
+| `TYPSTRY_BROWSER`    | The command `open` runs instead of the system default browser, with the URL added as the last argument, e.g. `firefox --new-window`   |
 | `TYPSTRY_LOG`        | Log filter in `RUST_LOG` syntax, `warn` by default                                                                                    |
 | `TYPSTRY_PLAIN`      | Set to `1` for the same effect as `--plain`                                                                                           |
 | `TYPSTRY_CONFIG_DIR` | Where the device key, the person graph, the owner keys and the list of project folders live, instead of the platform config directory |
 
 ## Things to know
 
-- **The tracked branch.** typstry syncs on one git branch, the one checked out when the folder was first linked. On any other branch, or while git is merging or rebasing, `sync` pauses and `pull`/`push` refuse unless you pass `--force`.
-- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then publish by pressing `p` in the sync terminal (typing `push` and Enter with `--plain`), running `typstry push --force`, or starting `sync` with `--publish`. Committing on the tracked branch before switching avoids this.
+- **The tracked branch.** typstry syncs on one git branch, the one checked out when the folder was first linked. On any other branch, or while git is merging or rebasing, `sync` pauses and `pull`/`push` refuse unless you pass `--force`. A repository whose git folder lives elsewhere is found through `GIT_DIR`/`GIT_WORK_TREE` (git has to be installed for that), so set them for typstry as you do for git.
+- **Coming back from a branch.** If the files differ from the last sync when you return to the tracked branch, `sync` keeps receiving but holds back your outgoing changes. Otherwise a co-author edit that you only committed on the other branch would look like a deletion. Files changed on both sides wait too. The same applies after `git reset`, and when you switched branches while `sync` was not running. Check with `typstry status`, then publish by pressing `p` in the sync terminal (typing `push` and Enter with `--plain`), running `typstry push --force`, or starting `sync` with `--publish`. `--publish` only applies to a `sync` started on the tracked branch; started elsewhere, it says so and the check runs when you return. Committing on the tracked branch before switching avoids this.
 - **Commands next to `sync`.** While `sync` runs, `status`, `info`, `version list`, `version save` and `push` in the same folder ask it instead of failing. `version save` and `push` publish what is on disk right away, so a version saved just after a save includes it. Both refuse while `sync` is paused, and need `--force` while it holds back changes after a branch switch, like the one-shot versions. `pull` only says that `sync` already pulls. `track` and `export` refuse to start until `sync` is stopped.
 - **The key lives in `.typstry/`.** That folder holds the link, the owner keys of a project you own and a local cache. It ignores itself with its own `.gitignore` and is also added to `.git/info/exclude`. Never commit it. To keep the link out of your shell history, pass it on standard input (`pbpaste | typstry clone - thesis`) or in `TYPSTRY_LINK`.
-- **Ignored files.** `.gitignore` and an optional `.typstryignore` decide which files are synced, so build output such as PDFs stays local. git's own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`) and `.typstryignore` itself are not synced either; re-include one with a negated pattern in `.typstryignore`, such as `!.gitignore`. An ignored file is never written to the folder, and removing or editing it locally never changes the project. A file the project gets from someone else never replaces a local file that is not synced, or one whose name only differs in case on macOS and Windows.
+- **Ignored files.** `.gitignore`, git's global excludes (`core.excludesFile`, for `.DS_Store` or editor swap files), `.git/info/exclude` and an optional `.typstryignore` decide which files are synced, so build output such as PDFs stays local. git's own files (`.gitignore`, `.gitattributes`, `.gitmodules`, `.github/`) and `.typstryignore` itself are not synced either; re-include one with a negated pattern in `.typstryignore`, such as `!.gitignore`. An ignored file is never written to the folder, and removing or editing it locally never changes the project. A file the project gets from someone else never replaces a local file that is not synced, or one whose name only differs in case on macOS and Windows. The same goes for folders there: with `Fig/a.png` and `fig/b.png` in the project, only the spelling already on disk (else the first one) is synced, and the other path is left out with a warning.
 - **Editors.** Files can change on disk while you edit them. Let your editor reload changed files automatically (VS Code does this for files without unsaved changes).

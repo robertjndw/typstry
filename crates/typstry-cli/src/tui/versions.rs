@@ -14,6 +14,7 @@ use ratatui::widgets::{ListItem, ListState, Paragraph};
 use typstry_doc::versions::named_versions;
 
 use crate::commands::version::{author_name, format_ms, valid_version_name};
+use crate::term::printable;
 
 /// One listed version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,8 +34,9 @@ pub fn rows(doc: &loro::LoroDoc) -> Vec<Row> {
         .map(|v| Row {
             index: v.index,
             date: format_ms(v.created_at),
-            author: author_name(doc, &v.author),
-            name: v.name,
+            // Both come from co-authors and end up on the terminal.
+            author: printable(&author_name(doc, &v.author)).into_owned(),
+            name: printable(&v.name).into_owned(),
         })
         .collect()
 }

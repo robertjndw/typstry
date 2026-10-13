@@ -1,0 +1,64 @@
+{
+  "list": [
+    {
+      "addedAt": 100,
+      "link": {
+        "edit": true,
+        "retired": false,
+        "secret": "ASIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi",
+        "token": "compat0000000000000002"
+      },
+      "openedAt": 5000,
+      "projectId": "alpha",
+      "state": "listed",
+      "title": "Alpha paper"
+    },
+    {
+      "addedAt": 130,
+      "link": {
+        "edit": false,
+        "retired": false,
+        "secret": "AvOExVOACB8Pg000FeTJ10-YnzW9Qz27jmuueWAf37C1wjSik9koN1RO6UdLQKmcPcGfn7ZlRD--97RfFIgkLwk",
+        "token": "compat0000000000000004"
+      },
+      "openedAt": null,
+      "projectId": "gamma",
+      "state": "forgotten",
+      "title": null
+    },
+    {
+      "addedAt": 120,
+      "link": {
+        "edit": false,
+        "retired": false,
+        "secret": "ArweKu_m30uCUI2Y_lwoF4rNfORgGU1fe7M7XCsQgPwP5lJ1MZx5pKr1m35dT3p6T-7wo_Uf2-fPM-fRODWN_EY",
+        "token": "compat0000000000000003"
+      },
+      "openedAt": null,
+      "projectId": "beta",
+      "state": "gone",
+      "title": null
+    }
+  ],
+  "ownerKeys": {
+    "alpha": [
+      [
+        "2cc424d6dcdb6062e11de841f116a25526a1c9244660bdbc5caf9b054924d238",
+        "iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg"
+      ],
+      [
+        "3dab625a74baeb941a19ee917bc63ee43b27000eb4d6147a57b1523ebf720152",
+        "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c"
+      ]
+    ],
+    "beta": [],
+    "gamma": []
+  },
+  "projectOfToken": {
+    "compat0000000000000001": "alpha",
+    "compat0000000000000002": "alpha",
+    "compat0000000000000003": "beta",
+    "compat0000000000000004": "gamma"
+  },
+  "schema": 1
+}

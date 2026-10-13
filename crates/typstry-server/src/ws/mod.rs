@@ -9,7 +9,8 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use loro_protocol::MAX_MESSAGE_SIZE;
@@ -18,8 +19,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use crate::limits::ConnPermit;
 use crate::room::{Outbound, Outbox, OutboxReceiver};
-
 use crate::state::AppState;
 
 /// Protocol messages are capped at 256 KiB; anything larger is split into
@@ -28,6 +29,13 @@ const MAX_FRAME: usize = MAX_MESSAGE_SIZE + 1024;
 
 /// The JS client pings every 30 s, so silence this long means a dead peer.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long one frame may take to go out. A client that stops reading
+/// fills the socket's buffers, and then the writer waits; past this the
+/// connection is dropped, so it cannot keep its queue (which may hold a
+/// whole backfill) in memory for good. Frames are at most a few MiB, so a
+/// client still reading at a few dozen KiB/s never gets near it.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A deliberate close that is no error, like a peer that finished.
 pub(crate) const CLOSE_NORMAL: u16 = 1000;
@@ -40,13 +48,19 @@ pub(crate) const CLOSE_GOING_AWAY: u16 = 1001;
 /// 1008 is in the JS client's fatal list, so it stops retrying a token that
 /// does not work.
 pub(crate) const CLOSE_POLICY: u16 = 1008;
-pub(crate) const CLOSE_INTERNAL: u16 = 1011;
+
+/// "Try again later", for failures that are ours and passing, like a
+/// database error or a client over its join rate. Unlike 1011 it is in
+/// neither client's fatal list, so they reconnect with backoff.
+pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
 
 /// Writes queued frames to the socket until a close frame goes out or the
-/// socket breaks.
+/// socket breaks. A frame stuck for [`WRITE_STALL_TIMEOUT`] ends it too, and
+/// fires `stalled` so the connection closes.
 pub(crate) fn spawn_writer(
     mut sink: SplitSink<WebSocket, Message>,
     mut rx: OutboxReceiver,
+    stalled: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -61,8 +75,17 @@ pub(crate) fn spawn_writer(
                     true,
                 ),
             };
-            if sink.send(msg).await.is_err() || last {
-                break;
+            match timeout(WRITE_STALL_TIMEOUT, sink.send(msg)).await {
+                Ok(Ok(())) if !last => {}
+                Ok(_) => break,
+                Err(_) => {
+                    tracing::debug!("client stopped reading, dropping it");
+                    // Dropping the queue frees whatever it held; the
+                    // socket is not worth a polite close.
+                    drop(rx);
+                    stalled.notify_one();
+                    return;
+                }
             }
         }
         let _ = sink.close().await;
@@ -98,7 +121,7 @@ impl Socket {
             outbox: outbox.clone(),
             overflow: outbox.overflow_signal(),
             shutdown: state.shutdown.clone(),
-            writer: spawn_writer(sink, rx),
+            writer: spawn_writer(sink, rx, outbox.overflow_signal()),
             overflowed: false,
             heard: Instant::now(),
         };
@@ -154,7 +177,8 @@ impl Socket {
         } = self;
         drop(outbox);
         // After an overflow the queue is full, so no close frame can follow;
-        // dropping the socket makes the client reconnect promptly.
+        // dropping the socket makes the client reconnect promptly. A stalled
+        // writer counts as an overflow too.
         if overflowed || timeout(Duration::from_secs(2), &mut writer).await.is_err() {
             writer.abort();
         }
@@ -162,15 +186,32 @@ impl Socket {
     }
 }
 
+/// A slot for one more socket, or the answer refusing the upgrade. Refused
+/// before the upgrade, as a plain HTTP error, which every client treats as
+/// a failed connect and retries with backoff.
+pub(crate) fn admit(state: &AppState) -> Result<ConnPermit, StatusCode> {
+    state.conns.connect().map_err(|_| {
+        tracing::debug!("websocket refused, server full");
+        StatusCode::SERVICE_UNAVAILABLE
+    })
+}
+
 /// Outdated clients never get here, see [`crate::http::protocol::gate`].
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    let permit = match admit(&state) {
+        Ok(permit) => permit,
+        Err(refused) => return refused.into_response(),
+    };
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| {
             // An upgraded socket is no longer a request axum waits for on
             // graceful shutdown, so the server tracks it itself.
             let connections = state.connections.clone();
-            connections.track_future(conn::run(socket, state))
+            connections.track_future(async move {
+                conn::run(socket, state).await;
+                drop(permit);
+            })
         })
 }
 
@@ -193,13 +234,19 @@ pub struct ConnLimits {
     pub outbox_bytes: usize,
 }
 
+/// Twice the largest update one client can send (and so the largest relay
+/// another one receives), so a client that reads keeps up with a big paste
+/// arriving while it is busy. Every connection may pin this much, which is
+/// why it is no larger.
+pub const DEFAULT_OUTBOX_BYTES: usize = 2 * typstry_wire::fragment::MAX_REASSEMBLED;
+
 impl Default for ConnLimits {
     fn default() -> Self {
         Self {
             update_burst: 200,
             updates_per_sec: 50.0,
             max_rooms: 8,
-            outbox_bytes: 64 * 1024 * 1024,
+            outbox_bytes: DEFAULT_OUTBOX_BYTES,
         }
     }
 }

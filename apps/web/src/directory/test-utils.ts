@@ -21,17 +21,20 @@ export function token(n: number): string {
   return String(n).padStart(22, "0");
 }
 
-/**
- * Secrets by shape only, like secretKind checks them. Rust additionally
- * needs a view secret's public half to be a valid point, so fixtures use
- * the real ones below.
- */
+/** An edit secret: any 32 bytes are a seed. */
 export function editSecret(fill = 1): string {
   return toBase64Url(new Uint8Array([1, ...new Array<number>(32).fill(fill)]));
 }
 
+// The Ed25519 base point, so the attestation key of a test view secret
+// decompresses like a real one has to.
+const BASE_POINT = [0x58, ...new Array<number>(31).fill(0x66)];
+
+/** A view secret: a view key and a valid attestation key. */
 export function viewSecret(fill = 1): string {
-  return toBase64Url(new Uint8Array([2, ...new Array<number>(64).fill(fill)]));
+  return toBase64Url(
+    new Uint8Array([2, ...new Array<number>(32).fill(fill), ...BASE_POINT]),
+  );
 }
 
 export function link(

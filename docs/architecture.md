@@ -32,7 +32,7 @@ The document layout is defined twice, in `crates/typstry-doc` (Rust, used by the
 ## In the browser
 
 - **CodeMirror** is the text editor. It is bound to the Loro document, so every keystroke becomes a small document change.
-- **The Typst worker** compiles the project with [typst.ts](https://github.com/Myriad-Dreamin/typst.ts) in a background thread and draws the result as SVG. Packages from Typst Universe are downloaded when a document imports them.
+- **The Typst worker** compiles the project with [typst.ts](https://github.com/Myriad-Dreamin/typst.ts) in a background thread and draws the result as SVG. Packages from Typst Universe are downloaded from `packages.typst.org` when a document imports them, and Typst's default fonts from `cdn.jsdelivr.net`. A build can point the fonts at a mirror with `VITE_TYPST_FONT_BASE` (and `VITE_TYPST_DEV_FONT_BASE` for the CJK and emoji fonts), set when the web app is built. See [Self-hosting](self-hosting.md).
 - **The tinymist worker** runs the [tinymist](https://github.com/Myriad-Dreamin/tinymist) language server for autocompletion, hover docs and signature help.
 - **The wasm module** (`crates/typstry-wasm`) holds the encryption and group code. It is the same Rust code the CLI uses, compiled to WebAssembly, so both sides encrypt in exactly the same way.
 
@@ -40,7 +40,7 @@ The document layout is defined twice, in `crates/typstry-doc` (Rust, used by the
 
 1. CodeMirror changes the local Loro document.
 2. The change is saved to IndexedDB.
-3. The change is encrypted, signed with your device key, and sent to the server over the `/ws` WebSocket.
+3. The change is encrypted, signed with your member key for this project (which your device key vouches for), and sent to the server over the `/ws` WebSocket.
 4. The server stores the encrypted record and forwards it to everyone else who has the project open.
 5. The other browsers check the signature, decrypt the record and merge it into their copy.
 
@@ -71,6 +71,8 @@ The server sees:
 - each project's owner public key.
 
 The server does not see document content, file names, uploaded files, names of people, cursors or the keys. The [encryption page](encryption.md) explains why.
+
+Those two other hosts, `cdn.jsdelivr.net` and `packages.typst.org`, see your IP address, that typstry is in use, and which packages your documents import. They never see document content.
 
 ## Code layout
 

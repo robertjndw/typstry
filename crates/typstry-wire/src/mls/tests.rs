@@ -832,6 +832,11 @@ fn saved_state_is_versioned_and_checked() {
         SpaceGroup::import_state(&newer),
         Err(MlsError::NewerState(v)) if v == MLS_STATE_VERSION + 1
     ));
+    newer[0] = 0;
+    assert!(matches!(
+        SpaceGroup::import_state(&newer),
+        Err(MlsError::Malformed(_))
+    ));
     for len in (0..200).chain([saved.len() - 1]) {
         assert!(SpaceGroup::import_state(&saved[..len]).is_err(), "{len}");
     }
@@ -1582,12 +1587,8 @@ fn forks() -> (DeviceKey, DeviceKey, PersonGraph, PersonGraph, PersonGraph) {
     graph.append(&a, add(&b)).unwrap();
     let mut left = graph.clone();
     let mut right = graph.clone();
-    while left.len() < crate::identity::MAX_GRAPH_ENTRIES - 1 {
-        left.append(&a, add(&DeviceKey::generate())).unwrap();
-    }
-    while right.len() < crate::identity::MAX_GRAPH_ENTRIES - 1 {
-        right.append(&b, add(&DeviceKey::generate())).unwrap();
-    }
+    while left.append(&a, add(&DeviceKey::generate())).is_ok() {}
+    while right.append(&b, add(&DeviceKey::generate())).is_ok() {}
     assert!(left.clone().merge(&right).is_err());
     (a, b, graph, left, right)
 }
@@ -2122,6 +2123,14 @@ fn forged_owners_cannot_act_as_owner() {
     }
 }
 
+/// Fills `graph` as far as `signer` can: adds until only the reserve is
+/// left, then revokes of keys nobody knows into the reserve.
+fn pad_to_cap(graph: &mut PersonGraph, signer: &DeviceKey) {
+    while graph.append(signer, add(&DeviceKey::generate())).is_ok() {}
+    while graph.append(signer, revoke(&DeviceKey::generate())).is_ok() {}
+    assert_eq!(graph.len(), crate::identity::MAX_GRAPH_ENTRIES);
+}
+
 #[test]
 fn a_revoked_device_cannot_pad_its_stale_graph_past_the_caps() {
     let (mut ds, [mut laptop, mut phone, mut alice, _], _, robert) = robert_owns();
@@ -2138,11 +2147,7 @@ fn a_revoked_device_cannot_pad_its_stale_graph_past_the_caps() {
     // Its stale branch, filled up to the cap with entries that do nothing.
     // Alone it is a fine graph; merged with the revoke it is one too many.
     let mut padded = robert.graph.clone();
-    while padded.len() < crate::identity::MAX_GRAPH_ENTRIES {
-        padded
-            .append(&robert.phone, add(&DeviceKey::generate()))
-            .unwrap();
-    }
+    pad_to_cap(&mut padded, &robert.phone);
     assert!(revoked.clone().merge(&padded).is_err());
     let leaf_pub = phone.g.device().signer_pub();
     let identity = LeafIdentity {
@@ -2260,11 +2265,7 @@ fn an_unverified_leaf_adds_nothing_to_the_persons_graph() {
     // pad it with entries signed by keys of its own, which no graph takes,
     // so this signs them with robert's own laptop to get one that decodes.
     let mut padded = robert.graph.clone();
-    while padded.len() < crate::identity::MAX_GRAPH_ENTRIES {
-        padded
-            .append(&robert.laptop, add(&DeviceKey::generate()))
-            .unwrap();
-    }
+    pad_to_cap(&mut padded, &robert.laptop);
     let view = view_of(&link);
     let outsider = DeviceKey::generate();
     let leaf = LeafKeys::generate();
@@ -3154,6 +3155,66 @@ fn concurrent_owner_rotations_leave_the_loser_with_the_winners_key() {
     assert!(alice.g.owner_secret().is_none());
     let payload = phone.g.reset_links().unwrap();
     commit(&mut ds, &mut phone, payload).unwrap();
+}
+
+/// Applies the log like [`Client::sync`], but leaves the keyring as it was.
+fn sync_without_keyring(client: &mut Client, ds: &Ds) {
+    while let Some((epoch, commit, envelope)) = ds.log.get(client.g.epoch() as usize) {
+        let key = ds.log_keys[*epoch as usize];
+        client
+            .g
+            .process_commit(*epoch, commit, envelope.as_deref(), key.as_ref())
+            .unwrap();
+    }
+}
+
+#[test]
+fn an_owner_whose_keyring_lags_cannot_rotate_or_reset() {
+    let (mut ds, [mut laptop, mut phone, ..], ..) = robert_with_tablet();
+    let payload = laptop.g.reset_links().unwrap();
+    commit(&mut ds, &mut laptop, payload).unwrap();
+    sync_without_keyring(&mut phone, &ds);
+    assert!(phone.g.needs_keyring());
+    assert!(phone.g.holds_owner_key());
+
+    // Built on the old keyring, either would leave the group without the
+    // newest generation's doc key.
+    assert!(matches!(
+        phone.g.reset_links(),
+        Err(MlsError::KeyringBehind)
+    ));
+    assert!(matches!(
+        phone.g.reset(b"phone", None).map(drop),
+        Err(MlsError::KeyringBehind)
+    ));
+    assert!(!phone.g.has_pending());
+
+    phone.g.set_keyring(&ds.keyring).unwrap();
+    let payload = phone.g.reset_links().unwrap();
+    commit(&mut ds, &mut phone, payload).unwrap();
+    laptop.sync(&ds);
+    assert!(!laptop.g.needs_keyring());
+}
+
+#[test]
+fn a_keyring_that_rewrites_older_generations_is_refused() {
+    let (mut ds, [mut laptop, mut phone, ..], ..) = robert_with_tablet();
+    let payload = laptop.g.reset_links().unwrap();
+    commit(&mut ds, &mut laptop, payload).unwrap();
+    sync_without_keyring(&mut phone, &ds);
+
+    // Same attestation keys, signed with the current link, but another
+    // generation 1 doc key, as an editor rebuilding the keyring would make.
+    let mut plain = laptop.g.doc_keys().keyring().export();
+    plain[1 + 4] ^= 1;
+    let forged = Keyring::seal_signed_plain(phone.g.link(), &plain);
+    assert!(matches!(
+        phone.g.set_keyring(&forged),
+        Err(MlsError::Rewritten)
+    ));
+    assert!(phone.g.needs_keyring());
+    phone.g.set_keyring(&ds.keyring).unwrap();
+    assert!(!phone.g.needs_keyring());
 }
 
 #[test]

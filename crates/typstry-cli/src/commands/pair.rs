@@ -42,7 +42,8 @@ use crate::user::{
 /// new device, either here (`typstry pair <CODE>`) or in the browser at the
 /// printed link.
 ///
-/// A code allows one attempt and expires after five minutes.
+/// A code allows one attempt and expires after a few minutes (the server
+/// decides how long; the device showing it counts down).
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// The code or link shown by the other device. Without it, this device
@@ -271,7 +272,21 @@ async fn pair(
                     .as_deref_mut()
                     .context("approval asked of a device that is not a person yet")?;
                 let tag = device_fingerprint(&device_pub);
-                let approved = yes || ask(ws, &new_name, &tag, &mut ping).await?;
+                let approved = if yes {
+                    true
+                } else {
+                    match ask(ws, &new_name, &tag, &mut ping).await {
+                        Ok(approved) => approved,
+                        Err(err) => {
+                            // Otherwise the other device only sees the
+                            // connection drop and cannot tell why.
+                            if let Ok(frame) = pairing.reject() {
+                                let _ = send(ws, frame).await;
+                            }
+                            return Err(err);
+                        }
+                    }
+                };
                 if !approved {
                     send(ws, pairing.reject().map_err(explain)?).await?;
                     bail!("Declined. {new_name} was not added.");
@@ -333,7 +348,13 @@ async fn ask(
     ping: &mut tokio::time::Interval,
 ) -> anyhow::Result<bool> {
     let question = format!("{device_name} (key {tag}) wants to join as you. Approve?");
-    let mut answer = tokio::task::spawn_blocking(move || confirm(&question));
+    let mut answer = tokio::task::spawn_blocking(move || {
+        confirm(
+            &question,
+            "cannot ask whether to approve the device without a terminal; \
+             run `typstry pair --yes` to approve whoever enters the code",
+        )
+    });
     loop {
         tokio::select! {
             answer = &mut answer => return answer?,
@@ -500,10 +521,11 @@ fn offer_switch(yes: bool) -> anyhow::Result<bool> {
     } else {
         format!(" when it opened {}", folders.join(", "))
     };
-    println!("This machine became a person of its own{opened}, and has no other devices yet.");
+    eprintln!("This machine became a person of its own{opened}, and has no other devices yet.");
     confirm(
         "Does the device showing the code already belong to you, so this machine should join \
          it? Its folders switch over on their next sync. (No: add that device to this machine.)",
+        "unreachable: only asked on a terminal",
     )
 }
 

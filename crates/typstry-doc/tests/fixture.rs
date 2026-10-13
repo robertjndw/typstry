@@ -130,7 +130,6 @@ struct Names {
 
 /// `names.json` is hand-written and read by both sides, so the browser
 /// never accepts a name the CLI refuses to write, or the other way around.
-/// Backslashes stay out of it: only Rust refuses them, see `validate_name`.
 #[test]
 fn name_rules_match_typescript() {
     let names: Names = serde_json::from_str(include_str!("fixtures/names.json")).unwrap();

@@ -538,7 +538,7 @@ pub struct Signer {
 
 #[wasm_bindgen]
 impl Signer {
-    /// A fresh device key that the edit link attests for `generation`. The
+    /// A fresh member key that the edit link attests for `generation`. The
     /// stand-in for a group member's leaf key, for a client that has no
     /// group state. Throws `ReadOnly` for a view link.
     pub fn attested(link: &LinkSecret, generation: u32) -> Result<Signer, JsValue> {
@@ -665,7 +665,8 @@ impl DocKeys {
     }
 
     /// Encrypts and signs the Loro updates for ops `[start, end)` of `peer`.
-    /// Throws `ReadOnly` when `signer` cannot write the current generation.
+    /// Throws `ReadOnly` when `signer` cannot write the current generation,
+    /// and `MalformedRecord` for an empty span or a counter past `2^31 - 1`.
     #[wasm_bindgen(js_name = encryptDelta)]
     pub fn encrypt_delta(
         &self,
@@ -675,12 +676,6 @@ impl DocKeys {
         end: u32,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, JsValue> {
-        if end <= start {
-            return Err(invalid(
-                "MalformedRecord",
-                format!("delta span {start}..{end} is empty"),
-            ));
-        }
         self.inner
             .encrypt_delta(
                 signer.inner.as_ref(),
@@ -693,7 +688,8 @@ impl DocKeys {
     }
 
     /// Encrypts and signs a snapshot covering `vv`, an array of
-    /// `{ peer, counter }` in any order.
+    /// `{ peer, counter }` in any order. Throws `MalformedRecord` for a peer
+    /// listed twice or a counter past `2^31 - 1`.
     #[wasm_bindgen(js_name = encryptSnapshot)]
     pub fn encrypt_snapshot(
         &self,

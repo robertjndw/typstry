@@ -26,6 +26,9 @@ test("created projects are listed and can be removed", async ({ page }) => {
     .getByRole("button", { name: "Delete" })
     .click();
   await expect(recent).toBeHidden();
+  // The list hides the project before the delete is saved; reloading
+  // before the toast could bring it back.
+  await expect(page.getByText('Deleted "Listed"')).toBeVisible();
 
   await page.reload();
   await expect(page.getByRole("link", { name: /Listed/ })).toBeHidden();

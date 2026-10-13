@@ -12,7 +12,8 @@ import {
 import { mapConcurrent } from "@/lib/concurrent";
 import { toError } from "@/lib/errors";
 
-import { unzip } from "./unzip";
+import { unzip, UnzipLimitError, type UnzipLimits } from "./unzip";
+import { isJunk, mb, tooLargeMessage } from "./unzip-limits";
 
 export class ImportError extends Error {
   /** Paths of the files at fault, if the error is about specific files. */
@@ -42,19 +43,42 @@ interface RawEntry {
   bytes: Uint8Array | null;
 }
 
-// OS clutter nobody means to import. Dropped without a mention.
-const JUNK_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
-const JUNK_DIRS = new Set(["__MACOSX"]);
+export { JUNK_DIRS } from "./unzip-limits";
+
+/** Most bytes one import reads, before anything is uploaded. */
+export const MAX_IMPORT_BYTES = 500 * 1024 * 1024;
+/** Most files and folders one import takes. */
+export const MAX_IMPORT_ENTRIES = 10_000;
+
+const LIMITS: UnzipLimits = {
+  maxEntries: MAX_IMPORT_ENTRIES,
+  // Same cap as assertImportable, applied before inflating anything.
+  maxEntryBytes: MAX_ASSET_BYTES,
+  maxTotalBytes: MAX_IMPORT_BYTES,
+};
+
+export function tooManyEntries(): ImportError {
+  return new ImportError(
+    `There are more than ${MAX_IMPORT_ENTRIES} files and folders to import`,
+  );
+}
 
 // Uploads run a few at a time: one by one is slow for a folder of figures,
 // all at once can stall the browser on a big project.
 const UPLOAD_CONCURRENCY = 4;
 
 export async function readZip(file: File): Promise<ImportSource> {
+  if (file.size > MAX_IMPORT_BYTES) {
+    throw new ImportError(
+      `${file.name} is larger than ${mb(MAX_IMPORT_BYTES)} MB`,
+    );
+  }
   let entries: [string, Uint8Array][];
   try {
-    entries = await unzip(await file.arrayBuffer());
+    entries = await unzip(await file.arrayBuffer(), LIMITS);
   } catch (err) {
+    if (err instanceof UnzipLimitError)
+      throw new ImportError(err.message, err.paths);
     throw new ImportError(
       `${file.name} is not a valid zip file`,
       [],
@@ -72,13 +96,50 @@ export async function readZip(file: File): Promise<ImportSource> {
 export async function readFiles(
   entries: { path: string; file: File | null }[],
 ): Promise<ImportSource> {
-  const raw = await Promise.all(
-    entries.map(async ({ path, file }) => ({
+  if (entries.length > MAX_IMPORT_ENTRIES) throw tooManyEntries();
+  // Sizes are known up front, so limits fail before anything is read, and
+  // files collect() would drop anyway are never read at all.
+  const wanted = entries.map(({ path, file }) => ({
+    path,
+    file: file && !dropped(segmentsOf(path)) ? file : null,
+    isFile: file !== null,
+  }));
+  const tooLarge = wanted
+    .filter(({ file }) => file && file.size > MAX_ASSET_BYTES)
+    .map(({ path }) => segmentsOf(path).join("/"))
+    .sort();
+  if (tooLarge.length > 0) {
+    throw new ImportError(tooLargeMessage(tooLarge, MAX_ASSET_BYTES), tooLarge);
+  }
+  const total = wanted.reduce((sum, { file }) => sum + (file?.size ?? 0), 0);
+  if (total > MAX_IMPORT_BYTES) {
+    throw new ImportError(
+      `The files add up to more than ${mb(MAX_IMPORT_BYTES)} MB`,
+    );
+  }
+  const raw = await mapConcurrent(
+    wanted,
+    8,
+    async ({ path, file, isFile }) => ({
       path,
-      bytes: file && new Uint8Array(await file.arrayBuffer()),
-    })),
+      // Skipped files stay files (empty ones), so collect() still reports
+      // the reserved ones and the folder detection is unchanged.
+      bytes: file
+        ? new Uint8Array(await file.arrayBuffer())
+        : isFile
+          ? new Uint8Array()
+          : null,
+    }),
   );
   return collect("", raw);
+}
+
+/**
+ * Whether collect() would drop a file at these segments no matter how the
+ * import is wrapped: clutter, or a reserved name below the top level.
+ */
+function dropped(segments: string[]): boolean {
+  return isJunk(segments) || segments.slice(1).some((s) => !isSafePath(s));
 }
 
 function segmentsOf(path: string): string[] {
@@ -93,12 +154,7 @@ function segmentsOf(path: string): string[] {
 export function collect(fallbackName: string, raw: RawEntry[]): ImportSource {
   const entries = raw
     .map((e) => ({ segments: segmentsOf(e.path), bytes: e.bytes }))
-    .filter(
-      ({ segments }) =>
-        segments.length > 0 &&
-        !segments.some((s) => JUNK_DIRS.has(s)) &&
-        !JUNK_NAMES.has(segments.at(-1)!),
-    );
+    .filter(({ segments }) => segments.length > 0 && !isJunk(segments));
 
   let name = fallbackName;
   const root = entries[0]?.segments[0];
@@ -161,12 +217,7 @@ export function assertImportable(source: ImportSource): void {
     .map(([path]) => path)
     .sort();
   if (tooLarge.length > 0) {
-    const what =
-      tooLarge.length === 1 ? tooLarge[0] : `${tooLarge.length} files`;
-    throw new ImportError(
-      `${what} ${tooLarge.length === 1 ? "is" : "are"} larger than ${Math.floor(MAX_ASSET_BYTES / 1024 / 1024)} MB`,
-      tooLarge,
-    );
+    throw new ImportError(tooLargeMessage(tooLarge, MAX_ASSET_BYTES), tooLarge);
   }
 }
 

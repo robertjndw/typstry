@@ -23,6 +23,7 @@ use loro_protocol::{BytesReader, BytesWriter};
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::HpkeCiphertext;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use super::MlsError;
 use super::storage::hpke_config;
@@ -112,11 +113,11 @@ pub fn seal(
 
     let mut view = BytesWriter::new();
     push_links(&mut view, &link.view_secret(), &[&tokens.view]);
-    let view = SealKey::new(*exporter).seal(&view.finalize(), ENVELOPE_CONTEXT);
+    let view = SealKey::new(*exporter).seal(&Zeroizing::new(view.finalize()), ENVELOPE_CONTEXT);
 
     let mut edit = BytesWriter::new();
     push_links(&mut edit, &link.to_base64url(), &[edit_token, &tokens.view]);
-    let edit = edit.finalize();
+    let edit = Zeroizing::new(edit.finalize());
     let mut w = BytesWriter::new();
     w.push_byte(ENVELOPE_VERSION);
     w.push_var_bytes(&view);
@@ -214,11 +215,13 @@ pub fn open(
         return Err(MlsError::Envelope("trailing bytes".into()));
     }
 
-    let view = SealKey::new(*exporter)
-        .open(view, ENVELOPE_CONTEXT)
-        .map_err(|e| MlsError::Envelope(e.to_string()))?;
+    let view = Zeroizing::new(
+        SealKey::new(*exporter)
+            .open(view, ENVELOPE_CONTEXT)
+            .map_err(|e| MlsError::Envelope(e.to_string()))?,
+    );
     let mut v = BytesReader::new(&view);
-    let view_link = v.read_var_string().map_err(bad)?;
+    let view_link = Zeroizing::new(v.read_var_string().map_err(bad)?);
     let view_token = v.read_var_string().map_err(bad)?;
     if v.remaining() != 0 {
         return Err(MlsError::Envelope("trailing bytes in the view part".into()));
@@ -247,13 +250,14 @@ pub fn open(
     else {
         return Ok(view_only(shared));
     };
+    let edit = Zeroizing::new(edit);
     Ok(read_edit_part(&edit, &view_link, &view_token).unwrap_or_else(|| view_only(shared)))
 }
 
 /// A member's edit entry, or `None` if it is damaged in any way.
 fn read_edit_part(edit: &[u8], view_link: &str, view_token: &str) -> Option<Opened> {
     let mut e = BytesReader::new(edit);
-    let link = e.read_var_string().ok()?;
+    let link = Zeroizing::new(e.read_var_string().ok()?);
     let edit_token = e.read_var_string().ok()?;
     let token = e.read_var_string().ok()?;
     if e.remaining() != 0 || token != view_token {

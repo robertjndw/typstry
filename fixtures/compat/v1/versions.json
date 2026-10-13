@@ -1,6 +1,7 @@
 {
   "base": 1,
   "config": 1,
+  "directory": 1,
   "docLog": 1,
   "ds": 1,
   "keyring": 1,

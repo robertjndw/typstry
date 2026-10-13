@@ -1,5 +1,5 @@
 import { relayApiPath, relayWsPath } from "@/crypto/wasm";
-import { apiFetch, ApiError } from "@/sync/api";
+import { apiFetchRetrying, ApiError } from "@/sync/api";
 import { socketUrl } from "@/sync/protocol";
 
 export interface AllocatedChannel {
@@ -14,7 +14,7 @@ export interface AllocatedChannel {
 export async function allocateChannel(
   opts: { baseUrl?: string; signal?: AbortSignal } = {},
 ): Promise<AllocatedChannel> {
-  const res = await apiFetch(`${opts.baseUrl ?? ""}${relayApiPath()}`, {
+  const res = await apiFetchRetrying(`${opts.baseUrl ?? ""}${relayApiPath()}`, {
     method: "POST",
     signal: opts.signal,
   });

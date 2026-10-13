@@ -210,6 +210,15 @@ describe("MLS group", () => {
       text("x"),
     );
 
+    // The keys a new epoch replaces are freed, not left to the collector.
+    const held = crypto as unknown as { presence: { __wbg_ptr: number } };
+    const replaced = held.presence;
+    crypto.setGroupKeys(group.docKeys(), group.signer(), group.presenceKey());
+    expect(replaced.__wbg_ptr).toBe(0);
+    expect(crypto.openPresence(crypto.sealPresence(text("y")))).toEqual(
+      text("y"),
+    );
+
     const restored = wasm.SpaceGroup.importState(group.exportState());
     expect(restored.epoch).toBe(group.epoch);
   });

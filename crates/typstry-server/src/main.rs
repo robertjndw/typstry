@@ -1,3 +1,4 @@
+use std::future::IntoFuture;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -9,7 +10,13 @@ use typstry_server::http;
 use typstry_server::state::AppState;
 use typstry_server::store::db;
 
+/// How long HTTP requests still running at shutdown (uploads, mostly) get
+/// to finish before they are cut off.
+const REQUEST_GRACE: Duration = Duration::from_secs(10);
+
 /// How long open WebSockets get to close before the rooms stop anyway.
+/// Together with [`REQUEST_GRACE`] and the rooms finishing their queues,
+/// this has to fit in the `stop_grace_period` in the compose files.
 const CONNECTION_GRACE: Duration = Duration::from_secs(5);
 
 /// Below the image's HEALTHCHECK timeout so a hung server gets a proper error
@@ -20,8 +27,7 @@ const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,tower_http=debug")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -69,16 +75,27 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // WebSockets are told to close as soon as the signal arrives, not after
     // HTTP drained: axum no longer waits for upgraded connections.
     let shutdown = state.shutdown.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("shutting down");
-            shutdown.cancel();
-        })
-        .await?;
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutting down");
+        shutdown.cancel();
+    });
+    // Graceful shutdown waits for every running request, and a client can
+    // keep one going for as long as it likes.
+    let stopping = state.shutdown.clone();
+    tokio::select! {
+        result = server.into_future() => result?,
+        () = async {
+            stopping.cancelled().await;
+            tokio::time::sleep(REQUEST_GRACE).await;
+        } => {
+            tracing::warn!("requests still running after the grace period, cutting them off");
+        }
+    }
 
     // Every record is written before it is acked, so stopping the rooms only
-    // lets them finish what is already queued.
+    // lets them finish what is already queued. Nothing is compacted or
+    // rewritten on the way out.
     state.stop(CONNECTION_GRACE).await;
     db.close().await;
     tracing::info!("shut down");

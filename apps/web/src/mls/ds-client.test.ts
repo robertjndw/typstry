@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RetryQueue } from "@/project/retry";
+import { RetryQueue } from "@/project/retry";
 
 import {
   DsClient,
@@ -65,6 +65,9 @@ class ManualRetry {
     this.scheduled.push(run);
   }
   succeeded() {}
+  cancel() {
+    this.scheduled = [];
+  }
   dispose() {}
   runNext() {
     this.scheduled.shift()?.();
@@ -323,6 +326,35 @@ describe("DsClient", () => {
     // Late frames of the old socket are ignored.
     first.receive(frames.ready(0, 5));
     expect(client.ready).toBeNull();
+    client.stop();
+  });
+
+  it("reconnects after a drop once stopped and started again", async () => {
+    vi.useFakeTimers();
+    const { client } = setup({ retry: new RetryQueue() });
+    client.start();
+    await vi.advanceTimersByTimeAsync(0);
+    client.stop();
+    // A removed device that comes back with a new link restarts the client.
+    client.restart();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakeSocket.all).toHaveLength(2);
+    last().open();
+    last().drop();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(FakeSocket.all).toHaveLength(3);
+    client.stop();
+  });
+
+  it("leaves a fetch on a closing socket to the reconnect", async () => {
+    const { client } = setup();
+    client.start();
+    await flush();
+    const socket = last();
+    socket.open();
+    socket.receive(frames.ready(2, 7));
+    socket.readyState = 2;
+    expect(() => client.fetch(3)).not.toThrow();
     client.stop();
   });
 

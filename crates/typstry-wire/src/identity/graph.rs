@@ -169,7 +169,8 @@ impl PersonGraph {
     /// The person's own profile bytes: the latest counting `SetProfile`,
     /// ties between concurrent ones broken by entry hash. Clients should
     /// append one only when the profile actually changed, since every entry
-    /// stays in the graph for good and counts toward [`MAX_GRAPH_ENTRIES`].
+    /// stays in the graph for good and counts toward the caps that leave
+    /// [`RESERVED_ENTRIES`](super::RESERVED_ENTRIES) for revokes.
     pub fn profile(&self) -> Option<&[u8]> {
         self.validity.profile.as_deref()
     }
@@ -297,7 +298,8 @@ impl PersonGraph {
         let mut r = BytesReader::new(bytes);
         match r.read_byte().map_err(bad)? {
             GRAPH_VERSION => {}
-            v => return Err(GraphError::NewerVersion(v)),
+            v if v > GRAPH_VERSION => return Err(GraphError::NewerVersion(v)),
+            v => return Err(bad(format!("version {v}"))),
         }
         let count = plausible_count(&mut r, MIN_ENTRY_BYTES).map_err(bad)?;
         if count > MAX_GRAPH_ENTRIES as u64 {
@@ -926,6 +928,11 @@ mod tests {
             PersonGraph::decode(&newer),
             Err(GraphError::NewerVersion(2))
         );
+        newer[0] = 0;
+        assert!(matches!(
+            PersonGraph::decode(&newer),
+            Err(GraphError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -951,37 +958,95 @@ mod tests {
         assert!(PersonGraph::decode(&w.finalize()).is_err());
     }
 
+    /// Appends `kind()` signed by `signer` until the caps refuse it.
+    fn fill(g: &mut PersonGraph, signer: &DeviceKey, kind: impl Fn() -> EntryKind) {
+        let before = loop {
+            let before = g.clone();
+            if let Err(e) = g.append(signer, kind()) {
+                assert_eq!(e, GraphError::TooLarge);
+                break before;
+            }
+        };
+        assert_eq!(*g, before);
+    }
+
     #[test]
     fn entry_cap_holds() {
         let a = DeviceKey::generate();
         let mut g = PersonGraph::genesis(&a);
-        for _ in 1..MAX_GRAPH_ENTRIES {
-            g.append(&a, add(&DeviceKey::generate())).unwrap();
-        }
-        assert_eq!(g.len(), MAX_GRAPH_ENTRIES);
-        let before = g.clone();
-        assert_eq!(
-            g.append(&a, add(&DeviceKey::generate())),
-            Err(GraphError::TooLarge)
-        );
-        assert_eq!(g, before);
+        fill(&mut g, &a, || add(&DeviceKey::generate()));
+        assert!(g.len() <= MAX_GRAPH_ENTRIES - crate::identity::RESERVED_ENTRIES);
+        assert!(g.encode().len() <= MAX_GRAPH_BYTES - crate::identity::RESERVED_BYTES);
+        assert_eq!(PersonGraph::decode(&g.encode()).unwrap(), g);
+
+        // Revokes go on into the reserve, up to the hard caps.
+        let b = DeviceKey::generate();
+        while g.append(&a, revoke(&b)).is_ok() {}
+        assert!(g.len() <= MAX_GRAPH_ENTRIES);
         assert!(g.encode().len() <= MAX_GRAPH_BYTES);
         assert_eq!(PersonGraph::decode(&g.encode()).unwrap(), g);
+    }
+
+    /// Any valid device may make a recovery key, which then signs into the
+    /// reserve. That is what lets a recovery key made on a paired device
+    /// work, and also why a thief can drain the reserve with a key of its
+    /// own (see `RESERVED_ENTRIES`).
+    #[test]
+    fn a_recovery_key_from_a_paired_device_signs_into_the_reserve() {
+        let (_, b, mut g) = pair();
+        let r = DeviceKey::generate();
+        g.append(&b, recovery(&r)).unwrap();
+        fill(&mut g, &b, || add(&DeviceKey::generate()));
+        let ordinary = g.len();
+        assert!(ordinary <= MAX_GRAPH_ENTRIES - crate::identity::RESERVED_ENTRIES);
+
+        while g.append(&r, add(&DeviceKey::generate())).is_ok() {}
+        assert!(g.len() > ordinary);
+        assert!(g.len() <= MAX_GRAPH_ENTRIES);
+        assert!(g.encode().len() <= MAX_GRAPH_BYTES);
+        // With the reserve spent, not even a revoke fits.
+        assert_eq!(
+            g.append(&b, revoke(&DeviceKey::generate())),
+            Err(GraphError::TooLarge)
+        );
     }
 
     #[test]
     fn merge_rechecks_the_caps() {
         let a = DeviceKey::generate();
-        let mut base = PersonGraph::genesis(&a);
-        for _ in 1..MAX_GRAPH_ENTRIES - 1 {
-            base.append(&a, add(&DeviceKey::generate())).unwrap();
-        }
+        let base = PersonGraph::genesis(&a);
         let (mut left, mut right) = (base.clone(), base);
-        left.append(&a, add(&DeviceKey::generate())).unwrap();
-        right.append(&a, add(&DeviceKey::generate())).unwrap();
+        fill(&mut left, &a, || add(&DeviceKey::generate()));
+        fill(&mut right, &a, || add(&DeviceKey::generate()));
         let before = left.clone();
         assert_eq!(left.merge(&right), Err(GraphError::TooLarge));
         assert_eq!(left, before);
+    }
+
+    #[test]
+    fn a_flood_leaves_room_to_revoke_and_recover() {
+        let (a, thief, mut g) = pair();
+        let r = DeviceKey::generate();
+        g.append(&a, recovery(&r)).unwrap();
+        fill(&mut g, &thief, || profile(&"x".repeat(MAX_PROFILE_LEN)));
+        fill(&mut g, &thief, || add(&DeviceKey::generate()));
+        // The empty profile is the smallest entry there is.
+        fill(&mut g, &thief, || profile(""));
+        assert_eq!(g.append(&a, profile("")), Err(GraphError::TooLarge));
+
+        // The other device can still throw the thief out ...
+        let mut revoked = g.clone();
+        revoked.append(&a, revoke(&thief)).unwrap();
+        assert_eq!(state(&revoked, &thief), DeviceState::Revoked);
+
+        // ... and so can the recovery key, bringing in a new device.
+        let fresh = DeviceKey::generate();
+        g.append(&r, add(&fresh)).unwrap();
+        g.append(&r, revoke(&thief)).unwrap();
+        g.append(&r, revoke(&a)).unwrap();
+        assert_eq!(state(&g, &fresh), DeviceState::Valid);
+        assert_eq!(state(&g, &thief), DeviceState::Revoked);
+        assert_eq!(PersonGraph::decode(&g.encode()).unwrap(), g);
     }
 
     #[test]
@@ -1175,12 +1240,10 @@ mod tests {
         };
         g.append(&a, fits).unwrap();
 
-        // Profiles share the entry cap.
+        // Profiles share the caps of everything but revokes.
         let mut full = PersonGraph::genesis(&a);
-        for _ in 1..MAX_GRAPH_ENTRIES {
-            full.append(&a, profile("n")).unwrap();
-        }
-        assert_eq!(full.append(&a, profile("n")), Err(GraphError::TooLarge));
+        fill(&mut full, &a, || profile("n"));
+        assert!(full.len() <= MAX_GRAPH_ENTRIES - crate::identity::RESERVED_ENTRIES);
     }
 
     #[test]

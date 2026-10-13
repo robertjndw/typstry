@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { directory } from "@/directory/store";
 import { seedProject, token } from "@/directory/test-utils";
@@ -12,6 +13,7 @@ function renderHome() {
   render(
     <TooltipProvider>
       <RouterProvider router={router} />
+      <Toaster />
     </TooltipProvider>,
   );
 }
@@ -85,8 +87,31 @@ describe("Home project list", () => {
       }),
     );
     await screen.findByText(/Projects you create or open/);
+    expect(await screen.findByText('Deleted "Doomed"')).toBeInTheDocument();
     expect((await directory()).list(Date.now())).toMatchObject([
       { projectId: "a", state: "forgotten" },
     ]);
+  });
+
+  it("says so when a project could not be deleted", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await seedProject("a", 1, { title: "Stuck" });
+    const dir = await directory();
+    // A newer layout is never written, so forgetting fails.
+    dir.doc.getMap("meta").set("schema", 99);
+    dir.doc.commit();
+    renderHome();
+    const projects = await list();
+    fireEvent.click(projects.getByRole("button", { name: "Delete Stuck" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Delete",
+      }),
+    );
+    expect(
+      await screen.findByText('Could not delete "Stuck"'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Deleted "Stuck"')).toBeNull();
+    error.mockRestore();
   });
 });

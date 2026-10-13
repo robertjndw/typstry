@@ -48,4 +48,15 @@ describe("Pair", () => {
     );
     expect(flow.enterCode).toHaveBeenCalledExactlyOnceWith("42-acorn-amber");
   });
+
+  it("treats a link with a broken escape as one without a code", () => {
+    render(
+      <MemoryRouter initialEntries={["/pair#42-%E0%A4%A"]}>
+        <Pair />
+      </MemoryRouter>,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Connect to the other device" }),
+    ).toBeNull();
+  });
 });

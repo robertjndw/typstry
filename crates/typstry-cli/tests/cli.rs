@@ -3,7 +3,9 @@
 
 mod common;
 
-use common::{Server, cached_doc, clone, git, has_git, read, typstry};
+use common::{
+    Server, binary_with, cached_doc, clone, failed, git, has_git, read, stderr, stdout, typstry,
+};
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -283,6 +285,89 @@ async fn sync_only_happens_on_the_tracked_branch() {
     // A detached HEAD is never the tracked branch.
     git(&repo, &["switch", "--quiet", "--detach", "draft"]);
     assert!(typstry(&repo, &["push"]).await.is_err());
+}
+
+#[tokio::test]
+async fn track_rejects_empty_names_and_warns_about_unknown_branches() {
+    if !has_git() {
+        return;
+    }
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Track").await;
+    let work = tempfile::tempdir().unwrap();
+    typstry(work.path(), &["clone", &edit, "repo", "--git"])
+        .await
+        .unwrap();
+    let repo = work.path().join("repo");
+
+    let err = failed(&binary_with(&repo, &["track", " "], "", &[]).await);
+    assert!(err.contains("must not be empty"), "{err}");
+
+    let out = binary_with(&repo, &["track", "typo"], "", &[]).await;
+    assert!(out.status.success());
+    assert!(stderr(&out).contains("no branch typo"), "{}", stderr(&out));
+
+    let tracked = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+    let out = binary_with(&repo, &["track", tracked.trim()], "", &[]).await;
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+}
+
+/// A repository whose git dir is elsewhere, found only through GIT_DIR,
+/// still pauses syncing off the tracked branch.
+#[tokio::test]
+async fn a_git_dir_from_the_environment_is_found() {
+    if !has_git() {
+        return;
+    }
+    let server = Server::start().await;
+    let (edit, _) = server.seeded_project("Git dir").await;
+    let work = tempfile::tempdir().unwrap();
+    let folder = clone(&edit, work.path(), "folder").await;
+    let git_dir = work.path().join("store.git");
+    let git_dir_str = git_dir.to_str().unwrap();
+    let folder_str = folder.to_str().unwrap();
+    git(
+        work.path(),
+        &[
+            "--git-dir",
+            git_dir_str,
+            "--work-tree",
+            folder_str,
+            "init",
+            "--quiet",
+        ],
+    );
+    git(
+        work.path(),
+        &[
+            "--git-dir",
+            git_dir_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+    );
+    let env = [("GIT_DIR", git_dir_str), ("GIT_WORK_TREE", folder_str)];
+
+    let out = binary_with(&folder, &["push"], "", &env).await;
+    assert!(
+        stdout(&out).contains("tracking git branch main"),
+        "{}",
+        stdout(&out)
+    );
+
+    git(
+        work.path(),
+        &[
+            "--git-dir",
+            git_dir_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/draft",
+        ],
+    );
+    let err = failed(&binary_with(&folder, &["push"], "", &env).await);
+    assert!(err.contains("on branch draft"), "{err}");
 }
 
 #[tokio::test]

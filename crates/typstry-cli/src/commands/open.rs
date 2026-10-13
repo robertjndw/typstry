@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
@@ -9,8 +10,8 @@ use crate::state::StateDir;
 /// Open the project in the browser.
 ///
 /// Uses the edit link, or the view link with --view. Set TYPSTRY_BROWSER
-/// to a command to use instead of the system default; it gets the URL as
-/// its only argument.
+/// to a command to use instead of the system default, such as `firefox
+/// --new-window`; it gets the URL as its last argument.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// Open the view-only link.
@@ -71,9 +72,26 @@ pub fn launch_in_background(url: String) {
     });
 }
 
+/// `TYPSTRY_BROWSER` as a command: a program and arguments split at
+/// whitespace, like `$BROWSER` usually is. A value that names a file as a
+/// whole is taken as the program, so a path with spaces such as
+/// `/Applications/Google Chrome.app/...` still works without quoting.
+fn browser_command(value: &std::ffi::OsStr) -> Command {
+    let as_text = value.to_str().filter(|_| !Path::new(value).is_file());
+    let mut words = as_text.map(str::split_whitespace).into_iter().flatten();
+    match words.next() {
+        Some(program) => {
+            let mut command = Command::new(program);
+            command.args(words);
+            command
+        }
+        None => Command::new(value),
+    }
+}
+
 fn opener(url: &str) -> Command {
     if let Some(browser) = std::env::var_os("TYPSTRY_BROWSER").filter(|b| !b.is_empty()) {
-        let mut command = Command::new(browser);
+        let mut command = browser_command(&browser);
         command.arg(url);
         return command;
     }
@@ -91,5 +109,29 @@ fn opener(url: &str) -> Command {
         let mut command = Command::new("xdg-open");
         command.arg(url);
         command
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts(command: &Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn browser_commands_take_arguments() {
+        let command = browser_command("firefox --new-window".as_ref());
+        assert_eq!(parts(&command), ["firefox", "--new-window"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("my browser");
+        std::fs::write(&program, "").unwrap();
+        let command = browser_command(program.as_os_str());
+        assert_eq!(parts(&command), [program.to_string_lossy().into_owned()]);
     }
 }

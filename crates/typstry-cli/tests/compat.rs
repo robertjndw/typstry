@@ -29,6 +29,7 @@ use typstry_cli::mailbox;
 use typstry_cli::state::{
     BASE_VERSION, Base, CONFIG_VERSION, Config, LOG_FORMAT, STATE_DIR, StateDir,
 };
+use typstry_doc::directory::DIRECTORY_SCHEMA_VERSION;
 use typstry_doc::init::init_project;
 use typstry_doc::materialize::{FileContent, materialize, materialize_at};
 use typstry_doc::paths::build_path_index;
@@ -336,6 +337,7 @@ fn write_fixture(out: &Path) {
         "versions.json",
         &json!({
             "schema": SCHEMA_VERSION,
+            "directory": DIRECTORY_SCHEMA_VERSION,
             "seal": SEAL_VERSION,
             "record": RECORD_VERSION,
             "keyring": KEYRING_VERSION,
@@ -654,6 +656,10 @@ wild uses it.
   service messages).
 - `doc.loro`, `doc.json`: a project snapshot (text files, an asset, peers,
   named versions, a deleted version) and what it has to read as.
+- `directory.loro`, `directory.json`: a person's directory (links,
+  retired links, titles, states, owner keys) and what it has to list.
+  Written by `TYPSTRY_WRITE_COMPAT_DIRECTORY={n} cargo test -p typstry-doc
+  --test compat`, since the directory is that crate's.
 - `crypto.json`: the edit and view secrets and share links; the signed,
   sealed keyring with its key id and generation 1 doc key; a fixed device
   key with the editor attestation made for it; a delta and a snapshot

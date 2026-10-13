@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use loro::{Frontiers, LoroDoc, LoroResult, LoroValue, TreeID, ValueOrContainer};
 
-use crate::names::is_portable_segment;
+use crate::names::validate_path;
 use crate::paths::{PathEntry, PathIndex, build_path_index};
 use crate::{FileKind, node, node_text, root, string_value};
 
@@ -140,18 +140,13 @@ pub fn materialize_at(doc: &LoroDoc, frontiers: &Frontiers) -> LoroResult<Vec<Ma
 
 /// The UI refuses names like `..` or ones with control characters, but a
 /// modified client can write anything into the doc, and exported paths end
-/// up on disk when someone unzips or checks out the project. Backslashes
-/// count as separators here because Windows tools treat them as such, and
-/// segments that some file system would read as `.git` or as a drive or
-/// device are refused for the same reason.
+/// up on disk when someone unzips or checks out the project. So every
+/// segment has to pass [`crate::names::validate_name`]: a backslash would be
+/// a separator on Windows, a name some file system reads as `.git`, a drive
+/// or a device would land somewhere else, and one over 255 bytes would fail
+/// to write at all.
 pub fn is_safe_path(path: &str) -> bool {
-    path.split(['/', '\\']).all(|segment| {
-        !segment.is_empty()
-            && segment != "."
-            && segment != ".."
-            && !segment.chars().any(char::is_control)
-            && is_portable_segment(segment)
-    })
+    validate_path(path).is_ok()
 }
 
 /// Sizes written by the browser arrive as doubles.
@@ -230,8 +225,12 @@ mod tests {
         let dir = add(&doc, None, "..", FileKind::Dir);
         add(&doc, Some(dir), "inner.typ", FileKind::Text);
 
-        assert_eq!(paths(&materialize(&doc)), ["a\\b.typ", "ok.typ"]);
+        // A backslash is a separator only on Windows, so a file named
+        // `a\b.typ` would be a folder there and a file everywhere else.
+        assert_eq!(paths(&materialize(&doc)), ["ok.typ"]);
         assert!(is_safe_path("chapters/intro.typ"));
+        assert!(is_safe_path(&"a".repeat(255)));
+        assert!(!is_safe_path(&format!("dir/{}", "a".repeat(256))));
         assert!(!is_safe_path("/abs.typ"));
         assert!(!is_safe_path("a//b"));
         for path in [

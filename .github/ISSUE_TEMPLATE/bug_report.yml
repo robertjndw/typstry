@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in typstry does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please report security issues privately as described in [SECURITY.md](https://github.com/robertjndw/typstry/blob/main/SECURITY.md), not here.
+        Do not paste share links: the part after `#` is the project's key.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a project
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server version
+      description: The image tag (for example `0.1.0` or `nightly`) with its digest, or the commit you built from.
+  - type: input
+    id: cli
+    attributes:
+      label: CLI version
+      description: The output of `typstry --version`, if the CLI is involved.
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and OS
+      placeholder: Firefox 150 on macOS 26
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Browser console output, CLI output or server logs, with any keys removed.
+      render: text

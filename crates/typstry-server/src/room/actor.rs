@@ -10,6 +10,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use typstry_wire::ds::ClientMessage;
 use typstry_wire::elo::{PeerId, Record, Version, encode_container, parse_container};
 
+use super::backfill::BackfillCache;
 use super::elo::{self, DocIndex};
 use super::mls::{Ctx, DsState, Rotation};
 use super::registry::Inner;
@@ -32,12 +33,11 @@ pub(super) struct RoomActor {
     generation: u64,
     registry: Arc<Inner>,
     index: DocIndex,
-    /// The frames a client joining with an empty version gets, which is
-    /// every fresh tab and every first sync. Encoding them means copying
-    /// the whole doc, so they are kept until the doc changes. That doubles
-    /// the room's memory while it is cached, so it is let go once the last
-    /// peer leaves rather than kept for the whole unload delay.
-    full_backfill: Option<Arc<[Bytes]>>,
+    /// The doc encoded as backfill frames, shared by every join instead of
+    /// copied into each. It doubles the room's memory while it exists, so
+    /// it is let go once the last peer leaves rather than kept for the whole
+    /// unload delay.
+    backfill: Option<BackfillCache>,
     presence: HashMap<ConnId, Presence>,
     peers: HashMap<(ConnId, [u8; 4]), Outbox>,
     /// The token each doc or presence peer joined with.
@@ -59,7 +59,7 @@ impl RoomActor {
             generation,
             registry,
             index: DocIndex::default(),
-            full_backfill: None,
+            backfill: None,
             presence: HashMap::new(),
             peers: HashMap::new(),
             peer_tokens: HashMap::new(),
@@ -273,7 +273,7 @@ impl RoomActor {
     fn note_idle(&mut self) {
         let ds_empty = self.ds.as_ref().is_none_or(DsState::is_empty);
         if self.peers.is_empty() {
-            self.full_backfill = None;
+            self.backfill = None;
         }
         if self.peers.is_empty() && ds_empty && self.empty_since.is_none() {
             self.empty_since = Some(Instant::now());
@@ -300,12 +300,12 @@ impl RoomActor {
             });
             return false;
         }
-        // Checked before the backfill is built, which for most versions
-        // means copying the doc.
+        // Checked before the backfill is built, which can mean encoding the
+        // doc.
         let Some(backfill) = outbox.start_backfill(&self.space_id, crdt) else {
             return false;
         };
-        let (server_version, extra, frames): (_, _, Arc<[Bytes]>) = match crdt {
+        let (server_version, extra, frames): (_, _, Vec<Bytes>) = match crdt {
             CrdtType::Elo => {
                 let client = if version.is_empty() {
                     Version::new()
@@ -363,8 +363,8 @@ impl RoomActor {
         if !outbox.push_message(&ok) {
             return false;
         }
-        for frame in frames.iter() {
-            if !outbox.push_backfill(&backfill, frame.clone()) {
+        for frame in frames {
+            if !outbox.push_backfill(&backfill, frame) {
                 return false;
             }
         }
@@ -374,19 +374,20 @@ impl RoomActor {
         true
     }
 
-    fn backfill_frames(&mut self, client: &Version) -> Arc<[Bytes]> {
-        let full = client.is_empty();
-        if full && let Some(frames) = &self.full_backfill {
-            return frames.clone();
+    fn backfill_frames(&mut self, client: &Version) -> Vec<Bytes> {
+        // Building the cache encodes the whole doc; a reconnect that is
+        // already up to date should not pay for that.
+        if !self.index.has_backfill_for(client) {
+            return Vec::new();
         }
-        let frames: Arc<[Bytes]> = elo::pack(&self.index.backfill(client))
-            .into_iter()
-            .flat_map(|container| update_frames(CrdtType::Elo, &self.space_id, container))
-            .collect();
-        if full {
-            self.full_backfill = Some(frames.clone());
+        match &mut self.backfill {
+            Some(cache) if cache.fits(&self.index) => cache.extend(&self.index, &self.space_id),
+            _ => self.backfill = Some(BackfillCache::new(&self.index, &self.space_id)),
         }
-        frames
+        self.backfill
+            .as_ref()
+            .expect("filled above")
+            .frames_for(client, &self.space_id)
     }
 
     /// Stores a whole update message in one transaction. Every record is
@@ -441,10 +442,9 @@ impl RoomActor {
             self.index.commit();
         } else {
             match docs::write_batch(&self.registry.db, &self.space_id, &writes).await {
-                Ok(()) => {
-                    self.index.commit();
-                    self.full_backfill = None;
-                }
+                // New deltas extend the backfill cache on the next join; a
+                // snapshot changes the index's layout, which drops it.
+                Ok(()) => self.index.commit(),
                 Err(err) => {
                     tracing::error!(space = %self.space_id, %err, "failed to store records");
                     self.index.rollback();

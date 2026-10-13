@@ -5,7 +5,13 @@ import { dirname } from "@/doc/names";
 import { buildPathIndex } from "@/doc/paths";
 import { fileText } from "@/doc/restore";
 import { NODE, type ProjectDoc } from "@/doc/schema";
+import { mapConcurrent } from "@/lib/concurrent";
 import { toError } from "@/lib/errors";
+
+import type { ZipRequest, ZipResponse } from "./zip.worker";
+
+/** Asset downloads in flight at once; each one is a fetch and a decrypt. */
+const LOAD_CONCURRENCY = 4;
 
 export class ExportError extends Error {
   /** Paths of the files that could not be included. */
@@ -46,7 +52,7 @@ export async function exportZip(
 ): Promise<ExportedZip> {
   const index = buildPathIndex(project);
   const files: Zippable = {};
-  const pending: Promise<void>[] = [];
+  const assets: { path: string; hash: string }[] = [];
   const failed: string[] = [];
   let firstError: Error | undefined;
   const nonEmptyDirs = new Set<string>();
@@ -74,7 +80,10 @@ export async function exportZip(
       failed.push(path);
       continue;
     }
-    pending.push(
+    assets.push({ path, hash });
+  }
+  if (loadAsset) {
+    await mapConcurrent(assets, LOAD_CONCURRENCY, ({ path, hash }) =>
       loadAsset(hash).then(
         // Images, PDFs and fonts are compressed already; deflating them
         // again only costs time.
@@ -86,7 +95,6 @@ export async function exportZip(
       ),
     );
   }
-  await Promise.all(pending);
   if (failed.length > 0) throw new ExportError(failed.sort(), firstError);
 
   // Zips only know folders implicitly through file paths, so an empty one
@@ -94,5 +102,46 @@ export async function exportZip(
   for (const dir of dirs) {
     if (!nonEmptyDirs.has(dir)) files[`${dir}/`] = new Uint8Array(0);
   }
-  return { zip: zipSync(files, { level: 6, mtime }), skipped: skipped.sort() };
+  return { zip: await zip(files, mtime), skipped: skipped.sort() };
+}
+
+/**
+ * Deflates off the main thread; a project with large text files or many
+ * images would otherwise freeze the page. A module worker of our own rather
+ * than fflate's async API, which builds its workers from blob URLs and
+ * starts one per large file. Falls back to the main thread where there are
+ * no workers (tests).
+ */
+function zip(files: Zippable, mtime: number): Promise<Uint8Array<ArrayBuffer>> {
+  if (typeof Worker === "undefined") {
+    return Promise.resolve(
+      zipSync(files, { level: 6, mtime }) as Uint8Array<ArrayBuffer>,
+    );
+  }
+  const worker = new Worker(new URL("./zip.worker.ts", import.meta.url), {
+    type: "module",
+    name: "zip",
+  });
+  const transfer = new Set<ArrayBuffer>();
+  for (const entry of Object.values(files)) {
+    const bytes = Array.isArray(entry) ? entry[0] : entry;
+    // Only buffers nothing else could be looking at: the loader hands out
+    // fresh ones, but a view into something larger would take the rest
+    // along when detached.
+    if (
+      bytes instanceof Uint8Array &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === bytes.buffer.byteLength
+    )
+      transfer.add(bytes.buffer as ArrayBuffer);
+  }
+  return new Promise<Uint8Array<ArrayBuffer>>((resolve, reject) => {
+    worker.onmessage = (e: MessageEvent<ZipResponse>) => {
+      if (e.data.ok) resolve(e.data.zip);
+      else reject(new Error(e.data.message));
+    };
+    worker.onerror = (e) => reject(new Error(e.message || "zip failed"));
+    const request: ZipRequest = { files, mtime };
+    worker.postMessage(request, [...transfer]);
+  }).finally(() => worker.terminate());
 }

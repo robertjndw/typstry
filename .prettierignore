@@ -4,3 +4,4 @@ target/
 data/
 crates/
 apps/web/vendor/
+fixtures/

@@ -1,6 +1,7 @@
 import { LinkSecret, SpaceGroup, loadWasm } from "@/crypto/wasm";
 import { createGroup, type DsClientOptions } from "@/mls/ds-client";
 import { localIdentity } from "@/mls/identity";
+import { deviceOf, emptyRecord } from "@/mls/session";
 import { defaultBackend, type DocBackend } from "@/persist/local-doc-store";
 import {
   encodeProfile,
@@ -9,6 +10,7 @@ import {
 } from "@/presence/identity";
 import { createSpace, type ApiOptions, type CreatedSpace } from "@/sync/api";
 
+/** `link` and `group` are wasm objects the caller frees. */
 export interface CreatedGroup {
   created: CreatedSpace;
   /** Edit secret for the `#` part of the edit link. */
@@ -42,27 +44,30 @@ export async function createSpaceGroup(
     identity.deviceSeed,
     identity.graph,
   );
-  // Kept before the server learns the public key: if the tab dies after the
-  // init lands, this is the only copy of the secret that can ever rotate.
-  await backend.saveMls(created.spaceId, {
-    state: null,
-    device: null,
-    removed: false,
-    rotation: null,
-    ownerSecrets: group.ownerSecrets(),
-  });
-  await createGroup(created.editToken, message, opts.ds);
-  // The group exists on the server now, and this device is its first
-  // member. Keeping it is what lets the creator follow the group (and
-  // remove people from it) instead of joining their own space as a
-  // newcomer on the first visit.
-  await backend.saveMls(created.spaceId, {
-    state: group.exportState(),
-    device: group.leafKeys().export(),
-    removed: false,
-    rotation: null,
-    ownerPerson: group.ownerPerson(),
-    ownerSecrets: group.ownerSecrets(),
-  });
+  try {
+    // Kept before the server learns the public key: if the tab dies after
+    // the init lands, this is the only copy of the secret that can ever
+    // rotate.
+    await backend.saveMls(created.spaceId, {
+      ...emptyRecord(),
+      ownerSecrets: group.ownerSecrets(),
+    });
+    await createGroup(created.editToken, message, opts.ds);
+    // The group exists on the server now, and this device is its first
+    // member. Keeping it is what lets the creator follow the group (and
+    // remove people from it) instead of joining their own space as a
+    // newcomer on the first visit.
+    await backend.saveMls(created.spaceId, {
+      ...emptyRecord(),
+      state: group.exportState(),
+      device: deviceOf(group),
+      ownerPerson: group.ownerPerson(),
+      ownerSecrets: group.ownerSecrets(),
+    });
+  } catch (error) {
+    group.free();
+    link.free();
+    throw error;
+  }
   return { created, key, link, group, backend };
 }

@@ -177,9 +177,9 @@ async fn a_paired_device_is_an_owner_that_gets_the_key_from_the_directory() {
     // over inside the group.
     assert!(!listing.contains("no owner key"), "{listing}");
     let leaf = other_leaf(&listing, "editor");
-    stdout(&run_as(&b, &new_cfg, &["members", "remove", &leaf]).await);
+    stdout(&run_as(&b, &new_cfg, &["members", "remove", &leaf, "--yes"]).await);
     stdout(&run_as(&a, &holder_cfg, &["members"]).await);
-    stdout(&run_as(&a, &holder_cfg, &["share", "reset"]).await);
+    stdout(&run_as(&a, &holder_cfg, &["share", "reset", "--yes"]).await);
     stdout(&run_as(&b, &new_cfg, &["pull"]).await);
 }
 
@@ -353,7 +353,7 @@ async fn a_revoked_device_joins_another_person_without_replace() {
     pair_into(&server, &work, &a, &first_cfg, &new_cfg).await;
     let out = run_as(&work, &new_cfg, &["clone", "1", "shared"]).await;
     assert!(out.status.success(), "{}", failed(&out));
-    stdout(&run_as(&a, &first_cfg, &["devices", "revoke", "Tester"]).await);
+    stdout(&run_as(&a, &first_cfg, &["devices", "revoke", "Tester", "--yes"]).await);
     // The project's owner removes it, and it hears of the revoke from the
     // project they share.
     let owner = clone(&edit, &work, "owner").await;

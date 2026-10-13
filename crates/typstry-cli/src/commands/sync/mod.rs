@@ -393,7 +393,19 @@ impl Live {
         match &mut self.pause {
             // Whatever happened while sync was not running, the folder
             // gets the same check as after a branch switch on resume.
-            Some(pause) => pause.left_branch = true,
+            // That check also covers what happens until then, which
+            // --publish could not have vouched for, so it does not carry
+            // over; saying so beats publishing a tree nobody has seen.
+            Some(pause) => {
+                pause.left_branch = true;
+                if publish {
+                    say!(
+                        "sync: --publish has no effect while sync is paused for git; if outgoing \
+                         changes are held back once it resumes, {} to publish them",
+                        self.publish_hint
+                    );
+                }
+            }
             None => {
                 // --publish is the go-ahead the check would ask for.
                 if !publish && (marker.exists() || self.session.git_switched()) {

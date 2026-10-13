@@ -16,6 +16,7 @@ import { toProjectDiagnostic, type ProjectDiagnostic } from "./diagnostics";
 import {
   DEFAULT_FONTS,
   type FontConfig,
+  type WorkerEvents,
   type WorkerLike,
   type WorkerRequest,
   type WorkerResponse,
@@ -40,8 +41,17 @@ export interface PreviewState {
   /** Compile plus render time, from compile start to the DOM-ready pages. */
   totalMs: number | null;
   document: PreviewDocument | null;
-  /** Compiler startup or rendering failure, as opposed to Typst errors. */
+  /**
+   * Compiler startup, crash or rendering failure, as opposed to Typst
+   * errors. CompilerClient.retry() tries again.
+   */
   error: string | null;
+  /**
+   * The worker owes a compile or PDF and has been silent for a while. A
+   * package download on a slow connection or a big document legitimately
+   * takes that long, so it keeps going; retry() restarts it if it is hung.
+   */
+  stalled: boolean;
 }
 
 /**
@@ -54,10 +64,24 @@ export interface PreviewState {
 export type AssetLoader = (hash: string, path: string) => Promise<Uint8Array>;
 
 export interface CompilerClientOptions {
+  /** A worker owned by the caller. The client cannot replace it if it dies. */
   worker?: WorkerLike;
+  /** Creates (and recreates, after a crash) the client's own worker. */
+  createWorker?: () => WorkerLike;
   createRenderer?: () => Promise<PreviewRenderer>;
   assetLoader?: AssetLoader;
 }
+
+/**
+ * How long the worker may stay silent while a compile or PDF export is
+ * running before the preview offers a restart. It is never killed for it:
+ * the worker cannot report progress from inside a compile, so a hang looks
+ * the same as a slow package download or a long export.
+ */
+const WATCHDOG_MS = 60_000;
+
+/** Automatic restarts after crashes in a row before the client gives up. */
+const MAX_RESTARTS = 3;
 
 /** Coalesces bursts of text events per file before sending them. */
 const TEXT_DEBOUNCE_MS = 16;
@@ -94,8 +118,9 @@ export function createCompileWorker(): WorkerLike {
  */
 export class CompilerClient {
   private readonly project: ProjectDoc;
-  private readonly worker: WorkerLike;
-  private readonly ownsWorker: boolean;
+  private worker: WorkerLike;
+  /** Null for a caller-owned worker, which is never terminated or replaced. */
+  private readonly spawnWorker: (() => WorkerLike) | null;
   private readonly createRenderer: () => Promise<PreviewRenderer>;
   private readonly assetLoader: AssetLoader | undefined;
 
@@ -104,7 +129,7 @@ export class CompilerClient {
   private files: ProjectIndexState;
   /** Asset path -> hash currently mirrored (or being loaded). */
   private readonly assets = new Map<string, string>();
-  private readonly retry = new RetryQueue();
+  private readonly retries = new RetryQueue();
   private mainId: TreeID | null = null;
   private baseFonts: FontConfig = DEFAULT_FONTS;
   /**
@@ -126,6 +151,15 @@ export class CompilerClient {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   /** Set while the preview is hidden, see pause(). */
   private paused = false;
+  /** The worker has reported "ready" or "initError" since it was created. */
+  private workerStarted = false;
+  /** The worker could not build the compiler; it retries on its own. */
+  private initFailed = false;
+  /** Restarts after a crash since the last finished compile. */
+  private restarts = 0;
+  /** Restarting stopped (too many crashes, or a caller-owned worker). */
+  private workerDead = false;
+  private watchdog: ReturnType<typeof setTimeout> | null = null;
 
   private state: PreviewState = {
     status: "starting",
@@ -135,6 +169,7 @@ export class CompilerClient {
     totalMs: null,
     document: null,
     error: null,
+    stalled: false,
   };
   private readonly listeners = new Set<(state: PreviewState) => void>();
   private renderer: Promise<PreviewRenderer> | null = null;
@@ -155,12 +190,14 @@ export class CompilerClient {
 
   constructor(project: ProjectDoc, options: CompilerClientOptions = {}) {
     this.project = project;
-    this.ownsWorker = !options.worker;
-    this.worker = options.worker ?? createCompileWorker();
+    this.spawnWorker = options.worker
+      ? null
+      : (options.createWorker ?? createCompileWorker);
+    this.worker = options.worker ?? this.spawnWorker!();
     this.createRenderer = options.createRenderer ?? createPreviewRenderer;
     this.assetLoader = options.assetLoader;
 
-    this.worker.addEventListener("message", this.onWorkerMessage);
+    this.attach(this.worker);
     this.index = projectIndex(project);
     this.unsubscribeIndex = this.index.subscribe((change) =>
       this.onIndexChange(change),
@@ -209,6 +246,46 @@ export class CompilerClient {
     this.requestCompile();
   }
 
+  /**
+   * Tries again after a failure shown in `error`: a compiler that could not
+   * start or kept crashing, or a preview that could not render. While
+   * `stalled`, it restarts the worker instead.
+   */
+  retry(): void {
+    if (this.disposed) return;
+    if (this.workerDead) {
+      if (!this.spawnWorker) return;
+      this.workerDead = false;
+      this.restarts = 0;
+      this.replaceWorker();
+      this.setState({ error: "Restarting the compiler.", stalled: false });
+    } else if (this.state.stalled && this.spawnWorker) {
+      // Asked for by the user, so it is not a crash and does not count
+      // toward giving up.
+      this.rejectPdfRequests(new Error("the compiler was restarted"));
+      this.replaceWorker();
+      this.setState({ error: "Restarting the compiler.", stalled: false });
+    } else if (this.initFailed) {
+      this.post({ type: "restart" });
+    } else {
+      this.post({ type: "resync" });
+      this.requestCompile();
+    }
+  }
+
+  /**
+   * Loads assets and fonts that failed to load again right away, instead of
+   * waiting for the backoff. For when the loader starts working again, such
+   * as after the project's link was rotated and the old one stopped working.
+   */
+  refreshAssets(): void {
+    if (this.disposed || !this.assetLoader) return;
+    const failed =
+      this.fontKey === null ||
+      [...this.assets.values()].some((hash) => hash === FAILED_LOAD);
+    if (failed && this.syncAssets(this.files)) this.requestCompile();
+  }
+
   /** Loads the project's font files and rebuilds the compiler with them. */
   private loadFonts(): void {
     const load = ++this.fontLoad;
@@ -224,14 +301,14 @@ export class CompilerClient {
       Promise.all(files.map(([hash, path]) => loader(hash, path))).then(
         (data) => {
           if (load !== this.fontLoad) return;
-          this.retry.succeeded("fonts");
+          this.retries.succeeded("fonts");
           this.postFonts(data);
         },
         (err: unknown) => {
           console.error("failed to load project fonts", err);
           if (load !== this.fontLoad) return;
           this.fontKey = null;
-          this.retry.schedule("fonts", () => this.syncAssets(this.files));
+          this.retries.schedule("fonts", () => this.syncAssets(this.files));
         },
       ),
     );
@@ -267,29 +344,143 @@ export class CompilerClient {
     if (this.disposed) throw new Error("compiler disposed");
     const mainPath = this.mainPath();
     if (mainPath === undefined) throw new Error("the project has no main file");
+    if (this.workerDead) throw new Error("the compiler is not running");
     // Edits still waiting out the debounce would be missing otherwise.
     this.flushTexts();
     const id = this.nextPdfId++;
     return new Promise((resolve, reject) => {
       this.pdfRequests.set(id, { resolve, reject });
       this.post({ type: "exportPdf", id, mainPath: typstPath(mainPath) });
+      this.updateWatchdog();
     });
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const { reject } of this.pdfRequests.values())
-      reject(new Error("compiler disposed"));
-    this.pdfRequests.clear();
+    this.rejectPdfRequests(new Error("compiler disposed"));
     this.unsubscribeIndex();
-    this.retry.dispose();
+    this.retries.dispose();
     if (this.flushTimer !== null) clearTimeout(this.flushTimer);
-    this.worker.removeEventListener("message", this.onWorkerMessage);
-    if (this.ownsWorker) this.worker.terminate();
+    this.clearWatchdog();
+    this.detach(this.worker);
+    if (this.spawnWorker) this.worker.terminate();
     void this.renderer?.then((r) => r.dispose()).catch(() => undefined);
     this.onlineWait?.abort();
     this.listeners.clear();
+  }
+
+  private attach(worker: WorkerLike): void {
+    worker.addEventListener("message", this.onWorkerMessage);
+    worker.addEventListener("error", this.onWorkerError);
+    worker.addEventListener("messageerror", this.onWorkerError);
+  }
+
+  private detach(worker: WorkerLike): void {
+    worker.removeEventListener("message", this.onWorkerMessage);
+    worker.removeEventListener("error", this.onWorkerError);
+    worker.removeEventListener("messageerror", this.onWorkerError);
+  }
+
+  private rejectPdfRequests(err: Error): void {
+    for (const { reject } of this.pdfRequests.values()) reject(err);
+    this.pdfRequests.clear();
+  }
+
+  // An uncaught error can come from anywhere in the worker, and a lost
+  // message leaves a compile or export waiting forever. Neither leaves the
+  // worker in a state worth trusting, so both get a fresh one.
+  private readonly onWorkerError = (event: WorkerEvents["error"]) => {
+    console.error("the compile worker failed", event);
+    this.recoverWorker("The compiler crashed.");
+  };
+
+  /**
+   * Keeps a timer running while the worker owes an answer (a compile it
+   * started, or a PDF), restarted by every message from it. When it fires,
+   * the preview only says so; see WATCHDOG_MS.
+   */
+  private updateWatchdog(): void {
+    this.clearWatchdog();
+    const busy =
+      this.compileStartedAt.size > 0 ||
+      // An export waits for the compiler to start, which is not the
+      // compile hanging, and a failed start is shown as an error already.
+      (this.pdfRequests.size > 0 && this.workerStarted && !this.initFailed);
+    if (!busy || this.disposed) return;
+    this.watchdog = setTimeout(() => {
+      this.watchdog = null;
+      this.setState({ stalled: true });
+    }, WATCHDOG_MS);
+  }
+
+  private clearWatchdog(): void {
+    if (this.watchdog !== null) clearTimeout(this.watchdog);
+    this.watchdog = null;
+  }
+
+  /**
+   * Replaces a crashed worker. A document that brings down every
+   * fresh worker too would loop forever, so after a few restarts without a
+   * finished compile in between this stops and waits for retry().
+   */
+  private recoverWorker(reason: string): void {
+    if (this.disposed || this.workerDead) return;
+    this.clearWatchdog();
+    this.rejectPdfRequests(new Error(reason.toLowerCase()));
+    if (!this.spawnWorker || this.restarts >= MAX_RESTARTS) {
+      this.workerDead = true;
+      this.detach(this.worker);
+      if (this.spawnWorker) this.worker.terminate();
+      this.compileStartedAt.clear();
+      this.setState({
+        status: "error",
+        stalled: false,
+        error:
+          this.restarts >= MAX_RESTARTS
+            ? `${reason} It failed ${this.restarts + 1} times in a row; the document may be too large or trigger a compiler bug.`
+            : reason,
+      });
+      return;
+    }
+    this.restarts++;
+    this.replaceWorker();
+    this.setState({
+      status: "error",
+      stalled: false,
+      error: `${reason} Restarting it.`,
+    });
+  }
+
+  /** Starts a fresh worker and mirrors the whole project into it. */
+  private replaceWorker(): void {
+    const spawn = this.spawnWorker!;
+    this.detach(this.worker);
+    this.worker.terminate();
+    this.worker = spawn();
+    this.attach(this.worker);
+    this.workerStarted = false;
+    this.initFailed = false;
+    // The new worker counts compiles from 1 again, and its first update is
+    // a full reset for the renderer.
+    this.compileStartedAt.clear();
+    this.latestCompileId = 0;
+
+    if (this.flushTimer !== null) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.dirty.clear();
+    for (const file of this.files.texts.values()) this.sendText(file);
+    // Asset and font bytes were transferred to the old worker, so they are
+    // loaded again.
+    this.assets.clear();
+    this.fontKey = "";
+    this.fontFiles = new Map();
+    this.syncAssets(this.files);
+    // Without project fonts syncAssets has no reason to reinit, but the new
+    // worker starts with the default fonts, not the ones reinit() chose.
+    if (this.fontFiles.size === 0 && this.baseFonts !== DEFAULT_FONTS)
+      this.loadFonts();
+    this.requestCompile();
   }
 
   private loadRenderer(): Promise<PreviewRenderer> {
@@ -325,7 +516,8 @@ export class CompilerClient {
   }
 
   private post(message: WorkerRequest, transfer?: Transferable[]): void {
-    if (!this.disposed) this.worker.postMessage(message, transfer);
+    if (!this.disposed && !this.workerDead)
+      this.worker.postMessage(message, transfer);
   }
 
   private setState(patch: Partial<PreviewState>): void {
@@ -441,7 +633,7 @@ export class CompilerClient {
           (data) => {
             // The file may have been replaced or removed while loading.
             if (this.assets.get(path) !== hash) return;
-            this.retry.succeeded(`asset:${path}`);
+            this.retries.succeeded(`asset:${path}`);
             this.post({ type: "setAsset", path: typstPath(path), data }, [
               data.buffer,
             ]);
@@ -451,7 +643,7 @@ export class CompilerClient {
             console.error(`failed to load asset ${path}`, err);
             if (this.assets.get(path) !== hash) return;
             this.assets.set(path, FAILED_LOAD);
-            this.retry.schedule(`asset:${path}`, () => {
+            this.retries.schedule(`asset:${path}`, () => {
               if (this.syncAssets(this.files)) this.requestCompile();
             });
           },
@@ -518,11 +710,27 @@ export class CompilerClient {
     const msg = event.data;
     switch (msg.type) {
       case "ready":
-        if (this.state.status === "starting") this.setState({ status: "idle" });
+        // A first start, or one after a failure: the status still describes
+        // the failure, and the compile requested meanwhile follows.
+        if (!this.workerStarted || this.initFailed)
+          this.setState({ status: "idle" });
+        this.workerStarted = true;
+        this.initFailed = false;
+        this.retries.succeeded("init");
         if (this.state.error) this.setState({ error: null });
         break;
       case "initError":
-        this.setState({ status: "error", error: msg.message });
+        this.workerStarted = true;
+        this.initFailed = true;
+        this.setState({
+          status: "error",
+          error: `Could not start the Typst compiler: ${msg.message}`,
+        });
+        // Usually a dropped connection or a blocked CDN; the backoff also
+        // covers a connection that comes back without an "online" event.
+        this.retries.schedule("init", () => {
+          if (this.initFailed) this.post({ type: "restart" });
+        });
         break;
       case "compiling":
         this.latestCompileId = msg.id;
@@ -530,6 +738,7 @@ export class CompilerClient {
         this.setState({ status: "compiling" });
         break;
       case "result":
+        this.restarts = 0;
         this.handleResult(msg);
         break;
       case "pdf": {
@@ -540,6 +749,8 @@ export class CompilerClient {
         break;
       }
     }
+    if (this.state.stalled) this.setState({ stalled: false });
+    this.updateWatchdog();
   };
 
   private handleResult(msg: Extract<WorkerResponse, { type: "result" }>): void {
@@ -559,6 +770,11 @@ export class CompilerClient {
       let document = this.state.document;
       let error: string | null = null;
       const last = msg.id === this.latestCompileId;
+      // A compile of the previous main file, finished after the switch. Its
+      // update still goes to the renderer, but nothing of it is shown.
+      const current =
+        this.state.mainPath !== null &&
+        typstPath(this.state.mainPath) === msg.mainPath;
       let loadFailed = false;
       try {
         if (msg.update) {
@@ -571,7 +787,7 @@ export class CompilerClient {
         }
         // SVG work is skipped while a newer compile is already running. If
         // that one fails, its result still lands here and renders this state.
-        if (last && this.unrendered && this.renderer) {
+        if (last && current && this.unrendered && this.renderer) {
           const svg = await (await this.renderer).renderSvg();
           document = splitSvgPages(svg, document);
           this.unrendered = false;
@@ -588,10 +804,16 @@ export class CompilerClient {
         }
       }
       if (this.disposed) return;
-      // The main file may have gone away while this compile ran.
-      if (this.state.mainPath === null) return;
+      // The main file may have gone away or changed while this compile ran.
+      if (!current) return;
+      // A superseded compile's diagnostics are already out of date, and
+      // showing them would make errors flicker back in while typing.
+      if (!last) {
+        if (error) this.setState({ error });
+        return;
+      }
       this.setState({
-        status: last ? (failed || error ? "error" : "idle") : "compiling",
+        status: failed || error ? "error" : "idle",
         diagnostics,
         compileMs: msg.compileMs,
         totalMs: startedAt !== undefined ? performance.now() - startedAt : null,

@@ -3,6 +3,7 @@
 //! headers, and the presence room relays opaque ciphertext blobs.
 
 pub mod actor;
+mod backfill;
 pub mod elo;
 pub mod mls;
 pub mod registry;

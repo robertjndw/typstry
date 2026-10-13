@@ -110,6 +110,7 @@ pub fn mls_kind(error: &MlsError) -> Kind {
         MlsError::Identity(inner) => graph_kind(inner),
         MlsError::NoIdentity => plain("NoIdentity"),
         MlsError::NothingRevoked => plain("NothingRevoked"),
+        MlsError::KeyringBehind => plain("KeyringBehind"),
     }
 }
 

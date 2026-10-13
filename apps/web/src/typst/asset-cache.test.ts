@@ -20,11 +20,17 @@ function fakeFetch(status = 200) {
 /** Minimal in-memory Cache Storage. */
 function fakeCaches() {
   const entries = new Map<string, Response>();
+  const url = (key: string | Request) =>
+    typeof key === "string" ? key : key.url;
   const cache = {
-    match: vi.fn(async (key: string) => entries.get(key)?.clone()),
+    match: vi.fn(async (key: string | Request) =>
+      entries.get(url(key))?.clone(),
+    ),
     put: vi.fn(async (key: string, res: Response) => {
       entries.set(key, res);
     }),
+    keys: vi.fn(async () => [...entries.keys()].map((k) => new Request(k))),
+    delete: vi.fn(async (key: string | Request) => entries.delete(url(key))),
   };
   const storage = {
     open: vi.fn(async () => cache),
@@ -114,5 +120,56 @@ describe("AssetCache", () => {
       new AssetCache({ fetch: served, caches: storage }).get("tok", HASH),
     ).rejects.toThrow(/different content/);
     expect(store.put).not.toHaveBeenCalled();
+  });
+
+  describe("Cache Storage bound", () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const keyOf = (hash: string) =>
+      `https://typstry.invalid/__typstry-blob/${encodeURIComponent(hash)}`;
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it("drops the least recently used entries over its budget", async () => {
+      const { storage, entries } = fakeCaches();
+      const fetch = fakeFetch();
+      let now = 1_000_000;
+      const opts = { fetch, caches: storage, maxStoredBytes: 4 };
+      await new AssetCache({ ...opts, now: () => now }).get("tok", HASH);
+      await flush();
+      now += 1000;
+      await new AssetCache({ ...opts, now: () => now }).get("tok", OTHER);
+      await flush();
+      // Pruned at most once a minute, so going over is caught a bit later,
+      // here by the next page load.
+      expect(entries.size).toBe(2);
+      now += 1000;
+      await new AssetCache({ ...opts, now: () => now }).get("tok", OTHER);
+      await flush();
+      await flush();
+      expect([...entries.keys()]).toEqual([keyOf(OTHER)]);
+    });
+
+    it("drops entries unused for months, and refreshes the ones in use", async () => {
+      const { storage, entries } = fakeCaches();
+      const fetch = fakeFetch();
+      let now = 1_000_000;
+      const opts = { fetch, caches: storage, now: () => now };
+      await new AssetCache(opts).get("tok", HASH);
+      await new AssetCache(opts).get("tok", OTHER);
+      await flush();
+
+      now += 60 * DAY;
+      await new AssetCache(opts).get("tok", OTHER);
+      await flush();
+      expect(entries.get(keyOf(OTHER))!.headers.get("x-typstry-accessed")).toBe(
+        String(now),
+      );
+
+      now += 40 * DAY;
+      await new AssetCache(opts).get("tok", OTHER);
+      await flush();
+      await flush();
+      expect([...entries.keys()]).toEqual([keyOf(OTHER)]);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
   });
 });

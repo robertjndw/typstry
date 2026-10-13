@@ -43,10 +43,15 @@ import {
 import type { ShareInfo } from "@/sync/api";
 import type { SyncNowResult, SyncStatus } from "@/sync/connection";
 
+import { useDisposeOnUnmount } from "./dispose";
+
 export const NOT_A_PROJECT = "This link does not open a project.";
 
 /** Matches the server's presence timeout. */
-export const EPHEMERAL_TIMEOUT_MS = 30_000;
+const EPHEMERAL_TIMEOUT_MS = 30_000;
+
+// Stops the store's expiry timer, which would otherwise keep it alive.
+const destroyEphemeral = (ephemeral: EphemeralStore) => ephemeral.destroy();
 
 export type SessionPhase =
   | { phase: "resolving" }
@@ -77,6 +82,11 @@ export type { FollowedLinks };
 export interface ProjectSession {
   state: SessionPhase;
   status: SyncStatus;
+  /**
+   * The server refused local edits for good on this connection, said for
+   * people; null while all is well.
+   */
+  syncProblem: string | null;
   project: ProjectDoc;
   ephemeral: EphemeralStore;
   /** The project's member group; null until the share is known. */
@@ -105,6 +115,7 @@ export function useProjectSession(
     ephemeral: new EphemeralStore(EPHEMERAL_TIMEOUT_MS),
   }));
   const { project, ephemeral } = resources;
+  useDisposeOnUnmount(ephemeral, destroyEphemeral);
   const [fallbackIdentity] = useState(
     () => loadIdentity() ?? provisionalIdentity(),
   );
@@ -255,6 +266,7 @@ export function useProjectSession(
   return {
     state,
     status: snap.status,
+    syncProblem: snap.syncProblem,
     project,
     ephemeral,
     mls,

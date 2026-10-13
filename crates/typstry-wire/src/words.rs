@@ -1,4 +1,5 @@
-//! The 256 words a pairing code is spelled with, one per byte value.
+//! The 256 words pairing codes and recovery keys are spelled with, one per
+//! byte value.
 //!
 //! Short, common and unlike each other, so they are easy to read aloud and
 //! type. The order is part of the format: a word's index is its byte, so

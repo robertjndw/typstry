@@ -288,8 +288,7 @@ async fn revoke(ctx: &Ctx, query: &str, yes: bool) -> anyhow::Result<()> {
                  and their links are replaced."
             ),
         )? {
-            out.out("Nothing revoked.");
-            return Ok(());
+            bail!("cancelled; nothing was revoked");
         }
         identity
             .graph
@@ -373,6 +372,10 @@ async fn clean_everywhere(ctx: &Ctx, out: &mut Output) -> anyhow::Result<()> {
         "Until they are cleaned, the revoked device keeps the access it had there. \
          Run `typstry devices revoke` again once they can be reached.",
     );
+    // A script must not take a half-done revocation for a done one.
+    if !spread.unreached.is_empty() || !unsecured.is_empty() {
+        bail!("the revoked device was not removed everywhere; see above");
+    }
     Ok(())
 }
 
@@ -393,6 +396,9 @@ struct Spread {
     /// devices.
     reached: Vec<(String, Cleanup)>,
     unreached: Vec<(String, String)>,
+    /// How many of the unreached ones were tried and failed, rather than
+    /// only noted for having no folder here.
+    failed: usize,
 }
 
 /// The revoked devices of one project after [`clean_project`].
@@ -489,14 +495,16 @@ async fn spread(ctx: &Ctx, out: &mut Output, scope: Scope<'_>) -> anyhow::Result
                  or clone it here first"
             )),
         };
-        (entry.title, result, lines.into_lines())
+        let attempted = entry.dir.is_some() || revoking;
+        (entry.title, attempted, result, lines.into_lines())
     });
     let mut done = stream::iter(cleanups).buffered(SPREAD_CONCURRENCY);
     let mut spread = Spread {
         reached: Vec::new(),
         unreached: Vec::new(),
+        failed: 0,
     };
-    while let Some((title, result, lines)) = done.next().await {
+    while let Some((title, attempted, result, lines)) = done.next().await {
         for line in lines {
             match line {
                 Line::Stdout(text) => out.out(text),
@@ -505,7 +513,10 @@ async fn spread(ctx: &Ctx, out: &mut Output, scope: Scope<'_>) -> anyhow::Result
         }
         match result {
             Ok(removed) => spread.reached.push((title, removed)),
-            Err(err) => spread.unreached.push((title, format!("{err:#}"))),
+            Err(err) => {
+                spread.failed += usize::from(attempted);
+                spread.unreached.push((title, format!("{err:#}")));
+            }
         }
     }
     Ok(spread)
@@ -571,6 +582,11 @@ async fn recovery(ctx: &Ctx) -> anyhow::Result<()> {
         &mut out,
         "Run `typstry pull` in those folders, or this command's cleanup again, to put the key there.",
     );
+    // A project without a folder here is expected on a new device; one
+    // that could not be opened is not.
+    if spread.failed > 0 {
+        bail!("the recovery key was made, but not every project carries it yet; see above");
+    }
     Ok(())
 }
 
@@ -590,19 +606,52 @@ fn project_servers() -> anyhow::Result<Vec<String>> {
 /// argument: those end up in shell history.
 fn read_words() -> anyhow::Result<String> {
     let mut stdin = std::io::stdin();
-    let mut words = String::new();
-    if stdin.is_terminal() {
-        eprint!("Recovery words: ");
+    let words = if stdin.is_terminal() {
+        eprint!("Recovery words (not shown as you type): ");
         std::io::Write::flush(&mut std::io::stderr())?;
-        stdin.read_line(&mut words)
+        read_hidden_line()
     } else {
-        stdin.read_to_string(&mut words)
+        let mut words = String::new();
+        stdin.read_to_string(&mut words).map(|_| words)
     }
     .context("reading the recovery words")?;
     if words.trim().is_empty() {
         bail!("expected the recovery words on standard input");
     }
     Ok(words)
+}
+
+/// A line from the terminal without echoing it, so the words never land
+/// in the scrollback or a screen share. Raw mode is the portable way to
+/// turn echo off; it also turns off line editing, so Backspace is handled
+/// here.
+fn read_hidden_line() -> std::io::Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    crossterm::terminal::enable_raw_mode()?;
+    let read = (|| {
+        let mut line = String::new();
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Enter => return Ok(line),
+                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                    }
+                    KeyCode::Char(c) => line.push(c),
+                    KeyCode::Backspace => {
+                        line.pop();
+                    }
+                    _ => {}
+                },
+                Event::Paste(text) => line.push_str(&text),
+                _ => {}
+            }
+        }
+    })();
+    let _ = crossterm::terminal::disable_raw_mode();
+    eprintln!();
+    read
 }
 
 async fn recover(ctx: &Ctx, link: &str, replace: bool, keep_devices: bool) -> anyhow::Result<()> {
@@ -792,7 +841,7 @@ async fn restore_projects(
         .collect();
     let mut owned = 0;
     for entry in &entries {
-        let title = entry.title.as_deref().unwrap_or("Untitled");
+        let title = crate::term::printable(entry.title.as_deref().unwrap_or("Untitled"));
         match take_owner_key(server, entry, recovery).await {
             Ok(true) => owned += 1,
             Ok(false) => {}
@@ -873,7 +922,11 @@ async fn profile(ctx: &Ctx, color: Option<&str>) -> anyhow::Result<()> {
     let known = current.as_deref().and_then(profile_identity);
     if ctx.name.is_none() && color.is_none() {
         match &known {
-            Some(Identity { name, color }) => println!("Your devices go by {name} ({color})."),
+            Some(Identity { name, color }) => println!(
+                "Your devices go by {} ({}).",
+                crate::term::printable(name),
+                crate::term::printable(color)
+            ),
             None => println!(
                 "No name or color is set for your devices yet; set them with \
                  `typstry devices profile --name <NAME> --color <#rrggbb>`."

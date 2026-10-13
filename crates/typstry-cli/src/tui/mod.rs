@@ -9,7 +9,9 @@ pub mod versions;
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use ratatui::crossterm::event::{Event, EventStream, KeyEvent};
+use ratatui::crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{List, ListItem, Paragraph};
@@ -57,6 +59,9 @@ pub(crate) async fn run_view<S, O>(
     loop {
         terminal.draw(|frame| render(frame, state))?;
         match events.next().await {
+            Some(Ok(Event::Key(key))) if is_suspend(&key) => {
+                suspend_full_screen(&mut terminal)?;
+            }
             Some(Ok(Event::Key(key))) => {
                 if let Some(outcome) = on_key(state, key) {
                     return Ok(outcome);
@@ -67,6 +72,47 @@ pub(crate) async fn run_view<S, O>(
             None => return Ok(closed),
         }
     }
+}
+
+/// Whether `key` is Ctrl+Z. In raw mode the terminal hands it over as a
+/// key instead of suspending the process, so the views do that
+/// themselves. Only on Unix, where there is job control to hand over to.
+pub(crate) fn is_suspend(key: &KeyEvent) -> bool {
+    cfg!(unix)
+        && key.kind != KeyEventKind::Release
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('z')
+}
+
+/// Stops the process like Ctrl+Z does outside raw mode and returns once
+/// the shell resumes it (`fg`). Without job control the stop is discarded
+/// and this returns right away.
+pub(crate) fn stop_self() {
+    // Raising a signal from inside the process takes unsafe code or another
+    // dependency; kill(1) is there wherever a shell has job control.
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .arg("-TSTP")
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Gives the terminal back to the shell for a Ctrl+Z, and takes it over
+/// again, fully redrawn, once the process is resumed.
+pub(crate) fn suspend_full_screen(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+    let _ = terminal.show_cursor();
+    ratatui::restore();
+    stop_self();
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    )?;
+    terminal.clear()?;
+    Ok(())
 }
 
 /// Moves a cursor over `len` rows by one, stopping at either end instead

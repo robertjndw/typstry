@@ -21,7 +21,7 @@ use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::{
     HpkeAeadType, HpkeConfig, HpkeKdfType, HpkeKemType, HpkeKeyPair, SignatureScheme,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::rotation::Tokens;
 use super::{MlsError, SubmitPayload};
@@ -191,7 +191,21 @@ pub struct SavedState {
     /// not known to exist.
     pub unconfirmed_join: bool,
     pub pending: Option<SavedPending>,
-    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub entries: Entries,
+}
+
+/// openmls' storage as key-value pairs. It holds the epoch secrets and the
+/// leaf's private keys, so the copies are wiped once saved or restored.
+#[derive(Default)]
+pub struct Entries(Vec<(Vec<u8>, Vec<u8>)>);
+
+impl Drop for Entries {
+    fn drop(&mut self) {
+        for (key, value) in &mut self.0 {
+            key.zeroize();
+            value.zeroize();
+        }
+    }
 }
 
 pub fn encode(state: &SavedState) -> Zeroizing<Vec<u8>> {
@@ -219,8 +233,8 @@ pub fn encode(state: &SavedState) -> Zeroizing<Vec<u8>> {
     if let Some(key) = &state.owner_key {
         w.push_bytes(key);
     }
-    w.push_uleb128(state.entries.len() as u64);
-    for (key, value) in &state.entries {
+    w.push_uleb128(state.entries.0.len() as u64);
+    for (key, value) in &state.entries.0 {
         w.push_var_bytes(key);
         w.push_var_bytes(value);
     }
@@ -308,6 +322,7 @@ pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
     let mut r = BytesReader::new(bytes);
     match r.read_byte().map_err(bad)? {
         MLS_STATE_VERSION => {}
+        0 => return Err(bad("version 0".into())),
         newer => return Err(MlsError::NewerState(newer)),
     }
     let group_id = r.read_var_bytes().map_err(bad)?.to_vec();
@@ -353,11 +368,11 @@ pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
     };
     // Every entry is at least two length bytes.
     let count = plausible_count(&mut r, 2).map_err(bad)?;
-    let mut entries = Vec::with_capacity(count as usize);
+    let mut entries = Entries(Vec::with_capacity(count as usize));
     for _ in 0..count {
         let key = r.read_var_bytes().map_err(bad)?.to_vec();
         let value = r.read_var_bytes().map_err(bad)?.to_vec();
-        entries.push((key, value));
+        entries.0.push((key, value));
     }
     if r.remaining() != 0 {
         return Err(bad("trailing bytes".into()));
@@ -378,16 +393,17 @@ pub fn decode(bytes: &[u8]) -> Result<SavedState, MlsError> {
 
 /// The provider's whole storage, in a stable order so equal state saves to
 /// equal bytes.
-pub fn dump(provider: &OpenMlsRustCrypto) -> Vec<(Vec<u8>, Vec<u8>)> {
+pub fn dump(provider: &OpenMlsRustCrypto) -> Entries {
     let values = provider.storage().values.read().expect("storage lock");
     let mut entries: Vec<_> = values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     entries.sort();
-    entries
+    Entries(entries)
 }
 
-pub fn restore(entries: Vec<(Vec<u8>, Vec<u8>)>) -> OpenMlsRustCrypto {
+/// Moves the pairs into the provider, so they are not copied again.
+pub fn restore(mut entries: Entries) -> OpenMlsRustCrypto {
     let provider = OpenMlsRustCrypto::default();
-    let map: HashMap<_, _> = entries.into_iter().collect();
+    let map: HashMap<_, _> = std::mem::take(&mut entries.0).into_iter().collect();
     *provider.storage().values.write().expect("storage lock") = map;
     provider
 }

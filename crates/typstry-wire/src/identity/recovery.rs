@@ -51,7 +51,7 @@ impl RecoveryKey {
     /// The key for `words`, in any case and with any mix of whitespace,
     /// hyphens and commas between them, as people copy them down.
     pub fn from_words(words: &str) -> Result<DeviceKey, RecoveryError> {
-        let lower = words.to_ascii_lowercase();
+        let lower = Zeroizing::new(words.to_ascii_lowercase());
         let parts: Vec<&str> = lower
             .split(|c: char| c.is_whitespace() || c == '-' || c == ',')
             .filter(|part| !part.is_empty())
@@ -308,6 +308,32 @@ mod tests {
         let mut want = vec![p.laptop.public(), p.phone.public()];
         want.sort();
         assert_eq!(out.revoked, want);
+    }
+
+    #[test]
+    fn recovery_still_fits_after_a_stolen_device_fills_the_graph() {
+        let mut p = person();
+        let profile = || EntryKind::SetProfile {
+            profile: vec![b'x'; super::super::MAX_PROFILE_LEN],
+        };
+        while p.graph.append(&p.phone, profile()).is_ok() {}
+        assert_eq!(
+            p.graph.append(&p.laptop, profile()),
+            Err(GraphError::TooLarge)
+        );
+        let fresh = DeviceKey::generate();
+        let out = recover(
+            std::slice::from_ref(&p.graph),
+            &p.recovery,
+            &fresh.public(),
+            None,
+            RecoverOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(state(&out.graph, &fresh), DeviceState::Valid);
+        for lost in [&p.laptop, &p.phone] {
+            assert_eq!(state(&out.graph, lost), DeviceState::Revoked);
+        }
     }
 
     #[test]

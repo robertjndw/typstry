@@ -107,7 +107,7 @@ export async function uploadReporting(
   }
 }
 
-export function friendlyFsError(err: unknown): string {
+function friendlyFsError(err: unknown): string {
   if (!(err instanceof FsError)) {
     console.error(err);
     return "Something went wrong. See the console for details.";

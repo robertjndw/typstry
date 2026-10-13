@@ -34,6 +34,10 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(150);
 
 const POLL: Duration = Duration::from_millis(50);
 
+/// An asker reads its answer within [`POLL`], so one that is still there
+/// after this belongs to an asker that gave up.
+const STALE_RESPONSE: Duration = Duration::from_secs(60);
+
 /// Sent with every request, since a running sync survives an upgrade and
 /// may be an older build than the command. Bump it when an existing request
 /// or [`Response`] changes. A new request needs no bump, an older sync
@@ -109,8 +113,11 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
             // sync never saw it and nothing happened.
             match fs::remove_file(&request_path) {
                 Ok(()) => bail!(
-                    "`typstry sync` ({}) did not take the request; check its terminal, or stop it with Ctrl+C and run the command again",
-                    running.holder
+                    "`typstry sync` ({}) did not take the request within {} s, so nothing was \
+                     done. It may just be busy with a long upload; try again in a moment, or \
+                     check its terminal",
+                    running.holder,
+                    PICKUP_TIMEOUT.as_secs()
                 ),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => taken = true,
                 Err(err) => {
@@ -121,7 +128,8 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
         }
         if started.elapsed() > ANSWER_TIMEOUT {
             bail!(
-                "`typstry sync` ({}) did not answer in time; check its terminal for what happened",
+                "`typstry sync` ({}) took the request but did not answer in time; it may still \
+                 complete, so check its terminal before running the command again",
                 running.holder
             );
         }
@@ -190,12 +198,22 @@ impl Mailbox {
 
     /// The requests waiting, oldest first, each removed from the mailbox.
     /// One that does not parse comes back as an error to answer with.
+    /// Answers nobody picked up are cleared on the way.
     pub fn take(&self) -> anyhow::Result<Vec<(String, anyhow::Result<Request>)>> {
         let mut waiting = Vec::new();
         for path in self.entries()? {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            if name.ends_with(RESPONSE) && !name.starts_with('.') {
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > STALE_RESPONSE));
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
             // Dot files are atomic writes still in progress.
             let Some(id) = name
                 .strip_suffix(REQUEST)
@@ -291,6 +309,24 @@ mod tests {
             err.to_string().contains("different typstry version"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn answers_nobody_picked_up_are_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = Mailbox::open(dir.path()).unwrap();
+        let old = mailbox.dir.join(format!("old{RESPONSE}"));
+        let fresh = mailbox.dir.join(format!("new{RESPONSE}"));
+        fs::write(&old, "{}").unwrap();
+        fs::write(&fresh, "{}").unwrap();
+        let file = fs::File::options().write(true).open(&old).unwrap();
+        let then = std::time::SystemTime::now() - STALE_RESPONSE - Duration::from_secs(5);
+        file.set_modified(then).unwrap();
+
+        assert!(mailbox.take().unwrap().is_empty());
+        assert!(!old.exists());
+        // An asker may be about to read this one.
+        assert!(fresh.exists());
     }
 
     #[test]

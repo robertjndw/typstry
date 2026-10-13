@@ -3,11 +3,11 @@
 // the person may have written junk: an entry that does not validate is
 // skipped, never an error. Writes are no-ops when they would change nothing,
 // so reopening a project does not pile up ops.
-import type { LoroDoc, LoroMap } from "loro-crdt";
+import { isContainer, type LoroDoc, type LoroMap } from "loro-crdt";
 
 import { fromBase64Url, toBase64Url, toHex } from "@/crypto/bytes";
-import { secretKind } from "@/crypto/secret";
 import { ownerPublicKeyOf } from "@/crypto/wasm";
+import { normalizeTitle } from "@/doc/fs-ops";
 import { CHANGE_MERGE_INTERVAL_S, DOC_KIND, META } from "@/doc/schema";
 
 import {
@@ -23,6 +23,7 @@ import {
   STATUS,
   type State,
 } from "./schema";
+import { linkSecretKind } from "./link-secret";
 
 export interface LinkRef {
   token: string;
@@ -75,8 +76,22 @@ interface Parsed {
 
 type Plain = Record<string, unknown>;
 
+// A child container is never a valid entry: Rust only reads plain values.
+// Containers are objects too, so they have to be ruled out by name, and so
+// do the byte arrays Loro hands out for binary values.
 function isPlain(value: unknown): value is Plain {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    !ArrayBuffer.isView(value) &&
+    !isContainer(value)
+  );
+}
+
+/** A root map's entries, skipping child containers like `plain` in Rust. */
+function plainEntries(map: LoroMap): [string, unknown][] {
+  return map.entries().filter(([, value]) => !isContainer(value));
 }
 
 /** Integers and doubles read the same; Rust truncates the same way. */
@@ -99,7 +114,7 @@ function linkProblem(
 ): string | null {
   if (!validToken(token)) return "token";
   if (!projectId) return "project id";
-  const kind = secretKind(secret);
+  const kind = linkSecretKind(secret);
   if (kind !== "edit" && kind !== "view") return "secret";
   if (edit && kind !== "edit") return "edit flag on a view secret";
   return null;
@@ -215,16 +230,29 @@ export class Directory {
   /**
    * Runs the writes `fn` makes as one commit, so a caller that records
    * several facts at once wakes the subscribers and the sync only once.
-   * Reads inside `fn` already see the earlier writes.
+   * Reads inside `fn` already see the earlier writes. When `fn` throws, its
+   * writes are undone: Loro cannot drop pending ops, and the next commit
+   * would otherwise publish half of what `fn` meant to record.
    */
   batch<T>(message: string, fn: () => T): T {
     if (this.batching) return fn();
+    // Every write here commits right away, so only an outside writer can
+    // have left ops pending, and those are not this batch's to undo.
+    this.doc.commit();
+    const before = this.doc.frontiers();
     this.batching = true;
+    let done = false;
     try {
-      return fn();
+      const result = fn();
+      done = true;
+      return result;
     } finally {
       this.batching = false;
       this.doc.commit({ message });
+      if (!done) {
+        this.doc.revertTo(before);
+        this.doc.commit({ message: `undo ${message}` });
+      }
     }
   }
 
@@ -270,9 +298,7 @@ export class Directory {
   /** Valid links, skipping ones dated in the future. */
   private validLinks(now: number): Parsed[] {
     const out: Parsed[] = [];
-    for (const [token, value] of Object.entries(
-      this.map(ROOT.links).toJSON(),
-    )) {
+    for (const [token, value] of plainEntries(this.map(ROOT.links))) {
       const parsed = parseLink(token, value);
       if (parsed && notFuture(parsed.addedAt, now)) out.push(parsed);
     }
@@ -281,9 +307,7 @@ export class Directory {
 
   private retiredMap(): Map<string, number> {
     const out = new Map<string, number>();
-    for (const [token, value] of Object.entries(
-      this.map(ROOT.retired).toJSON(),
-    )) {
+    for (const [token, value] of plainEntries(this.map(ROOT.retired))) {
       const at = num(value);
       if (at !== null) out.set(token, at);
     }
@@ -366,7 +390,7 @@ export class Directory {
       state = status.state;
     return {
       projectId,
-      title: typeof title === "string" && title.trim() ? title.trim() : null,
+      title: typeof title === "string" ? normalizeTitle(title) : null,
       link: linkRef(best, retired),
       state,
       openedAt: num(this.map(ROOT.opened).get(projectId)),
@@ -443,11 +467,14 @@ export class Directory {
     return true;
   }
 
-  /** Sets the title the person sees, trimmed. Empty titles are ignored. */
+  /**
+   * Sets the title the person sees, normalized with normalizeTitle. Titles
+   * it rejects are ignored.
+   */
   setTitle(projectId: string, title: string): boolean {
-    const next = title.trim();
+    const next = normalizeTitle(title);
     const titles = this.map(ROOT.titles);
-    if (!next || titles.get(projectId) === next) return false;
+    if (next === null || titles.get(projectId) === next) return false;
     titles.set(projectId, next);
     this.commit("set title");
     return true;
@@ -495,9 +522,7 @@ export class Directory {
     projectId: string,
   ): (OwnerKeyRef & { id: string; addedAt: number })[] {
     const out: (OwnerKeyRef & { id: string; addedAt: number })[] = [];
-    for (const [id, value] of Object.entries(
-      this.map(ROOT.ownerKeys).toJSON(),
-    )) {
+    for (const [id, value] of plainEntries(this.map(ROOT.ownerKeys))) {
       const slash = id.lastIndexOf("/");
       if (slash <= 0 || id.slice(0, slash) !== projectId) continue;
       const publicKey = id.slice(slash + 1);

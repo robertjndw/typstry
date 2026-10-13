@@ -53,7 +53,9 @@ impl From<io::Error> for AppError {
 impl From<WriteError> for AppError {
     fn from(err: WriteError) -> Self {
         match err {
-            WriteError::TooLarge(_) => Self::Status(StatusCode::PAYLOAD_TOO_LARGE),
+            WriteError::TooLarge(_) | WriteError::OverLimit(_) => {
+                Self::Status(StatusCode::PAYLOAD_TOO_LARGE)
+            }
             WriteError::Body(err) => {
                 tracing::debug!(%err, "upload body aborted");
                 Self::Status(StatusCode::BAD_REQUEST)

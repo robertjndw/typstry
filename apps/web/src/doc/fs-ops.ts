@@ -76,6 +76,9 @@ export function validateName(name: string): void {
     throw new FsError("invalid-name", `"${name}" is reserved`);
   if (name.includes("/"))
     throw new FsError("invalid-name", 'Name must not contain "/"');
+  // A separator on Windows, so the CLI could never check such a file out.
+  if (name.includes("\\"))
+    throw new FsError("invalid-name", 'Name must not contain "\\"');
   if (CONTROL_CHARS.test(name)) {
     throw new FsError(
       "invalid-name",
@@ -111,12 +114,10 @@ export function validateName(name: string): void {
 /**
  * Whether every segment of `path` is a name this app would create, and
  * safe to write anywhere. Docs from other clients can hold any name, so
- * whatever writes paths to disk checks them again. Backslashes are fine as
- * names here but separators on Windows, so they count as unsafe too.
+ * whatever writes paths to disk checks them again.
  */
 export function isSafePath(path: string): boolean {
   return path.split("/").every((segment) => {
-    if (segment.includes("\\")) return false;
     try {
       validateName(segment);
       return true;
@@ -288,8 +289,8 @@ export function getText(project: ProjectDoc, id: TreeID): LoroText {
 }
 
 /**
- * Trims a project title and checks it against the server's limit (counted
- * in code points, like Rust's `chars()`). Returns null when it is unusable.
+ * Trims a project title and checks its length in code points, the same as
+ * `normalize_title` in crates/typstry-doc. Returns null when it is unusable.
  */
 export function normalizeTitle(raw: string): string | null {
   return normalizeBounded(raw, MAX_TITLE_CHARS);

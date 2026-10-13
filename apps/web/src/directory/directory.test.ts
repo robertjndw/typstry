@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { LoroCounter, LoroMap } from "loro-crdt";
 import { describe, expect, it } from "vitest";
 
 import { toBase64Url, toHex } from "@/crypto/bytes";
@@ -99,6 +100,11 @@ describe("links", () => {
       link(1, P1, { projectId: "" }),
       link(1, P1, { secret: "not a secret" }),
       link(1, P1, { secret: viewSecret(), edit: true }),
+      // The right shape, but the attestation key is not a curve point.
+      link(1, P1, {
+        secret: toBase64Url(new Uint8Array([2, ...new Array(64).fill(2)])),
+        edit: false,
+      }),
     ])
       expect(() => dir.addLink(bad)).toThrow("not a valid link");
     expect(dir.list(NOW)).toEqual([]);
@@ -256,6 +262,22 @@ describe("list", () => {
     expect(dir.setTitle(P1, "Paper")).toBe(true);
     expect(dir.list(NOW)[0]!.title).toBe("Paper");
   });
+
+  // Same cases as sets_titles_like_the_browser in directory.rs.
+  it("normalizes titles like project titles", () => {
+    const dir = newDirectory(1);
+    dir.addLink(link(1, P1));
+    expect(dir.setTitle(P1, "\ufeff")).toBe(false);
+    expect(dir.setTitle(P1, "x".repeat(201))).toBe(false);
+    expect(dir.setTitle(P1, "\ufeffThesis\ufeff")).toBe(true);
+    expect(dir.list(NOW)[0]!.title).toBe("Thesis");
+    expect(dir.setTitle(P1, "\u0085")).toBe(true);
+    expect(dir.list(NOW)[0]!.title).toBe("\u0085");
+    // A modified client can store anything; reads apply the same rules.
+    dir.doc.getMap(ROOT.titles).set(P1, "x".repeat(201));
+    dir.doc.commit();
+    expect(dir.list(NOW)[0]!.title).toBeNull();
+  });
 });
 
 describe("refileLink", () => {
@@ -308,6 +330,35 @@ describe("no-op writes", () => {
   });
 });
 
+describe("batch", () => {
+  it("commits once", () => {
+    const dir = newDirectory(1);
+    const changes = dir.doc.getAllChanges().get("1")?.length ?? 0;
+    dir.batch("two", () => {
+      dir.addLink(link(1, P1));
+      dir.setTitle(P1, "T");
+    });
+    expect(dir.doc.getAllChanges().get("1")).toHaveLength(changes + 1);
+  });
+
+  it("undoes the writes of a batch that throws", () => {
+    const dir = newDirectory(1);
+    dir.addLink(link(1, P1));
+    const before = dir.list(NOW);
+    expect(() =>
+      dir.batch("half", () => {
+        dir.setTitle(P1, "T");
+        dir.retire(token(1), 5);
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    dir.doc.commit();
+    expect(dir.list(NOW)).toEqual(before);
+    expect(dir.doc.getMap(ROOT.titles).size).toBe(0);
+    expect(dir.doc.getMap(ROOT.retired).size).toBe(0);
+  });
+});
+
 describe("untrusted data", () => {
   it("skips malformed entries", () => {
     const dir = newDirectory(1);
@@ -347,6 +398,30 @@ describe("untrusted data", () => {
     });
     expect(dir.projectOfToken(token(4), NOW)).toBeNull();
     expect(dir.bestLink("x", NOW)).toBeNull();
+  });
+
+  // Rust reads plain values only, so a child container must not count
+  // however valid its contents look.
+  it("skips child containers", () => {
+    const dir = newDirectory(1);
+    dir.addLink(link(1, P1));
+    const nested = dir.doc
+      .getMap(ROOT.links)
+      .setContainer(token(2), new LoroMap());
+    nested.set("projectId", P2);
+    nested.set("secret", editSecret(2));
+    nested.set("edit", true);
+    nested.set("addedAt", 5);
+    dir.doc.getMap(ROOT.retired).setContainer(token(1), new LoroCounter());
+    (dir.doc.getMap(ROOT.retired).get(token(1)) as LoroCounter).increment(5);
+    dir.doc.getMap(ROOT.status).setContainer(P1, new LoroMap()).set("x", 1);
+    dir.doc.commit();
+
+    expect(dir.list(NOW).map((e) => e.projectId)).toEqual([P1]);
+    expect(dir.projectOfToken(token(2), NOW)).toBeNull();
+    expect(dir.bestLink(P1, NOW)?.retired).toBe(false);
+    expect(dir.setStatus(P1, "forgotten", 9)).toBe(true);
+    expect(dir.list(NOW)[0]!.state).toBe("forgotten");
   });
 
   it("keeps unknown keys and maps when rewriting an entry", () => {

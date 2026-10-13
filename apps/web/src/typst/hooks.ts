@@ -19,6 +19,7 @@ export function useCompilerClient(
 ): CompilerClient | null {
   const [client, setClient] = useState<CompilerClient | null>(null);
   // Options are read once per project; changing them later is not supported.
+  // Pass callbacks that read fresh values through a ref instead.
   const [initialOptions] = useState(options);
   useEffect(() => {
     if (!project) return;

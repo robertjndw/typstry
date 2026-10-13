@@ -198,8 +198,12 @@ mod secret {
 
         /// Inverse of [`Self::to_raw`].
         pub fn from_raw(bytes: &[u8]) -> Result<Self, CryptoError> {
-            let secret = <[u8; KEY_LEN]>::try_from(bytes).map_err(|_| CryptoError::MalformedKey)?;
-            Ok(Self::from_secret(Zeroizing::new(secret)))
+            if bytes.len() != KEY_LEN {
+                return Err(CryptoError::MalformedKey);
+            }
+            let mut secret = Zeroizing::new([0; KEY_LEN]);
+            secret.copy_from_slice(bytes);
+            Ok(Self::from_secret(secret))
         }
 
         /// [`Self::to_raw`] as base64url without padding.
@@ -222,8 +226,7 @@ mod secret {
             if bytes.len() != EXPORT_LEN || bytes[0] != EXPORT_VERSION {
                 return Err(CryptoError::MalformedKey);
             }
-            let secret = Zeroizing::new(<[u8; KEY_LEN]>::try_from(&bytes[1..]).expect("32 bytes"));
-            Ok(Self::from_secret(secret))
+            Self::from_raw(&bytes[1..])
         }
     }
 
@@ -242,22 +245,24 @@ mod secret {
     /// The owner key secrets a device holds, newest first, of which the one
     /// whose public key the server holds is used.
     ///
-    /// Which key the server holds is only what the server says, so no word
-    /// of it ever drops a secret: a server that names a stale or made-up
-    /// key would otherwise get a device to throw away the current one, and
-    /// once every device has, nobody can rotate again. A secret only ever
-    /// leaves the set by being pushed out by newer ones of the same
-    /// [`Origin`], at most [`Self::KEEP`] of each.
+    /// What the server says is current never drops a secret: a server that
+    /// names a stale or made-up key would otherwise get a device to throw
+    /// away the current one, and once every device has, nobody can rotate
+    /// again. A secret only leaves the set when newer ones of the same
+    /// [`Origin`] push it out, at most [`Self::KEEP`] of each.
     ///
     /// That bound holds against a lying server because it cannot add
-    /// anything here. Secrets come from this device's own rotations, which
-    /// it starts, and from shares that open for this device's leaf in a
-    /// leaf the tree shows as an owner device. Those are the owner's own
-    /// devices sealing secrets they hold, so all a server can do is have an
-    /// older genuine one re-added, and it would take more than `KEEP` of
-    /// those this device no longer has to push out a received secret it
-    /// learnt since. A secret this device made is never pushed out by
-    /// received ones at all.
+    /// anything here. Secrets come from this device's own rotations, from
+    /// shares that open for this device's leaf in a leaf the tree shows as
+    /// an owner device, and from copies kept outside the group (the
+    /// person's directory) that a join or `SpaceGroup::keep_owner_secrets`
+    /// takes along. The first two only add genuine secrets, so all a server
+    /// can do is have an older one re-added, and it would take more than
+    /// `KEEP` of those to push out a received secret learnt since. Copies
+    /// only fill free room ([`Self::extend_older`]), except the one of the
+    /// key the server names, which may only push out a secret the copies
+    /// hold too (`take_from`). A secret this device made is never pushed out
+    /// by received ones.
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct OwnerSecrets {
         held: Vec<(OwnerSecret, Origin)>,
@@ -341,12 +346,27 @@ mod secret {
         }
 
         /// The secret of `key` from `other`, if this set lacks it, as the
-        /// newest: the one to use is not left out for want of room.
+        /// newest: the one to use is not left out for want of room. Making
+        /// room only ever drops a secret `other` holds as well, since `key`
+        /// is merely what the server says is current; with none such the
+        /// set stays as it is.
         #[cfg(feature = "mls")]
         pub(crate) fn take_from(&mut self, other: &Self, key: &OwnerKey) {
-            if let Some((secret, origin)) = other.entry(key) {
-                self.add(secret.clone(), *origin);
+            let Some((secret, origin)) = other.entry(key) else {
+                return;
+            };
+            let full = self.held.iter().filter(|(_, o)| o == origin).count() >= Self::KEEP;
+            if full && self.find(key).is_none() {
+                let spare = self
+                    .held
+                    .iter()
+                    .rposition(|(s, o)| o == origin && other.find(&s.public()).is_some());
+                let Some(spare) = spare else {
+                    return;
+                };
+                self.held.remove(spare);
             }
+            self.add(secret.clone(), *origin);
         }
 
         fn evict(&mut self, origin: Origin) {
@@ -374,11 +394,31 @@ mod secret {
             out
         }
 
-        /// Inverse of [`Self::encode`].
+        /// A saved copy to add to before writing it back. Missing or
+        /// damaged bytes have nothing left to keep, so they count as empty;
+        /// only [`CryptoError::NewerVersion`] fails, so the caller keeps
+        /// those bytes rather than save over them.
+        pub fn decode_kept(bytes: Option<&[u8]>) -> Result<Self, CryptoError> {
+            match bytes.map(Self::decode) {
+                Some(Err(err @ CryptoError::NewerVersion(_))) => Err(err),
+                Some(Ok(set)) => Ok(set),
+                None | Some(Err(_)) => Ok(Self::default()),
+            }
+        }
+
+        /// Inverse of [`Self::encode`]. Bytes of a format this build does
+        /// not know fail with [`CryptoError::NewerVersion`], which a caller
+        /// must not take for damage and write over: they may hold keys this
+        /// build cannot read but a newer one still needs.
         pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
             let bad = || CryptoError::MalformedKey;
             let [SET_VERSION, count, rest @ ..] = bytes else {
-                return Err(bad());
+                return match bytes.first() {
+                    Some(&version) if version > SET_VERSION => {
+                        Err(CryptoError::NewerVersion(version))
+                    }
+                    _ => Err(bad()),
+                };
             };
             let count = usize::from(*count);
             if count > 2 * Self::KEEP || rest.len() != count * EXPORT_LEN {
@@ -394,8 +434,7 @@ mod secret {
                     1 => Origin::Made,
                     _ => return Err(bad()),
                 };
-                let secret: [u8; KEY_LEN] = *secret;
-                set.add(OwnerSecret::from_secret(Zeroizing::new(secret)), origin);
+                set.add(OwnerSecret::from_raw(secret)?, origin);
             }
             Ok(set)
         }
@@ -417,6 +456,7 @@ mod secret {
 #[cfg(all(test, feature = "crypto"))]
 mod tests {
     use super::*;
+    use crate::crypto::CryptoError;
 
     #[test]
     fn a_secret_round_trips_through_its_bare_bytes() {
@@ -603,11 +643,68 @@ mod tests {
         assert!(OwnerSecrets::decode(&bytes[..bytes.len() - 1]).is_err());
         let mut newer = bytes.to_vec();
         newer[0] = 2;
-        assert!(OwnerSecrets::decode(&newer).is_err());
+        // Not damage: a caller must not write over it.
+        assert!(matches!(
+            OwnerSecrets::decode(&newer),
+            Err(CryptoError::NewerVersion(2))
+        ));
+        assert!(matches!(
+            OwnerSecrets::decode(&[2]),
+            Err(CryptoError::NewerVersion(2))
+        ));
+        newer[0] = 0;
+        assert!(matches!(
+            OwnerSecrets::decode(&newer),
+            Err(CryptoError::MalformedKey)
+        ));
+        assert!(matches!(
+            OwnerSecrets::decode(&[]),
+            Err(CryptoError::MalformedKey)
+        ));
         let mut origin = bytes.to_vec();
         origin[2] = 7;
         assert!(OwnerSecrets::decode(&origin).is_err());
         assert!(OwnerSecrets::decode(&[1, 0]).unwrap().is_empty());
+    }
+
+    #[cfg(feature = "mls")]
+    #[test]
+    fn the_named_key_only_pushes_out_what_the_copies_hold_too() {
+        let genuine: Vec<_> = (0..OwnerSecrets::KEEP)
+            .map(|_| OwnerSecret::generate())
+            .collect();
+        let mut set: OwnerSecrets = genuine
+            .iter()
+            .map(|secret| (secret.clone(), Origin::Received))
+            .collect();
+        // Stale keys the directory still has, which a lying server names
+        // one after the other.
+        let stale: Vec<_> = (0..OwnerSecrets::KEEP)
+            .map(|_| OwnerSecret::generate())
+            .collect();
+        let directory: OwnerSecrets = stale
+            .iter()
+            .map(|secret| (secret.clone(), Origin::Received))
+            .collect();
+        for secret in &stale {
+            set.take_from(&directory, &secret.public());
+        }
+        assert_eq!(set.len(), OwnerSecrets::KEEP);
+        for secret in &genuine {
+            assert_eq!(set.find(&secret.public()), Some(secret));
+        }
+
+        // With a copy elsewhere, the oldest such one makes room.
+        let mut directory = directory;
+        directory.add(genuine[0].clone(), Origin::Received);
+        set.take_from(&directory, &stale[0].public());
+        assert_eq!(set.iter().next(), Some(&stale[0]));
+        assert!(set.find(&genuine[0].public()).is_none());
+        assert_eq!(set.len(), OwnerSecrets::KEEP);
+        // Room left: the named one just goes in.
+        let mut roomy = OwnerSecrets::received(genuine[1].clone());
+        roomy.take_from(&directory, &stale[1].public());
+        assert_eq!(roomy.iter().next(), Some(&stale[1]));
     }
 
     #[test]

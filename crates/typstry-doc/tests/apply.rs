@@ -492,15 +492,17 @@ fn changes_block_on_untouched_files_only() {
 }
 
 #[test]
-fn changes_keep_files_with_names_the_rules_reject() {
-    // The browser allows backslashes, the push side does not.
+fn keeps_files_with_names_the_rules_reject() {
+    // A modified client can write any name. The CLI never sees such a file,
+    // so neither a partial nor a full list of changes may delete it.
     let doc = project();
     let odd = add(&doc, None, "a\\b.typ", FileKind::Text);
+    let long = add(&doc, None, &"a".repeat(256), FileKind::Text);
     apply_changes(&doc, &changes(&[("main.typ", Some("m"))]), MESSAGE).unwrap();
+    let report = apply(&doc, &[text("main.typ", "m2")]);
+    assert!(report.deleted.is_empty(), "{:?}", report.deleted);
     assert_eq!(id_of(&doc, "a\\b.typ"), odd);
-    // A full list without it deletes it, as before.
-    let report = apply(&doc, &[text("main.typ", "m")]);
-    assert_eq!(report.deleted, ["a\\b.typ"]);
+    assert_eq!(id_of(&doc, &"a".repeat(256)), long);
 }
 
 #[test]

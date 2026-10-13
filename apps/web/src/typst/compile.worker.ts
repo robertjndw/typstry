@@ -26,18 +26,35 @@ import {
 import { FONT_CACHE } from "./cache-names";
 import { CompileScheduler } from "./scheduler";
 
-// typst.ts 0.7 fetches its default fonts from typst-assets on jsdelivr. We
-// point it at the release that matches the bundled Typst 0.14.2 (its own
-// default is v0.13.1) so the preview uses the same font files as a native
-// typst 0.14.2 build, which matters once PDFs are also exported server-side.
+// typst.ts 0.7 fetches its default fonts from typst-assets on jsdelivr. Point
+// it at the release matching the bundled Typst 0.14.2 (its own default is
+// v0.13.1) so the preview uses the same fonts as a native typst 0.14.2 build,
+// which matters once PDFs are also exported server-side.
 const FONT_PREFIX = {
-  text: "https://cdn.jsdelivr.net/gh/typst/typst-assets@v0.14.2/files/fonts/",
-  _: "https://cdn.jsdelivr.net/gh/typst/typst-dev-assets@v0.13.1/files/fonts/",
+  text: fontBase(
+    import.meta.env.VITE_TYPST_FONT_BASE,
+    "https://cdn.jsdelivr.net/gh/typst/typst-assets@v0.14.2/files/fonts/",
+  ),
+  // The CJK and emoji bundles, which the app does not load by default.
+  _: fontBase(
+    import.meta.env.VITE_TYPST_DEV_FONT_BASE,
+    "https://cdn.jsdelivr.net/gh/typst/typst-dev-assets@v0.13.1/files/fonts/",
+  ),
 };
 
-// Set to false to send a full vector artifact on every compile instead of
-// incremental deltas. The renderer handles both; deltas are much smaller
-// (a few KB instead of ~120 KB for 20 pages) and that is the default.
+/**
+ * Self-hosters who cannot reach jsdelivr can mirror the font files and
+ * point the build at their copy. typst.ts appends file names directly, so
+ * the prefix needs its trailing slash.
+ */
+function fontBase(configured: string | undefined, fallback: string): string {
+  const base = configured?.trim();
+  if (!base) return fallback;
+  return base.endsWith("/") ? base : base + "/";
+}
+
+// False sends a full vector artifact on every compile. Deltas are much
+// smaller (a few KB instead of ~120 KB for 20 pages); the renderer takes both.
 const INCREMENTAL = true;
 
 type IncrementalServer = Parameters<
@@ -111,6 +128,11 @@ let session: Promise<Session> | null = null;
 let current: Session | null = null;
 let nextId = 1;
 let lastMainPath: string | null = null;
+/**
+ * Set when a panic rebuilt the compiler and the same compile runs again,
+ * so a document that panics every time does not loop.
+ */
+let retryingAfterPanic = false;
 
 function applyFile(compiler: TypstCompiler, path: string, f: FileEntry): void {
   if (f.kind === "text") compiler.addSource(path, f.text);
@@ -176,6 +198,12 @@ function startSession(config: FontConfig): void {
   previous?.incr?.release();
 }
 
+/** A fresh compiler with the current fonts, compiling what was last asked. */
+function restartSession(): void {
+  startSession(fonts);
+  if (lastMainPath) scheduler.request(lastMainPath);
+}
+
 /**
  * The current session once it is ready, or null when it failed to start
  * (initError was already reported) or a reinit replaced it meanwhile.
@@ -198,6 +226,7 @@ async function compile(mainPath: string): Promise<void> {
   const started = performance.now();
   let diagnostics: WorkerDiagnostic[];
   let update: ArtifactUpdate | undefined;
+  let crashed = false;
   try {
     // A world compile reports warnings too, which the vector export paths
     // drop. Typst memoizes, so the export below reuses this work.
@@ -222,7 +251,20 @@ async function compile(mainPath: string): Promise<void> {
         range: null,
       },
     ];
+    crashed = true;
+  }
+  if (!crashed) {
+    retryingAfterPanic = false;
+  } else if (s === current) {
     startSession(fonts);
+    // The preview would otherwise show the crash until the next edit, even
+    // when the panic came from state the fresh compiler does not have.
+    if (!retryingAfterPanic && lastMainPath) {
+      retryingAfterPanic = true;
+      scheduler.request(lastMainPath);
+    } else {
+      retryingAfterPanic = false;
+    }
   }
   const transfer: Transferable[] = [];
   const data = update?.data;
@@ -287,16 +329,17 @@ async function exportPdf(id: number, mainPath: string): Promise<void> {
         : "the compiler produced no output",
     );
   } catch (err) {
+    // Like a panic in a preview compile: the compiler may be broken now.
+    console.error("typst PDF export crashed", err);
     fail(String(err));
+    if (s === current) restartSession();
   }
 }
 
-// Throttle rather than a pure trailing debounce: with a trailing debounce
-// every keystroke pays the full 200 ms on top of compile and render, and
-// continuous typing starves the preview until the user pauses. Measured on a
-// 20 page document: about 400 ms keystroke-to-paint and a single update
-// during 2.3 s of typing with the debounce. Compiles still run at most every
-// 200 ms with the latest text, one running and one queued.
+// Throttle, not a trailing debounce: a debounce adds the full 200 ms to every
+// keystroke and starves the preview while the user keeps typing (on a 20 page
+// doc: ~400 ms keystroke-to-paint, one update in 2.3 s of typing). Compiles
+// run at most every 200 ms with the latest text, one running and one queued.
 const scheduler = new CompileScheduler<string>(compile, {
   delayMs: 200,
   mode: "throttle",
@@ -339,8 +382,10 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
       break;
     case "reinit":
       fonts = msg.fonts;
-      startSession(fonts);
-      if (lastMainPath) scheduler.request(lastMainPath);
+      restartSession();
+      break;
+    case "restart":
+      restartSession();
       break;
   }
 });

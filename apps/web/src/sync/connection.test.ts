@@ -224,13 +224,13 @@ describe("an outdated page", () => {
 });
 
 describe("syncNow", () => {
-  function connect() {
+  function connect(doc = new LoroDoc()) {
     const conn = connectSpace({
       spaceId: "p",
       token: "t",
       crypto,
       canWrite: true,
-      doc: new LoroDoc(),
+      doc,
       url: "ws://x/ws",
     });
     const client = lastClient();
@@ -258,6 +258,18 @@ describe("syncNow", () => {
     goOnline();
     await expect(result).resolves.toBe("synced");
     expect(client.ping).toHaveBeenCalledTimes(1);
+    conn.close();
+  });
+
+  it("does not call edits synced that could not go up yet", async () => {
+    const doc = new LoroDoc();
+    doc.getText("t").insert(0, "local");
+    doc.commit();
+    // Connected, but the join's answer (and so the permission to send) has
+    // not been handled yet.
+    const { conn, goOnline } = connect(doc);
+    goOnline();
+    await expect(conn.syncNow()).resolves.toBe("pending");
     conn.close();
   });
 

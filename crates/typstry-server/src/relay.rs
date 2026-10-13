@@ -28,8 +28,8 @@ const HELD_FRAMES: usize = 4;
 const HELD_BYTES: usize = 4 * 1024;
 
 /// Bytes held across all channels, so what an idle crowd of first peers
-/// pins does not grow with `max_channels`. Even every number with its
-/// first message waiting needs about a third of this.
+/// pins stays bounded however many channels are open. Even every number
+/// with its first message waiting needs about a third of this.
 const HELD_BYTES_TOTAL: usize = 1024 * 1024;
 
 /// How often expired channels are dropped in the background, so their
@@ -40,16 +40,12 @@ const SWEEP_EVERY: Duration = Duration::from_secs(1);
 pub struct RelayConfig {
     /// How long a channel lives after it was allocated.
     pub ttl: Duration,
-    /// Open channels across all callers. Nothing limits callers per
-    /// address, so this is what keeps the numbers from being used up.
-    pub max_channels: usize,
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             ttl: Duration::from_secs(CHANNEL_TTL_SECS),
-            max_channels: 1000,
         }
     }
 }
@@ -173,25 +169,28 @@ impl RelayRegistry {
         self.lock().sweep(now);
     }
 
-    /// Opens the lowest free channel number and returns it with the claim
-    /// for the owner seat. Expired channels are swept first so they never
-    /// count against the cap.
+    /// Opens a random free channel number and returns it with the claim for
+    /// the owner seat. Expired channels are swept first so they never count
+    /// against the cap.
+    ///
+    /// Random rather than the lowest free one, so the number of a channel
+    /// about to be used cannot be guessed and its guest seat taken first.
+    /// The claim still protects the owner seat either way; this keeps a
+    /// squatter from spoiling pairings by sitting in the guest seat.
     pub fn allocate(&self, now: Instant) -> Result<(u16, String), AllocateError> {
         let mut channels = self.lock();
         channels.sweep(now);
-        if channels.open.len() >= self.config.max_channels {
-            return Err(AllocateError::Full);
-        }
-        let mut free = 1;
-        for &taken in channels.open.keys() {
-            if taken != free {
-                break;
-            }
-            free += 1;
-        }
-        if free > CHANNEL_MAX {
-            return Err(AllocateError::Full);
-        }
+        // No cap below the number space: a lower one would only make it
+        // cheaper to take every channel. Holding one caller to its share is
+        // the reverse proxy's job, as it knows the caller's address.
+        //
+        // From a random start, the next number up that is free, wrapping
+        // around.
+        let start = random_below(CHANNEL_MAX);
+        let free = (0..CHANNEL_MAX)
+            .map(|step| (start + step) % CHANNEL_MAX + 1)
+            .find(|n| !channels.open.contains_key(n))
+            .ok_or(AllocateError::Full)?;
         let claim = token::generate();
         channels.open.insert(
             free,
@@ -312,6 +311,14 @@ impl RelayRegistry {
     }
 }
 
+/// A uniform pick from `0..bound`. The modulo bias over a u32 is far
+/// below anything that would help guess a number.
+fn random_below(bound: u16) -> u16 {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).expect("OS random source unavailable");
+    (u32::from_le_bytes(bytes) % u32::from(bound)) as u16
+}
+
 fn lock(channels: &Mutex<Channels>) -> MutexGuard<'_, Channels> {
     // Nothing here panics while holding the lock, and the map stays
     // consistent either way.
@@ -338,10 +345,9 @@ async fn sweep_until(channels: Weak<Mutex<Channels>>, shutdown: CancellationToke
 mod tests {
     use super::*;
 
-    fn registry(max_channels: usize) -> RelayRegistry {
+    fn registry() -> RelayRegistry {
         RelayRegistry::new(RelayConfig {
             ttl: Duration::from_secs(10),
-            max_channels,
         })
     }
 
@@ -350,43 +356,52 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn allocates_the_lowest_free_number() {
-        let relay = registry(100);
+    async fn allocates_random_free_numbers() {
+        let relay = registry();
         let now = Instant::now();
-        assert_eq!(relay.allocate(now).unwrap().0, 1);
-        assert_eq!(relay.allocate(now).unwrap().0, 2);
-        assert_eq!(relay.allocate(now).unwrap().0, 3);
-        relay.join(2, None, 1, outbox(), now).unwrap();
-        relay.leave(2, 1);
-        assert_eq!(relay.allocate(now).unwrap().0, 2);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..50 {
+            let (number, _) = relay.allocate(now).unwrap();
+            assert!((1..=CHANNEL_MAX).contains(&number));
+            assert!(seen.insert(number), "{number} handed out twice");
+        }
+        // Lowest-free numbering would have produced exactly 1..=50.
+        assert_ne!(seen, (1..=50).collect());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn refuses_past_the_cap() {
-        let relay = registry(2);
+    async fn finds_the_last_free_number() {
+        let relay = registry();
         let now = Instant::now();
-        relay.allocate(now).unwrap();
-        relay.allocate(now).unwrap();
+        for _ in 0..CHANNEL_MAX {
+            relay.allocate(now).unwrap();
+        }
+        assert_eq!(relay.open_channels(), usize::from(CHANNEL_MAX));
         assert_eq!(relay.allocate(now), Err(AllocateError::Full));
+        relay.join(77, None, 1, outbox(), now).unwrap();
+        relay.leave(77, 1);
+        assert_eq!(relay.allocate(now).unwrap().0, 77);
     }
 
     #[tokio::test(start_paused = true)]
     async fn expired_channels_are_swept_on_allocate() {
-        let relay = registry(1);
+        let relay = registry();
         let now = Instant::now();
         relay.allocate(now).unwrap();
         let later = now + Duration::from_secs(10);
-        assert_eq!(relay.allocate(later).unwrap().0, 1);
+        relay.allocate(later).unwrap();
         assert_eq!(relay.open_channels(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_held_budget_is_shared_across_channels() {
-        let relay = registry(1000);
+        let relay = registry();
         let now = Instant::now();
         let full = HELD_BYTES_TOTAL / HELD_BYTES;
+        let mut numbers = Vec::new();
         for id in 0..full {
             let (number, claim) = relay.allocate(now).unwrap();
+            numbers.push(number);
             relay
                 .join(number, Some(&claim), id as ConnId, outbox(), now)
                 .unwrap();
@@ -405,9 +420,9 @@ mod tests {
         assert_eq!(relay.open_channels(), full);
 
         // A guest arriving takes what was held for it off the total.
-        relay.join(1, None, 9999, outbox(), now).unwrap();
+        relay.join(numbers[0], None, 9999, outbox(), now).unwrap();
         assert_eq!(relay.held_bytes(), HELD_BYTES_TOTAL - HELD_BYTES);
-        relay.leave(2, 1);
+        relay.leave(numbers[1], 1);
         assert_eq!(relay.held_bytes(), HELD_BYTES_TOTAL - 2 * HELD_BYTES);
         relay.sweep(now + Duration::from_secs(10));
         assert_eq!(relay.open_channels(), 0);
@@ -416,7 +431,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_drops_expired_channels_and_stops_on_shutdown() {
-        let relay = registry(10);
+        let relay = registry();
         let shutdown = CancellationToken::new();
         relay.spawn_sweeper(shutdown.clone());
         let (number, claim) = relay.allocate(Instant::now()).unwrap();
@@ -436,7 +451,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_ends_with_its_registry() {
-        let relay = registry(10);
+        let relay = registry();
         let channels = Arc::downgrade(&relay.channels);
         relay.spawn_sweeper(CancellationToken::new());
         drop(relay);
@@ -446,20 +461,26 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn leave_ignores_a_stale_connection() {
-        let relay = registry(10);
+        let relay = registry();
         let now = Instant::now();
-        let (_, claim) = relay.allocate(now).unwrap();
-        relay.join(1, Some(&claim), 7, outbox(), now).unwrap();
+        // With every other number taken, the freed one is handed out again.
+        let mut claims = BTreeMap::new();
+        for _ in 0..CHANNEL_MAX {
+            let (number, claim) = relay.allocate(now).unwrap();
+            claims.insert(number, claim);
+        }
+        relay.join(1, Some(&claims[&1]), 7, outbox(), now).unwrap();
         relay.leave(1, 7);
-        let (_, claim) = relay.allocate(now).unwrap();
+        let (number, claim) = relay.allocate(now).unwrap();
+        assert_eq!(number, 1);
         relay.join(1, Some(&claim), 8, outbox(), now).unwrap();
         relay.leave(1, 7);
-        assert_eq!(relay.open_channels(), 1);
+        assert_eq!(relay.open_channels(), usize::from(CHANNEL_MAX));
     }
 
     #[tokio::test(start_paused = true)]
     async fn only_the_claim_opens_the_owner_seat() {
-        let relay = registry(10);
+        let relay = registry();
         let now = Instant::now();
         let (number, claim) = relay.allocate(now).unwrap();
         assert_eq!(

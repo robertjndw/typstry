@@ -1,0 +1,38 @@
+# The quick CI checks, run on commit. The tests take over a minute, so they
+# stay in CI and CONTRIBUTING.md. Set up with `pre-commit install`.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        files: '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$'
+        pass_filenames: false
+      # Clippy has to see the whole workspace, so it runs once for any Rust
+      # change rather than per file.
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --quiet -- -D warnings
+        language: system
+        files: '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain\.toml$'
+        pass_filenames: false
+      - id: prettier
+        name: prettier
+        entry: pnpm exec prettier --check --ignore-unknown --log-level warn
+        language: system
+        types: [text]
+      # Both run over the whole web app, as in CI: a change in one file can
+      # break the types or lint of another.
+      - id: eslint
+        name: eslint
+        entry: pnpm lint
+        language: system
+        files: '^apps/web/|^package\.json$|^pnpm-lock\.yaml$'
+        pass_filenames: false
+      - id: typecheck
+        name: typecheck
+        entry: pnpm typecheck
+        language: system
+        files: '^apps/web/|^package\.json$|^pnpm-lock\.yaml$'
+        pass_filenames: false

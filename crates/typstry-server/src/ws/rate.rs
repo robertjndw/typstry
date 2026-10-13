@@ -1,4 +1,4 @@
-//! Token bucket for per-connection update rate limiting.
+//! Token bucket for rate limiting, per connection.
 
 use std::time::Instant;
 

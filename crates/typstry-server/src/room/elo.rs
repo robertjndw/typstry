@@ -31,7 +31,7 @@ pub fn from_vv(vv: &VersionVector) -> Version {
         .collect()
 }
 
-fn get(version: &Version, peer: PeerId) -> u64 {
+pub(super) fn get(version: &Version, peer: PeerId) -> u64 {
     version.get(&peer).copied().unwrap_or(0)
 }
 
@@ -96,6 +96,9 @@ pub struct DocIndex {
     /// in-order case O(1).
     gapped: HashSet<PeerId>,
     journal: Option<Journal>,
+    /// Bumped whenever the records change other than by deltas appended at
+    /// the end, so a cache built from them knows it has to start over.
+    layout: u64,
 }
 
 impl DocIndex {
@@ -127,6 +130,28 @@ impl DocIndex {
 
     pub fn delta_count(&self) -> usize {
         self.deltas.len()
+    }
+
+    /// See the field. Between two changes of it, the deltas only grow at
+    /// the end, so `deltas_from` with an old count yields just the new ones.
+    pub fn layout(&self) -> u64 {
+        self.layout
+    }
+
+    /// The stored snapshot's version and record.
+    pub fn snapshot_record(&self) -> Option<(&Version, &Bytes)> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| (&snapshot.vv, &snapshot.bytes))
+    }
+
+    /// Peer, end and record of every delta from the `skip`th on, in the
+    /// order backfill replays them.
+    pub fn deltas_from(&self, skip: usize) -> impl Iterator<Item = (PeerId, u64, &Bytes)> {
+        self.deltas
+            .iter()
+            .skip(skip)
+            .map(|delta| (delta.peer, delta.end, &delta.bytes))
     }
 
     pub fn coverage(&self) -> &Version {
@@ -171,6 +196,7 @@ impl DocIndex {
         let Some(journal) = self.journal.take() else {
             return;
         };
+        self.layout += 1;
         match journal.before_snapshot {
             Some(before) => {
                 self.snapshot = before.snapshot;
@@ -236,11 +262,23 @@ impl DocIndex {
     /// already serve, or replacing deltas with it would lose ops, and it
     /// must let at least one delta go, or it is just a copy of what is
     /// already stored.
+    ///
+    /// It must not claim more than the server holds either. The version is
+    /// plaintext the server cannot check against the ciphertext, and once
+    /// installed it becomes coverage: a snapshot claiming a peer's ops up to
+    /// some far counter would have every later delta of that peer acked as
+    /// a duplicate and silently dropped. So the version has to match the
+    /// coverage exactly. The client only snapshots after its own ops are
+    /// stored, so an honest one meets that; one that raced a delta it did
+    /// not have yet is only refused and compacts next time.
     pub fn snapshot_replaces(&self, vv: &Version) -> Option<Vec<i64>> {
         if self
             .coverage
             .iter()
             .any(|(&peer, &count)| get(vv, peer) < count)
+            || vv
+                .iter()
+                .any(|(&peer, &count)| count > get(&self.coverage, peer))
         {
             return None;
         }
@@ -273,13 +311,30 @@ impl DocIndex {
                 gapped: self.gapped.clone(),
             });
         }
+        self.layout += 1;
         self.deltas.retain(|delta| delta.end > get(&vv, delta.peer));
         self.snapshot = Some(StoredSnapshot { seq, vv, bytes });
         self.recompute_all();
     }
 
+    /// Whether a client at version `client` lacks any stored record, so a
+    /// join can skip building backfill frames for one that is up to date.
+    pub fn has_backfill_for(&self, client: &Version) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot
+                .vv
+                .iter()
+                .all(|(&peer, &count)| get(client, peer) >= count)
+        }) || self
+            .deltas
+            .iter()
+            .any(|delta| delta.end > get(client, delta.peer))
+    }
+
     /// The records a client at version `client` is missing, in the order it
-    /// must apply them: the snapshot first, then deltas oldest first.
+    /// must apply them: the snapshot first, then deltas oldest first. Joins
+    /// are served from `BackfillCache`, which tests check against this.
+    #[cfg(test)]
     pub fn backfill(&self, client: &Version) -> Vec<&[u8]> {
         let mut out = Vec::new();
         if let Some(snapshot) = &self.snapshot
@@ -409,6 +464,29 @@ mod tests {
 
         assert_eq!(index.backfill(&full), vec![&b"d"[..]]);
         assert_eq!(index.backfill(&Version::new()), vec![&b"snap"[..], b"d"]);
+    }
+
+    #[test]
+    fn snapshot_cannot_claim_more_than_is_stored() {
+        let mut index = DocIndex::default();
+        index.add_delta(1, 1, 0, 5, Bytes::new());
+        index.add_delta(2, 2, 7, 9, Bytes::new());
+        let max = u64::from(u32::MAX);
+        // Past a peer the server holds, of a peer it has never seen, and
+        // into a gap it has not filled.
+        for vv in [
+            version(&[(1, max)]),
+            version(&[(1, 5), (3, 1)]),
+            version(&[(1, 5), (2, 9)]),
+        ] {
+            assert_eq!(index.snapshot_replaces(&vv), None, "{vv:?}");
+        }
+        assert_eq!(index.coverage(), &version(&[(1, 5)]));
+        // A zero counter claims nothing.
+        assert_eq!(
+            index.snapshot_replaces(&version(&[(1, 5), (3, 0)])),
+            Some(vec![1])
+        );
     }
 
     #[test]

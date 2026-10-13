@@ -138,7 +138,10 @@ export class DsClient {
   stop(): void {
     this.running = false;
     this.drop();
-    this.retry.dispose();
+    // Cancelled, not disposed: a stopped client can be started again (a
+    // removed device that comes back with a new link), and its reconnects
+    // still need the queue. The queue may also be shared.
+    this.retry.cancel(RETRY_KEY);
   }
 
   private drop(): void {
@@ -330,7 +333,12 @@ export class DsClient {
   /** Asks for the commits from `since` on again. */
   fetch(since: number): void {
     if (!this.readyInfo) return;
-    this.sendRaw({ type: "fetch", since });
+    try {
+      this.sendRaw({ type: "fetch", since });
+    } catch (error) {
+      // Closing already: the hello after the reconnect asks for the same.
+      if (!(error instanceof DsDisconnectedError)) throw error;
+    }
   }
 }
 

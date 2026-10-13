@@ -5,7 +5,10 @@ import type { ProjectAssets } from "@/assets/project-assets";
 import type { ProjectDoc } from "@/doc/schema";
 
 import { ProjectContext, type ProjectContextValue } from "./context";
+import { useDisposeOnUnmount } from "./dispose";
 import { ProjectStore } from "./store";
+
+const disposeStore = (store: ProjectStore) => store.dispose();
 
 export interface ProjectProviderProps {
   doc: ProjectDoc;
@@ -29,6 +32,7 @@ export function ProjectProvider({
       }),
     [project],
   );
+  useDisposeOnUnmount(store, disposeStore);
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
   const value = useMemo<ProjectContextValue>(

@@ -30,6 +30,9 @@ pub struct ShareInfo {
 /// `POST /api/spaces`. Takes no body: the title belongs to the encrypted
 /// document, which the creating client seeds itself. Whatever body a client
 /// does send (`{}`, say) is never read, so it cannot make creation fail.
+///
+/// Anyone who can reach the server may call this. Limiting how often one
+/// address does is left to the reverse proxy in front.
 pub async fn create(
     State(state): State<AppState>,
 ) -> Result<(StatusCode, Json<CreatedSpace>), AppError> {

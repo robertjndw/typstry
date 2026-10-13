@@ -29,7 +29,7 @@ function versionKey(doc: LoroDoc): string {
   return JSON.stringify(doc.oplogFrontiers());
 }
 
-export function loadHistory(
+function loadHistory(
   project: ProjectDoc,
   grouping: GroupingOptions,
 ): HistoryData {

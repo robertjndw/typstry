@@ -322,6 +322,11 @@ async function syncWithFeedback(
     toast.success(readOnly ? "Up to date" : "All changes synced", {
       id: SYNC_TOAST,
     });
+  } else if (result === "pending") {
+    toast.warning(
+      "Some changes could not be sent yet. They are kept on this device.",
+      { id: SYNC_TOAST },
+    );
   } else {
     toast.warning(
       readOnly

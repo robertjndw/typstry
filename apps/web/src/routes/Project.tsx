@@ -57,8 +57,16 @@ function ProjectSessionView({
   const stored = useStoredIdentity();
   const [provisional] = useState(() => provisionalIdentity());
   const identity = stored ?? provisional;
-  const { state, status, project, ephemeral, mls, following, syncNow } =
-    useProjectSession(token, linkKey, { identity });
+  const {
+    state,
+    status,
+    syncProblem,
+    project,
+    ephemeral,
+    mls,
+    following,
+    syncNow,
+  } = useProjectSession(token, linkKey, { identity });
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -172,7 +180,9 @@ function ProjectSessionView({
                 <ProjectWorkspace
                   documentTitle
                   onSyncNow={syncNow}
-                  status={<ConnectionStatus status={status} />}
+                  status={
+                    <ConnectionStatus status={status} problem={syncProblem} />
+                  }
                   share={
                     <ShareDialog
                       projectId={share.spaceId}

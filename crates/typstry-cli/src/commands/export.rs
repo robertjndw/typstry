@@ -8,6 +8,7 @@ use super::clone::check_empty;
 use super::init::absolute;
 use super::version::{find_version, format_ms};
 use super::{Ctx, Fetch, Output};
+use crate::term::printable;
 use crate::worktree::{Worktree, case_clashes};
 
 /// Write the project's files, now or at a named version, to a new folder.
@@ -70,7 +71,11 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let dropped: Vec<String> = clashes
         .into_iter()
         .map(|(kept, dropped)| {
-            eprintln!("warning: {dropped} differs from {kept} only in case; not writing it");
+            eprintln!(
+                "warning: {} differs from {} only in case; not writing it",
+                printable(&dropped),
+                printable(&kept)
+            );
             dropped
         })
         .collect();

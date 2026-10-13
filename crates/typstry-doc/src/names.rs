@@ -33,10 +33,9 @@ pub enum NameError {
     DeviceName,
 }
 
-/// The browser's rules for a single path segment, plus a ban on backslashes.
-/// The browser allows those, but [`crate::materialize::is_safe_path`] treats
-/// them as separators, so a file named `a\b` would never come back out of
-/// `materialize` and a push of it could not round-trip.
+/// The rules for a single path segment, the same as the browser's. Windows
+/// reads a backslash as a separator, so `a\b` is refused here and hidden by
+/// [`crate::materialize::is_safe_path`] rather than written as a folder.
 pub fn validate_name(name: &str) -> Result<(), NameError> {
     if name.is_empty() {
         return Err(NameError::Empty);
@@ -145,12 +144,6 @@ fn portability(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-/// The part of [`validate_name`] that [`crate::materialize::is_safe_path`]
-/// adds on top of its own checks.
-pub(crate) fn is_portable_segment(segment: &str) -> bool {
-    !is_reserved_segment(segment) && portability(segment).is_ok()
-}
-
 /// The first segment of a path that breaks the name rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("{segment:?}: {error}")]
@@ -180,6 +173,18 @@ pub fn normalize_bounded(raw: &str, max: usize) -> Option<&str> {
     let value = raw.trim_matches(is_js_whitespace);
     let len = value.chars().count();
     (1..=max).contains(&len).then_some(value)
+}
+
+/// Longest project title, in characters. Must match `MAX_TITLE_CHARS` in
+/// `apps/web/src/doc/schema.ts`.
+pub const MAX_TITLE_CHARS: usize = 200;
+
+/// Trimmed project title, or None when it is not 1 to [`MAX_TITLE_CHARS`]
+/// characters long. Same as `normalizeTitle` in `fs-ops.ts`, so a title
+/// with a byte order mark or a NEL at either end reads the same on both
+/// sides.
+pub fn normalize_title(raw: &str) -> Option<&str> {
+    normalize_bounded(raw, MAX_TITLE_CHARS)
 }
 
 #[cfg(test)]
@@ -333,5 +338,17 @@ mod tests {
         assert_eq!(normalize_bounded("\u{feff} v1\u{3000}", 100), Some("v1"));
         // NEL is not whitespace to JS, so it is part of the name there.
         assert_eq!(normalize_bounded("\u{85}v1", 100), Some("\u{85}v1"));
+    }
+
+    #[test]
+    fn normalizes_titles_like_the_browser() {
+        assert_eq!(normalize_title(" Thesis \u{feff}"), Some("Thesis"));
+        assert_eq!(normalize_title("\u{feff}"), None);
+        assert_eq!(normalize_title("\u{85}"), Some("\u{85}"));
+        assert_eq!(
+            normalize_title(&"t".repeat(MAX_TITLE_CHARS)).map(str::len),
+            Some(200)
+        );
+        assert_eq!(normalize_title(&"t".repeat(MAX_TITLE_CHARS + 1)), None);
     }
 }

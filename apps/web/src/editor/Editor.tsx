@@ -19,7 +19,8 @@ export interface EditorProps {
   doc: LoroDoc;
   text: LoroText;
   undoManager?: UndoManager;
-  onReady?: (view: EditorView) => void;
+  /** Called with each new view, and with null once that view is gone. */
+  onReady?: (view: EditorView | null) => void;
   /**
    * Swapped in place when it changes; memoize it per text. Carries the
    * language too (see languageFor), since a rename can change it.
@@ -80,6 +81,7 @@ export function Editor({
     return () => {
       viewRef.current = null;
       view.destroy();
+      latest.current.onReady?.(null);
     };
   }, [doc, textId, undoManager, readOnly, extra]);
 

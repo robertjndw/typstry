@@ -14,6 +14,7 @@ pub mod peers;
 pub mod testing;
 pub mod versions;
 
+pub use names::{MAX_TITLE_CHARS, normalize_title};
 pub use versions::{NamedVersion, named_versions};
 
 use std::fmt;
@@ -155,7 +156,8 @@ pub(crate) fn configure_commits(doc: &LoroDoc) {
     doc.set_change_merge_interval(CHANGE_MERGE_INTERVAL_S);
 }
 
-/// The project title from `meta.title`, if it is a non-empty string.
+/// The project title from `meta.title`, normalized with
+/// [`normalize_title`]. None when it is missing or not a usable title.
 pub fn title(doc: &LoroDoc) -> Option<String> {
     match doc
         .get_map(root::META)
@@ -163,7 +165,7 @@ pub fn title(doc: &LoroDoc) -> Option<String> {
         .into_value()
         .ok()?
     {
-        LoroValue::String(s) if !s.trim().is_empty() => Some(s.to_string()),
+        LoroValue::String(s) => normalize_title(&s).map(str::to_owned),
         _ => None,
     }
 }
@@ -432,5 +434,24 @@ mod tests {
         assert_eq!(schema_version(&doc), Some(2));
         meta_map.insert(meta::SCHEMA, "1").unwrap();
         assert_eq!(schema_version(&doc), None);
+    }
+
+    #[test]
+    fn reads_titles_like_the_browser() {
+        let doc = LoroDoc::new();
+        let meta_map = doc.get_map(root::META);
+        for (stored, read) in [
+            (" Thesis\u{feff}", Some("Thesis")),
+            ("\u{feff}", None),
+            ("\u{85}", Some("\u{85}")),
+            ("", None),
+        ] {
+            meta_map.insert(meta::TITLE, stored).unwrap();
+            assert_eq!(title(&doc).as_deref(), read, "{stored:?}");
+        }
+        meta_map
+            .insert(meta::TITLE, "x".repeat(MAX_TITLE_CHARS + 1))
+            .unwrap();
+        assert_eq!(title(&doc), None);
     }
 }

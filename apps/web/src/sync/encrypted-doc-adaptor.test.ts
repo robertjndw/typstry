@@ -549,6 +549,132 @@ describe("EncryptedDocAdaptor", () => {
     expect(server.deltas).toHaveLength(1);
   });
 
+  it("backs off further while the server keeps refusing for a passing reason", () => {
+    vi.useFakeTimers();
+    try {
+      vi.spyOn(Math, "random").mockReturnValue(1);
+      const adaptor = new EncryptedDocAdaptor(new LoroDoc(), {
+        crypto: project.crypto,
+        canWrite: true,
+        retryMs: 1000,
+        retryMaxMs: 4000,
+      });
+      const resend = vi
+        .spyOn(adaptor as unknown as { enqueuePush(): void }, "enqueuePush")
+        .mockImplementation(() => {});
+      for (const delay of [1000, 2000, 4000, 4000]) {
+        resend.mockClear();
+        adaptor.onUpdateError([], UpdateStatusCode.RateLimited);
+        vi.advanceTimersByTime(delay - 1);
+        expect(resend).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(resend).toHaveBeenCalledTimes(1);
+      }
+      adaptor.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says when the server refuses edits for good, and keeps counting them unsent", async () => {
+    const server = new FakeServer();
+    const onUpdateRefused = vi.fn();
+    const doc = new LoroDoc();
+    const adaptor = new EncryptedDocAdaptor(doc, {
+      crypto: project.crypto,
+      canWrite: true,
+      pushDelayMs: 0,
+      onUpdateRefused,
+    });
+    adaptor.setCtx({
+      send: (updates: Uint8Array[]) =>
+        adaptor.onUpdateError(
+          updates,
+          UpdateStatusCode.PermissionDenied,
+          "permission_denied",
+        ),
+      onJoinFailed: vi.fn(),
+      onImportError: vi.fn(),
+    } as never);
+    await adaptor.handleJoinOk(server.join(adaptor.getVersion()).res);
+    write(doc, "refused");
+    await adaptor.flush();
+    expect(onUpdateRefused).toHaveBeenCalledWith("permission_denied");
+    expect(adaptor.hasPendingPush).toBe(false);
+    expect(adaptor.hasUnsentChanges).toBe(true);
+    adaptor.destroy();
+  });
+
+  it("reports a span the format cannot carry once, and sends the rest", async () => {
+    const server = new FakeServer();
+    const onUpdateRefused = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const real = project.crypto;
+    const bad = new LoroDoc();
+    write(bad, "x");
+    const badPeer = bad.peerIdStr;
+    const crypto = {
+      get canWrite() {
+        return real.canWrite;
+      },
+      encryptDelta: (span: { peer: string }, plaintext: Uint8Array) => {
+        if (span.peer === badPeer)
+          throw Object.assign(new Error("counter too large"), {
+            kind: "MalformedRecord",
+          });
+        return real.encryptDelta(span as never, plaintext);
+      },
+      encryptSnapshot: real.encryptSnapshot.bind(real),
+      decryptRecord: real.decryptRecord.bind(real),
+    };
+    const doc = new LoroDoc();
+    doc.import(bad.export({ mode: "snapshot" }));
+    const adaptor = new EncryptedDocAdaptor(doc, {
+      crypto,
+      canWrite: true,
+      pushDelayMs: 0,
+      onUpdateRefused,
+    });
+    const sent: Uint8Array[] = [];
+    adaptor.setCtx({
+      send: (updates: Uint8Array[]) => {
+        for (const u of updates) server.receive(u);
+        sent.push(...updates);
+      },
+      onJoinFailed: vi.fn(),
+      onImportError: vi.fn(),
+    } as never);
+    await adaptor.handleJoinOk(server.join(adaptor.getVersion()).res);
+    write(doc, "mine");
+    await adaptor.flush();
+    write(doc, " more");
+    await adaptor.flush();
+    expect(onUpdateRefused).toHaveBeenCalledExactlyOnceWith("malformed_record");
+    expect(server.deltas.map((d) => d.peer)).not.toContain(badPeer);
+    expect(server.deltas.length).toBeGreaterThan(0);
+    expect(adaptor.hasUnsentChanges).toBe(true);
+    adaptor.destroy();
+    error.mockRestore();
+  });
+
+  it("counts edits as unsent while it may not send them yet", async () => {
+    const server = new FakeServer();
+    const b = makeClient(server, project.crypto);
+    write(b.doc, "theirs");
+    await b.join();
+    await vi.waitFor(() => expect(server.deltas).toHaveLength(1));
+
+    // Joined, but the backfill is not in, so nothing says yet whether the
+    // doc is one this device may write into.
+    const a = makeClient(server, project.crypto, { accept: () => undefined });
+    write(a.doc, "mine");
+    await a.adaptor.handleJoinOk(server.join(a.adaptor.getVersion()).res);
+    await a.adaptor.flush();
+    expect(server.deltas).toHaveLength(1);
+    expect(a.adaptor.hasPendingPush).toBe(false);
+    expect(a.adaptor.hasUnsentChanges).toBe(true);
+  });
+
   it("never sends from a view link", async () => {
     const server = new FakeServer();
     const viewer = makeClient(server, viewerOf(project), { canWrite: false });

@@ -1,10 +1,14 @@
 .git
 .github
-.agents
+.claude
+.playwright-cli
+docs
 **/node_modules
 **/dist
 # Built inside the image (see the tinymist stage in the Dockerfile).
 apps/web/vendor
+apps/web/test-results
+apps/web/playwright-report
 target
 data
 coverage

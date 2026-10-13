@@ -4,11 +4,16 @@ import { DeviceKey, PersonGraph } from "@/crypto/wasm";
 import { localIdentity, mergeOwnGraph } from "@/mls/identity";
 import { MemoryBackend } from "@/persist/local-doc-store";
 import { seedProject } from "@/directory/test-utils";
+import { RateLimitedError } from "@/sync/api";
 
+import { allocateChannel } from "./relay";
 import { isDisposable, startShowing } from "./start";
 
 beforeEach(() => localStorage.clear());
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
 
 describe("isDisposable", () => {
   it("is false for a browser that is no person yet", async () => {
@@ -72,5 +77,19 @@ describe("startShowing", () => {
     expect(socket.protocol).toBe("wss:");
     expect(socket.host).toBe("relay.example");
     expect(socket.searchParams.get("channel")).toBe("7");
+  });
+});
+
+describe("allocateChannel", () => {
+  it("retries a 429 and then reports it plainly", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<(url: string) => Promise<Response>>(
+      async () => new Response(null, { status: 429 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const allocated = allocateChannel().catch((e: unknown) => e);
+    await vi.runAllTimersAsync();
+    expect(await allocated).toBeInstanceOf(RateLimitedError);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
   });
 });

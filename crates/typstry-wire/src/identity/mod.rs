@@ -45,10 +45,32 @@ pub type Hash = [u8; 32];
 /// rarely, and the graph rides in every leaf of every project, so it has to
 /// stay small.
 pub const MAX_GRAPH_ENTRIES: usize = 48;
-/// Upper bound on an encoded graph, for the same reason. Entries with many
-/// parents are bigger than the usual 164 bytes, so this binds before the
-/// count does only for unusually forked graphs.
+/// Upper bound on an encoded graph, for the same reason.
 pub const MAX_GRAPH_BYTES: usize = 8192;
+
+/// Of [`MAX_GRAPH_ENTRIES`] and [`MAX_GRAPH_BYTES`], what only revokes and
+/// entries a recovery device signs may use. Every other entry, the genesis
+/// included, has to fit in what is left, so a stolen device that fills the
+/// graph with profiles or adds still leaves room for another device to
+/// revoke it and for a recovery key to add a new device and revoke the
+/// rest.
+///
+/// That only holds while the thief leaves the reserve alone. It can spend
+/// it on revokes of its own, and, since any valid device may flag a key it
+/// adds as recovery (that is how a person makes a recovery key on whichever
+/// device is at hand), on adds signed by a recovery key of its own too.
+/// Nothing in the graph tells either from honest ones: limiting the reserve
+/// to recovery keys that the genesis or another recovery key flagged would
+/// shut out every recovery key made on a paired device. So the reserve
+/// guards against a thief that fills the graph without aiming at it, not
+/// one that sets out to drain it.
+///
+/// The bytes cover one entry that merges a few dozen heads plus a handful
+/// of plain ones. Whether an entry is a recovery device's is judged in the
+/// entry's own past, like everything else about it, so every replica draws
+/// the line in the same place.
+pub const RESERVED_ENTRIES: usize = 8;
+pub const RESERVED_BYTES: usize = 2560;
 
 const PERSON_ID_INFO: &[u8] = b"typstry:v1:person-id";
 const DEVICE_ID_INFO: &[u8] = b"typstry:v1:device-id";

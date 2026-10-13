@@ -97,7 +97,7 @@ export class NotEditorError extends CryptoError {
 }
 
 /** Turns what the wasm threw into one of the classes above. */
-export function toCryptoError(error: unknown): unknown {
+function toCryptoError(error: unknown): unknown {
   if (!(error instanceof Error)) return error;
   const { kind, version, generation } = error as Error & {
     kind?: unknown;
@@ -202,10 +202,17 @@ export class SpaceCrypto {
   static open(secret: string, signedKeyring: Uint8Array): SpaceCrypto {
     return guard(() => {
       const link = LinkSecret.parse(secret);
-      return new SpaceCrypto(
-        link,
-        new DocKeys(Keyring.openVerified(link, signedKeyring)),
-      );
+      let keyring: Keyring | null = null;
+      try {
+        keyring = Keyring.openVerified(link, signedKeyring);
+        // DocKeys copies what it needs out of the keyring.
+        return new SpaceCrypto(link, new DocKeys(keyring));
+      } catch (error) {
+        link.free();
+        throw error;
+      } finally {
+        keyring?.free();
+      }
     });
   }
 
@@ -257,10 +264,27 @@ export class SpaceCrypto {
    * epoch) then sees all of it at once.
    */
   setGroupKeys(keys: DocKeys, signer: Signer, presence: PresenceKey): void {
+    // Only this object holds the ones replaced: the group hands out fresh
+    // copies on every call.
+    const old = [this.keys, this.signer, this.presence];
     this.keys = keys;
     this.signer = signer;
     this.presence = presence;
+    for (const item of old) {
+      if (item && item !== keys && item !== signer && item !== presence)
+        item.free();
+    }
     this.emit();
+  }
+
+  /** Frees the wasm objects, the link included. Unusable afterwards. */
+  free(): void {
+    this.keys.free();
+    this.signer?.free();
+    this.presence?.free();
+    this.link.free();
+    this.signer = null;
+    this.presence = null;
   }
 
   /** Calls `listener` whenever keys, signer or presence key change. */

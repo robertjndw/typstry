@@ -1,0 +1,145 @@
+# typstry behind Traefik, for an instance reachable from the internet.
+#
+#   cp .env.example .env    # set TYPSTRY_DOMAIN and ACME_EMAIL
+#   docker compose -f compose.prod.yaml up -d
+#
+# Traefik terminates TLS (Let's Encrypt), redirects HTTP to HTTPS and holds
+# each client address to its share of the instance. typstry itself has no
+# per-address limits: only the proxy at the edge knows who is on the other
+# end. See docs/self-hosting.md for tuning the limits below.
+
+services:
+  traefik:
+    image: traefik:v3.7
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=typstry-backend
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
+      # Traefik's default of 60 s covers the whole request body, which would
+      # cut off a 25 MiB upload on a slow link. typstry drops an upload that
+      # stalls for 30 s on its own, so this only needs to bound the total;
+      # raise it with TYPSTRY_MAX_UPLOAD_BYTES. It does not end WebSockets.
+      - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=15m
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?set ACME_EMAIL in .env}
+      - --certificatesresolvers.letsencrypt.acme.storage=/acme/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      # No access log: share tokens are part of the URL path, and whoever
+      # holds one can open the project. No dashboard either.
+      - --global.sendanonymoususage=false
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Read-only keeps Traefik from writing to the socket file, not from
+      # using the Docker API. Put a socket proxy in between for more.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme
+    networks:
+      - edge
+      - backend
+    restart: unless-stopped
+
+  typstry:
+    # Pin a release tag like `0.1` for production, so an update is a
+    # deliberate change and not whatever `latest` was at the last pull.
+    image: ghcr.io/robertjndw/typstry:latest
+    environment:
+      RUST_LOG: info
+    volumes:
+      - typstry-data:/data
+    # Only on the internal network: reachable through Traefik, not from
+    # the host or the internet directly.
+    networks:
+      - backend
+    restart: unless-stopped
+    # On shutdown the server lets running requests finish (up to 10 s),
+    # closes WebSockets (up to 5 s) and lets each project handle what is
+    # already queued, so give it time before Docker kills it.
+    stop_grace_period: 30s
+    labels:
+      - traefik.enable=true
+      - traefik.http.services.typstry.loadbalancer.server.port=8787
+
+      # Every limit below counts per client address as Traefik sees it.
+      # Traefik is the edge here, so that is the TCP peer. If another proxy
+      # or a CDN sits in front, add `sourcecriterion.ipstrategy.depth=1` (one
+      # per hop) to each, or every visitor counts as that proxy. IPv6 is
+      # counted per /64, since one client usually holds a whole one.
+
+      # Everything not matched by a router further down: the app itself,
+      # assets, share lookups. Opening a project fetches a lot at once, so
+      # there is no general rate limit here.
+      - traefik.http.routers.typstry.rule=Host(`${TYPSTRY_DOMAIN:?set TYPSTRY_DOMAIN in .env}`)
+      - traefik.http.routers.typstry.priority=10
+      - traefik.http.routers.typstry.entrypoints=websecure
+      - traefik.http.routers.typstry.service=typstry
+      - traefik.http.routers.typstry.middlewares=typstry-hsts
+
+      - traefik.http.middlewares.typstry-hsts.headers.stsseconds=31536000
+
+      # Creating a project: 2 a minute after a burst of 20.
+      - traefik.http.routers.typstry-spaces.rule=Host(`${TYPSTRY_DOMAIN}`) && Method(`POST`) && Path(`/api/spaces`)
+      - traefik.http.routers.typstry-spaces.priority=100
+      - traefik.http.routers.typstry-spaces.entrypoints=websecure
+      - traefik.http.routers.typstry-spaces.service=typstry
+      - traefik.http.routers.typstry-spaces.middlewares=typstry-hsts,typstry-spaces-limit
+      - traefik.http.middlewares.typstry-spaces-limit.ratelimit.average=2
+      - traefik.http.middlewares.typstry-spaces-limit.ratelimit.period=1m
+      - traefik.http.middlewares.typstry-spaces-limit.ratelimit.burst=20
+      - traefik.http.middlewares.typstry-spaces-limit.ratelimit.sourcecriterion.ipstrategy.ipv6subnet=64
+
+      # Uploading assets: 60 a minute after a burst of 200. Importing a
+      # project uploads all of its files at once, hence the burst.
+      - traefik.http.routers.typstry-uploads.rule=Host(`${TYPSTRY_DOMAIN}`) && Method(`POST`) && PathRegexp(`^/api/s/[^/]+/assets$$`)
+      - traefik.http.routers.typstry-uploads.priority=100
+      - traefik.http.routers.typstry-uploads.entrypoints=websecure
+      - traefik.http.routers.typstry-uploads.service=typstry
+      - traefik.http.routers.typstry-uploads.middlewares=typstry-hsts,typstry-uploads-limit
+      - traefik.http.middlewares.typstry-uploads-limit.ratelimit.average=60
+      - traefik.http.middlewares.typstry-uploads-limit.ratelimit.period=1m
+      - traefik.http.middlewares.typstry-uploads-limit.ratelimit.burst=200
+      - traefik.http.middlewares.typstry-uploads-limit.ratelimit.sourcecriterion.ipstrategy.ipv6subnet=64
+
+      # Opening a pairing channel: 10 a minute. Pairing a device takes one,
+      # and the 9999 channel numbers are shared by everyone.
+      - traefik.http.routers.typstry-relay.rule=Host(`${TYPSTRY_DOMAIN}`) && Method(`POST`) && Path(`/api/relay`)
+      - traefik.http.routers.typstry-relay.priority=100
+      - traefik.http.routers.typstry-relay.entrypoints=websecure
+      - traefik.http.routers.typstry-relay.service=typstry
+      - traefik.http.routers.typstry-relay.middlewares=typstry-hsts,typstry-relay-limit
+      - traefik.http.middlewares.typstry-relay-limit.ratelimit.average=10
+      - traefik.http.middlewares.typstry-relay-limit.ratelimit.period=1m
+      - traefik.http.middlewares.typstry-relay-limit.ratelimit.burst=10
+      - traefik.http.middlewares.typstry-relay-limit.ratelimit.sourcecriterion.ipstrategy.ipv6subnet=64
+
+      # WebSockets (/ws, /ws/mls, /ws/relay): at most 200 open per address.
+      # A request counts as in flight for as long as its socket is open. A
+      # browser tab holds two per project, and a whole office may share one
+      # address. The ip strategy is spelled out because inFlightReq would
+      # otherwise group by Host header, which is one bucket for everyone.
+      - traefik.http.routers.typstry-ws.rule=Host(`${TYPSTRY_DOMAIN}`) && (Path(`/ws`) || PathPrefix(`/ws/`))
+      - traefik.http.routers.typstry-ws.priority=100
+      - traefik.http.routers.typstry-ws.entrypoints=websecure
+      - traefik.http.routers.typstry-ws.service=typstry
+      - traefik.http.routers.typstry-ws.middlewares=typstry-hsts,typstry-ws-limit
+      - traefik.http.middlewares.typstry-ws-limit.inflightreq.amount=200
+      - traefik.http.middlewares.typstry-ws-limit.inflightreq.sourcecriterion.ipstrategy.ipv6subnet=64
+
+networks:
+  # Holds the published ports and lets Traefik reach Let's Encrypt.
+  edge:
+  # Traefik to typstry only. Named so the provider option above can find it
+  # whatever the compose project is called.
+  backend:
+    name: typstry-backend
+    internal: true
+
+volumes:
+  traefik-acme:
+  typstry-data:

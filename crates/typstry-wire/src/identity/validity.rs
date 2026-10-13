@@ -53,13 +53,26 @@
 //!   counting entry that no other counting entry builds on; among concurrent
 //!   ones the greatest hash wins.
 //!
+//! - The genesis and every entry that is neither a revoke nor authored by
+//!   a recovery device in its past are at most `MAX_GRAPH_ENTRIES -
+//!   RESERVED_ENTRIES` entries and `MAX_GRAPH_BYTES - RESERVED_BYTES`
+//!   encoded bytes together; a graph past either is refused as too large.
+//!   The rest is kept for revokes and for a recovery key, so a device that
+//!   fills the graph with profiles or adds leaves room for the revoke that
+//!   throws it out. One that fills the reserve too still blocks it, with
+//!   revokes or with adds signed by a recovery key it flagged itself: the
+//!   caps cannot tell those from honest ones, as any valid device may flag
+//!   a recovery key (see [`RESERVED_ENTRIES`]).
+//!
 //! The same rules judge `past(E)` and the whole graph, so every replica
 //! reaches one verdict no matter in which order it learned the entries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::entry::{Entry, EntryKind, FLAG_RECOVERY};
-use super::{GraphError, Hash, MAX_GRAPH_ENTRIES};
+use super::{
+    GraphError, Hash, MAX_GRAPH_BYTES, MAX_GRAPH_ENTRIES, RESERVED_BYTES, RESERVED_ENTRIES,
+};
 use crate::crypto::PublicKey;
 
 // Ancestor sets are bitsets over the entries in topological order.
@@ -78,7 +91,9 @@ pub(super) struct Validity {
 
 impl Validity {
     /// Fails with [`GraphError::Unauthorized`] on an entry that is not
-    /// authorized.
+    /// authorized, and with [`GraphError::TooLarge`] when the entries other
+    /// than revokes and those of recovery devices reach into the reserve
+    /// (see [`RESERVED_ENTRIES`]).
     pub fn compute(entries: &BTreeMap<Hash, Entry>) -> Result<Self, GraphError> {
         if entries.len() > MAX_GRAPH_ENTRIES {
             return Err(GraphError::TooLarge);
@@ -95,12 +110,15 @@ impl Validity {
         let mut ancestors = vec![0u64; items.len()];
         let mut flagged_by = vec![0u64; items.len()];
         let mut counting_adds = vec![0u64; items.len()];
+        let (mut ordinary, mut ordinary_bytes) = (0, 0);
         for (i, entry) in items.iter().enumerate() {
             for parent in &entry.parents {
                 let j = index[parent];
                 ancestors[i] |= ancestors[j] | 1 << j;
             }
             if entry.kind == EntryKind::Genesis {
+                ordinary += 1;
+                ordinary_bytes += entry.encode().len();
                 continue;
             }
             // Every entry before this one in the order passed already, so
@@ -119,6 +137,10 @@ impl Validity {
             {
                 return Err(GraphError::Unauthorized);
             }
+            if !recovery && !matches!(entry.kind, EntryKind::RevokeDevice { .. }) {
+                ordinary += 1;
+                ordinary_bytes += entry.encode().len();
+            }
             counting_adds[i] = adds;
             flagged_by[i] = adds
                 & (0..i)
@@ -129,6 +151,11 @@ impl Validity {
                         _ => false,
                     })
                     .fold(0u64, |mask, j| mask | 1 << j);
+        }
+        if ordinary > MAX_GRAPH_ENTRIES - RESERVED_ENTRIES
+            || ordinary_bytes > MAX_GRAPH_BYTES - RESERVED_BYTES
+        {
+            return Err(GraphError::TooLarge);
         }
         let all = if items.len() == u64::BITS as usize {
             u64::MAX

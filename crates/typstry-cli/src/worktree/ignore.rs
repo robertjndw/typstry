@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::gitignore::{Gitignore, GitignoreBuilder, gitconfig_excludes_path};
 use typstry_doc::names::is_reserved_segment;
 
 use super::Worktree;
@@ -43,14 +43,18 @@ pub(super) struct IgnoreBase {
     /// The repo's `info/exclude` and the folder its patterns are relative
     /// to.
     exclude: Option<(PathBuf, PathBuf)>,
+    /// git's global excludes (`core.excludesFile`, or `git/ignore` in the
+    /// config folder) and the folder its patterns are relative to. The
+    /// walker applies it outside repos too, so this does as well.
+    global: Option<(PathBuf, PathBuf)>,
 }
 
 impl Worktree {
     /// Whether the ignore rules exclude `path`, for callers that look at
     /// single paths instead of scanning. Approximates the walker in
     /// [`Self::scan`]: the `.gitignore` and `.typstryignore` files from the
-    /// repo root down to the file's folder, plus the repo's `info/exclude`.
-    /// The global git excludes are not consulted.
+    /// repo root down to the file's folder, the repo's `info/exclude` and
+    /// the global git excludes.
     pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
         let segments: Vec<&str> = path.split('/').collect();
         if segments.iter().any(|s| is_always_skipped(s)) {
@@ -67,6 +71,10 @@ impl Worktree {
         let base = self.ignore_base();
         let (chain, abs) = folders_to(&base.root, &segments);
         let mut matchers = Vec::new();
+        // Lowest priority first, as in the walker.
+        if let Some((file, dir)) = &base.global {
+            matchers.extend(self.matcher(file, dir));
+        }
         if let Some((file, workdir)) = &base.exclude {
             matchers.extend(self.matcher(file, workdir));
         }
@@ -124,11 +132,14 @@ impl Worktree {
                 root: self.root.clone(),
                 outer: Vec::new(),
                 exclude: None,
+                global: None,
             });
         };
         let mut outer = Vec::new();
         let mut exclude = None;
+        let mut global_dir = root.clone();
         if let Some(repo) = crate::git::Repo::discover(&root) {
+            global_dir.clone_from(&repo.workdir);
             outer.extend(
                 root.ancestors()
                     .skip(1)
@@ -138,10 +149,12 @@ impl Worktree {
             outer.reverse();
             exclude = Some((repo.common_dir.join("info").join("exclude"), repo.workdir));
         }
+        let global = gitconfig_excludes_path().map(|file| (file, global_dir));
         let base = Arc::new(IgnoreBase {
             root,
             outer,
             exclude,
+            global,
         });
         *cached = Some(Arc::clone(&base));
         base
@@ -215,4 +228,35 @@ pub(super) fn is_always_skipped(name: &str) -> bool {
 /// Case-insensitive, since `.GITIGNORE` is `.gitignore` on macOS.
 pub(super) fn is_git_file(name: &str) -> bool {
     GIT_FILES.iter().any(|file| name.eq_ignore_ascii_case(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_excludes_apply_to_single_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let global = root.join("global-ignore");
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(&global, ".DS_Store\n*.swp\n").unwrap();
+        let wt = Worktree::new(&tree);
+        // Stands in for core.excludesFile, which would otherwise come from
+        // the developer's own git config.
+        *wt.caches.ignore_base.lock().unwrap() = Some(Arc::new(IgnoreBase {
+            root: tree.clone(),
+            outer: Vec::new(),
+            exclude: None,
+            global: Some((global, tree.clone())),
+        }));
+        assert!(wt.is_ignored(".DS_Store", false));
+        assert!(wt.is_ignored("chapters/.intro.typ.swp", false));
+        assert!(!wt.is_ignored("main.typ", false));
+
+        // A project's own rules still win over the global ones.
+        fs::write(tree.join(".gitignore"), "!keep.swp\n").unwrap();
+        assert!(!wt.is_ignored("keep.swp", false));
+    }
 }

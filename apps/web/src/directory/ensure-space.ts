@@ -27,7 +27,11 @@ export async function ensureSpace(
     // Another tab may have made it while this one waited for the lock.
     const raced = loadBinding();
     if (raced) return raced;
-    const { created, key } = await createSpaceGroup(opts);
+    const { created, key, link, group } = await createSpaceGroup(opts);
+    // The group state is saved by now and the binding only needs the key as
+    // text, so the wasm handles can go right away.
+    group.free();
+    link.free();
     const binding = {
       spaceId: created.spaceId,
       token: created.editToken,

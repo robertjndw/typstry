@@ -19,26 +19,31 @@ const ROOT = "file:///project/";
 
 class FakeWorker {
   sent: { message: TinymistRequest; transfer: Transferable[] }[] = [];
-  private listeners = new Set<(e: MessageEvent<TinymistResponse>) => void>();
+  terminated = false;
+  private listeners = new Map<string, Set<(e: never) => void>>();
   postMessage(message: TinymistRequest, transfer: Transferable[] = []) {
     this.sent.push({ message, transfer });
   }
-  addEventListener(
-    _type: "message",
-    l: (e: MessageEvent<TinymistResponse>) => void,
-  ) {
-    this.listeners.add(l);
+  addEventListener(type: string, l: (e: never) => void) {
+    const set = this.listeners.get(type) ?? new Set();
+    set.add(l);
+    this.listeners.set(type, set);
   }
-  removeEventListener(
-    _type: "message",
-    l: (e: MessageEvent<TinymistResponse>) => void,
-  ) {
-    this.listeners.delete(l);
+  removeEventListener(type: string, l: (e: never) => void) {
+    this.listeners.get(type)?.delete(l);
   }
-  terminate() {}
+  terminate() {
+    this.terminated = true;
+  }
   emit(message: TinymistResponse) {
-    for (const l of this.listeners)
-      l({ data: message } as MessageEvent<TinymistResponse>);
+    for (const l of this.listeners.get("message") ?? [])
+      (l as (e: MessageEvent<TinymistResponse>) => void)({
+        data: message,
+      } as MessageEvent<TinymistResponse>);
+  }
+  crash() {
+    for (const l of this.listeners.get("error") ?? [])
+      (l as (e: Event) => void)(new Event("error"));
   }
   /** File messages sent so far, LSP traffic left out; clears the log. */
   takeFiles() {
@@ -200,6 +205,42 @@ describe("TinymistClient assets", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     const sent = worker.takeFiles().map((s) => s.message);
     expect(sent.map((m) => decode(m))).toEqual(["new"]);
+    client.dispose();
+  });
+});
+
+describe("TinymistClient worker failures", () => {
+  it("replaces a failed worker once, then reports language features as unavailable", async () => {
+    const { toast } = await import("sonner");
+    const warning = vi.spyOn(toast, "warning").mockImplementation(() => 1);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const project = initProject(newProject(1), { title: "T" });
+    const workers: FakeWorker[] = [];
+    const client = new TinymistClient(project, null, {
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w as unknown as TinymistWorker;
+      },
+    });
+
+    workers[0]!.emit({ type: "initError", message: "no wasm" });
+    expect(workers[0]!.terminated).toBe(true);
+    expect(workers).toHaveLength(2);
+    // The new worker gets the project again and a fresh LSP handshake.
+    const sent = workers[1]!.sent.map((s) => s.message);
+    expect(sent).toContainEqual(
+      expect.objectContaining({ type: "setFile", uri: `${ROOT}main.typ` }),
+    );
+    expect(
+      sent.some((m) => m.type === "lsp" && m.message.includes('"initialize"')),
+    ).toBe(true);
+    expect(warning).not.toHaveBeenCalled();
+
+    workers[1]!.crash();
+    expect(workers[1]!.terminated).toBe(true);
+    expect(workers).toHaveLength(2);
+    expect(warning).toHaveBeenCalledTimes(1);
     client.dispose();
   });
 });

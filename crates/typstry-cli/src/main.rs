@@ -2,7 +2,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use typstry_cli::commands::{self, Cli};
 use typstry_cli::engine::Conflicts;
-use typstry_cli::term::LogWriter;
+use typstry_cli::term::{self, LogWriter};
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +19,8 @@ async fn main() {
         .init();
 
     if let Err(err) = commands::run(Cli::parse()).await {
-        eprintln!("error: {err:#}");
+        // Errors quote paths and names from the project.
+        eprintln!("error: {}", term::without_bidi(&format!("{err:#}")));
         if err.downcast_ref::<Conflicts>().is_some() {
             eprintln!(
                 "hint: run `typstry push` to merge both sides, or undo the local changes and pull again"

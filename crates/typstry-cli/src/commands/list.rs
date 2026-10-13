@@ -3,7 +3,8 @@ use crate::space::sync_bound;
 use crate::tui::picker::{Mode, Outcome, pick};
 use crate::user::catalog;
 
-/// List your projects, including the ones other devices of yours have.
+/// List your projects, most recently opened first, including the ones other
+/// devices of yours have.
 ///
 /// Projects that only exist on your other devices (handed over by
 /// `typstry pair`) show a `typstry clone` shortcut. Pass its number or the

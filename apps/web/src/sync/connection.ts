@@ -23,8 +23,12 @@ import { fetchServerInfo, isOutdated, socketUrl } from "./protocol";
 
 export type SyncStatus = "connecting" | "connected" | "disconnected";
 
-/** "offline": the server could not be reached in time; edits stay queued. */
-export type SyncNowResult = "synced" | "offline";
+/**
+ * "offline": the server could not be reached in time; edits stay queued.
+ * "pending": it is reachable, but some local edits could not go up yet (the
+ * project's kind is not confirmed yet) or were refused; they stay queued.
+ */
+export type SyncNowResult = "synced" | "offline" | "pending";
 
 const SYNC_NOW_TIMEOUT_MS = 5000;
 
@@ -82,6 +86,11 @@ export interface ConnectOptions {
   onRefused?: () => void;
   /** Upload a snapshot right after joining: a rotation just moved the keys. */
   compactOnJoin?: boolean;
+  /**
+   * The server refused local edits for a reason resending does not fix
+   * (see EncryptedDocAdaptorOptions.onUpdateRefused).
+   */
+  onUpdateRefused?: (reason: string) => void;
 }
 
 export interface SpaceConnection {
@@ -153,6 +162,7 @@ export function connectSpace(opts: ConnectOptions): SpaceConnection {
     onDecryptError: opts.onDecryptError,
     onUnknownGeneration: opts.onUnknownGeneration,
     compactOnJoin: opts.compactOnJoin,
+    onUpdateRefused: opts.onUpdateRefused,
     accept: opts.accept,
     onRefused: () => {
       if (finished) return;
@@ -275,7 +285,7 @@ export function connectSpace(opts: ConnectOptions): SpaceConnection {
       // The socket is ordered, so a pong means the server has read every
       // update sent before the ping.
       await client.ping(timeoutMs);
-      return "synced";
+      return docAdaptor.hasUnsentChanges ? "pending" : "synced";
     } catch {
       return "offline";
     }
@@ -305,9 +315,9 @@ export function connectSpace(opts: ConnectOptions): SpaceConnection {
       update();
       listeners.clear();
       // Commits not yet handed to the socket (waiting for the push timer,
-      // queued, or still encrypting) would otherwise only go up on the next
-      // visit, since destroy() makes a running push give up. Encrypting them
-      // takes a moment, so the socket stays open until then.
+      // or queued behind other steps) would otherwise only go up on the next
+      // visit, since destroy() makes a queued push give up. So the socket
+      // stays open until they are sent.
       if (docAdaptor.hasPendingPush) void docAdaptor.flush().finally(shutdown);
       else shutdown();
     },

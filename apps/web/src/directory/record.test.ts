@@ -52,6 +52,20 @@ describe("directory records", () => {
     });
   });
 
+  it("leaves a directory of another kind or a newer layout alone", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const dir = await directory();
+    dir.doc.getMap("meta").set("schema", 99);
+    dir.doc.commit();
+    const before = dir.doc.oplogVersion();
+    await recordOpened("p", edit, "T");
+    await expect(recordForgotten("p")).rejects.toThrow(/unsupported directory/);
+    await recordOwnerSecret("p", new Uint8Array(32).fill(7));
+    expect(dir.doc.oplogVersion().compare(before)).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
   it("adopting a link lists it without marking it opened", async () => {
     await recordAdopted(
       "p",
@@ -78,6 +92,20 @@ describe("directory records", () => {
     expect((await directory()).doc.getMap("retired").get(token(1))).toBeTypeOf(
       "number",
     );
+  });
+
+  it("records a rotation in one commit", async () => {
+    await recordOpened("p", edit, "T");
+    const dir = await directory();
+    const peer = dir.doc.peerIdStr;
+    const changes = dir.doc.getAllChanges().get(peer)?.length ?? 0;
+    await recordRotation("p", {
+      link: editSecret(2),
+      token: token(2),
+      viewToken: null,
+      canEdit: true,
+    });
+    expect(dir.doc.getAllChanges().get(peer)).toHaveLength(changes + 1);
   });
 
   it("a view rotation is not an edit link", async () => {

@@ -1,8 +1,10 @@
 // @vitest-environment node
 import { strToU8, zipSync } from "fflate";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { ImportError, MAX_IMPORT_BYTES } from "./import";
 import { readDrop, readPicked } from "./sources";
+import { UnzipLimitError, unzipWithLimits } from "./unzip-limits";
 
 function fileEntry(fullPath: string, text: string): FileSystemEntry {
   const name = fullPath.slice(fullPath.lastIndexOf("/") + 1);
@@ -62,6 +64,50 @@ describe("readDrop", () => {
     expect([...source.dirs]).toEqual(["figures"]);
   });
 
+  it("does not walk into reserved or clutter folders", async () => {
+    const untouchable = {
+      isFile: false,
+      isDirectory: true,
+      createReader() {
+        throw new Error("walked into a skipped folder");
+      },
+    };
+    const folder = dirEntry("/thesis", [
+      fileEntry("/thesis/main.typ", "= Hi"),
+      { ...untouchable, name: ".git", fullPath: "/thesis/.git" },
+      {
+        ...untouchable,
+        name: "node_modules",
+        fullPath: "/thesis/node_modules",
+      },
+    ] as unknown as FileSystemEntry[]);
+    const source = await readDrop(transfer([{ entry: folder, file: null }]))!
+      .source;
+    expect([...source.files.keys()]).toEqual(["main.typ"]);
+    // The reserved folder is reported, the clutter is not.
+    expect(source.skipped).toEqual([".git"]);
+  });
+
+  it("checks file sizes before reading anything", async () => {
+    const big = new File(["x"], "video.mp4");
+    Object.defineProperty(big, "size", { value: 30 * 1024 * 1024 });
+    const read = vi.spyOn(big, "arrayBuffer");
+    const small = new File(["x"], "main.typ");
+    const readSmall = vi.spyOn(small, "arrayBuffer");
+    const dropped = readDrop(
+      transfer([
+        { entry: null, file: big },
+        { entry: null, file: small },
+      ]),
+    )!;
+    await expect(dropped.source).rejects.toMatchObject({
+      name: "ImportError",
+      paths: ["video.mp4"],
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(readSmall).not.toHaveBeenCalled();
+  });
+
   it("unpacks a single dropped zip", async () => {
     const zip = new File(
       [zipSync({ "main.typ": strToU8("= Hi") })],
@@ -103,5 +149,40 @@ describe("readPicked", () => {
       "data.zip",
       "main.typ",
     ]);
+  });
+});
+
+describe("zip limits", () => {
+  const limits = { maxEntries: 10, maxEntryBytes: 100, maxTotalBytes: 150 };
+
+  it("rejects entries over the per-file cap by their declared size", () => {
+    const zip = zipSync({
+      "main.typ": strToU8("x"),
+      "big.bin": new Uint8Array(101),
+    });
+    expect(() => unzipWithLimits(zip, limits)).toThrow(
+      expect.objectContaining({ paths: ["big.bin"] }),
+    );
+  });
+
+  it("rejects archives over the total and the entry count", () => {
+    const total = zipSync({
+      "a.bin": new Uint8Array(80),
+      "b.bin": new Uint8Array(80),
+    });
+    expect(() => unzipWithLimits(total, limits)).toThrow(/more than 0 MB/);
+    const many = zipSync(
+      Object.fromEntries(
+        Array.from({ length: 11 }, (_, i) => [`${i}.typ`, strToU8("x")]),
+      ),
+    );
+    expect(() => unzipWithLimits(many, limits)).toThrow(UnzipLimitError);
+    expect(() => unzipWithLimits(many, limits)).toThrow(/more than 10/);
+  });
+
+  it("refuses to read a zip larger than the import cap", async () => {
+    const zip = new File([zipSync({})], "huge.zip");
+    Object.defineProperty(zip, "size", { value: MAX_IMPORT_BYTES + 1 });
+    await expect(readPicked([zip]).source).rejects.toBeInstanceOf(ImportError);
   });
 });

@@ -43,6 +43,10 @@
     "COM1",
     "lpt9.md",
     "com¹",
-    "CONIN$"
+    "CONIN$",
+    "a\\b.typ",
+    "\\",
+    "..\\evil.typ",
+    "trailing\\"
   ]
 }

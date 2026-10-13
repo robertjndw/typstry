@@ -11,6 +11,8 @@ const dataDir = path.join(os.tmpdir(), "typstry-e2e");
 
 export default defineConfig({
   testDir: "e2e",
+  // Fails fast when dist/ is older than src/, see the file.
+  globalSetup: "./e2e/global-setup.ts",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -24,7 +26,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   // Tests run against the production build served by the real server, so
-  // `pnpm build` has to run first.
+  // `pnpm build` has to run first; globalSetup checks that it did.
   webServer: {
     command: `rm -rf "${dataDir}" && cargo run --quiet -p typstry-server`,
     cwd: root,

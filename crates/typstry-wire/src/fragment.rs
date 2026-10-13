@@ -12,6 +12,13 @@ const FRAGMENT_LIMIT: usize = 240 * 1024;
 /// Upper bound for one reassembled update.
 pub const MAX_REASSEMBLED: usize = 8 * 1024 * 1024;
 
+/// Upper bound for the fragments of one update. Both clients cut at
+/// [`FRAGMENT_LIMIT`], so a full [`MAX_REASSEMBLED`] update is 35 of them;
+/// this leaves room for senders with fragments down to 8 KiB, while the
+/// parts list a header makes the receiver allocate stays small. Bounding it
+/// by the total size alone would let one header pin hundreds of megabytes.
+const MAX_FRAGMENTS: u64 = 1024;
+
 /// Batches a single connection may have in flight at once. Bounds memory a
 /// misbehaving client can pin to `MAX_PENDING_BATCHES * MAX_REASSEMBLED`.
 const MAX_PENDING_BATCHES: usize = 4;
@@ -120,9 +127,8 @@ impl Reassembler {
         if total_size > MAX_REASSEMBLED as u64 {
             return Err(UpdateStatusCode::PayloadTooLarge);
         }
-        // Every fragment carries at least one byte, which also caps the
-        // allocation for the parts list.
-        if fragment_count == 0 || fragment_count > total_size {
+        // Every fragment carries at least one byte.
+        if fragment_count == 0 || fragment_count > total_size || fragment_count > MAX_FRAGMENTS {
             return Err(UpdateStatusCode::InvalidUpdate);
         }
         let key = (crdt.magic_bytes(), room_id.to_owned(), batch_id);
@@ -276,6 +282,37 @@ mod tests {
             r.start(CrdtType::Elo, "x", id, 10, 5),
             Err(UpdateStatusCode::InvalidUpdate)
         );
+        // One byte per fragment would pass the size check, but not the
+        // fragment cap.
+        assert_eq!(
+            r.start(
+                CrdtType::Elo,
+                "x",
+                id,
+                MAX_REASSEMBLED as u64,
+                MAX_REASSEMBLED as u64
+            ),
+            Err(UpdateStatusCode::InvalidUpdate)
+        );
+        assert_eq!(
+            r.start(
+                CrdtType::Elo,
+                "x",
+                id,
+                MAX_FRAGMENTS + 1,
+                MAX_REASSEMBLED as u64
+            ),
+            Err(UpdateStatusCode::InvalidUpdate)
+        );
+        r.start(
+            CrdtType::Elo,
+            "x",
+            id,
+            MAX_FRAGMENTS,
+            MAX_REASSEMBLED as u64,
+        )
+        .unwrap();
+        assert!(MAX_REASSEMBLED.div_ceil(FRAGMENT_LIMIT) as u64 <= MAX_FRAGMENTS);
         r.start(CrdtType::Elo, "x", id, 2, 4).unwrap();
         assert_eq!(
             r.push(CrdtType::Elo, "x", id, 0, vec![0; 5]),

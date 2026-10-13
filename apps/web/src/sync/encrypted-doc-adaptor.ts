@@ -14,7 +14,7 @@ import {
   UnknownGenerationError,
   type SpaceCrypto,
 } from "@/crypto/space-crypto";
-import { toError } from "@/lib/errors";
+import { errorKind, toError } from "@/lib/errors";
 import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
@@ -57,8 +57,13 @@ export interface EncryptedDocAdaptorOptions {
    * server log (and everyone's backfill) by one record per character.
    */
   pushDelayMs?: number;
-  /** Delay before resending spans the server refused for a passing reason. */
+  /**
+   * First delay before resending spans the server refused for a passing
+   * reason. It doubles (with jitter) while refusals keep coming, up to
+   * `retryMaxMs`.
+   */
   retryMs?: number;
+  retryMaxMs?: number;
   /**
    * Upload a snapshot as soon as the backfill is in, whatever the log
    * length. For a connection opened right after a rotation: the keys are
@@ -78,6 +83,12 @@ export interface EncryptedDocAdaptorOptions {
   accept?: (doc: LoroDoc) => boolean | undefined;
   /** `accept` said no. Nothing local was or will be sent. */
   onRefused?: () => void;
+  /**
+   * The server refused an update for a reason resending does not fix
+   * (`reason` as loro-protocol names it): those ops will not reach it on
+   * this connection.
+   */
+  onUpdateRefused?: (reason: string) => void;
   /** A record could not be decrypted: wrong key, unsigned or tampered. */
   onDecryptError?: (error: Error) => void;
   /**
@@ -97,9 +108,10 @@ export interface EncryptedDocAdaptorOptions {
 // joining client compacts right away.
 const COMPACT_INTERVAL_MS = 5 * 60 * 1000;
 
-// A local commit landing during every encryption could keep the pre-snapshot
-// push going forever; past this many rounds the compaction waits for the
-// next chance instead.
+// A push sends everything in one synchronous step, so one round before a
+// snapshot normally does. One that may not send (nothing accepted yet)
+// leaves ops out every time; past this many rounds the compaction waits for
+// the next chance instead.
 const SNAPSHOT_PUSH_ROUNDS = 5;
 
 // One container per send keeps each update well under the server's limit
@@ -147,12 +159,18 @@ function storedDeltas(extra: Uint8Array | undefined): number {
   }
 }
 
+type OptionalCallbacks =
+  | "onDecryptError"
+  | "onUnknownGeneration"
+  | "accept"
+  | "onRefused"
+  | "onUpdateRefused";
+
 /**
- * Syncs a LoroDoc over the `%ELO` CRDT type of the Loro Protocol: every op
- * leaves this client encrypted and signed (see `crypto/space-crypto.ts`),
- * and the server only sees which op
- * ranges (peer, counter span) a record covers so it can store, dedupe and
- * backfill without reading anything.
+ * Syncs a LoroDoc over the `%ELO` CRDT type of the Loro Protocol. Every op
+ * leaves this client encrypted and signed (see `crypto/space-crypto.ts`);
+ * the server only sees which op ranges (peer, counter span) a record covers,
+ * which is enough to store, dedupe and backfill.
  *
  * Replaces `EloAdaptor` from loro-adaptors, which resolves "synced" before
  * its async decryption has imported the backfill, re-uploads a full snapshot
@@ -164,15 +182,9 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
 
   private readonly doc: LoroDoc;
   private readonly options: Required<
-    Omit<
-      EncryptedDocAdaptorOptions,
-      "onDecryptError" | "onUnknownGeneration" | "accept" | "onRefused"
-    >
+    Omit<EncryptedDocAdaptorOptions, OptionalCallbacks>
   > &
-    Pick<
-      EncryptedDocAdaptorOptions,
-      "onDecryptError" | "onUnknownGeneration" | "accept" | "onRefused"
-    >;
+    Pick<EncryptedDocAdaptorOptions, OptionalCallbacks>;
   private ctx?: CrdtAdaptorContext;
   private unsubscribe?: () => void;
   private destroyed = false;
@@ -204,10 +216,19 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
    */
   private generationDue = false;
   private retry: ReturnType<typeof setTimeout> | null = null;
+  /** Passing refusals in a row, for the backoff. */
+  private retryAttempt = 0;
+  private lastRetryableAt = 0;
+  /**
+   * Set once the server refused deltas for good. Their ops count as sent,
+   * since resending would only be refused again, so this is what still
+   * says they are not on the server.
+   */
+  private deltasRefused = false;
   private pushTimer: ReturnType<typeof setTimeout> | null = null;
   private stopPageListeners?: () => void;
-  // Encryption and decryption are async. Running every step through one
-  // chain keeps sends in op order and imports in arrival order.
+  // Running every step through one chain keeps sends in op order, imports
+  // in arrival order, and a compaction behind the pushes queued before it.
   private readonly enqueue = createSerialQueue("encrypted sync step failed");
   private readonly synced: Promise<void>;
   private resolveSynced!: () => void;
@@ -223,11 +244,13 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       compactIntervalMs: options.compactIntervalMs ?? COMPACT_INTERVAL_MS,
       pushDelayMs: options.pushDelayMs ?? 150,
       retryMs: options.retryMs ?? 2000,
+      retryMaxMs: options.retryMaxMs ?? 60_000,
       compactOnJoin: options.compactOnJoin ?? false,
       onDecryptError: options.onDecryptError,
       onUnknownGeneration: options.onUnknownGeneration,
       accept: options.accept,
       onRefused: options.onRefused,
+      onUpdateRefused: options.onUpdateRefused,
     };
     this.generationDue = this.options.compactOnJoin && this.options.canWrite;
     this.synced = new Promise((resolve) => {
@@ -260,8 +283,20 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
   }
 
   /**
+   * Whether local commits are still short of the server, as far as this
+   * adaptor can tell: not handed to the socket yet (also when nothing may
+   * be sent yet, e.g. before `accept` answered), or refused for good.
+   */
+  get hasUnsentChanges(): boolean {
+    if (!this.options.canWrite || this.refused) return false;
+    if (this.deltasRefused || this.pushTimer !== null || this.queuedPushes > 0)
+      return true;
+    return missingSpans(this.doc.oplogVersion(), this.server).length > 0;
+  }
+
+  /**
    * True while local commits have not been handed to the socket: waiting
-   * for the push timer, or for a push that is queued or still encrypting.
+   * for the push timer, or for a push that is queued or still running.
    */
   get hasPendingPush(): boolean {
     if (this.pushTimer !== null || this.queuedPushes > 0) return true;
@@ -308,6 +343,7 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     this.target = version;
     this.targetReached = false;
     this.serverDeltas = storedDeltas(res.extra);
+    this.retryAttempt = 0;
     // snapshotSent stays as it is: a compaction queued before the
     // reconnect still runs, and clears it once it is done.
     this.joined = true;
@@ -353,7 +389,11 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     }
   }
 
-  onUpdateError(updates: Uint8Array[], errorCode: number): void {
+  onUpdateError(
+    updates: Uint8Array[],
+    errorCode: number,
+    reason?: string,
+  ): void {
     if (this.destroyed) return;
     const retryable =
       errorCode === UpdateStatusCode.RateLimited ||
@@ -364,7 +404,10 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       // Every delta a snapshot would replace is already stored, so only the
       // compaction is lost, and sending the next one would hit the same
       // limit.
-      if (updates.some(holdsSnapshot)) this.compactionRefused = true;
+      const snapshot = updates.some(holdsSnapshot);
+      if (snapshot) this.compactionRefused = true;
+      if (!snapshot || updates.some((u) => !holdsSnapshot(u)))
+        this.refuseDeltas(reason ?? `code ${errorCode}`);
       return;
     }
     // The ops are still in the doc; forget that the server has them so the
@@ -379,10 +422,32 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       }
     }
     if (this.retry !== null) return;
+    // The server sends no word of an update it took, so a while without
+    // refusals is what counts as the trouble having passed.
+    const now = Date.now();
+    if (now - this.lastRetryableAt > this.options.retryMaxMs * 2)
+      this.retryAttempt = 0;
+    this.lastRetryableAt = now;
+    const ceiling = Math.min(
+      this.options.retryMs * 2 ** this.retryAttempt,
+      this.options.retryMaxMs,
+    );
+    this.retryAttempt++;
+    // Jittered, so clients that a busy server refused together do not all
+    // come back at once.
+    const delay = ceiling / 2 + Math.random() * (ceiling / 2);
     this.retry = setTimeout(() => {
       this.retry = null;
       void this.enqueuePush();
-    }, this.options.retryMs);
+    }, delay);
+  }
+
+  private refuseDeltas(reason: string, error?: unknown): void {
+    // Said once per connection; the next push trips over the same span.
+    if (this.deltasRefused) return;
+    this.deltasRefused = true;
+    if (error) console.error("could not encrypt local changes", error);
+    this.options.onUpdateRefused?.(reason);
   }
 
   cmpVersion(v: Uint8Array): 0 | 1 | -1 | undefined {
@@ -409,8 +474,9 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
   }
 
   /**
-   * Sends every op the server does not have yet, as of when it starts.
-   * Commits landing while it encrypts are left to the next push.
+   * Sends every op the server does not have yet. Encrypting runs in the
+   * same synchronous step as reading the version, so nothing lands in
+   * between; the commits a caller makes after it are the next push's.
    */
   private async push(): Promise<void> {
     if (!this.mayPush()) return;
@@ -429,16 +495,31 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       batch = [];
       size = 0;
     };
-    for (const span of spans) {
-      for (const [piece, plaintext] of this.exportSpan(span)) {
-        const record = this.options.crypto.encryptDelta(piece, plaintext);
-        if (size + record.length > CONTAINER_BUDGET) flush();
-        batch.push(record);
-        size += record.length;
-        raise(this.server, piece.peer, piece.end);
+    // Flushed whatever happens: the records batched so far already count
+    // as sent.
+    try {
+      for (const span of spans) {
+        for (const [piece, plaintext] of this.exportSpan(span)) {
+          let record: Uint8Array;
+          try {
+            record = this.options.crypto.encryptDelta(piece, plaintext);
+          } catch (error) {
+            // A span the format cannot carry (a counter past 2^31 - 1) is
+            // refused the same way on every try, so it is reported once
+            // and the rest of the doc still goes up. It stays unsent.
+            if (errorKind(error) !== "MalformedRecord") throw error;
+            this.refuseDeltas("malformed_record", error);
+            break;
+          }
+          if (size + record.length > CONTAINER_BUDGET) flush();
+          batch.push(record);
+          size += record.length;
+          raise(this.server, piece.peer, piece.end);
+        }
       }
+    } finally {
+      flush();
     }
-    flush();
     this.maybeCompact(false);
   }
 
@@ -565,9 +646,8 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
     // The server takes the snapshot's version as covered and drops (and
     // never relays) deltas inside it afterwards, while the snapshot itself
     // only goes to later joiners. So every op in it must have gone out as a
-    // delta first, and push() leaves out commits made while it encrypts.
-    // Checking and exporting in one synchronous step pins the snapshot to
-    // exactly what was sent.
+    // delta first. Checking and exporting in one synchronous step pins the
+    // snapshot to exactly what was sent.
     for (let round = 0; ; round++) {
       await this.push();
       // A compaction queued before a reconnect would otherwise go out
@@ -584,7 +664,15 @@ export class EncryptedDocAdaptor implements CrdtDocAdaptor {
       counter,
     }));
     const snapshot = this.doc.export({ mode: "snapshot" });
-    const record = this.options.crypto.encryptSnapshot(vv, snapshot);
+    let record: Uint8Array;
+    try {
+      record = this.options.crypto.encryptSnapshot(vv, snapshot);
+    } catch (error) {
+      // Refused the same way next time, so compaction stops for this
+      // connection instead of failing every round.
+      if (errorKind(error) === "MalformedRecord") this.compactionRefused = true;
+      throw error;
+    }
     this.ctx?.send([encodeEloContainer([record])]);
     this.serverDeltas = 0;
   }

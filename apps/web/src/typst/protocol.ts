@@ -25,6 +25,8 @@ export type WorkerRequest =
   | { type: "cancel" }
   /** Rebuilds the compiler with a new font set and resends all files. */
   | { type: "reinit"; fonts: FontConfig }
+  /** Builds the compiler again with the same fonts, after a failed start. */
+  | { type: "restart" }
   /**
    * The renderer lost track of the incremental stream (e.g. a merge failed);
    * the next result must be a full "reset" update.
@@ -76,16 +78,25 @@ export type WorkerResponse =
     }
   | ({ type: "pdf"; id: number } & ({ data: Uint8Array } | { error: string }));
 
+/** The Worker events the client listens to. */
+export interface WorkerEvents {
+  message: MessageEvent<WorkerResponse>;
+  /** An uncaught error in the worker, or its script failing to load. */
+  error: Event;
+  /** A response that could not be deserialized, and so never arrived. */
+  messageerror: MessageEvent;
+}
+
 /** Minimal Worker surface, so tests can substitute a fake. */
 export interface WorkerLike {
   postMessage(message: WorkerRequest, transfer?: Transferable[]): void;
-  addEventListener(
-    type: "message",
-    listener: (event: MessageEvent<WorkerResponse>) => void,
+  addEventListener<K extends keyof WorkerEvents>(
+    type: K,
+    listener: (event: WorkerEvents[K]) => void,
   ): void;
-  removeEventListener(
-    type: "message",
-    listener: (event: MessageEvent<WorkerResponse>) => void,
+  removeEventListener<K extends keyof WorkerEvents>(
+    type: K,
+    listener: (event: WorkerEvents[K]) => void,
   ): void;
   terminate(): void;
 }
