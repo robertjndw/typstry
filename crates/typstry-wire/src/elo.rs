@@ -194,6 +194,29 @@ pub fn parse_peer_id(bytes: &[u8]) -> Option<u64> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
+/// What [`SealedRecord::parse`] demands of a delta span, for writers to
+/// check before they seal a record nobody would take.
+pub fn check_delta_span(start: u64, end: u64) -> Result<(), String> {
+    counter(start)?;
+    counter(end)?;
+    if end <= start {
+        return Err(format!("delta span {start}..{end} is empty"));
+    }
+    Ok(())
+}
+
+/// [`check_delta_span`] for the version vector of a snapshot.
+pub fn check_snapshot_vv(vv: &[(u64, u64)]) -> Result<(), String> {
+    let mut peers = std::collections::HashSet::with_capacity(vv.len());
+    for &(peer, count) in vv {
+        counter(count)?;
+        if !peers.insert(peer) {
+            return Err(format!("snapshot lists peer {peer} twice"));
+        }
+    }
+    Ok(())
+}
+
 /// The plaintext header of a record carrying ops `[start, end)` of `peer`.
 ///
 /// # Panics

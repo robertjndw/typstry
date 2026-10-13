@@ -21,8 +21,9 @@
 //! nonces per GCM key does not apply, and each purpose gets its own keys.
 //!
 //! Who wrote a record is not a shared secret either. Each record is signed
-//! with the author's device key (the MLS leaf signature key) and carries an
-//! attestation, a signature of the attestation key over that device key and
+//! with the author's member key (the per-project MLS leaf signature key,
+//! which the device key only signs a binding for) and carries an
+//! attestation, a signature of the attestation key over that member key and
 //! the generation. Readers refuse records without a valid attestation, so
 //! viewers stay read-only even if the server lets their writes through, and
 //! authors are authenticated, not just claimed.
@@ -51,7 +52,8 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::elo::{
-    IV_LEN, Iv, Record, SealedRecord, encode_delta_header, encode_record, encode_snapshot_header,
+    IV_LEN, Iv, Record, SealedRecord, check_delta_span, check_snapshot_vv, encode_delta_header,
+    encode_record, encode_snapshot_header,
 };
 use crate::identity::PersonId;
 
@@ -83,9 +85,10 @@ const TAG_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 
-/// An Ed25519 public key, the way device keys and attestation keys travel.
+/// An Ed25519 public key, the way device, member and attestation keys
+/// travel.
 pub type PublicKey = [u8; KEY_LEN];
-/// The attestation key's signature over a device key and a generation.
+/// The attestation key's signature over a member key and a generation.
 pub type Attestation = [u8; SIGNATURE_LEN];
 
 /// First byte of a sealed blob, profile, presence update, group info or
@@ -166,7 +169,7 @@ pub enum CryptoError {
 }
 
 /// A record after decryption, with the header it was authenticated under
-/// and the device key that wrote it.
+/// and the member key that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecryptedRecord {
     pub record: Record,
@@ -300,6 +303,13 @@ impl std::fmt::Debug for SealKey {
 impl SealKey {
     pub fn new(key: [u8; KEY_LEN]) -> Self {
         Self(Zeroizing::new(key))
+    }
+
+    /// [`Self::new`] for a key that is already wiped on drop, without a
+    /// copy of it left behind.
+    #[cfg(feature = "pairing")]
+    pub(crate) fn from_zeroizing(key: Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self(key)
     }
 
     /// Binds `context` (one of the `*_CONTEXT` constants) so a sealed value
@@ -457,7 +467,7 @@ impl LinkSecret {
         SealKey(hkdf(self.view_key.as_ref(), &[], &[KEYRING_KEY_INFO]))
     }
 
-    /// The statement that the device key `signer` may write in `generation`.
+    /// The statement that the member key `signer` may write in `generation`.
     /// Only an edit secret can make it.
     pub fn attest(&self, signer: &PublicKey, generation: u32) -> Result<Attestation, CryptoError> {
         let (_, attest) = self.edit.as_ref().ok_or(CryptoError::ReadOnly)?;
@@ -584,8 +594,12 @@ impl Keyring {
     fn from_plain(plain: &[u8]) -> Result<Self, CryptoError> {
         let bad = |why: &str| CryptoError::MalformedKeyring(why.into());
         let (&version, rest) = plain.split_first().ok_or_else(|| bad("empty"))?;
-        if version != KEYRING_VERSION {
+        // Versions start at 1. Only a higher byte means a newer build wrote this.
+        if version > KEYRING_VERSION {
             return Err(CryptoError::NewerVersion(version));
+        }
+        if version != KEYRING_VERSION {
+            return Err(bad("version 0"));
         }
         let (count, mut rest) = rest.split_first_chunk::<4>().ok_or_else(|| bad("short"))?;
         let count = u32::from_be_bytes(*count) as usize;
@@ -684,8 +698,13 @@ impl Keyring {
         let keyring = Self::from_plain(&plain)?;
         // The link's own key must be the newest one, or the keyring is for
         // another generation and the link would read the wrong history.
+        // The error names the keyring's side: the link's own fingerprint
+        // is not the key the data is under.
         if keyring.attest_pubs.last() != Some(&link.attest_pub) {
-            return Err(CryptoError::KeyMismatch(link.fingerprint()));
+            return Err(CryptoError::KeyMismatch(format!(
+                "of keyring generation {}",
+                keyring.generation()
+            )));
         }
         Ok(keyring)
     }
@@ -703,9 +722,9 @@ pub trait RecordSigner {
     fn attestation(&self, generation: u32) -> Option<Attestation>;
 }
 
-/// A bare device key and the attestation an editor made for it. What an MLS
-/// member signs with, and what tests and tools use to write records outside
-/// a group.
+/// A bare member key and the attestation an editor made for it. What an MLS
+/// member signs with (its leaf key, which the device key signs a binding
+/// for), and what tests and tools use to write records outside a group.
 pub struct LocalSigner {
     key: SigningKey,
     attestation: Option<(u32, Attestation)>,
@@ -849,11 +868,9 @@ impl DocKeys {
     }
 
     /// Encrypts the Loro updates for ops `[start, end)` of `peer` into a
-    /// signed delta record.
-    ///
-    /// # Panics
-    ///
-    /// When the span is empty.
+    /// signed delta record. An empty span or a counter past
+    /// [`MAX_COUNTER`](crate::elo::MAX_COUNTER), which no reader takes, is
+    /// [`CryptoError::MalformedRecord`].
     pub fn encrypt_delta(
         &self,
         signer: &dyn RecordSigner,
@@ -866,6 +883,9 @@ impl DocKeys {
     }
 
     /// Encrypts a Loro snapshot covering `vv` into a signed snapshot record.
+    /// A peer listed twice or a counter past
+    /// [`MAX_COUNTER`](crate::elo::MAX_COUNTER) is
+    /// [`CryptoError::MalformedRecord`].
     pub fn encrypt_snapshot(
         &self,
         signer: &dyn RecordSigner,
@@ -918,6 +938,7 @@ impl DocKeys {
         iv: &Iv,
         salt: &Salt,
     ) -> Result<Vec<u8>, CryptoError> {
+        check_delta_span(start, end).map_err(CryptoError::MalformedRecord)?;
         let header = encode_delta_header(peer, start, end, self.key_id(), iv);
         self.seal_record(signer, &header, iv, salt, plaintext)
     }
@@ -930,6 +951,7 @@ impl DocKeys {
         iv: &Iv,
         salt: &Salt,
     ) -> Result<Vec<u8>, CryptoError> {
+        check_snapshot_vv(vv).map_err(CryptoError::MalformedRecord)?;
         let header = encode_snapshot_header(vv, self.key_id(), iv);
         self.seal_record(signer, &header, iv, salt, plaintext)
     }
@@ -989,7 +1011,7 @@ impl DocKeys {
 
     /// Verifies and decrypts a record that is already parsed, for callers
     /// that need its header even when decryption fails. Returns the
-    /// plaintext and the device key that signed it.
+    /// plaintext and the member key that signed it.
     ///
     /// The attestation is checked first, then the record signature, and only
     /// then is anything decrypted, so a record by someone who is not an
@@ -1075,7 +1097,7 @@ fn record_aad(version: u8, header: &[u8]) -> Vec<u8> {
 
 /// The per-epoch key of presence: ephemeral cursors and names, sealed under
 /// an MLS exporter secret so a removed member loses it with the next epoch,
-/// and signed with the sender's device key so nobody can speak as another
+/// and signed with the sender's member key so nobody can speak as another
 /// member.
 pub struct PresenceKey {
     epoch: u64,
@@ -1140,9 +1162,15 @@ impl PresenceKey {
     }
 
     /// Opens an update from the current epoch. `signer_of` maps a leaf to
-    /// the device key it holds in this epoch, which the signature has to
+    /// the member key it holds in this epoch, which the signature has to
     /// match. Returns the sending leaf and the plaintext. An update from any
     /// other epoch is [`CryptoError::WrongEpoch`], which callers drop.
+    ///
+    /// Nothing here tells a fresh update from one the server replays within
+    /// the epoch: there is no counter. The payload has to carry its own
+    /// ordering, as the clients' ephemeral-store updates do with their
+    /// per-key timestamps, so a replay is at most stale presence until the
+    /// sender's next update or the entry times out.
     pub fn open(
         &self,
         sealed: &[u8],
@@ -1467,6 +1495,25 @@ mod tests {
     }
 
     #[test]
+    fn records_no_reader_takes_are_refused_before_sealing() {
+        let (keys, editor) = (keys(), editor());
+        let too_big = crate::elo::MAX_COUNTER + 1;
+        for (start, end) in [(3, 3), (4, 3), (0, too_big)] {
+            assert!(matches!(
+                keys.encrypt_delta(&editor, 7, start, end, b"x"),
+                Err(CryptoError::MalformedRecord(_))
+            ));
+        }
+        for vv in [&[(1, 2), (1, 3)][..], &[(1, too_big)]] {
+            assert!(matches!(
+                keys.encrypt_snapshot(&editor, vv, b"x"),
+                Err(CryptoError::MalformedRecord(_))
+            ));
+        }
+        assert!(keys.encrypt_snapshot(&editor, &[], b"x").is_ok());
+    }
+
+    #[test]
     fn every_message_gets_its_own_salt() {
         let keys = keys();
         let a = keys.seal_blob(b"blob");
@@ -1676,10 +1723,9 @@ mod tests {
         let signature = other
             .sign(&[KEYRING_SIGNATURE_CONTEXT, &sealed].concat())
             .unwrap();
-        assert!(matches!(
-            Keyring::open_verified(&other, &[&sealed[..], &signature].concat()),
-            Err(CryptoError::KeyMismatch(_))
-        ));
+        let err = Keyring::open_verified(&other, &[&sealed[..], &signature].concat()).unwrap_err();
+        assert!(matches!(err, CryptoError::KeyMismatch(_)));
+        assert!(!err.to_string().contains(&other.fingerprint()), "{err}");
     }
 
     #[test]
@@ -1724,6 +1770,10 @@ mod tests {
         assert!(matches!(
             Keyring::from_plain(&[KEYRING_VERSION + 1]),
             Err(CryptoError::NewerVersion(_))
+        ));
+        assert!(matches!(
+            Keyring::from_plain(&[0]),
+            Err(CryptoError::MalformedKeyring(_))
         ));
     }
 

@@ -246,7 +246,8 @@ impl Grant {
 fn version(r: &mut BytesReader<'_>, known: u8) -> Result<(), PairError> {
     match r.read_byte().map_err(PairError::Malformed)? {
         v if v == known => Ok(()),
-        v => Err(PairError::NewerVersion(v)),
+        v if v > known => Err(PairError::NewerVersion(v)),
+        v => Err(PairError::Malformed(format!("version {v}"))),
     }
 }
 
@@ -407,7 +408,7 @@ impl Pairing {
                 Ok((
                     State::AwaitConfirm {
                         expected,
-                        seal: SealKey::new(*seal),
+                        seal: SealKey::from_zeroizing(seal),
                     },
                     Step {
                         send: Some(frame(TAG_CONFIRM, &body)),
@@ -584,6 +585,13 @@ impl Hello {
             .expect("read 32 bytes");
         done(&r)?;
         check_device_name(&device_name)?;
+        // The holder vouches for this key in the person's graph, so it has
+        // to be one that signatures can verify under.
+        if !ed25519_dalek::VerifyingKey::from_bytes(&device_pub).is_ok_and(|key| !key.is_weak()) {
+            return Err(PairError::Malformed(
+                "the device key is no valid key".into(),
+            ));
+        }
         Ok(Self {
             device_name,
             device_pub,
@@ -608,7 +616,8 @@ fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
 fn split_frame(bytes: &[u8]) -> Result<(u8, &[u8]), PairError> {
     match bytes {
         [FRAME_VERSION, tag, payload @ ..] => Ok((*tag, payload)),
-        [v, _, ..] if *v != FRAME_VERSION => Err(PairError::NewerVersion(*v)),
+        [v, _, ..] if *v > FRAME_VERSION => Err(PairError::NewerVersion(*v)),
+        [v, _, ..] => Err(PairError::Malformed(format!("frame version {v}"))),
         _ => Err(PairError::Malformed("frame too short".into())),
     }
 }

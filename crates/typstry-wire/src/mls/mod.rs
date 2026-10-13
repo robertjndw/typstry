@@ -114,7 +114,8 @@ pub use crate::owner::{Origin, OwnerSecret, OwnerSecrets};
 use crate::owner::{OwnerKey, RotationClaim};
 use crate::token;
 
-/// Exporter label and context of the presence key.
+/// Exporter label of the presence key, which is exported with an empty
+/// context.
 const PRESENCE_LABEL: &str = "typstry presence";
 
 #[derive(Debug, thiserror::Error)]
@@ -152,6 +153,11 @@ pub enum MlsError {
     /// the keyring it knew: someone with an edit link rebuilt it.
     #[error("the group's keyring does not keep the generations this device knew")]
     Rewritten,
+    /// The group rotated past the keyring this device holds, and
+    /// [`SpaceGroup::set_keyring`] has not caught it up yet. Building on the
+    /// old keyring would drop the newest generation for everyone.
+    #[error("this device has not fetched the group's current keyring yet")]
+    KeyringBehind,
     #[error("no device in the group is revoked")]
     NothingRevoked,
     #[error("no member at leaf {0}, or it is this device")]
@@ -213,7 +219,7 @@ pub struct MemberInfo {
     /// device lacks the keys of its generation.
     pub profile: Option<Vec<u8>>,
     pub is_self: bool,
-    /// The device key that signs this member's records and presence.
+    /// The member (leaf) key that signs this member's records and presence.
     pub sig_pub: PublicKey,
     pub person: Person,
     /// The person's own profile from their merged graph, for a verified
@@ -1221,6 +1227,7 @@ impl SpaceGroup {
     ) -> Result<(Self, ResetPayload), MlsError> {
         self.ensure_editor()?;
         let policy = self.policy()?;
+        self.ensure_keyring_current(&policy)?;
         let sealed = match identity {
             Some(local) => Some(seal_identity(self.keys.keyring(), &self.device, local)?),
             None => self.own_identity(),
@@ -1545,7 +1552,10 @@ impl SpaceGroup {
     }
 
     /// Takes the keyring the server holds, after a rotation. It has to be
-    /// signed by the link this device holds and agree with the group.
+    /// signed by the link this device holds, agree with the group and keep
+    /// every generation this device already had: a keyring with the same
+    /// attestation keys but other doc keys is a forged history, e.g. one an
+    /// editor with the link rebuilt in a reset.
     pub fn set_keyring(&mut self, signed: &[u8]) -> Result<(), MlsError> {
         let keyring = Keyring::open_verified(&self.link, signed)?;
         if keyring.attest_pubs() != self.policy()?.attest_pubs {
@@ -1553,7 +1563,19 @@ impl SpaceGroup {
                 "the keyring is not the group's generation".into(),
             ));
         }
+        if !keyring.extends(self.keys.keyring()) {
+            return Err(MlsError::Rewritten);
+        }
         self.keys = DocKeys::new(keyring);
+        Ok(())
+    }
+
+    /// Refuses to build a new keyring on one that lags `policy`, see
+    /// [`MlsError::KeyringBehind`].
+    fn ensure_keyring_current(&self, policy: &Policy) -> Result<(), MlsError> {
+        if self.keys.keyring().attest_pubs() != policy.attest_pubs {
+            return Err(MlsError::KeyringBehind);
+        }
         Ok(())
     }
 
@@ -1573,14 +1595,12 @@ impl SpaceGroup {
 
     /// This epoch's presence key.
     pub fn presence_key(&self) -> Result<PresenceKey, MlsError> {
-        let secret = self
-            .group
-            .export_secret(self.provider.crypto(), PRESENCE_LABEL, &[], KEY_LEN)
-            .map_err(mls)?;
-        Ok(PresenceKey::new(
-            self.epoch(),
-            secret.try_into().expect("asked for 32 bytes"),
-        ))
+        let secret = Zeroizing::new(
+            self.group
+                .export_secret(self.provider.crypto(), PRESENCE_LABEL, &[], KEY_LEN)
+                .map_err(mls)?,
+        );
+        Ok(PresenceKey::new(self.epoch(), exporter_key(&secret)))
     }
 
     /// This device's leaf, which presence names it by.
@@ -1588,12 +1608,12 @@ impl SpaceGroup {
         self.group.own_leaf_index().u32()
     }
 
-    /// The device key of each leaf in this epoch, for [`PresenceKey::open`].
+    /// The member key of each leaf in this epoch, for [`PresenceKey::open`].
     pub fn signer_of(&self, leaf: u32) -> Option<PublicKey> {
         signer_pub(self.group.public_group().leaf(LeafNodeIndex::new(leaf))?)
     }
 
-    /// The leaf and device key of every member, without opening profiles
+    /// The leaf and member key of every member, without opening profiles
     /// the way [`Self::members`] does. Enough for a presence roster.
     pub fn signers(&self) -> impl Iterator<Item = (u32, PublicKey)> + '_ {
         member_leaves(&self.group)
@@ -1667,7 +1687,7 @@ impl SpaceGroup {
     /// What the tree's leaves together know of `person`: their graphs,
     /// merged. `None` when no leaf carries one, or when they do not merge.
     #[cfg(test)]
-    pub fn person_graph(&self, person: &PersonId) -> Option<PersonGraph> {
+    pub(crate) fn person_graph(&self, person: &PersonId) -> Option<PersonGraph> {
         let key = self.keys.keyring().identity_key();
         TreeGraphs::of_tree(&self.group, &key).get(person).cloned()
     }
@@ -1702,7 +1722,7 @@ impl SpaceGroup {
     /// leaf lacks, e.g. a device added or revoked since the leaf was last
     /// committed. [`Self::self_update`] with `local` puts them in.
     #[cfg(test)]
-    pub fn needs_identity_refresh(&self, local: &PersonGraph) -> bool {
+    pub(crate) fn needs_identity_refresh(&self, local: &PersonGraph) -> bool {
         self.is_active()
             && self.link.can_attest()
             && self
@@ -2245,9 +2265,15 @@ impl SpaceGroup {
         }
 
         let policy = self.policy()?;
+        self.ensure_keyring_current(&policy)?;
         let link = LinkSecret::generate_edit();
         let keyring = self.keys.keyring().next(&link);
         let next_policy = policy.next(link.attest_pub());
+        assert_eq!(
+            keyring.attest_pubs(),
+            next_policy.attest_pubs,
+            "the next keyring and policy are built from the same generation"
+        );
         let keys = DocKeys::new(keyring);
         let tokens = Tokens {
             edit: Some(token::generate()),
@@ -2307,20 +2333,21 @@ impl SpaceGroup {
             epoch: epoch + 1,
             commit: &commit,
         };
-        let exporter = self
-            .group
-            .pending_commit()
-            .ok_or_else(|| mls("commit was not staged"))?
-            .export_secret(
-                self.provider.crypto(),
-                ROTATION_LABEL,
-                &binding.digest(),
-                KEY_LEN,
-            )
-            .map_err(mls)?;
+        let exporter = Zeroizing::new(
+            self.group
+                .pending_commit()
+                .ok_or_else(|| mls("commit was not staged"))?
+                .export_secret(
+                    self.provider.crypto(),
+                    ROTATION_LABEL,
+                    &binding.digest(),
+                    KEY_LEN,
+                )
+                .map_err(mls)?,
+        );
         let envelope = rotation::seal(
             self.provider.crypto(),
-            &exporter.try_into().expect("asked for 32 bytes"),
+            &Zeroizing::new(exporter_key(&exporter)),
             &binding,
             &link,
             &tokens,
@@ -2343,12 +2370,12 @@ impl SpaceGroup {
             view_token: &tokens.view,
             next_owner_key: &next_owner_key,
         };
-        // Without the current key there is nothing to sign with. Only the
-        // checks of the public entry points keep such a device from getting
-        // here, and the server refuses what it would send.
+        // Without the current key there is nothing to sign with: an older
+        // one is refused by the server just the same. The public entry
+        // points fail with NoOwnerKey before getting here; only tests come
+        // through to see what members make of such a rotation.
         let owner_proof = self
             .owner_secret()
-            .or_else(|| self.owner.iter().next())
             .map_or([0; crate::owner::OWNER_PROOF_LEN], |owner| {
                 owner.sign(&claim)
             });
@@ -2635,17 +2662,19 @@ impl SpaceGroup {
             epoch: self.epoch() + 1,
             commit,
         };
-        let exporter = staged
-            .export_secret(
-                self.provider.crypto(),
-                ROTATION_LABEL,
-                &binding.digest(),
-                KEY_LEN,
-            )
-            .map_err(|e| e.to_string())?;
+        let exporter = Zeroizing::new(
+            staged
+                .export_secret(
+                    self.provider.crypto(),
+                    ROTATION_LABEL,
+                    &binding.digest(),
+                    KEY_LEN,
+                )
+                .map_err(|e| e.to_string())?,
+        );
         let opened = rotation::open(
             self.provider.crypto(),
-            &exporter.try_into().expect("asked for 32 bytes"),
+            &Zeroizing::new(exporter_key(&exporter)),
             &binding,
             &self.device.signer_pub(),
             self.device.hpke_private(),
@@ -2758,6 +2787,11 @@ impl SpaceGroup {
             dead: false,
         })
     }
+}
+
+/// An exporter secret asked for with [`KEY_LEN`] as a key.
+fn exporter_key(secret: &[u8]) -> [u8; KEY_LEN] {
+    secret.try_into().expect("asked for 32 bytes")
 }
 
 fn editor_info(

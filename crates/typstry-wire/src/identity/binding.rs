@@ -60,7 +60,8 @@ impl LeafIdentity {
         let mut r = BytesReader::new(bytes);
         match r.read_byte().map_err(bad)? {
             IDENTITY_VERSION => {}
-            v => return Err(GraphError::NewerVersion(v)),
+            v if v > IDENTITY_VERSION => return Err(GraphError::NewerVersion(v)),
+            v => return Err(bad(format!("version {v}"))),
         }
         let device = r
             .read_bytes(KEY_LEN)
@@ -134,6 +135,11 @@ mod tests {
             LeafIdentity::decode(&newer),
             Err(GraphError::NewerVersion(2))
         );
+        newer[0] = 0;
+        assert!(matches!(
+            LeafIdentity::decode(&newer),
+            Err(GraphError::Malformed(_))
+        ));
     }
 
     #[test]

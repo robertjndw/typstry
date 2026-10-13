@@ -130,7 +130,8 @@ impl Entry {
         let bad = |e: String| malformed("person entry", e);
         match r.read_byte().map_err(bad)? {
             ENTRY_VERSION => {}
-            v => return Err(GraphError::NewerVersion(v)),
+            v if v > ENTRY_VERSION => return Err(GraphError::NewerVersion(v)),
+            v => return Err(bad(format!("version {v}"))),
         }
         let count = plausible_count(r, KEY_LEN).map_err(bad)?;
         if count > MAX_GRAPH_ENTRIES as u64 {
@@ -258,6 +259,11 @@ mod tests {
         let mut newer = bytes.clone();
         newer[0] = 2;
         assert_eq!(Entry::decode(&newer), Err(GraphError::NewerVersion(2)));
+        newer[0] = 0;
+        assert!(matches!(
+            Entry::decode(&newer),
+            Err(GraphError::Malformed(_))
+        ));
     }
 
     #[test]
