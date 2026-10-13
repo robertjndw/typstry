@@ -1,7 +1,8 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use typstry_server::http::{APP_CSP, AppState, COMPILE_WORKER_CSP, router};
+use typstry_server::config::Config;
+use typstry_server::http::{AppState, app_csp, compile_worker_csp, default_font_origins, router};
 use typstry_server::store::blobs::BlobStore;
 use typstry_server::store::db;
 
@@ -52,6 +53,12 @@ async fn app_pages_carry_a_strict_csp() {
     std::fs::write(dist.join("app.js"), "").unwrap();
     let pool = common::open_db(dir.path()).await;
     let app = router(AppState::new(pool, BlobStore::new(dir.path())), &dist);
+    let fonts = default_font_origins();
+    let app_policy = app_csp(&fonts);
+    assert!(
+        app_policy
+            .contains("connect-src 'self' https://cdn.jsdelivr.net https://packages.typst.org;")
+    );
 
     for path in ["/", "/p/sometoken", "/app.js"] {
         let res = app
@@ -61,13 +68,17 @@ async fn app_pages_carry_a_strict_csp() {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK, "{path}");
         let headers = res.headers();
-        assert_eq!(headers["content-security-policy"], APP_CSP, "{path}");
+        assert_eq!(
+            headers["content-security-policy"],
+            app_policy.as_str(),
+            "{path}"
+        );
         assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
         assert_eq!(headers["referrer-policy"], "no-referrer", "{path}");
     }
     // The policy that matters most: no inline script, so injected event
     // handler attributes stay inert.
-    let script_src = APP_CSP
+    let script_src = app_policy
         .split(';')
         .map(str::trim)
         .find(|d| d.starts_with("script-src"))
@@ -87,7 +98,10 @@ async fn app_pages_carry_a_strict_csp() {
         )
         .await
         .unwrap();
-    assert_eq!(res.headers()["content-security-policy"], COMPILE_WORKER_CSP);
+    assert_eq!(
+        res.headers()["content-security-policy"],
+        compile_worker_csp(&fonts).as_str()
+    );
 
     // API responses are not pages and keep no page policy.
     let res = app
@@ -96,6 +110,41 @@ async fn app_pages_carry_a_strict_csp() {
         .unwrap();
     assert!(res.headers().get("content-security-policy").is_none());
     assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+}
+
+#[tokio::test]
+async fn font_origins_feed_both_policies() {
+    let dir = tempfile::tempdir().unwrap();
+    let dist = dir.path().join("dist");
+    std::fs::create_dir_all(dist.join("assets")).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html>app").unwrap();
+    std::fs::write(dist.join("assets/compile.worker-Ab1_x.js"), "").unwrap();
+
+    for (origins, connect) in [
+        (
+            vec!["https://fonts.example.com".to_owned()],
+            "connect-src 'self' https://fonts.example.com https://packages.typst.org",
+        ),
+        (Vec::new(), "connect-src 'self' https://packages.typst.org"),
+    ] {
+        let config = Config {
+            data_dir: dir.path().to_owned(),
+            font_origins: origins,
+            ..Config::default()
+        };
+        let pool = common::open_db(dir.path()).await;
+        let app = router(AppState::from_config(pool, &config), &dist);
+        for path in ["/", "/assets/compile.worker-Ab1_x.js"] {
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let policy = res.headers()["content-security-policy"].to_str().unwrap();
+            assert!(!policy.contains("jsdelivr"), "{path}: {policy}");
+            assert!(policy.contains(connect), "{path}: {policy}");
+        }
+    }
 }
 
 #[tokio::test]

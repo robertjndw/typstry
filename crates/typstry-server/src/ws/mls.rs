@@ -11,13 +11,15 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc;
+use tokio::time::timeout_at;
 use typstry_wire::ds::{ClientMessage, DsError, MAX_DS_MESSAGE, RefusalCode, ServerMessage};
 
 use super::rate::TokenBucket;
 use super::{
-    CLOSE_GOING_AWAY, CLOSE_INTERNAL, CLOSE_POLICY, CLOSE_PROTOCOL_ERROR, IDLE_TIMEOUT, Socket,
+    CLOSE_GOING_AWAY, CLOSE_POLICY, CLOSE_PROTOCOL_ERROR, CLOSE_TRY_AGAIN, IDLE_TIMEOUT, Socket,
+    admit,
 };
 use crate::room::{ConnId, JoinOutcome, Outbound, Outbox, RoomCmd};
 use crate::state::AppState;
@@ -26,16 +28,24 @@ use crate::store::spaces;
 /// Frames buffered per connection before the client counts as too slow.
 const OUTBOX_FRAMES: usize = 512;
 
-/// Whoever opens a socket and then says nothing is not a client.
+/// Whoever opens a socket and then says nothing is not a client. Counted
+/// from the upgrade, so keepalive pings do not stretch it.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outdated clients never get here, see [`crate::http::protocol::gate`].
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    let permit = match admit(&state) {
+        Ok(permit) => permit,
+        Err(refused) => return refused.into_response(),
+    };
     ws.max_message_size(MAX_DS_MESSAGE)
         .max_frame_size(MAX_DS_MESSAGE)
         .on_upgrade(move |socket| {
             let connections = state.connections.clone();
-            connections.track_future(run(socket, state))
+            connections.track_future(async move {
+                run(socket, state).await;
+                drop(permit);
+            })
         })
 }
 
@@ -61,13 +71,20 @@ async fn run(socket: WebSocket, state: AppState) {
         room: None,
     };
 
+    let hello_deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
     loop {
-        let wait = if conn.room.is_some() {
-            IDLE_TIMEOUT
+        let next = if conn.room.is_some() {
+            socket.next(IDLE_TIMEOUT).await
         } else {
-            HELLO_TIMEOUT
+            match timeout_at(hello_deadline, socket.next(IDLE_TIMEOUT)).await {
+                Ok(next) => next,
+                Err(_) => {
+                    conn.close(CLOSE_GOING_AWAY, "hello_timeout");
+                    None
+                }
+            }
         };
-        let Some(bytes) = socket.next(wait).await else {
+        let Some(bytes) = next else {
             break;
         };
         if !conn.on_binary(&bytes).await {
@@ -139,7 +156,7 @@ impl Conn {
             Ok(resolved) => resolved,
             Err(err) => {
                 tracing::error!(%err, "token lookup failed");
-                self.close(CLOSE_INTERNAL, "internal error");
+                self.close(CLOSE_TRY_AGAIN, "try_again_later");
                 return false;
             }
         };
@@ -170,8 +187,11 @@ impl Conn {
                 self.room = Some(room);
                 true
             }
+            // The room refuses a hello only when it could not load the
+            // group or the log, or the client's queue overflowed on the
+            // backfill. None of that says the token is bad.
             JoinOutcome::Refused => {
-                self.close(CLOSE_INTERNAL, "internal error");
+                self.close(CLOSE_TRY_AGAIN, "try_again_later");
                 false
             }
             JoinOutcome::Unavailable => {

@@ -5,9 +5,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use typstry_wire::ds::MAX_DS_MESSAGE;
+
+use crate::http::{default_font_origins, valid_font_origin};
+use crate::limits::DEFAULT_MAX_CONNECTIONS;
 use crate::relay::RelayConfig;
 use crate::room::RoomConfig;
-use crate::store::blobs::DEFAULT_MAX_SIZE;
+use crate::store::blobs::{DEFAULT_MAX_SIZE, DEFAULT_SPACE_QUOTA};
 use crate::ws::ConnLimits;
 
 #[derive(Debug, Clone)]
@@ -17,9 +21,16 @@ pub struct Config {
     pub web_dist: PathBuf,
     /// Largest asset upload, in bytes.
     pub max_upload_bytes: u64,
+    /// What the assets of one space may add up to, in bytes.
+    pub space_quota_bytes: u64,
     pub rooms: RoomConfig,
     pub limits: ConnLimits,
     pub relay: RelayConfig,
+    /// Open WebSockets across all clients.
+    pub max_connections: usize,
+    /// Origins the web app may fetch Typst fonts from, for its CSP. Empty
+    /// means fonts are served by this server.
+    pub font_origins: Vec<String>,
 }
 
 impl Default for Config {
@@ -29,9 +40,12 @@ impl Default for Config {
             data_dir: "data".into(),
             web_dist: "apps/web/dist".into(),
             max_upload_bytes: DEFAULT_MAX_SIZE,
+            space_quota_bytes: DEFAULT_SPACE_QUOTA,
             rooms: RoomConfig::default(),
             limits: ConnLimits::default(),
             relay: RelayConfig::default(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            font_origins: default_font_origins(),
         }
     }
 }
@@ -70,6 +84,17 @@ impl Config {
         if let Some(dir) = lookup("TYPSTRY_WEB_DIST") {
             config.web_dist = dir.into();
         }
+        if let Some(raw) = text("TYPSTRY_FONT_ORIGINS") {
+            let origins: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+            if !origins.iter().all(|origin| valid_font_origin(origin)) {
+                return Err(ConfigError::Invalid {
+                    var: "TYPSTRY_FONT_ORIGINS",
+                    expected: "space-separated origins like https://fonts.example.com",
+                    value: raw,
+                });
+            }
+            config.font_origins = origins;
+        }
 
         let parse = |var, expected| Var {
             text: &text,
@@ -81,6 +106,16 @@ impl Config {
             parse("TYPSTRY_MAX_UPLOAD_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
         {
             config.max_upload_bytes = bytes;
+        }
+        if let Some(bytes) =
+            parse("TYPSTRY_SPACE_QUOTA_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        {
+            config.space_quota_bytes = bytes;
+        }
+        if let Some(n) =
+            parse("TYPSTRY_MAX_CONNECTIONS", "a positive whole number").get_where(|&n| n >= 1)?
+        {
+            config.max_connections = n;
         }
         if let Some(secs) = parse("TYPSTRY_ROOM_UNLOAD_SECS", "whole seconds").get()? {
             config.rooms.unload_after = Duration::from_secs(secs);
@@ -97,9 +132,8 @@ impl Config {
         {
             config.limits.update_burst = burst;
         }
-        // Zero would never refill the bucket, and NaN poisons it.
-        if let Some(rate) = parse("TYPSTRY_UPDATES_PER_SEC", "a positive number")
-            .get_where(|&r: &f64| r.is_finite() && r > 0.0)?
+        if let Some(rate) =
+            parse("TYPSTRY_UPDATES_PER_SEC", "a positive number").get_where(positive_rate)?
         {
             config.limits.updates_per_sec = rate;
         }
@@ -129,13 +163,23 @@ impl Config {
         {
             config.rooms.ds.max_log_bytes = bytes;
         }
-        if let Some(bytes) =
-            parse("TYPSTRY_MAX_COMMIT_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        // These travel inside one delivery service message, which the
+        // socket never accepts above MAX_DS_MESSAGE, so a larger cap would
+        // only look like it allowed more.
+        let ds_bytes = |n: &usize| (1..=MAX_DS_MESSAGE).contains(n);
+        if let Some(bytes) = parse(
+            "TYPSTRY_MAX_COMMIT_BYTES",
+            "a positive byte count of at most 2097152",
+        )
+        .get_where(ds_bytes)?
         {
             config.rooms.ds.max_commit_bytes = bytes;
         }
-        if let Some(bytes) =
-            parse("TYPSTRY_MAX_GROUP_INFO_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        if let Some(bytes) = parse(
+            "TYPSTRY_MAX_GROUP_INFO_BYTES",
+            "a positive byte count of at most 2097152",
+        )
+        .get_where(ds_bytes)?
         {
             config.rooms.ds.max_group_info_bytes = bytes;
         }
@@ -145,13 +189,13 @@ impl Config {
         {
             config.relay.ttl = Duration::from_secs(secs);
         }
-        if let Some(n) =
-            parse("TYPSTRY_RELAY_MAX_CHANNELS", "a positive whole number").get_where(|&n| n >= 1)?
-        {
-            config.relay.max_channels = n;
-        }
         Ok(config)
     }
+}
+
+/// Zero would never refill a bucket, and NaN poisons it.
+fn positive_rate(rate: &f64) -> bool {
+    rate.is_finite() && *rate > 0.0
 }
 
 /// One numeric variable and how to say what it should hold.
@@ -213,7 +257,10 @@ mod tests {
         assert_eq!(config.rooms.ds.max_commit_bytes, 64 * 1024);
         assert_eq!(config.rooms.ds.max_log_bytes, 16 * 1024 * 1024);
         assert_eq!(config.relay.ttl, Duration::from_secs(300));
-        assert_eq!(config.relay.max_channels, 1000);
+        assert_eq!(config.limits.outbox_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.space_quota_bytes, 1 << 30);
+        assert_eq!(config.font_origins, ["https://cdn.jsdelivr.net"]);
+        assert_eq!(config.max_connections, 10_000);
     }
 
     #[test]
@@ -233,7 +280,12 @@ mod tests {
             ("TYPSTRY_MAX_COMMIT_BYTES", "2048"),
             ("TYPSTRY_MAX_LOG_BYTES", "99999"),
             ("TYPSTRY_RELAY_TTL_SECS", "30"),
-            ("TYPSTRY_RELAY_MAX_CHANNELS", "5"),
+            ("TYPSTRY_SPACE_QUOTA_BYTES", "4096"),
+            ("TYPSTRY_MAX_CONNECTIONS", "100"),
+            (
+                "TYPSTRY_FONT_ORIGINS",
+                " https://fonts.example.com  http://10.0.0.5:8080 ",
+            ),
         ])
         .unwrap();
         assert_eq!(config.addr.port(), 9000);
@@ -250,7 +302,15 @@ mod tests {
         assert_eq!(config.rooms.ds.max_commit_bytes, 2048);
         assert_eq!(config.rooms.ds.max_log_bytes, 99_999);
         assert_eq!(config.relay.ttl, Duration::from_secs(30));
-        assert_eq!(config.relay.max_channels, 5);
+        assert_eq!(config.space_quota_bytes, 4096);
+        assert_eq!(config.max_connections, 100);
+        assert_eq!(
+            config.font_origins,
+            ["https://fonts.example.com", "http://10.0.0.5:8080"]
+        );
+        // Set but empty: fonts come from this server only.
+        let same_origin = super::tests::config(&[("TYPSTRY_FONT_ORIGINS", "")]).unwrap();
+        assert!(same_origin.font_origins.is_empty());
     }
 
     #[test]
@@ -273,10 +333,23 @@ mod tests {
             ("TYPSTRY_MAX_LOG_BYTES", "0"),
             ("TYPSTRY_COMMIT_RETENTION_SECS", "-1"),
             ("TYPSTRY_RELAY_TTL_SECS", "0"),
-            ("TYPSTRY_RELAY_MAX_CHANNELS", "0"),
+            ("TYPSTRY_MAX_COMMIT_BYTES", "2097153"),
+            ("TYPSTRY_MAX_GROUP_INFO_BYTES", "3000000"),
+            ("TYPSTRY_SPACE_QUOTA_BYTES", "0"),
+            ("TYPSTRY_MAX_CONNECTIONS", "0"),
+            ("TYPSTRY_FONT_ORIGINS", "cdn.jsdelivr.net"),
+            ("TYPSTRY_FONT_ORIGINS", "https://cdn.jsdelivr.net/gh/typst"),
+            ("TYPSTRY_FONT_ORIGINS", "https://a.example;script-src *"),
+            (
+                "TYPSTRY_FONT_ORIGINS",
+                "https://a.example,https://b.example",
+            ),
+            ("TYPSTRY_FONT_ORIGINS", "'unsafe-inline'"),
+            ("TYPSTRY_FONT_ORIGINS", "https://*.example.com"),
         ] {
             assert!(config(&[(var, value)]).is_err(), "{var}={value}");
         }
+        assert!(config(&[("TYPSTRY_MAX_COMMIT_BYTES", "2097152")]).is_ok());
         let err = config(&[("TYPSTRY_MAX_ROOMS_PER_CONN", " 1")]).unwrap_err();
         assert_eq!(
             err.to_string(),

@@ -12,12 +12,12 @@ use loro_protocol::{
     BatchId, CrdtType, JoinErrorCode, ProtocolMessage, UpdateStatusCode, try_decode,
 };
 use tokio::sync::mpsc;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep_until};
 use typstry_wire::elo::container_len;
 use typstry_wire::fragment::Reassembler;
 
 use super::rate::TokenBucket;
-use super::{CLOSE_PROTOCOL_ERROR, IDLE_TIMEOUT, Socket};
+use super::{CLOSE_GOING_AWAY, CLOSE_PROTOCOL_ERROR, CLOSE_TRY_AGAIN, IDLE_TIMEOUT, Socket};
 use crate::room::{ConnId, JoinOutcome, MAX_PRESENCE_BYTES, Outbound, Outbox, RoomCmd};
 use crate::state::AppState;
 use crate::store::spaces::{self, Permission};
@@ -26,6 +26,18 @@ use crate::store::spaces::{self, Permission};
 /// Only small frames ever reach this many; big ones hit the byte budget in
 /// [`super::ConnLimits::outbox_bytes`] first.
 const OUTBOX_FRAMES: usize = 512;
+
+/// Clients join as soon as the socket is open, so one that has not joined
+/// anything by then is not a client. Counted from the upgrade, so keepalive
+/// pings do not stretch it.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Every join resolves a token in the database and builds a backfill. A
+/// client joins two rooms per space, again after each reconnect (which is a
+/// new connection with a fresh bucket) and once more after a version it
+/// sent was not understood, so this is plenty.
+const JOIN_BURST: u32 = 16;
+const JOINS_PER_SEC: f64 = 1.0;
 
 struct Joined {
     crdt: CrdtType,
@@ -44,6 +56,9 @@ struct Conn {
     fragments: Reassembler,
     doc_updates: TokenBucket,
     presence_updates: TokenBucket,
+    joins: TokenBucket,
+    /// Whether any join succeeded yet; until then [`JOIN_TIMEOUT`] runs.
+    joined_once: bool,
 }
 
 pub async fn run(socket: WebSocket, state: AppState) {
@@ -51,17 +66,21 @@ pub async fn run(socket: WebSocket, state: AppState) {
     let (mut socket, outbox) = Socket::open(socket, &state, OUTBOX_FRAMES);
 
     let limits = &state.limits;
-    let bucket = TokenBucket::new(limits.update_burst, limits.updates_per_sec, Instant::now());
+    let now = Instant::now();
+    let bucket = TokenBucket::new(limits.update_burst, limits.updates_per_sec, now);
     let mut conn = Conn {
         id,
         doc_updates: bucket.clone(),
         presence_updates: bucket,
+        joins: TokenBucket::new(JOIN_BURST, JOINS_PER_SEC, now),
+        joined_once: false,
         state,
         outbox,
         joined: Vec::new(),
         fragments: Reassembler::default(),
     };
 
+    let join_deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     let mut sweep = interval(Duration::from_secs(1));
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -75,6 +94,10 @@ pub async fn run(socket: WebSocket, state: AppState) {
                 None => break,
             },
             _ = sweep.tick() => conn.expire_fragments(),
+            () = sleep_until(join_deadline), if !conn.joined_once => {
+                conn.close(CLOSE_GOING_AWAY, "join_timeout");
+                break;
+            }
         }
     }
 
@@ -88,10 +111,7 @@ impl Conn {
     /// Returns false when the connection should close.
     async fn on_binary(&mut self, bytes: &[u8]) -> bool {
         match try_decode(bytes) {
-            Some(msg) => {
-                self.on_protocol(msg).await;
-                true
-            }
+            Some(msg) => self.on_protocol(msg).await,
             None => {
                 self.close(CLOSE_PROTOCOL_ERROR, "Protocol error");
                 false
@@ -99,14 +119,25 @@ impl Conn {
         }
     }
 
-    async fn on_protocol(&mut self, msg: ProtocolMessage) {
+    /// Returns false when the connection should close.
+    async fn on_protocol(&mut self, msg: ProtocolMessage) -> bool {
         match msg {
             ProtocolMessage::JoinRequest {
                 crdt,
                 room_id,
                 auth,
                 version,
-            } => self.join(crdt, room_id, auth, version).await,
+            } => {
+                // The protocol has no join error a client would back off
+                // on, so a client joining in a loop is sent away to
+                // reconnect with backoff instead.
+                if !self.joins.try_take(Instant::now(), 1) {
+                    tracing::debug!(conn = self.id, "join rate limited");
+                    self.close(CLOSE_TRY_AGAIN, "rate_limited");
+                    return false;
+                }
+                self.join(crdt, room_id, auth, version).await;
+            }
             ProtocolMessage::DocUpdate {
                 crdt,
                 room_id,
@@ -122,17 +153,14 @@ impl Conn {
             } => {
                 if let Err(status) = self.writable(crdt, &room_id) {
                     self.ack(crdt, &room_id, batch_id, status);
-                    return;
-                }
-                // The actor refuses oversized presence anyway; this keeps a
-                // client from making us buffer megabytes of it first.
-                if crdt == CrdtType::LoroEphemeralStore
+                } else if crdt == CrdtType::LoroEphemeralStore
                     && total_size_bytes > MAX_PRESENCE_BYTES as u64
                 {
+                    // The actor refuses oversized presence anyway; this
+                    // keeps a client from making us buffer megabytes of it
+                    // first.
                     self.ack(crdt, &room_id, batch_id, UpdateStatusCode::PayloadTooLarge);
-                    return;
-                }
-                if let Err(status) =
+                } else if let Err(status) =
                     self.fragments
                         .start(crdt, &room_id, batch_id, fragment_count, total_size_bytes)
                 {
@@ -162,8 +190,10 @@ impl Conn {
             ProtocolMessage::Ack {
                 status, room_id, ..
             } => {
+                // Debug, not warn: a client can send these as fast as it
+                // likes, and nothing here charges for them.
                 if status != UpdateStatusCode::Ok {
-                    tracing::warn!(conn = self.id, room = %room_id, ?status, "client rejected an update");
+                    tracing::debug!(conn = self.id, room = %room_id, ?status, "client rejected an update");
                 }
             }
             // Server-to-client messages; a client has no business sending them.
@@ -171,6 +201,7 @@ impl Conn {
             | ProtocolMessage::JoinError { .. }
             | ProtocolMessage::RoomError { .. } => {}
         }
+        true
     }
 
     async fn join(&mut self, crdt: CrdtType, room_id: String, auth: Vec<u8>, version: Vec<u8>) {
@@ -225,6 +256,7 @@ impl Conn {
             .await;
         match outcome {
             JoinOutcome::Joined(room) => {
+                self.joined_once = true;
                 self.joined.push(Joined {
                     crdt,
                     room_id,

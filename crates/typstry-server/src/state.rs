@@ -5,8 +5,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::relay::{RelayConfig, RelayRegistry};
-use crate::room::{RoomConfig, RoomRegistry};
+use crate::http::Csp;
+use crate::limits::ConnCeiling;
+use crate::relay::RelayRegistry;
+use crate::room::RoomRegistry;
 use crate::store::blobs::BlobStore;
 use crate::ws::ConnLimits;
 
@@ -17,6 +19,10 @@ pub struct AppState {
     pub blobs: BlobStore,
     pub limits: ConnLimits,
     pub relay: RelayRegistry,
+    /// Caps open WebSockets across all clients.
+    pub conns: ConnCeiling,
+    /// Content security policies for the app's pages.
+    pub csp: Csp,
     /// Cancelled when the server starts shutting down; open WebSockets
     /// close with "going away" so clients reconnect elsewhere or later.
     pub shutdown: CancellationToken,
@@ -27,42 +33,28 @@ pub struct AppState {
 impl AppState {
     /// State with the default limits, for tests and embedding.
     pub fn new(db: SqlitePool, blobs: BlobStore) -> Self {
-        Self::build(
-            db,
-            blobs,
-            RoomConfig::default(),
-            ConnLimits::default(),
-            RelayConfig::default(),
-        )
+        Self::build(db, blobs, &Config::default())
     }
 
     pub fn from_config(db: SqlitePool, config: &Config) -> Self {
-        let blobs = BlobStore::new(&config.data_dir).with_max_size(config.max_upload_bytes);
-        Self::build(
-            db,
-            blobs,
-            config.rooms.clone(),
-            config.limits.clone(),
-            config.relay.clone(),
-        )
+        let blobs = BlobStore::new(&config.data_dir)
+            .with_max_size(config.max_upload_bytes)
+            .with_space_quota(config.space_quota_bytes);
+        Self::build(db, blobs, config)
     }
 
-    fn build(
-        db: SqlitePool,
-        blobs: BlobStore,
-        rooms: RoomConfig,
-        limits: ConnLimits,
-        relay: RelayConfig,
-    ) -> Self {
+    fn build(db: SqlitePool, blobs: BlobStore, config: &Config) -> Self {
         let shutdown = CancellationToken::new();
-        let relay = RelayRegistry::new(relay);
+        let relay = RelayRegistry::new(config.relay.clone());
         relay.spawn_sweeper(shutdown.clone());
         Self {
-            rooms: RoomRegistry::new(db.clone(), rooms),
+            rooms: RoomRegistry::new(db.clone(), config.rooms.clone()),
             db,
             blobs,
-            limits,
+            limits: config.limits.clone(),
             relay,
+            conns: ConnCeiling::new(config.max_connections),
+            csp: Csp::new(&config.font_origins),
             shutdown,
             connections: TaskTracker::new(),
         }

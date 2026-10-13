@@ -18,14 +18,15 @@ pub struct Channel {
     expires_in: u64,
 }
 
-/// `POST /api/relay`. Takes no body.
+/// `POST /api/relay`. Takes no body. 503 when the server has no channel
+/// left.
 pub async fn allocate(
     State(state): State<AppState>,
 ) -> Result<(StatusCode, Json<Channel>), AppError> {
     let (channel, claim) = state
         .relay
         .allocate(Instant::now())
-        .map_err(|AllocateError::Full| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|AllocateError::Full| AppError::from(StatusCode::SERVICE_UNAVAILABLE))?;
     Ok((
         StatusCode::CREATED,
         Json(Channel {

@@ -7,13 +7,13 @@ use std::time::Instant as StdInstant;
 
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio::time::Instant;
 use typstry_wire::relay::{CHANNEL_MAX, MAX_RELAY_MESSAGE, close_reason};
 
 use super::rate::TokenBucket;
-use super::{CLOSE_POLICY, IDLE_TIMEOUT, Socket};
+use super::{CLOSE_POLICY, IDLE_TIMEOUT, Socket, admit};
 use crate::room::Outbound;
 use crate::state::AppState;
 
@@ -40,11 +40,18 @@ pub async fn handler(
     Query(query): Query<JoinQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    let permit = match admit(&state) {
+        Ok(permit) => permit,
+        Err(refused) => return refused.into_response(),
+    };
     ws.max_message_size(MAX_RELAY_MESSAGE)
         .max_frame_size(MAX_RELAY_MESSAGE)
         .on_upgrade(move |socket| {
             let connections = state.connections.clone();
-            connections.track_future(run(socket, state, query))
+            connections.track_future(async move {
+                run(socket, state, query).await;
+                drop(permit);
+            })
         })
 }
 

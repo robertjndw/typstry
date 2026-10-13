@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -23,45 +23,110 @@ pub use self::error::AppError;
 pub use crate::state::AppState;
 use crate::ws;
 
-/// Policy for the app pages. The preview inserts compiler-generated SVG
-/// built from collaborators' documents into the page, so inline script must
-/// never run, whatever slips past the sanitizer in `svg-pages.ts`.
+/// Where the browser fetches Typst fonts from when the web app was built
+/// with its default font base (`VITE_TYPST_FONT_BASE`).
+pub const DEFAULT_FONT_ORIGINS: &[&str] = &["https://cdn.jsdelivr.net"];
+
+/// Packages always come from the Typst registry.
+const PACKAGE_ORIGIN: &str = "https://packages.typst.org";
+
+/// Policy for the app pages, allowing fonts from `font_origins`. The preview
+/// inserts compiler-generated SVG built from collaborators' documents into
+/// the page, so inline script must never run, whatever slips past the
+/// sanitizer in `svg-pages.ts`.
 ///
 /// - `'wasm-unsafe-eval'`: the Typst compiler, renderer, tinymist and Loro
 ///   are all wasm.
 /// - `style-src 'unsafe-inline'`: CodeMirror and the preview's typst.ts CSS
 ///   use `<style>` elements and style attributes. Styles cannot run script.
-/// - `connect-src`: typst.ts fetches its default fonts from jsdelivr and
-///   packages from the Typst registry. `'self'` covers the same-origin
-///   websocket too.
+/// - `connect-src`: typst.ts fetches its fonts from `font_origins` (unless
+///   they are hosted on this origin) and packages from the Typst registry.
+///   `'self'` covers the same-origin websocket too.
 /// - `object-src blob:`: Chrome shows PDFs in an iframe through its plugin
 ///   viewer, which `object-src` governs; the only PDFs are object URLs the
 ///   app made itself.
-pub const APP_CSP: &str = concat!(
-    "default-src 'self'; ",
-    "script-src 'self' 'wasm-unsafe-eval'; ",
-    "style-src 'self' 'unsafe-inline'; ",
-    "img-src 'self' blob: data:; ",
-    "font-src 'self' blob: data:; ",
-    "media-src 'self' blob:; ",
-    "connect-src 'self' https://cdn.jsdelivr.net https://packages.typst.org; ",
-    "worker-src 'self' blob:; ",
-    "frame-src 'self' blob:; ",
-    "object-src blob:; ",
-    "base-uri 'none'; ",
-    "form-action 'self'; ",
-    "frame-ancestors 'none'",
-);
+pub fn app_csp(font_origins: &[String]) -> String {
+    format!(
+        "default-src 'self'; \
+         script-src 'self' 'wasm-unsafe-eval'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' blob: data:; \
+         font-src 'self' blob: data:; \
+         media-src 'self' blob:; \
+         connect-src {}; \
+         worker-src 'self' blob:; \
+         frame-src 'self' blob:; \
+         object-src blob:; \
+         base-uri 'none'; \
+         form-action 'self'; \
+         frame-ancestors 'none'",
+        connect_src(font_origins)
+    )
+}
 
 /// Policy for the Typst compiler worker, which runs under its own CSP. The
 /// typst.ts compiler builds functions from strings (wasm-bindgen's
 /// `Function` import), so it needs `'unsafe-eval'`. It never touches a DOM
 /// and only fetches its wasm, fonts and packages, so that is all it gets.
-pub const COMPILE_WORKER_CSP: &str = concat!(
-    "default-src 'none'; ",
-    "script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; ",
-    "connect-src 'self' https://cdn.jsdelivr.net https://packages.typst.org",
-);
+pub fn compile_worker_csp(font_origins: &[String]) -> String {
+    format!(
+        "default-src 'none'; \
+         script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; \
+         connect-src {}",
+        connect_src(font_origins)
+    )
+}
+
+fn connect_src(font_origins: &[String]) -> String {
+    let mut sources = vec!["'self'"];
+    sources.extend(font_origins.iter().map(String::as_str));
+    sources.push(PACKAGE_ORIGIN);
+    sources.join(" ")
+}
+
+/// Whether `origin` is a plain `http(s)://host[:port]` that can go into a
+/// CSP source list as is: no path, quotes, wildcards or separators.
+pub fn valid_font_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (rest, None),
+    };
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && port.is_none_or(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The two page policies, rendered once at startup.
+#[derive(Debug, Clone)]
+pub struct Csp {
+    app: HeaderValue,
+    compile_worker: HeaderValue,
+}
+
+impl Csp {
+    /// `font_origins` must have passed [`valid_font_origin`].
+    pub fn new(font_origins: &[String]) -> Self {
+        let value = |policy: String| {
+            HeaderValue::try_from(policy).expect("font origins are validated in config")
+        };
+        Self {
+            app: value(app_csp(font_origins)),
+            compile_worker: value(compile_worker_csp(font_origins)),
+        }
+    }
+}
+
+pub fn default_font_origins() -> Vec<String> {
+    DEFAULT_FONT_ORIGINS.iter().map(|&o| o.to_owned()).collect()
+}
 
 /// Vite emits the worker as `assets/compile.worker-<hash>.js`.
 fn is_compile_worker(path: &str) -> bool {
@@ -69,17 +134,15 @@ fn is_compile_worker(path: &str) -> bool {
         .is_some_and(|rest| rest.ends_with(".js") && !rest.contains('/'))
 }
 
-async fn app_csp(req: Request, next: Next) -> Response {
+async fn page_csp(State(csp): State<Csp>, req: Request, next: Next) -> Response {
     let policy = if is_compile_worker(req.uri().path()) {
-        COMPILE_WORKER_CSP
+        csp.compile_worker
     } else {
-        APP_CSP
+        csp.app
     };
     let mut res = next.run(req).await;
-    res.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(policy),
-    );
+    res.headers_mut()
+        .insert(header::CONTENT_SECURITY_POLICY, policy);
     res
 }
 
@@ -119,8 +182,10 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
             StatusCode::SERVICE_UNAVAILABLE,
             API_TIMEOUT,
         ));
-    // Uploads get no timeout: a 25 MB body on a slow link legitimately
-    // takes minutes, and the size cap already bounds what one can cost.
+    // Uploads get no overall timeout: a 25 MB body on a slow link
+    // legitimately takes minutes. The size cap bounds what one can cost,
+    // and an idle timeout on the body (see assets::upload) what a stalled
+    // one can hold.
     let gated = Router::new()
         .merge(api)
         .route("/api/s/{token}/assets", post(assets::upload))
@@ -147,7 +212,7 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         app = app.fallback_service(
             Router::new()
                 .fallback_service(pages)
-                .layer(middleware::from_fn(app_csp))
+                .layer(middleware::from_fn_with_state(state.csp.clone(), page_csp))
                 .layer(middleware::from_fn(cache_control)),
         );
     } else {
@@ -163,8 +228,20 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     ))
-    .layer(TraceLayer::new_for_http())
+    .layer(TraceLayer::new_for_http().make_span_with(request_span))
     .with_state(state)
+}
+
+/// The span every request's logs carry. Share tokens travel in URL paths
+/// (`/api/s/{token}/...`, `/api/share/{token}`) and the relay claim in the
+/// query, so only the route pattern is recorded, never the URI, whatever
+/// the log level.
+fn request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("(static)", MatchedPath::as_str);
+    tracing::info_span!("request", method = %req.method(), route)
 }
 
 async fn healthz() -> &'static str {

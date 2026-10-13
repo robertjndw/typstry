@@ -9,9 +9,13 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
         .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        // NORMAL is durable enough under WAL: a crash can only lose the last
-        // commits, never corrupt the database, and clients resend updates.
-        .synchronous(SqliteSynchronous::Normal)
+        // FULL, not the usual WAL pairing NORMAL: under NORMAL a power loss
+        // can roll back the last commits, and that is not harmless here.
+        // The delivery service acks a group commit once it is stored, and
+        // members move to the new epoch on that ack; losing the row would
+        // let a different commit win the same epoch and fork the group.
+        // Writes are small and rare enough that the extra fsync is cheap.
+        .synchronous(SqliteSynchronous::Full)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
 

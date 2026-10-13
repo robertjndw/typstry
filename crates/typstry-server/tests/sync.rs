@@ -540,6 +540,44 @@ async fn coverage_waits_for_gaps_and_duplicates_are_dropped() {
 }
 
 #[tokio::test]
+async fn a_snapshot_cannot_claim_ops_the_server_never_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let (room, edit, _) = server.create_space().await;
+
+    let mut a = server.connect().await;
+    let mut b = server.connect().await;
+    a.join_doc(&room, &edit, &[]).await;
+    b.join_doc(&room, &edit, &[]).await;
+    let d1 = delta(1, 0, 3, b"a");
+    assert_eq!(a.send_records(&room, &[&d1], 1).await, UpdateStatusCode::Ok);
+    b.recv_records(1).await;
+
+    // Covers what is stored and claims far more of peer 1, and all of a
+    // peer nobody has written as yet.
+    let max = i32::MAX as u64;
+    let forged = snapshot(&[(1, max), (2, max)], b"forged");
+    assert_eq!(
+        a.send_records(&room, &[&forged], 2).await,
+        UpdateStatusCode::Ok
+    );
+    assert_eq!(server.records(&room).await, 1);
+
+    // Later ops of both peers are still stored and relayed.
+    let d2 = delta(1, 3, 4, b"b");
+    let d3 = delta(2, 0, 1, b"c");
+    assert_eq!(
+        a.send_records(&room, &[&d2, &d3], 3).await,
+        UpdateStatusCode::Ok
+    );
+    assert_eq!(b.recv_records(2).await, [d2, d3]);
+    assert_eq!(server.records(&room).await, 3);
+    let mut fresh = server.connect().await;
+    let joined = fresh.join_doc(&room, &edit, &[]).await;
+    assert_eq!(joined.coverage, coverage(&[(1, 4), (2, 1)]));
+}
+
+#[tokio::test]
 async fn snapshots_replace_covered_deltas() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
@@ -1006,7 +1044,9 @@ async fn answers_text_ping() {
 async fn silent_connection_is_closed_as_idle() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let (room, edit, _) = server.create_space().await;
     let mut c = server.connect().await;
+    c.join_doc(&room, &edit, &[]).await;
     // The connection's 1 s fragment sweep must not keep pushing the idle
     // deadline back. Paused time skips ahead instead of waiting 90 s.
     tokio::time::pause();
@@ -1022,6 +1062,62 @@ async fn silent_connection_is_closed_as_idle() {
     .await
     .expect("a silent connection was never closed");
     assert_eq!(close.unwrap().reason.as_str(), "idle_timeout");
+}
+
+#[tokio::test]
+async fn a_connection_that_never_joins_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let mut c = server.connect().await;
+    tokio::time::pause();
+    // Keepalives do not count as joining.
+    let close = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            c.ws.send(Message::text("ping")).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match tokio::time::timeout(Duration::from_millis(1), c.ws.next()).await {
+                Ok(Some(Ok(Message::Close(frame)))) => return frame,
+                Ok(Some(Ok(_))) | Err(_) => {}
+                other => panic!("socket ended without a close frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a connection that never joined was kept open");
+    assert_eq!(close.unwrap().reason.as_str(), "join_timeout");
+}
+
+#[tokio::test]
+async fn joining_in_a_loop_is_cut_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), RoomConfig::default()).await;
+    let (room, edit, _) = server.create_space().await;
+    let mut c = server.connect().await;
+    // One at a time, reading each answer, so the server never closes on
+    // unread input (which would reset the socket before the close frame).
+    let close = tokio::time::timeout(TIMEOUT, async {
+        for _ in 0..100 {
+            let join = ProtocolMessage::JoinRequest {
+                crdt: CrdtType::LoroEphemeralStore,
+                room_id: room.clone(),
+                auth: edit.as_bytes().to_vec(),
+                version: Vec::new(),
+            };
+            c.ws.send(Message::Binary(encode(&join).unwrap().into()))
+                .await
+                .unwrap();
+            match c.ws.next().await {
+                Some(Ok(Message::Close(frame))) => return frame.unwrap(),
+                Some(Ok(_)) => {}
+                other => panic!("socket ended without a close frame: {other:?}"),
+            }
+        }
+        panic!("never rate limited");
+    })
+    .await
+    .expect("never closed");
+    assert_eq!(u16::from(close.code), 1013);
+    assert_eq!(close.reason.as_str(), "rate_limited");
 }
 
 #[tokio::test]

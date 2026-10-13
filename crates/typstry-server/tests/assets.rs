@@ -144,7 +144,7 @@ async fn upload_then_fetch_roundtrip() {
         assert_eq!(headers[header::ETAG], format!("\"{hash}\"").as_str());
         assert_eq!(
             headers[header::CACHE_CONTROL],
-            "public, max-age=31536000, immutable"
+            "private, max-age=31536000, immutable"
         );
         assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         assert_eq!(
@@ -224,6 +224,114 @@ async fn rejects_uploads_over_the_limit() {
 
     let res = h.upload(&p.edit, &[7u8; 16]).await;
     assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+/// A file over the size limit is refused as such (413) even when the space
+/// is nearly or entirely full and would have refused it anyway (507).
+#[tokio::test]
+async fn too_large_wins_over_a_full_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = common::open_db(dir.path()).await;
+    let blobs = BlobStore::new(dir.path())
+        .with_max_size(10)
+        .with_space_quota(20);
+    let h = Harness {
+        state: AppState::new(pool, blobs),
+        dir,
+    };
+    let p = h.space().await;
+    let streamed = |byte: u8, chunks: usize| {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..chunks)
+            .map(|_| Ok(Bytes::from(vec![byte; 4])))
+            .collect();
+        Request::post(format!("/api/s/{}/assets", p.edit))
+            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+            .unwrap()
+    };
+
+    assert_eq!(h.send(streamed(1, 2)).await.status(), StatusCode::CREATED);
+    assert_eq!(h.send(streamed(2, 2)).await.status(), StatusCode::CREATED);
+    // 4 bytes left: 8 only overflows the quota, 12 is over the size limit.
+    assert_eq!(
+        h.send(streamed(3, 2)).await.status(),
+        StatusCode::INSUFFICIENT_STORAGE
+    );
+    assert_eq!(
+        h.send(streamed(3, 3)).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let declared = Request::post(format!("/api/s/{}/assets", p.edit))
+        .header(header::CONTENT_LENGTH, 12)
+        .body(Body::from(vec![3u8; 12]))
+        .unwrap();
+    assert_eq!(
+        h.send(declared).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    // And with nothing left at all.
+    assert_eq!(h.send(streamed(4, 1)).await.status(), StatusCode::CREATED);
+    assert_eq!(
+        h.send(streamed(5, 1)).await.status(),
+        StatusCode::INSUFFICIENT_STORAGE
+    );
+    assert_eq!(
+        h.send(streamed(5, 3)).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(h.blob_files().len(), 3);
+    assert_eq!(h.tmp_files(), 0);
+}
+
+#[tokio::test]
+async fn enforces_the_space_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = common::open_db(dir.path()).await;
+    let blobs = BlobStore::new(dir.path()).with_space_quota(20);
+    let h = Harness {
+        state: AppState::new(pool, blobs),
+        dir,
+    };
+    let p = h.space().await;
+    let other = h.space().await;
+
+    assert_eq!(
+        h.upload(&p.edit, &[1u8; 12]).await.status(),
+        StatusCode::CREATED
+    );
+    // Declared too large for what is left: refused before reading.
+    assert_eq!(
+        h.upload(&p.edit, &[2u8; 9]).await.status(),
+        StatusCode::INSUFFICIENT_STORAGE
+    );
+    // Undeclared: cut off while streaming, and nothing is left behind.
+    let chunks: Vec<Result<Bytes, std::io::Error>> =
+        (0..3).map(|_| Ok(Bytes::from_static(&[3u8; 4]))).collect();
+    let res = h
+        .send(
+            Request::post(format!("/api/s/{}/assets", p.edit))
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(h.blob_files().len(), 1);
+    assert_eq!(h.tmp_files(), 0);
+
+    // What fits still goes in, up to the quota exactly.
+    assert_eq!(
+        h.upload(&p.edit, &[4u8; 8]).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        h.upload(&p.edit, &[5u8; 1]).await.status(),
+        StatusCode::INSUFFICIENT_STORAGE
+    );
+    // The quota is per space.
+    assert_eq!(
+        h.upload(&other.edit, &[6u8; 20]).await.status(),
+        StatusCode::CREATED
+    );
 }
 
 #[tokio::test]

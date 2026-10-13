@@ -16,7 +16,9 @@ use tower::ServiceExt;
 use typstry_server::config::Config;
 use typstry_server::http::AppState;
 use typstry_server::relay::RelayConfig;
-use typstry_wire::relay::{MAX_RELAY_MESSAGE, RELAY_API_PATH, RELAY_WS_PATH, close_reason};
+use typstry_wire::relay::{
+    CHANNEL_MAX, MAX_RELAY_MESSAGE, RELAY_API_PATH, RELAY_WS_PATH, close_reason,
+};
 
 mod common;
 
@@ -148,38 +150,24 @@ async fn send(ws: &mut Ws, bytes: &[u8]) {
 }
 
 #[tokio::test]
-async fn allocates_the_lowest_free_channel() {
+async fn allocates_a_free_channel() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
     let (status, body) = server.allocate().await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["channel"], 1);
+    let number = body["channel"].as_u64().unwrap();
+    assert!((1..=u64::from(CHANNEL_MAX)).contains(&number));
     assert_eq!(body["expiresIn"], 300);
     assert_eq!(body["claim"].as_str().unwrap().len(), 22);
     let two = server.channel().await;
-    assert_eq!(two.number, 2);
-    assert_eq!(server.channel().await.number, 3);
+    assert_ne!(two.number, number);
 
-    // Using up channel 2 frees it for the next caller.
+    // Using up a channel frees it.
     let mut a = server.owner(&two).await;
     let b = server.guest(&two).await;
     drop(b);
     assert_eq!(closed_with(&mut a).await, NORMAL);
-    assert_eq!(server.channel().await.number, 2);
-}
-
-#[tokio::test]
-async fn refuses_allocation_past_the_cap() {
-    let dir = tempfile::tempdir().unwrap();
-    let relay = RelayConfig {
-        max_channels: 2,
-        ..RelayConfig::default()
-    };
-    let server = Server::start_with(dir.path(), relay).await;
-    server.channel().await;
-    server.channel().await;
-    let (status, _) = server.allocate().await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(server.state.relay.open_channels(), 1);
 }
 
 #[tokio::test]
@@ -267,7 +255,6 @@ async fn unjoined_channels_expire() {
     let dir = tempfile::tempdir().unwrap();
     let relay = RelayConfig {
         ttl: Duration::from_millis(300),
-        ..RelayConfig::default()
     };
     let server = Server::start_with(dir.path(), relay).await;
     let channel = server.channel().await;
@@ -275,8 +262,9 @@ async fn unjoined_channels_expire() {
 
     let mut late = server.guest(&channel).await;
     assert_eq!(closed_with(&mut late).await, POLICY);
-    // The number is free again.
-    assert_eq!(server.channel().await.number, channel.number);
+    // The expired channel no longer counts.
+    server.channel().await;
+    assert_eq!(server.state.relay.open_channels(), 1);
 }
 
 #[tokio::test]
@@ -284,7 +272,6 @@ async fn a_pair_is_cut_off_at_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let relay = RelayConfig {
         ttl: Duration::from_millis(300),
-        ..RelayConfig::default()
     };
     let server = Server::start_with(dir.path(), relay).await;
     let channel = server.channel().await;
@@ -378,7 +365,6 @@ async fn expired_channels_are_swept_without_an_allocation() {
     let dir = tempfile::tempdir().unwrap();
     let relay = RelayConfig {
         ttl: Duration::from_millis(300),
-        ..RelayConfig::default()
     };
     let server = Server::start_with(dir.path(), relay).await;
     let channel = server.channel().await;
