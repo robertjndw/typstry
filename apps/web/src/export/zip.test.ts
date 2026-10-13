@@ -113,3 +113,27 @@ function rawRename(
   p.fs.getNodeByID(id)!.data.set(NODE.name, name);
   p.doc.commit();
 }
+
+describe("exportZip asset loads", () => {
+  it("loads at most four assets at a time", async () => {
+    const p = initProject(newProject(1), { title: "Many" });
+    for (let i = 0; i < 10; i++) {
+      createAsset(p, null, `${i}.png`, {
+        hash: `sha256:${i}`,
+        size: PNG.length,
+        mime: "image/png",
+      });
+    }
+    let inFlight = 0;
+    let peak = 0;
+    const load = async () => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      inFlight--;
+      return PNG.slice();
+    };
+    const { zip } = await exportZip(p, load);
+    expect(Object.keys(unzipSync(zip))).toHaveLength(11);
+    expect(peak).toBe(4);
+  });
+});

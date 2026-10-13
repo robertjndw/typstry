@@ -7,6 +7,7 @@ import {
   IndexedDbBackend,
   LocalDocStore,
   MemoryBackend,
+  storageHealth,
   type DocBackend,
 } from "./local-doc-store";
 
@@ -193,6 +194,94 @@ describe.each(backends)("LocalDocStore on %s", (_name, makeBackend) => {
   });
 });
 
+describe.each(backends)("reloading a store on %s", (_name, makeBackend) => {
+  it("keeps edits made while no store was bound to the doc", async () => {
+    const backend = await makeBackend();
+    const doc = new LoroDoc();
+    const first = new LocalDocStore("p1", doc, backend, { flushDelayMs: 5 });
+    await first.load();
+    first.start();
+    write(doc, "before ");
+    await first.stop();
+
+    // A reconnect: the doc lives on, the store is made anew once the keys
+    // open, and typing goes on in between.
+    write(doc, "between");
+    const second = new LocalDocStore("p1", doc, backend, { flushDelayMs: 5 });
+    await second.load();
+    second.start();
+    await second.stop();
+
+    expect(text((await reopen(backend)).doc)).toBe("before between");
+  });
+
+  it("writes nothing on a plain reload", async () => {
+    const backend = await makeBackend();
+    const doc = new LoroDoc();
+    const store = new LocalDocStore("p1", doc, backend, {
+      compactMinBytes: 1,
+    });
+    await store.load();
+    write(doc, "snap");
+    await store.flush();
+    const remote = new LoroDoc();
+    write(remote, "theirs");
+    doc.import(remote.export({ mode: "snapshot" }));
+    await backend.append("p1", remote.export({ mode: "snapshot" }));
+
+    const again = new LocalDocStore("p1", new LoroDoc(), backend, {
+      flushDelayMs: 1,
+    });
+    await again.load();
+    const append = vi.spyOn(backend, "append");
+    again.start();
+    await new Promise((r) => setTimeout(r, 20));
+    await again.stop();
+    expect(append).not.toHaveBeenCalled();
+  });
+
+  it("opens with the rows that import when one is broken", async () => {
+    const backend = await makeBackend();
+    const doc = new LoroDoc();
+    const store = new LocalDocStore("p1", doc, backend);
+    await store.load();
+    write(doc, "kept");
+    await store.flush();
+    await backend.append("p1", new Uint8Array([1, 2, 3, 4]));
+    write(doc, " too");
+    await store.flush();
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const again = await reopen(backend);
+      expect(again.found).toBe(true);
+      expect(text(again.doc)).toBe("kept too");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("drops a broken row when it compacts", async () => {
+    const backend = await makeBackend();
+    await backend.append("p1", new Uint8Array([1, 2, 3, 4]));
+    const doc = new LoroDoc();
+    const store = new LocalDocStore("p1", doc, backend, {
+      compactMinBytes: 1,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await store.load();
+      write(doc, "fine");
+      await store.flush();
+      const stored = await backend.load("p1");
+      expect(stored.updates).toEqual([]);
+      expect(stored.snapshot).not.toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe.each(backends)("device key on %s", (_name, makeBackend) => {
   it("is absent until saved", async () => {
     expect(await (await makeBackend()).loadDeviceKey()).toBeNull();
@@ -297,6 +386,44 @@ describe("IndexedDbBackend schema", () => {
       snapshot: null,
       updates: [],
     });
+  });
+});
+
+describe("IndexedDbBackend connection", () => {
+  it("opens the database again after it was deleted under it", async () => {
+    const factory = new IDBFactory();
+    const backend = await IndexedDbBackend.open(factory);
+    await backend.append("p1", new Uint8Array([1]));
+    // Clearing site data closes our connection through versionchange.
+    await new Promise<void>((resolve, reject) => {
+      const req = factory.deleteDatabase("typstry");
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+    await backend.append("p1", new Uint8Array([2]));
+    expect((await backend.load("p1")).updates).toEqual([new Uint8Array([2])]);
+    expect(storageHealth()).toBe("ok");
+  });
+
+  it("says saving fails once a newer schema took the database", async () => {
+    const factory = new IDBFactory();
+    const backend = await IndexedDbBackend.open(factory);
+    await new Promise<void>((resolve, reject) => {
+      const req = factory.open("typstry", 99);
+      req.onsuccess = () => {
+        req.result.close();
+        resolve();
+      };
+      req.onerror = () => reject(req.error);
+    });
+    await expect(
+      backend.append("p1", new Uint8Array([1])),
+    ).rejects.toMatchObject({ name: "VersionError" });
+    expect(storageHealth()).toBe("failing");
+    // Back once writing works again, here in a fresh database.
+    const fresh = await IndexedDbBackend.open(new IDBFactory());
+    await fresh.append("p1", new Uint8Array([1]));
+    expect(storageHealth()).toBe("ok");
   });
 });
 

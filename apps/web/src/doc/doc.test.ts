@@ -6,7 +6,9 @@ import {
   deleteNode,
   FsError,
   getText,
+  isSafePath,
   move,
+  normalizeTitle,
   rename,
   setMainFile,
 } from "./fs-ops";
@@ -152,6 +154,7 @@ describe("validation", () => {
       ".",
       "..",
       "a/b",
+      "a\\b",
       "tab\there",
       "nul\u0000",
       "\u0085",
@@ -169,6 +172,16 @@ describe("validation", () => {
       () => createFile(p, null, "é".repeat(128), "text"),
       "invalid-name",
     );
+    expect(isSafePath("dir/a\\b.typ")).toBe(false);
+  });
+
+  // Same cases as normalizes_titles_like_the_browser in names.rs.
+  it("normalizes titles like the CLI", () => {
+    expect(normalizeTitle(" Thesis \ufeff")).toBe("Thesis");
+    expect(normalizeTitle("\ufeff")).toBeNull();
+    expect(normalizeTitle("\u0085")).toBe("\u0085");
+    expect(normalizeTitle("t".repeat(200))).toHaveLength(200);
+    expect(normalizeTitle("t".repeat(201))).toBeNull();
   });
 
   it("rejects local name clashes on create, rename and move", () => {

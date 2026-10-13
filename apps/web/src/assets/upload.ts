@@ -3,9 +3,12 @@ import type { TreeID } from "loro-crdt";
 import { children, createAsset, createFile, validateName } from "@/doc/fs-ops";
 import { extensionOf, stemLength } from "@/doc/names";
 import { NODE, type ProjectDoc } from "@/doc/schema";
+import { mapConcurrent } from "@/lib/concurrent";
 import { toError } from "@/lib/errors";
 
 import type { ProjectAssets } from "./project-assets";
+
+const UPLOAD_CONCURRENCY = 4;
 
 /** Imported into the doc as editable text instead of going to the blob store. */
 export const TEXT_EXTENSIONS: ReadonlySet<string> = new Set([
@@ -106,8 +109,12 @@ export async function uploadFiles(
   files: File[],
   parent: TreeID | null,
 ): Promise<UploadResult> {
-  const results = await Promise.all(
-    files.map(async (file): Promise<UploadedFile | UploadFailure> => {
+  // A few at a time: dropping a folder of figures would otherwise read
+  // every file into memory and start every upload at once.
+  const results = await mapConcurrent(
+    files,
+    UPLOAD_CONCURRENCY,
+    async (file): Promise<UploadedFile | UploadFailure> => {
       try {
         return await addFile(project, assets, file, parent);
       } catch (err) {
@@ -116,7 +123,7 @@ export async function uploadFiles(
           error: toError(err),
         };
       }
-    }),
+    },
   );
   const out: UploadResult = { created: [], errors: [] };
   for (const r of results) {

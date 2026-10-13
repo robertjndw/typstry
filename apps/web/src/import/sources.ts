@@ -1,8 +1,17 @@
-import { readFiles, readZip, type ImportSource } from "./import";
+import { isSafePath } from "@/doc/fs-ops";
+
+import {
+  JUNK_DIRS,
+  readFiles,
+  readZip,
+  tooManyEntries,
+  MAX_IMPORT_ENTRIES,
+  type ImportSource,
+} from "./import";
 
 /** What is being imported, and the source once it has been read. */
 export interface PendingImport {
-  /** A zip is unpacked first, which is worth telling the user. */
+  /** A zip is unpacked first, so the UI says so. */
   kind: "zip" | "files";
   source: Promise<ImportSource>;
 }
@@ -70,7 +79,9 @@ function isDirectory(d: Dropped): boolean {
 async function walk(
   entry: FileSystemEntry,
   out: { path: string; file: File | null }[],
+  depth = 0,
 ): Promise<void> {
+  if (out.length >= MAX_IMPORT_ENTRIES) throw tooManyEntries();
   // fullPath starts with "/", which collect() drops along with empty segments.
   if (entry.isFile) {
     const file = await new Promise<File>((resolve, reject) =>
@@ -80,6 +91,13 @@ async function walk(
     return;
   }
   out.push({ path: entry.fullPath, file: null });
+  // A dropped folder is usually a project's root, so its own name does not
+  // matter (it names the project). Below it, a .git or node_modules can hold
+  // more files than the project itself; collect() would drop them, so they
+  // are not listed at all. The folder entry above still gets a reserved one
+  // reported as skipped.
+  if (depth > 0 && (JUNK_DIRS.has(entry.name) || !isSafePath(entry.name)))
+    return;
   const reader = (entry as FileSystemDirectoryEntry).createReader();
   // readEntries hands out a directory in batches (100 in Chromium) and
   // signals the end with an empty one.
@@ -88,6 +106,6 @@ async function walk(
       reader.readEntries(resolve, reject),
     );
     if (batch.length === 0) break;
-    for (const child of batch) await walk(child, out);
+    for (const child of batch) await walk(child, out, depth + 1);
   }
 }

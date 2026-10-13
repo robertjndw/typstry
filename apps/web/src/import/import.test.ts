@@ -80,6 +80,20 @@ describe("collect", () => {
   });
 });
 
+describe("readZip", () => {
+  it("leaves clutter and .git out of the limits", async () => {
+    const files: Record<string, Uint8Array> = { "p/main.typ": strToU8("x") };
+    // Past the entry cap together, but none of it is imported anyway.
+    for (let i = 0; i < 6_000; i++) {
+      files[`p/__MACOSX/._${i}`] = new Uint8Array(0);
+      files[`p/.git/objects/${i}`] = new Uint8Array(0);
+    }
+    const source = await readZip(new File([zipSync(files)], "p.zip"));
+    expect([...source.files.keys()]).toEqual(["main.typ"]);
+    expect(source.skipped).toEqual([".git"]);
+  });
+});
+
 describe("assertImportable", () => {
   it("rejects an empty source", () => {
     expect(() => assertImportable(collect("x", []))).toThrow(ImportError);

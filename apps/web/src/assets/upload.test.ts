@@ -92,6 +92,27 @@ describe("uploadFiles", () => {
     expect(font.get(NODE.mime)).toBe("font/ttf");
   });
 
+  it("uploads at most four files at a time", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const assets = {
+      load: async () => new Uint8Array(),
+      store: async (file: File) => {
+        peak = Math.max(peak, ++inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight--;
+        return { hash: `sha256:${file.name}`, size: file.size, mime: "" };
+      },
+    };
+    const files = Array.from(
+      { length: 10 },
+      (_, i) => new File([new Uint8Array([0, 1])], `${i}.png`),
+    );
+    const result = await uploadFiles(setup(), assets, files, null);
+    expect(result.created).toHaveLength(10);
+    expect(peak).toBe(4);
+  });
+
   it("writes a text file in a single commit", async () => {
     mockUploads();
     const project = setup();
