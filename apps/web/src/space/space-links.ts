@@ -28,7 +28,7 @@ export function saveShareLinks(
 }
 
 /** For a member who is no longer sent the edit link by a rotation. */
-export function clearShareLinks(
+function clearShareLinks(
   spaceId: string,
   storage: Storage | null = getStorage(),
 ): void {

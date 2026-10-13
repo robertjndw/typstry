@@ -733,6 +733,67 @@ describe("MlsSession", () => {
     sessions.forEach((s) => s.stop());
   });
 
+  it("fetches a lagging keyring before it rotates, and says when it cannot", async () => {
+    const { creator, device, pairedWithAlice, editSecret, server, sessions } =
+      world();
+    let offline = false;
+    const alice = await creator({
+      options: {
+        fetchBootstrap: (token) =>
+          offline ? Promise.resolve(null) : server.bootstrap(token),
+      },
+    });
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+    const { backend } = await pairedWithAlice(alice);
+    const second = device("Alice 2", { backend });
+    await second.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(second.session.getSnapshot().holdsOwnerKey).toBe(true),
+    );
+
+    // The other device rotates while this one cannot reach the keyring.
+    offline = true;
+    await second.session.resetLinks();
+    await vi.waitFor(() =>
+      expect(alice.errors.map((e) => e.message).join()).toMatch(
+        /could not be fetched/,
+      ),
+    );
+    await expect(alice.session.resetLinks()).rejects.toThrow(
+      /could not be fetched/,
+    );
+
+    offline = false;
+    await alice.session.resetLinks();
+    expect(server.notOwner).toBe(0);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("keeps owner keys a newer build saved instead of writing over them", async () => {
+    const backend = new MemoryBackend();
+    const newer = new Uint8Array([9]);
+    await backend.saveMls("p", {
+      state: null,
+      device: null,
+      removed: false,
+      rotation: null,
+      ownerSecrets: newer,
+    });
+    const seed = DeviceKey.generate().export();
+    const { group } = SpaceGroup.create(
+      LinkSecret.generateEdit(),
+      encodeProfile({ name: "Alice", color }),
+      seed,
+      PersonGraph.genesis(seed).encode(),
+    );
+    await expect(
+      keepOwnerKey(backend, "p", group.ownerSecrets()!, (_, fn) => fn()),
+    ).rejects.toThrow(/newer version/);
+    expect((await backend.loadMls("p"))?.ownerSecrets).toEqual(newer);
+  });
+
   it("brings the owner key along when it rejoins after losing its state", async () => {
     const { creator, device, editSecret, sessions } = world();
     const alice = await creator();
@@ -1172,6 +1233,103 @@ describe("MlsSession", () => {
     const stored = await first.backend.loadMls("p");
     expect(stored?.state).not.toBeNull();
     sessions.forEach((s) => s.stop());
+  });
+
+  it("learns from another tab what became of a commit whose reply it lost", async () => {
+    const { creator, device, server, sessions, editSecret } = world();
+    const bus = new Bus();
+    const options = { settleMs: 300 };
+    const first = await creator({ bus, options });
+    const second = device("Alice", { backend: first.backend, bus, options });
+    await second.session.start({ token: EDIT, link: editSecret });
+    await vi.waitFor(() =>
+      expect(first.session.getSnapshot().canCommit).toBe(true),
+    );
+    await vi.waitFor(() =>
+      expect(second.session.getSnapshot().phase).toBe("active"),
+    );
+
+    // The commit lands, the first tab's socket drops before the reply, and
+    // the second tab applies the echo before the first is back.
+    server.loseNextReply = { landed: true };
+    const epoch = server.head;
+    await first.session.resetLinks();
+
+    expect(server.head).toBe(epoch + 1);
+    expect([...first.rotations, ...second.rotations]).toHaveLength(1);
+    expect(first.errors).toEqual([]);
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("asks the server for missed commits once for a burst of requests", async () => {
+    const { creator, sessions } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().phase).toBe("active"),
+    );
+    const ds = (alice.session as unknown as { ds: { fetch: () => void } }).ds;
+    const fetch = vi.spyOn(ds, "fetch");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      for (let i = 0; i < 50; i++) alice.session.catchUp();
+      expect(fetch).toHaveBeenCalledTimes(1);
+
+      // The first fetch may have beaten the commit to the server, so the
+      // calls it swallowed get one fetch of their own once the window ends.
+      vi.advanceTimersByTime(1_000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      vi.advanceTimersByTime(5_000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+
+      // A lone call has nothing to follow up on.
+      alice.session.catchUp();
+      expect(fetch).toHaveBeenCalledTimes(3);
+      vi.advanceTimersByTime(5_000);
+      expect(fetch).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+    sessions.forEach((s) => s.stop());
+  });
+
+  it("drops a pending follow-up catch-up when stopped", async () => {
+    const { creator } = world();
+    const alice = await creator();
+    await vi.waitFor(() =>
+      expect(alice.session.getSnapshot().phase).toBe("active"),
+    );
+    const ds = (alice.session as unknown as { ds: { fetch: () => void } }).ds;
+    const fetch = vi.spyOn(ds, "fetch");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      alice.session.catchUp();
+      alice.session.catchUp();
+      alice.session.stop();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(5_000);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("takes the project's lock to keep an owner key", async () => {
+    const backend = new MemoryBackend();
+    const held: string[] = [];
+    const lock = async <T>(name: string, fn: () => Promise<T>) => {
+      held.push(name);
+      return fn();
+    };
+    const seed = DeviceKey.generate().export();
+    const { group } = SpaceGroup.create(
+      LinkSecret.generateEdit(),
+      encodeProfile({ name: "Alice", color }),
+      seed,
+      PersonGraph.genesis(seed).encode(),
+    );
+    await keepOwnerKey(backend, "p", group.ownerSecrets()!, lock);
+    expect(held).toEqual(["typstry:mls:p"]);
+    expect((await backend.loadMls("p"))?.ownerSecrets).toBeDefined();
   });
 
   it("reports a project whose server has no group", async () => {

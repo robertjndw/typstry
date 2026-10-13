@@ -10,12 +10,25 @@ import type { Directory, NewLink } from "./directory";
 import type { State } from "./schema";
 import { directory, flushDirectory } from "./store";
 
+/**
+ * The page's directory, unless it must not be written: a doc of another kind
+ * or a newer layout would be corrupted by this build's writes, the same rule
+ * as `ensure_supported` in the CLI.
+ */
+async function writableDirectory(): Promise<Directory> {
+  const dir = await directory();
+  const unsupported = dir.unsupported();
+  if (unsupported)
+    throw new Error(`unsupported directory: ${JSON.stringify(unsupported)}`);
+  return dir;
+}
+
 async function write(
   what: string,
   change: (dir: Directory, now: number) => unknown,
 ): Promise<void> {
   try {
-    await change(await directory(), Date.now());
+    await change(await writableDirectory(), Date.now());
     await flushDirectory();
   } catch (error) {
     console.warn(`could not record ${what} in the directory`, error);
@@ -70,19 +83,21 @@ export function recordRotation(
   rotation: StoredRotation,
   replaced?: string,
 ): Promise<void> {
-  return write("a rotation", (dir, now) => {
-    const before = dir.bestLink(projectId, now)?.token;
-    dir.addLink({
-      token: rotation.token,
-      projectId,
-      secret: rotation.link,
-      edit: rotation.canEdit && isEditSecret(rotation.link),
-      addedAt: now,
-    });
-    for (const old of new Set([before, replaced]))
-      if (old && old !== rotation.token) dir.retire(old, now);
-    dir.pruneRetired(now);
-  });
+  return write("a rotation", (dir, now) =>
+    dir.batch("rotate links", () => {
+      const before = dir.bestLink(projectId, now)?.token;
+      dir.addLink({
+        token: rotation.token,
+        projectId,
+        secret: rotation.link,
+        edit: rotation.canEdit && isEditSecret(rotation.link),
+        addedAt: now,
+      });
+      for (const old of new Set([before, replaced]))
+        if (old && old !== rotation.token) dir.retire(old, now);
+      dir.pruneRetired(now);
+    }),
+  );
 }
 
 /**
@@ -121,11 +136,14 @@ export function recordStatus(
   });
 }
 
-/** The person removed the project from their list. */
-export function recordForgotten(projectId: string): Promise<void> {
-  return write("a forgotten project", (dir, now) => {
-    dir.setStatus(projectId, "forgotten", now);
-  });
+/**
+ * The person removed the project from their list. Unlike the rest, this
+ * throws: the person asked for it and is told whether it worked.
+ */
+export async function recordForgotten(projectId: string): Promise<void> {
+  const dir = await writableDirectory();
+  dir.setStatus(projectId, "forgotten", Date.now());
+  await flushDirectory();
 }
 
 /**
@@ -144,7 +162,7 @@ export function recordOwnerSecret(
   return (async () => {
     try {
       await loadWasm();
-      const dir = await directory();
+      const dir = await writableDirectory();
       const now = Date.now();
       if (!dir.addOwnerKey(projectId, secret, now)) return;
       dir.pruneOwnerKeys(projectId, now);

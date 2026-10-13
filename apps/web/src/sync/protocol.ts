@@ -8,7 +8,7 @@ export const PROTOCOL_VERSION = 1;
 export const PROTOCOL_HEADER = "X-Typstry-Protocol";
 
 /** Query parameter on the WebSocket URL; browsers cannot set its headers. */
-export const PROTOCOL_QUERY = "protocol";
+const PROTOCOL_QUERY = "protocol";
 
 /** The WebSocket URL of `path` on the page's host, with the protocol query. */
 export function socketUrl(

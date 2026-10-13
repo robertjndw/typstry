@@ -42,9 +42,12 @@ describe("owner secret helpers", () => {
     expect(withOwnerSecrets(next, [secret(1)])).toEqual(next);
     expect(mergeOwnerSecrets(next, held)).toEqual(next);
     expect(() => ownerSecretList(new Uint8Array([9]))).toThrow();
+    // Damaged bytes have nothing to keep; a newer format is not saved over.
     expect(
-      ownerSecretList(withOwnerSecrets(new Uint8Array([9]), [secret(3)])),
+      ownerSecretList(withOwnerSecrets(new Uint8Array([1]), [secret(3)])),
     ).toEqual([secret(3)]);
+    expect(() => withOwnerSecrets(new Uint8Array([9]), [secret(3)])).toThrow();
+    expect(() => mergeOwnerSecrets(new Uint8Array([9]), held)).toThrow();
   });
 
   it("never evict a held secret for added ones", () => {

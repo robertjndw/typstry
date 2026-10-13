@@ -7,6 +7,16 @@ import { Button } from "@/components/ui/button";
 import { ApprovalDialog, PairingStatus } from "@/components/PairingStatus";
 import { usePairingFlow } from "@/pairing/usePairingFlow";
 
+/** A hand-edited or truncated link can carry a broken escape. */
+function codeFromHash(hash: string): string {
+  if (hash.length <= 1) return "";
+  try {
+    return decodeURIComponent(hash.slice(1));
+  } catch {
+    return "";
+  }
+}
+
 /**
  * The page a pairing link opens. The code rides in the fragment, which never
  * reaches the server.
@@ -14,9 +24,7 @@ import { usePairingFlow } from "@/pairing/usePairingFlow";
 export function Pair() {
   const { hash } = useLocation();
   const navigate = useNavigate();
-  const [linkCode] = useState(() =>
-    hash.length > 1 ? decodeURIComponent(hash.slice(1)) : "",
-  );
+  const [linkCode] = useState(() => codeFromHash(hash));
   // The code is spent once used, but keeping it out of the address bar and
   // history means a synced history or someone looking over a shoulder never
   // sees a live one.

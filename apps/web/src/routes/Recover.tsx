@@ -20,6 +20,7 @@ import { defaultBackend } from "@/persist/local-doc-store";
 export function Recover() {
   const navigate = useNavigate();
   const [words, setWords] = useState("");
+  const [showWords, setShowWords] = useState(false);
   const [link, setLink] = useState("");
   const [keepOthers, setKeepOthers] = useState(false);
   const [replace, setReplace] = useState(false);
@@ -49,6 +50,9 @@ export function Recover() {
         keepOthers,
         replace,
       });
+      // The words are the whole account; nothing should hold them longer
+      // than it takes to use them.
+      setWords("");
       // Only worth a stop when the rest of the list came back too.
       if (result.projects > 0) setRecovered(result);
       else open(result.path);
@@ -85,16 +89,35 @@ export function Recover() {
         </div>
       ) : (
         <form onSubmit={submit} className="flex flex-col gap-3">
-          <Input
-            aria-label="Recovery words"
-            placeholder="The 17 words"
-            autoComplete="off"
-            autoCapitalize="none"
-            spellCheck={false}
-            value={words}
-            onChange={(e) => setWords(e.target.value)}
-            className="h-9 font-mono"
-          />
+          <div className="flex gap-2">
+            {/* Masked against shoulder surfing and screen sharing; pasting
+                still works. The data attributes keep password managers from
+                offering to save the words. */}
+            <Input
+              aria-label="Recovery words"
+              placeholder="The 17 words"
+              type={showWords ? "text" : "password"}
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              data-1p-ignore
+              data-lpignore="true"
+              data-bwignore
+              value={words}
+              onChange={(e) => setWords(e.target.value)}
+              className="h-9 font-mono"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="lg"
+              aria-pressed={showWords}
+              onClick={() => setShowWords((show) => !show)}
+            >
+              {showWords ? "Hide" : "Show"}
+            </Button>
+          </div>
           <Input
             aria-label="Project link"
             placeholder="https://…/p/…#…"

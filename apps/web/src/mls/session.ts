@@ -37,6 +37,7 @@ import type { LocalIdentity } from "@/mls/identity";
 import {
   type DocBackend,
   type MlsRecord,
+  type SettledCommit,
   type StoredRotation,
 } from "@/persist/local-doc-store";
 import { loadBinding } from "@/directory/binding";
@@ -186,6 +187,11 @@ const ATTEMPTS = 5;
 const SILENCE_MS = 8_000;
 const PROFILE_DELAY_MS = 1_000;
 const SETTLE_MS = 10_000;
+/**
+ * `catchUp` calls closer together than this share one fetch, plus one more
+ * at the end of the window if any came in after the first.
+ */
+const CATCH_UP_MS = 1_000;
 
 /** The snapshot of a session that has not started, or of no session. */
 export const IDLE: MlsSnapshot = {
@@ -203,14 +209,29 @@ function defaultJitter(attempt: number): number {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Serializes callers within a page when there is no Web Locks API. */
+/**
+ * Serializes callers within a page when there is no Web Locks API. Other
+ * tabs are not held off, which is why it warns once.
+ */
 const pageLocks = new Map<string, Promise<unknown>>();
+let warnedNoLocks = false;
 const pageLock: Locker = (name, fn) => {
+  if (!warnedNoLocks) {
+    warnedNoLocks = true;
+    console.warn(
+      "this browser has no Web Locks: tabs of one project may overwrite each other's group state",
+    );
+  }
   const run = (pageLocks.get(name) ?? Promise.resolve()).then(fn, fn);
-  pageLocks.set(
-    name,
-    run.catch(() => undefined),
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
   );
+  pageLocks.set(name, tail);
+  // The last one in line clears the entry, so names used once do not pile up.
+  void tail.then(() => {
+    if (pageLocks.get(name) === tail) pageLocks.delete(name);
+  });
   return run;
 };
 
@@ -255,7 +276,7 @@ function sameRoster(
   );
 }
 
-function deviceOf(group: SpaceGroup): Uint8Array {
+export function deviceOf(group: SpaceGroup): Uint8Array {
   const device = group.leafKeys();
   try {
     return device.export();
@@ -269,6 +290,26 @@ export function emptyRecord(): MlsRecord {
 }
 
 /**
+ * `mergeOwnerSecrets`, with a clear refusal for stored secrets a newer
+ * build wrote: the wasm throws rather than save over them, and so does
+ * this, which aborts the save they were part of.
+ */
+function keptOwnerSecrets(
+  stored: Uint8Array | undefined,
+  added: Uint8Array | undefined,
+): Uint8Array | undefined {
+  try {
+    return mergeOwnerSecrets(stored, added);
+  } catch (error) {
+    if (errorKind(error) !== "NewerVersion") throw error;
+    throw new Error(
+      "This project's owner keys were saved by a newer version of typstry. Reload the page to update.",
+      { cause: error },
+    );
+  }
+}
+
+/**
  * Adds `ownerSecrets` (from a recovery or a pairing grant) to the space's
  * group record, where the join that follows picks them up: with them the
  * device can remove lost devices and replace the links they hold. What the
@@ -278,11 +319,16 @@ export async function keepOwnerKey(
   backend: Pick<DocBackend, "loadMls" | "saveMls">,
   spaceId: string,
   ownerSecrets: Uint8Array,
+  lock: Locker = defaultLocker(),
 ): Promise<void> {
-  const record = await backend.loadMls(spaceId);
-  await backend.saveMls(spaceId, {
-    ...(record ?? emptyRecord()),
-    ownerSecrets: mergeOwnerSecrets(record?.ownerSecrets, ownerSecrets),
+  // Under the project's lock: an open tab saving its group in between would
+  // otherwise be overwritten with the older state read here.
+  await lock(`typstry:mls:${spaceId}`, async () => {
+    const record = await backend.loadMls(spaceId);
+    await backend.saveMls(spaceId, {
+      ...(record ?? emptyRecord()),
+      ownerSecrets: keptOwnerSecrets(record?.ownerSecrets, ownerSecrets),
+    });
   });
 }
 
@@ -364,14 +410,15 @@ export class MlsSession {
   }[] = [];
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private profileTimer: ReturnType<typeof setTimeout> | null = null;
+  private catchUpTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A catchUp came in while `catchUpTimer` was running. */
+  private catchUpAgain = false;
   private recovering = false;
 
   constructor(opts: MlsSessionOptions) {
     this.opts = opts;
     this.lock = opts.locks ?? defaultLocker();
   }
-
-  // --- What the UI reads ---
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -396,13 +443,14 @@ export class MlsSession {
     };
   }
 
-  /** Calls `listener` whenever `keys()` has something new to give. */
+  /**
+   * Calls `listener` whenever `keys()` has something new to give. The keys
+   * are the listener's to free.
+   */
   onKeys(listener: (keys: GroupKeys) => void): () => void {
     this.keyListeners.add(listener);
     return () => this.keyListeners.delete(listener);
   }
-
-  // --- Lifecycle ---
 
   /**
    * Starts following the group with `token`, whose link carries `link`.
@@ -477,6 +525,9 @@ export class MlsSession {
     this.clearSilence();
     if (this.profileTimer !== null) clearTimeout(this.profileTimer);
     this.profileTimer = null;
+    if (this.catchUpTimer !== null) clearTimeout(this.catchUpTimer);
+    this.catchUpTimer = null;
+    this.catchUpAgain = false;
     this.inbox = [];
     this.group?.free();
     this.group = null;
@@ -499,12 +550,24 @@ export class MlsSession {
    * out by itself, this covers the times it doesn't.
    */
   catchUp(): void {
+    // Every record of a new generation asks, and a backfill after a
+    // rotation brings them by the hundred; one fetch answers them all.
     if (!this.running) return;
+    if (this.catchUpTimer !== null) {
+      // The fetch already sent may have reached the server before it stored
+      // the commit this caller is missing, so one more goes out at the end.
+      this.catchUpAgain = true;
+      return;
+    }
+    this.catchUpTimer = setTimeout(() => {
+      this.catchUpTimer = null;
+      if (!this.catchUpAgain) return;
+      this.catchUpAgain = false;
+      this.catchUp();
+    }, CATCH_UP_MS);
     if (this.ds?.ready) this.ds.fetch(this.group?.epoch ?? 0);
     else this.ds?.restart();
   }
-
-  // --- Reading the stored group ---
 
   private openChannel(): void {
     const name = `typstry:mls:${this.opts.spaceId}`;
@@ -612,13 +675,25 @@ export class MlsSession {
     this.unannounced = rotation;
   }
 
-  // --- State ---
-
   /** Takes `group` (a fresh import, or the result of an operation) as the current one. */
   private adopt(group: SpaceGroup | null, record: MlsRecord): void {
+    // Work that was under way when the session stopped must not bring a
+    // group back that nothing frees any more.
+    if (!this.running) {
+      if (group && group !== this.group) group.free();
+      return;
+    }
     if (this.group && this.group !== group) this.group.free();
     this.group = group;
     this.record = record;
+    // Another tab applied the log's answer to the commit this one is
+    // waiting on; this tab's own socket brings the echo too late or never.
+    const { settled } = record;
+    if (settled && this.sent?.state === "pending")
+      this.markSent(
+        settled.commit,
+        settled.confirmed ? "confirmed" : "discarded",
+      );
     this.publish();
     this.emitKeys();
   }
@@ -701,8 +776,12 @@ export class MlsSession {
     }
     if (id === this.keyId) return;
     this.keyId = id;
-    const keys = this.keys();
-    if (keys) for (const listener of [...this.keyListeners]) listener(keys);
+    // A copy each: the listener takes ownership (SpaceCrypto frees the keys
+    // it replaces), so two must never share one.
+    for (const listener of [...this.keyListeners]) {
+      const keys = this.keys();
+      if (keys) listener(keys);
+    }
   }
 
   /**
@@ -720,8 +799,6 @@ export class MlsSession {
     this.opts.onError?.(e);
     this.end("failed", e.message);
   }
-
-  // --- Serialized work ---
 
   /** Runs `task` after everything queued before it. */
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
@@ -769,7 +846,7 @@ export class MlsSession {
             // Added to the saved copy, never put in its place: a group
             // that holds none, or one the server lied to about which key
             // is current, must not cost a secret that may be the only one.
-            ownerSecrets: mergeOwnerSecrets(
+            ownerSecrets: keptOwnerSecrets(
               record.ownerSecrets,
               group?.ownerSecrets(),
             ),
@@ -799,8 +876,6 @@ export class MlsSession {
       }
     });
   }
-
-  // --- What the server tells us ---
 
   private async hello(): Promise<Hello | null> {
     const group = this.group;
@@ -956,6 +1031,9 @@ export class MlsSession {
       const group = tx.group;
       if (!group?.isActive) return found;
       let changed = false;
+      // Stored for the tab that sent it, which may have lost its socket
+      // before the answer and so never sees the echo apply.
+      let settled: SettledCommit | undefined;
       for (const { epoch, commit, envelope, ownerKey } of batch) {
         // Another tab applied it already.
         if (epoch < group.epoch) continue;
@@ -976,6 +1054,7 @@ export class MlsSession {
         const own = waiting && sameBytes(waiting.commit, commit);
         if (waiting && !group.hasPendingSubmit) {
           changed = true;
+          settled = { commit: waiting.commit, confirmed: !!own };
           this.markSent(waiting.commit, own ? "confirmed" : "discarded");
         }
         if (failure) {
@@ -1011,9 +1090,12 @@ export class MlsSession {
       }
       if (found.rotation && found.mine) this.opts.onRotated?.(found.rotation);
       if (found.keyring) this.opts.onKeyring?.(found.keyring);
-      if (found.removed) await tx.save({ removed: true });
+      if (found.removed) await tx.save({ removed: true, settled });
       else if (changed)
-        await tx.save(found.rotation ? { rotation: found.rotation } : {});
+        await tx.save({
+          ...(found.rotation ? { rotation: found.rotation } : {}),
+          ...(settled ? { settled } : {}),
+        });
       return found;
     });
 
@@ -1225,23 +1307,70 @@ export class MlsSession {
 
   private async refreshKeyring(): Promise<void> {
     await this.locked(async (tx) => {
-      const group = tx.group;
-      if (!group?.isActive || !group.needsKeyring()) return;
-      const boot = await this.opts.fetchBootstrap(this.token);
-      if (!boot) return;
-      try {
-        group.setKeyring(boot.keyring);
-      } catch {
-        // The server holds the keyring of a generation this device has not
-        // reached yet. Following the group's commits fixes that.
-        return;
-      }
-      await tx.save();
-      this.opts.onKeyring?.(boot.keyring);
+      const failure = await this.keyringIn(tx);
+      // The server holding the keyring of a generation this device has not
+      // reached yet is no failure: following the group's commits fixes
+      // that. Anything else is worth hearing about.
+      if (failure && failure.kind !== "Mismatch")
+        this.opts.onError?.(failure.error);
     });
   }
 
-  // --- Joining ---
+  /**
+   * Brings the keyring of `tx.group` up to the group's generation, from the
+   * server, when it lags (or when `force`d, after the wasm said it lags).
+   * A rotation refuses to build on a lagging keyring. Returns why it could
+   * not, or null when the keyring is current.
+   */
+  private async keyringIn(
+    tx: Tx,
+    force = false,
+  ): Promise<{ kind: string; error: Error } | null> {
+    const group = tx.group;
+    if (!group?.isActive || (!force && !group.needsKeyring())) return null;
+    const boot = await this.opts.fetchBootstrap(this.token);
+    if (!boot)
+      return {
+        kind: "Unavailable",
+        error: new Error(
+          "the project's current keys could not be fetched from the server; try again once it is reachable",
+        ),
+      };
+    try {
+      group.setKeyring(boot.keyring);
+    } catch (error) {
+      return {
+        kind: errorKind(error) ?? "Unknown",
+        error: new Error(
+          `the project's current keys did not fit this device's group: ${toError(error).message}`,
+        ),
+      };
+    }
+    await tx.save();
+    this.opts.onKeyring?.(boot.keyring);
+    return null;
+  }
+
+  /**
+   * Runs `build`, which may rotate, on a keyring brought up to date first.
+   * The wasm refuses a rotation on a lagging keyring with `KeyringBehind`;
+   * that gets one refresh and one more try, then the reason it lags.
+   */
+  private async buildOnKeyring<T>(
+    tx: Tx,
+    build: (group: SpaceGroup) => T,
+  ): Promise<T> {
+    // A failed fetch only matters to a build that rotates; others go on.
+    const early = await this.keyringIn(tx);
+    try {
+      return build(tx.group!);
+    } catch (error) {
+      if (errorKind(error) !== "KeyringBehind") throw error;
+      const failure = early ?? (await this.keyringIn(tx, true));
+      if (failure) throw failure.error;
+      return build(tx.group!);
+    }
+  }
 
   /**
    * An external join, as this device if it was in the group before (the
@@ -1255,6 +1384,11 @@ export class MlsSession {
     const device = tx.record.device
       ? LeafKeys.import(tx.record.device)
       : (tx.group?.leafKeys() ?? LeafKeys.generate());
+    // A commit the old group had waiting dies with it, in whichever tab
+    // sent it.
+    const dropped = tx.group?.hasPendingSubmit
+      ? tx.group.pendingSubmit()
+      : undefined;
     try {
       if (!tx.record.device) {
         // Stored before the join so a refused attempt or a crash keeps the
@@ -1343,6 +1477,9 @@ export class MlsSession {
             removed: false,
             rotation: null,
             ownerPerson: tx.record.ownerPerson ?? group.ownerPerson(),
+            ...(dropped
+              ? { settled: { commit: dropped.commit, confirmed: false } }
+              : {}),
           });
           this.stalled = false;
           this.terminal = null;
@@ -1362,8 +1499,6 @@ export class MlsSession {
       device.free();
     }
   }
-
-  // --- Commits of our own ---
 
   /**
    * Removes the members with the device keys `signers` (hex, as the roster
@@ -1506,7 +1641,7 @@ export class MlsSession {
     // A group with a commit waiting cannot build another one.
     if (group.hasPendingSubmit && (await this.resubmit(tx)) === "waiting")
       return { type: "unsettled" };
-    const message = build(group);
+    const message = await this.buildOnKeyring(tx, build);
     this.sent = { commit: message.commit, state: "pending" };
     await tx.save();
     return this.answered(tx, ds, message, await ds.request(message));
@@ -1552,7 +1687,7 @@ export class MlsSession {
     if (reply.type === "refused") {
       group.discardPending();
       this.markSent(message.commit, "discarded");
-      await tx.save();
+      await tx.save({ settled: { commit: message.commit, confirmed: false } });
       throw new Error(refusalText(reply.code));
     }
     const rotation = group.confirmPending();
@@ -1564,7 +1699,8 @@ export class MlsSession {
       this.opts.onRotated?.(stored);
       if (message.keyring) this.opts.onKeyring?.(message.keyring);
     }
-    await tx.save(stored ? { rotation: stored } : {});
+    const settled = { commit: message.commit, confirmed: true };
+    await tx.save(stored ? { rotation: stored, settled } : { settled });
     if (stored) this.moveTo(stored);
     return { type: "done" };
   }
@@ -1611,8 +1747,6 @@ export class MlsSession {
     });
   }
 
-  // --- A stalled group ---
-
   /**
    * Starts the group over when it met a commit it refuses. Every editor
    * that sees the stall tries after a random wait; the first reset wins and
@@ -1639,10 +1773,12 @@ export class MlsSession {
         const ds = this.ds;
         if (!group?.isActive || !ds) return;
         const identity = await this.opts.localIdentity?.();
-        const { group: next, message } = group.reset(
-          encodeProfile(this.opts.identity()),
-          identity?.deviceSeed,
-          identity?.graph,
+        const { group: next, message } = await this.buildOnKeyring(tx, (g) =>
+          g.reset(
+            encodeProfile(this.opts.identity()),
+            identity?.deviceSeed,
+            identity?.graph,
+          ),
         );
         let reply: Reply;
         try {

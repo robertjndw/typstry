@@ -1,7 +1,7 @@
 // HTTP helpers for the space endpoints served by crates/typstry-server.
-// Nothing sent here is readable by the server: a space's content only ever
-// travels encrypted, so these calls carry tokens and ciphertext alone.
+// The server never sees plaintext: these calls carry tokens and ciphertext only.
 import { fromBase64, ownBuffer } from "@/crypto/bytes";
+import { toError } from "@/lib/errors";
 
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
 
@@ -57,6 +57,79 @@ export async function apiFetch(
   return res;
 }
 
+export const RATE_LIMITED_MESSAGE = "Too many requests. Try again in a moment.";
+
+/** 429 that outlasted the retries in `apiFetchRetrying`. */
+export class RateLimitedError extends ApiError {
+  constructor() {
+    super(429, RATE_LIMITED_MESSAGE);
+    this.name = "RateLimitedError";
+  }
+}
+
+/** How often a 429 is retried before the caller sees it. */
+export const RATE_LIMIT_RETRIES = 3;
+const RATE_LIMIT_BASE_MS = 1000;
+// A Retry-After can ask for minutes (a proxy's rate limit may refill
+// slowly). Waiting that long behind a spinner is worse than telling the
+// user and letting them retry.
+const MAX_RETRY_AFTER_MS = 30_000;
+
+/**
+ * What a Retry-After header asks for, in ms, or null when there is none
+ * or it cannot be read. Traefik's rate limiter sends seconds; other proxies
+ * may send a date.
+ */
+export function retryAfterMs(
+  res: Response,
+  now: number = Date.now(),
+): number | null {
+  const value = res.headers.get("retry-after")?.trim();
+  if (!value) return null;
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : Math.max(0, at - now);
+}
+
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(toError(signal.reason));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(toError(signal?.reason));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * `apiFetch` for calls the reverse proxy in front of the server may rate
+ * limit per address (the provided compose.prod.yaml does): a 429 is tried
+ * again a few times, backing off or waiting as long as Retry-After says,
+ * and then thrown as RateLimitedError. Only for requests that are safe to
+ * send twice; a 429 means the first one was turned away before it did
+ * anything.
+ */
+export async function apiFetchRetrying(
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await apiFetch(url, init);
+    if (res.status !== 429) return res;
+    if (attempt >= RATE_LIMIT_RETRIES) throw new RateLimitedError();
+    const backoff = RATE_LIMIT_BASE_MS * 2 ** attempt;
+    await sleep(
+      Math.min(retryAfterMs(res) ?? backoff, MAX_RETRY_AFTER_MS),
+      init.signal,
+    );
+  }
+}
+
 export interface ApiOptions {
   /** Origin to talk to; empty means same origin (the Vite proxy in dev). */
   baseUrl?: string;
@@ -70,7 +143,7 @@ export interface ApiOptions {
 export async function createSpace(
   opts: ApiOptions = {},
 ): Promise<CreatedSpace> {
-  const res = await apiFetch(`${opts.baseUrl ?? ""}/api/spaces`, {
+  const res = await apiFetchRetrying(`${opts.baseUrl ?? ""}/api/spaces`, {
     method: "POST",
     signal: opts.signal,
   });
@@ -176,6 +249,9 @@ export function parseShareInfo(value: unknown): ShareInfo | null {
 /** Upload limit enforced by the server (413 above it). */
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
+// Not retried: the quota only grows back if the server operator raises it.
+export const STORAGE_FULL_MESSAGE = "This project's storage is full";
+
 export interface StoredBlob {
   /** `sha256:<hex>` of the uploaded (encrypted) bytes. */
   hash: string;
@@ -193,7 +269,7 @@ export async function uploadBlob(
   name: string,
   opts: ApiOptions = {},
 ): Promise<StoredBlob> {
-  const res = await apiFetch(
+  const res = await apiFetchRetrying(
     `${opts.baseUrl ?? ""}/api/s/${encodeURIComponent(token)}/assets`,
     {
       method: "POST",
@@ -206,9 +282,11 @@ export async function uploadBlob(
     const reason =
       res.status === 413
         ? `${name} is larger than ${MAX_UPLOAD_BYTES / 1024 / 1024} MB`
-        : res.status === 403
-          ? "This link is read-only"
-          : `uploading ${name} failed: ${res.status}`;
+        : res.status === 507
+          ? STORAGE_FULL_MESSAGE
+          : res.status === 403
+            ? "This link is read-only"
+            : `uploading ${name} failed: ${res.status}`;
     throw new ApiError(res.status, reason);
   }
   return (await res.json()) as StoredBlob;

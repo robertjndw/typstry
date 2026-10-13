@@ -255,7 +255,7 @@ const OWNER_KEY_CONCURRENCY = 4;
  * have planted a pointer: `restorePersonalSpace` tries them in order and
  * takes the first that really is the person's space.
  */
-export function recoveredPersonSpaces(
+function recoveredPersonSpaces(
   words: string,
   link: LinkSecret,
   boot: Pick<MlsBootstrap, "groupInfo" | "keyring">,

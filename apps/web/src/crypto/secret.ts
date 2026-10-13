@@ -7,9 +7,9 @@
 import { fromBase64Url } from "./bytes";
 
 /** First byte of an edit secret, followed by 32 key bytes. */
-export const SECRET_EDIT_V1 = 1;
+const SECRET_EDIT_V1 = 1;
 /** First byte of a view secret, followed by the view key and public key. */
-export const SECRET_VIEW_V1 = 2;
+const SECRET_VIEW_V1 = 2;
 
 const SECRET_BYTES = 32;
 const VIEW_KEY_BYTES = 64;

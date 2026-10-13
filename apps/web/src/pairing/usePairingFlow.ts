@@ -8,7 +8,7 @@ import {
 
 import { fitDeviceName, loadWasm } from "@/crypto/wasm";
 import { toError } from "@/lib/errors";
-import { ApiError } from "@/sync/api";
+import { ApiError, RateLimitedError } from "@/sync/api";
 
 import { defaultDeviceName } from "./device-name";
 import type { PairSession, PairState } from "./session";
@@ -102,7 +102,9 @@ export function usePairingFlow() {
             ? "That is not a pairing code. It looks like 42-word-word."
             : e instanceof ApiError && e.status === 503
               ? "The server has no free channel right now. Try again in a moment."
-              : `Could not start pairing: ${toError(e).message}`,
+              : e instanceof RateLimitedError
+                ? e.message
+                : `Could not start pairing: ${toError(e).message}`,
         );
       } finally {
         if (mine === generation.current) setBusy(false);

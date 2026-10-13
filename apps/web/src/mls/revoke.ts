@@ -129,9 +129,20 @@ export async function cleanProjects(
     if (detached && !resetLinks) return null;
     // Another device of the person may hold the key of a project this one
     // never opened; the directory carries it here.
-    const ownerSecrets = detached
-      ? await withDirectoryOwnerKeys(entry.projectId, record?.ownerSecrets)
-      : undefined;
+    let ownerSecrets: Uint8Array | undefined;
+    try {
+      ownerSecrets = detached
+        ? await withDirectoryOwnerKeys(entry.projectId, record?.ownerSecrets)
+        : undefined;
+    } catch (error) {
+      // Owner keys saved by a newer typstry must not be merged over, and one
+      // such project should not abort the cleanup of all the others.
+      console.error(error);
+      return {
+        status: "unreached",
+        reason: "its owner keys could not be read",
+      };
+    }
     if (!link || (detached && !(entry.link.edit && ownerSecrets)))
       // A project the person dropped and cannot clean from here is not worth
       // a word, they chose not to see it.

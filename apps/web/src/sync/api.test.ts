@@ -5,7 +5,12 @@ import {
   blobUrl,
   createSpace,
   OutdatedClientError,
+  RATE_LIMIT_RETRIES,
+  RATE_LIMITED_MESSAGE,
+  RateLimitedError,
   resolveShare,
+  retryAfterMs,
+  STORAGE_FULL_MESSAGE,
   uploadBlob,
 } from "./api";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, RELOAD_MESSAGE } from "./protocol";
@@ -21,8 +26,28 @@ function mockFetch(status: number, body?: unknown) {
   return fn;
 }
 
+/** Answers with each of `statuses` in turn, then keeps answering the last. */
+function mockFetchSequence(
+  statuses: number[],
+  body: unknown,
+  headers: Record<string, string> = {},
+) {
+  let call = 0;
+  const fn = vi.fn<typeof fetch>(async () => {
+    const status = statuses[Math.min(call++, statuses.length - 1)]!;
+    const ok = status >= 200 && status < 300;
+    return new Response(ok ? JSON.stringify(body) : null, {
+      status,
+      headers: ok ? {} : headers,
+    });
+  });
+  vi.stubGlobal("fetch", fn);
+  return fn;
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("createSpace", () => {
@@ -99,6 +124,94 @@ describe("uploadBlob", () => {
     await expect(uploadBlob("tok", empty, "a.pdf")).rejects.toMatchObject({
       status: 403,
     });
+  });
+});
+
+describe("storage and rate limits", () => {
+  const stored = { hash: "sha256:00", size: 1 };
+  const bytes = new Uint8Array([1]);
+
+  it("says the project is full on a 507, without retrying", async () => {
+    const fetch = mockFetch(507);
+    await expect(uploadBlob("tok", bytes, "a.png")).rejects.toMatchObject({
+      status: 507,
+      message: STORAGE_FULL_MESSAGE,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries an upload after a 429 with the same body", async () => {
+    vi.useFakeTimers();
+    const fetch = mockFetchSequence([429, 429, 201], stored);
+    const upload = uploadBlob("tok", bytes, "a.png");
+    await vi.runAllTimersAsync();
+    await expect(upload).resolves.toEqual(stored);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const [first, last] = [fetch.mock.calls[0]!, fetch.mock.calls[2]!];
+    expect(last[1]?.body).toEqual(first[1]?.body);
+  });
+
+  it("gives up after a few 429s with a friendly message", async () => {
+    vi.useFakeTimers();
+    const fetch = mockFetchSequence([429], stored);
+    const created = createSpace().catch((e: unknown) => e);
+    await vi.runAllTimersAsync();
+    const err = await created;
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status: 429, message: RATE_LIMITED_MESSAGE });
+    expect(fetch).toHaveBeenCalledTimes(RATE_LIMIT_RETRIES + 1);
+  });
+
+  it("backs off, or waits as long as Retry-After says", async () => {
+    vi.useFakeTimers();
+    let fetch = mockFetchSequence([429, 429, 201], stored);
+    let upload = uploadBlob("tok", bytes, "a.png");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    // The second wait doubles.
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(upload).resolves.toEqual(stored);
+
+    fetch = mockFetchSequence([429, 201], stored, { "retry-after": "5" });
+    upload = uploadBlob("tok", bytes, "a.png");
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(upload).resolves.toEqual(stored);
+  });
+
+  it("stops waiting when aborted", async () => {
+    vi.useFakeTimers();
+    const fetch = mockFetchSequence([429], stored);
+    const abort = new AbortController();
+    const created = createSpace({ signal: abort.signal }).catch(
+      (e: unknown) => e,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    abort.abort(new Error("gone"));
+    await expect(created).resolves.toMatchObject({ message: "gone" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads Retry-After as seconds or as a date", () => {
+    const res = (value?: string) =>
+      new Response(null, {
+        status: 429,
+        headers: value === undefined ? {} : { "retry-after": value },
+      });
+    expect(retryAfterMs(res())).toBeNull();
+    expect(retryAfterMs(res("3"))).toBe(3000);
+    expect(retryAfterMs(res("soon"))).toBeNull();
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    expect(retryAfterMs(res("Thu, 01 Jan 2026 00:00:10 GMT"), now)).toBe(
+      10_000,
+    );
+    expect(retryAfterMs(res("Wed, 31 Dec 2025 00:00:00 GMT"), now)).toBe(0);
   });
 });
 

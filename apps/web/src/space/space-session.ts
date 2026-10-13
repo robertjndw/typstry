@@ -55,7 +55,7 @@ const WRONG_KEY =
   "This link's key does not match the project. Check that the link was copied completely, including the part after #.";
 export const TOO_NEW =
   "This project was saved by a newer version of typstry. Reload the page to update.";
-export const UNREACHABLE = "The server could not be reached.";
+const UNREACHABLE = "The server could not be reached.";
 export const LINK_REPLACED =
   "This link was replaced, and this browser has no way to find the new one. Ask someone in the project for the current link.";
 
@@ -91,6 +91,11 @@ export interface SpaceSnapshot {
   /** Connecting takes suspiciously long. */
   slow: boolean;
   status: SyncStatus;
+  /**
+   * The server refused local edits for good on this connection, said for
+   * people; null while all is well. They stay in this browser.
+   */
+  syncProblem: string | null;
   followed: FollowedLinks | null;
   /** The member group; null until the share is known. */
   mls: MlsSession | null;
@@ -148,6 +153,7 @@ interface State {
   synced: boolean;
   slow: boolean;
   status: SyncStatus;
+  syncProblem: string | null;
   followed: FollowedLinks | null;
   mls: MlsSession | null;
   mlsSnapshot: MlsSnapshot;
@@ -161,6 +167,17 @@ function sameShare(a: ShareInfo | null | undefined, b: ShareInfo | null) {
     a.viewToken === b.viewToken &&
     a.retired === b.retired
   );
+}
+
+/** Why the server refused local edits, for people. */
+function refusedText(reason: string): string {
+  if (reason === "permission_denied")
+    return "The server no longer takes edits from this link. Your changes are kept in this browser.";
+  if (reason === "malformed_record")
+    return "Some changes could not be encrypted for upload. They are kept in this browser.";
+  if (reason === "payload_too_large")
+    return "Some changes are too large for the server. They are kept in this browser.";
+  return "The server refused some changes. They are kept in this browser.";
 }
 
 /** What to tell the user when the space's keys would not open. */
@@ -223,6 +240,7 @@ export class SpaceSession {
       synced: false,
       slow: false,
       status: "connecting",
+      syncProblem: null,
       followed: null,
       mls: null,
       mlsSnapshot: IDLE,
@@ -592,6 +610,9 @@ export class SpaceSession {
         },
         // The group rotated; its new links are what open these records.
         onUnknownGeneration: () => this.s.mls?.catchUp(),
+        onUpdateRefused: (reason) => {
+          if (active) this.set({ syncProblem: refusedText(reason) });
+        },
         checkRetired: async () => (await resolveShare(token))?.retired === true,
         onRetired: () => this.s.mls?.catchUp(),
         onOutdated: () => {
@@ -636,6 +657,8 @@ export class SpaceSession {
     return () => {
       active = false;
       this.flushAndSync = null;
+      // Said of this connection; the next one gets to try again.
+      this.s.syncProblem = null;
       close?.();
       void local?.stop();
     };
@@ -643,7 +666,7 @@ export class SpaceSession {
 
   private build(): SpaceSnapshot {
     const { share, error, unreachable, crypto, loadedLocally, synced } = this.s;
-    const { slow, status } = this.s;
+    const { slow, status, syncProblem } = this.s;
     const { followed, mls, mlsSnapshot } = this.s;
     const key = this.currentKey();
     const opened = synced || loadedLocally;
@@ -674,6 +697,7 @@ export class SpaceSession {
       synced,
       slow,
       status,
+      syncProblem,
       followed,
       mls,
     };
