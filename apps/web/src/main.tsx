@@ -7,6 +7,7 @@ import { RouterProvider } from "react-router/dom";
 import { refreshDirectoryService } from "@/directory/service";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { StorageNotice } from "@/persist/StorageNotice";
 import { routes } from "@/router";
 import { pruneStaleCaches } from "@/typst/cache-names";
 import "./index.css";
@@ -25,6 +26,11 @@ createRoot(document.getElementById("root")!).render(
     <ThemeProvider attribute="class" disableTransitionOnChange>
       <TooltipProvider>
         <RouterProvider router={router} />
+        {/* Fixed rather than in the flow: pages are sized to the viewport,
+            and this covers every route, Home included. */}
+        <div className="fixed inset-x-0 bottom-0 z-50 bg-background empty:hidden">
+          <StorageNotice />
+        </div>
         <Toaster />
       </TooltipProvider>
     </ThemeProvider>

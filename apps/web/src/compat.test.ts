@@ -9,7 +9,7 @@ import path from "node:path";
 import { LoroDoc, LoroText } from "loro-crdt";
 import { describe, expect, it } from "vitest";
 
-import { fromBase64Url } from "./crypto/bytes";
+import { fromBase64Url, toBase64Url } from "./crypto/bytes";
 import { SpaceCrypto } from "./crypto/space-crypto";
 import {
   DocKeys,
@@ -20,6 +20,8 @@ import {
   recordVersion,
   sealVersion,
 } from "./crypto/wasm";
+import { Directory } from "./directory/directory";
+import { DIRECTORY_SCHEMA_VERSION, ROOT } from "./directory/schema";
 import { buildPathIndex } from "./doc/paths";
 import { versionAt } from "./doc/restore";
 import {
@@ -252,6 +254,37 @@ describe.each(compatDirs())("compat crypto v%i", (_n, dir) => {
   });
 });
 
+// What compat.rs in typstry-doc wrote directory.json from: the list, the
+// owner keys and the project of every token, read at the same time.
+const DIRECTORY_NOW = 1_000_000;
+
+describe.each(compatDirs())("compat directory v%i", (_n, dir) => {
+  it("reads the directory", () => {
+    const expected = readJson<Record<string, unknown>>(dir, "directory.json");
+    const doc = new LoroDoc();
+    doc.import(readFileSync(path.join(dir, "directory.loro")));
+    const directory = new Directory(doc);
+    expect(directory.unsupported()).toBeNull();
+    const list = directory.list(DIRECTORY_NOW);
+    const tokens = Object.keys(doc.getMap(ROOT.links).toJSON()).sort();
+    expect({
+      schema: directory.schemaVersion,
+      list,
+      ownerKeys: Object.fromEntries(
+        list.map((e) => [
+          e.projectId,
+          directory
+            .ownerKeys(e.projectId, DIRECTORY_NOW)
+            .map((k) => [k.publicKey, toBase64Url(k.secret)]),
+        ]),
+      ),
+      projectOfToken: Object.fromEntries(
+        tokens.map((t) => [t, directory.projectOfToken(t, DIRECTORY_NOW)]),
+      ),
+    }).toEqual(expected);
+  });
+});
+
 // Without this, a format bump with no new fixture would pass on the old
 // ones while nothing reads the new format.
 it("has a compat fixture for every current format", () => {
@@ -259,6 +292,7 @@ it("has a compat fixture for every current format", () => {
   const frozen = readJson<Record<string, number>>(newest, "versions.json");
   for (const [name, current] of [
     ["schema", SCHEMA_VERSION],
+    ["directory", DIRECTORY_SCHEMA_VERSION],
     ["seal", sealVersion()],
     ["record", recordVersion()],
     ["ds", dsVersion()],

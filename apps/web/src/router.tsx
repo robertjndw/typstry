@@ -4,11 +4,19 @@ import { RouteError } from "@/components/RouteError";
 import { Home } from "@/routes/Home";
 import { Pair } from "@/routes/Pair";
 import { Recover } from "@/routes/Recover";
-import { Project } from "@/routes/Project";
 
 export const routes: RouteObject[] = [
   { path: "/", errorElement: <RouteError />, element: <Home /> },
-  { path: "/p/:token", errorElement: <RouteError />, element: <Project /> },
+  {
+    path: "/p/:token",
+    errorElement: <RouteError />,
+    // The editor, compiler client and sync stack are most of the bundle, and
+    // the start page needs none of them.
+    HydrateFallback: () => null,
+    lazy: async () => ({
+      Component: (await import("@/routes/Project")).Project,
+    }),
+  },
   { path: "/pair", errorElement: <RouteError />, element: <Pair /> },
   { path: "/recover", errorElement: <RouteError />, element: <Recover /> },
 ];

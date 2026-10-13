@@ -155,6 +155,14 @@ export class ProjectStore {
   private emit(): void {
     for (const listener of this.listeners) listener();
   }
+
+  /** Lets go of the doc. The store is unusable afterwards. */
+  dispose(): void {
+    this.listeners.clear();
+    this.unsubscribeIndex?.();
+    this.unsubscribeIndex = null;
+    this.undoManager.free();
+  }
 }
 
 /** The tab after `closed` that's still open, else the one before it. */

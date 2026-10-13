@@ -40,6 +40,12 @@ export class RetryQueue {
     this.waiting.set(key, cancel);
   }
 
+  /** Drops the retry waiting for `key`, if any, and its backoff. */
+  cancel(key: string): void {
+    this.waiting.get(key)?.();
+    this.failures.delete(key);
+  }
+
   /** Resets the backoff for `key`. */
   succeeded(key: string): void {
     this.failures.delete(key);

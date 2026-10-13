@@ -59,6 +59,8 @@ function matches(event: KeyboardEvent, combo: ParsedCombo): boolean {
   return code !== null && event.code === code;
 }
 
+const DIALOG_SELECTOR = '[role="dialog"], [role="alertdialog"]';
+
 /** Marks an element whose shortcuts only apply while focus is inside it. */
 const SCOPE_ATTR = "data-shortcut-scope";
 
@@ -95,9 +97,19 @@ export function useShortcuts(
         const owner = event.target.closest(`[${SCOPE_ATTR}]`);
         if (owner && owner !== scope.current) return;
       }
+      // Dialogs are portaled to the end of <body>, outside any scope, and
+      // a workspace shortcut acting behind an open dialog (Mod+B hiding the
+      // sidebar under it, Mod+P opening a second overlay) is never wanted.
+      const inDialog =
+        event.target instanceof Element &&
+        event.target.closest(DIALOG_SELECTOR) !== null &&
+        !(scope?.current && scope.current.contains(event.target));
       for (const [combo, handler] of Object.entries(latest.current)) {
         if (!handler || !matches(event, parse(combo))) continue;
+        // Still kept from the browser, whose save or print dialog would be
+        // just as unexpected over the app's.
         event.preventDefault();
+        if (inDialog) return;
         event.stopPropagation();
         if (!event.repeat) handler(event);
         return;

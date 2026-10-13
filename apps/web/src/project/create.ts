@@ -54,19 +54,31 @@ export async function createLocalProject(
   const { created, key, link, group, backend } = await createSpaceGroup(opts);
 
   const doc = new LoroDoc();
-  const store = new LocalDocStore(created.spaceId, doc, backend);
-  // Load first: the store only writes what changed after it loaded.
-  await store.load();
-  const project = initProject(doc, { title, starter: !opts.seed });
-  if (opts.seed) {
-    const assets = projectAssets(
-      created.editToken,
-      new SpaceCrypto(link, group.docKeys(), group.signer()),
-      { baseUrl: opts.baseUrl },
-    );
-    await opts.seed(project, assets);
+  // Owns `link` once made; whichever holds it frees it below.
+  let seedCrypto: SpaceCrypto | null = null;
+  try {
+    const store = new LocalDocStore(created.spaceId, doc, backend);
+    // Load first: the store only writes what changed after it loaded.
+    await store.load();
+    const project = initProject(doc, { title, starter: !opts.seed });
+    if (opts.seed) {
+      seedCrypto = new SpaceCrypto(link, group.docKeys(), group.signer());
+      const assets = projectAssets(created.editToken, seedCrypto, {
+        baseUrl: opts.baseUrl,
+      });
+      await opts.seed(project, assets);
+    }
+    await store.flush();
+  } catch (error) {
+    group.free();
+    throw error;
+  } finally {
+    if (seedCrypto) seedCrypto.free();
+    else link.free();
+    doc.free();
   }
-  await store.flush();
+  const ownerSecret = ownerSecretList(group.ownerSecrets())[0];
+  group.free();
 
   // Only remembered once seeding worked, so a failed import leaves no
   // half-filled project behind in the project list.
@@ -77,10 +89,7 @@ export async function createLocalProject(
     title,
   );
   // A fresh group holds exactly the one key the server was given.
-  await recordOwnerSecret(
-    created.spaceId,
-    ownerSecretList(group.ownerSecrets())[0],
-  );
+  await recordOwnerSecret(created.spaceId, ownerSecret);
   return { projectId: created.spaceId, editToken: created.editToken, key };
 }
 

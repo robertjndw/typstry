@@ -36,6 +36,7 @@ import { createLocalProject, deleteLocalProject } from "@/project/create";
 import type { Entry } from "@/directory/directory";
 import { useDirectory } from "@/directory/store";
 import { projectUrl } from "@/project/recent";
+import { RateLimitedError } from "@/sync/api";
 
 const TITLE_MAX_LENGTH = 120;
 
@@ -90,9 +91,13 @@ export function Home() {
   async function deleteProject(project: Entry) {
     try {
       await deleteLocalProject(project.projectId);
+      // The row disappears as soon as the directory doc changes, before
+      // anything is saved, and a reload in that gap brings the project back.
+      // The toast waits for the save, so it is the moment the delete sticks.
+      toast.success(`Deleted "${titleOf(project)}"`);
     } catch (err) {
       console.error(err);
-      toast.error("Could not clear the local copy of this project");
+      toast.error(`Could not delete "${titleOf(project)}"`);
     }
   }
 
@@ -106,7 +111,11 @@ export function Home() {
       navigate(projectUrl(created.editToken, created.key, ""));
     } catch (err) {
       console.error(err);
-      setError("Could not create a project. Is the server running?");
+      setError(
+        err instanceof RateLimitedError
+          ? err.message
+          : "Could not create a project. Is the server running?",
+      );
       setCreating(false);
     }
   }
@@ -142,7 +151,7 @@ export function Home() {
     } catch (err) {
       console.error(err);
       setError(
-        err instanceof ImportError
+        err instanceof ImportError || err instanceof RateLimitedError
           ? err.message
           : "Could not import the project. Is the server running?",
       );

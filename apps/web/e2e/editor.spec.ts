@@ -1,5 +1,6 @@
 import {
   appendLine,
+  createEntry,
   createProject,
   editor,
   expect,
@@ -84,4 +85,39 @@ test("the project can be renamed", async ({ page }) => {
   await expect(page).toHaveTitle("New name · typstry");
   await page.getByRole("link", { name: "All projects" }).click();
   await expect(page.getByRole("link", { name: /New name/ })).toBeVisible();
+});
+
+test("an error in another file opens it at the offending line", async ({
+  page,
+}) => {
+  await createProject(page, "Cross-file errors");
+
+  await createEntry(page, "chapter.typ");
+  await editor(page).click();
+  await page.keyboard.type("First line");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("#undefinedthing");
+
+  await tab(page, "main.typ").click();
+  await appendLine(page, '#include "chapter.typ"');
+  const error = preview(page)
+    .getByLabel("Diagnostics")
+    .getByRole("button", {
+      name: /chapter\.typ:2:\d+ unknown variable: undefinedthing/,
+    });
+  await expect(error).toBeVisible();
+
+  // The click swaps the editor to chapter.typ and must still land on line 2
+  // of the new file, not get lost with main.typ's editor.
+  await error.click();
+  await expect(tab(page, "chapter.typ")).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(editor(page)).toBeFocused();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Shift+Home");
+  await page.keyboard.press("Delete");
+  await expect(editor(page)).not.toContainText("undefinedthing");
+  await expect(editor(page)).toContainText("First line");
 });
