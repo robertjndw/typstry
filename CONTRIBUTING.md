@@ -6,6 +6,8 @@ Issues and pull requests are welcome. For anything larger than a small fix, open
 
 The [Development](README.md#development) section of the README lists the prerequisites and how to build the wasm parts and start the dev server. [The documentation](docs/README.md) explains how typstry works.
 
+To check formatting, clippy, lint and types on every commit, set up the hooks once with [pre-commit](https://pre-commit.com/): `pre-commit install`. [prek](https://prek.j178.dev/) reads the same config if you prefer it (`prek install`). The hooks skip the tests, so still run everything below before opening a pull request.
+
 ## Before opening a pull request
 
 Run the same checks as CI:
