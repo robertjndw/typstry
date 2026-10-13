@@ -59,6 +59,11 @@ const DIRECTORY_EVERY: Duration = Duration::from_secs(60);
 /// never overwritten. With a view-only link only remote edits come in.
 #[derive(Debug, Default, clap::Args)]
 #[command(after_long_help = "\
+In a terminal, sync shows a status bar under its log: the connection, \
+the totals synced, and the keys p (publish held changes), o (open the \
+project in the browser), l (print the links) and q or Ctrl+C (stop). \
+Pass --plain, or pipe the output, for plain lines.
+
 Git: sync pauses in both directions while git is rewriting files (merge, \
 rebase, index.lock) and while a branch other than the tracked one is \
 checked out, so other branches stay private drafts. Merging a draft into \
@@ -70,9 +75,9 @@ draft and the checkout removed them again. Publishing that folder would \
 revert those edits for everyone, so sync then holds back all outgoing \
 changes and lists the files. Incoming changes still arrive, except for \
 files that changed on both sides, which wait. Review the files, then \
-publish them by typing `push` and Enter in the sync terminal, or by \
-stopping sync and running `typstry push --force` or `typstry sync \
---publish`. Restoring the files so they match the last sync again lifts \
+publish them by pressing p in the status bar (typing `push` and Enter \
+with --plain), or by stopping sync and running `typstry push --force` \
+or `typstry sync --publish`. Restoring the files so they match the last sync again lifts \
 the hold too. The same check runs after a `git reset`, and when sync \
 starts after a branch switch that happened while it was not running.
 
@@ -108,9 +113,19 @@ pub enum Notice {
     Resumed,
     Holding,
     Released,
+    /// A reconcile moved files: `up` went out, `down` came in.
+    Synced {
+        up: usize,
+        down: usize,
+    },
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
+    if crate::term::interactive()
+        && let Some(screen) = crate::tui::sync_bar::Screen::new()
+    {
+        return crate::tui::sync_bar::run(ctx, args, screen).await;
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     let stdin_tx = tx.clone();
     // A plain thread rather than spawn_blocking: a blocked stdin read
@@ -132,15 +147,18 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             std::process::exit(130);
         }
     });
-    run_with(ctx, args, rx, None).await
+    run_with(ctx, args, rx, None, false).await
 }
 
 /// The sync loop, driven by `control` instead of the terminal.
+/// `interactive` says the status bar is on screen, so publishing is a key
+/// press instead of a typed `push`.
 pub async fn run_with(
     ctx: &Ctx,
     args: Args,
     mut control: mpsc::UnboundedReceiver<Control>,
     notices: Option<mpsc::UnboundedSender<Notice>>,
+    interactive: bool,
 ) -> anyhow::Result<()> {
     let session = ctx.open()?;
     // Before the announcement, so a command that sees sync in the lock
@@ -152,7 +170,12 @@ pub async fn run_with(
     // Watching starts before anything is read, so no edit falls between
     // the first reconcile and the first event.
     let (_watcher, mut changes) = Watcher::start(session.root())?;
-    let mut live = Live::new(session, mailbox, notices);
+    let publish_hint = if interactive {
+        "press p"
+    } else {
+        "type `push` and Enter"
+    };
+    let mut live = Live::new(session, mailbox, notices, publish_hint);
     live.start(args.publish).await?;
 
     loop {
@@ -272,6 +295,9 @@ struct Live {
     session: Session,
     mailbox: Mailbox,
     notices: Option<mpsc::UnboundedSender<Notice>>,
+    /// How the user publishes held changes: a key under the status bar,
+    /// a typed `push` otherwise.
+    publish_hint: &'static str,
     synced: Synced,
     local: LocalQueue,
     /// When paths were last saved locally, for the [`HOT`] hold.
@@ -303,12 +329,14 @@ impl Live {
         session: Session,
         mailbox: Mailbox,
         notices: Option<mpsc::UnboundedSender<Notice>>,
+        publish_hint: &'static str,
     ) -> Self {
         let now = Instant::now();
         Self {
             session,
             mailbox,
             notices,
+            publish_hint,
             synced: Synced::default(),
             local: LocalQueue::default(),
             saved: HashMap::new(),
@@ -332,6 +360,20 @@ impl Live {
     fn notify(&self, notice: Notice) {
         if let Some(tx) = &self.notices {
             let _ = tx.send(notice);
+        }
+    }
+
+    /// Prints one line per synced file and tells the status bar the totals.
+    fn report(&self, report: &Report) {
+        print_lines(report);
+        let applied = &report.applied;
+        let up = applied.created.len()
+            + applied.modified.len()
+            + applied.renamed.len()
+            + applied.deleted.len();
+        let down = report.written.len() + report.deleted.len();
+        if up + down > 0 {
+            self.notify(Notice::Synced { up, down });
         }
     }
 
@@ -366,7 +408,7 @@ impl Live {
             }
         }
         if !self.session.can_write() {
-            println!("sync: view-only link, only receiving changes");
+            say!("sync: view-only link, only receiving changes");
         }
         self.notify(Notice::Ready);
         self.step().await;
@@ -448,7 +490,7 @@ impl Live {
             return;
         }
         let line = format!("{err:#}");
-        println!("sync: offline ({line}), reconnecting");
+        say!("sync: offline ({line}), reconnecting");
         self.reconnect.lost(line);
         self.notify(Notice::Offline);
     }
@@ -457,9 +499,9 @@ impl Live {
         let could_write = self.session.can_write();
         match self.session.connect().await {
             Ok(()) => {
-                println!("sync: connected to {}", self.session.config.server);
+                say!("sync: connected to {}", self.session.config.server);
                 if could_write && !self.session.can_write() {
-                    println!("sync: the link is view-only now, only receiving changes");
+                    say!("sync: the link is view-only now, only receiving changes");
                 }
                 self.reconnect = Reconnect::default();
                 // Edits made while offline went out in connect(); anything
@@ -476,7 +518,7 @@ impl Live {
                 }
                 let line = format!("{err:#}");
                 if self.reconnect.shown.as_deref() != Some(line.as_str()) {
-                    println!("sync: offline ({line}), retrying in the background");
+                    say!("sync: offline ({line}), retrying in the background");
                     self.notify(Notice::Offline);
                 }
                 self.reconnect.failed(line);
@@ -530,7 +572,7 @@ impl Live {
         let server = self.session.config.server.clone();
         for warning in sync_pass(&server, PASS_BUDGET).await {
             if self.warned.insert(warning.clone()) {
-                eprintln!("warning: {warning}");
+                say_err!("warning: {warning}");
             }
         }
         self.next_directory = Instant::now() + DIRECTORY_EVERY;
@@ -570,7 +612,7 @@ impl Live {
         }
         let line = format!("{err:#}");
         if self.last_error.as_deref() != Some(line.as_str()) {
-            eprintln!("sync: {line}; retrying");
+            say_err!("sync: {line}; retrying");
             self.last_error = Some(line);
         }
         self.retry_at = Some(Instant::now() + ERROR_RETRY);
@@ -581,7 +623,7 @@ impl Live {
         if !self.session.can_write() {
             for path in batch {
                 if self.warned.insert(path.clone()) {
-                    eprintln!("warning: view-only link, not publishing {path}");
+                    say_err!("warning: view-only link, not publishing {path}");
                 }
             }
             return;
@@ -634,7 +676,7 @@ impl Live {
             Ok(Reconciled::Held(paths)) => self.remote_due = Some(self.hot_until(&paths)),
             Ok(Reconciled::Done(mut report)) => {
                 if !report.conflicts.is_empty() {
-                    println!(
+                    say!(
                         "sync: remote changes to {} wait until the local changes to them are published or undone",
                         report.conflicts.join(", ")
                     );
@@ -657,7 +699,7 @@ impl Live {
             .is_some()
             .then(|| self.session.doc().oplog_frontiers());
         self.last_error = None;
-        print_lines(report);
+        self.report(report);
         self.synced
             .update(&self.session, std::mem::take(&mut report.base));
         if report.applied.changed
@@ -698,7 +740,7 @@ impl Live {
     /// Stops after an error that reconnecting cannot fix, keeping what the
     /// run did so far. Edits not sent yet stay in the cached doc.
     async fn abort(mut self, err: SyncError) -> anyhow::Result<()> {
-        eprintln!("sync: stopping, {err}");
+        say_err!("sync: stopping, {err}");
         self.refuse_requests(&format!("typstry sync stopped: {err}"));
         print_warnings(&mut Output::terminal(), &mut self.session);
         self.session.save_compacted()?;
@@ -707,7 +749,7 @@ impl Live {
     }
 
     async fn shutdown(mut self) -> anyhow::Result<()> {
-        println!("sync: stopping");
+        say!("sync: stopping");
         self.refuse_requests("typstry sync is stopping; run the command again once it has");
         // After an unnoticed reset the folder may lack pulled edits; the
         // next run checks it before publishing anything.
@@ -722,15 +764,15 @@ impl Live {
                 .reconcile(&Scope::Full, Mode::Push, Flush::Deferred)
                 .await
             {
-                Ok(report) => print_lines(&report),
-                Err(err) => eprintln!("sync: final sync failed: {err:#}"),
+                Ok(report) => self.report(&report),
+                Err(err) => say_err!("sync: final sync failed: {err:#}"),
             }
             if self.session.is_connected()
                 && tokio::time::timeout(FLUSH_TIMEOUT, self.session.push_local())
                     .await
                     .map_or(true, |r| r.is_err())
             {
-                eprintln!(
+                say_err!(
                     "sync: some changes were not confirmed by the server; they go out with the next sync or push"
                 );
             }

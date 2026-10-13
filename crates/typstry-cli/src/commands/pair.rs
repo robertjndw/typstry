@@ -16,15 +16,16 @@ use typstry_wire::pairing::{
 };
 use typstry_wire::relay::{CHANNEL_TTL_SECS, close_reason};
 
-use super::Ctx;
 use super::init::confirm;
 use super::list::print_catalog;
+use super::{Ctx, clone};
 use crate::api::Api;
 use crate::client::{PING_INTERVAL, Socket, open_socket};
 use crate::directory::list_all;
 use crate::link::{ShareLink, relay_url};
 use crate::space::{ensure_space, join_space, sync_server};
 use crate::state::StateDir;
+use crate::tui::countdown::Countdown;
 use crate::user::{
     KnownProject, catalog, load_identity, load_or_create_device, merge_graph, owner_keys, projects,
     save_paired_graph, set_device_label,
@@ -105,6 +106,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     }
     let device_name = device_name(ctx.name.as_deref());
 
+    let mut countdown = None;
     let meeting = match args.code.as_deref() {
         None => {
             let origin = server_for(ctx, args.server.as_deref(), None)?;
@@ -113,10 +115,15 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             println!("Pairing code: {code}");
             println!("Or open:      {origin}/pair#{code}");
             println!("On the other device run: typstry pair {code}");
-            println!(
-                "Waiting for it (the code expires in {} min)...",
-                channel.expires_in.div_ceil(60)
-            );
+            if crate::term::interactive() {
+                // The countdown line takes the place of the static one.
+                countdown = Some(Countdown::new(Duration::from_secs(channel.expires_in)));
+            } else {
+                println!(
+                    "Waiting for it (the code expires in {} min)...",
+                    channel.expires_in.div_ceil(60)
+                );
+            }
             Meeting {
                 origin,
                 code,
@@ -153,6 +160,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             identity.as_mut(),
             &device_name,
             args.yes,
+            countdown,
         ),
     )
     .await;
@@ -160,7 +168,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     match outcome {
         Ok(Ok(Outcome::Approved)) => Ok(()),
         Ok(Ok(Outcome::Granted(grant))) => {
-            joined(grant, &meeting.origin, replace, old_person).await
+            joined(ctx, grant, &meeting.origin, replace, old_person).await
         }
         Ok(Err(err)) => Err(err),
         Err(_) => {
@@ -183,6 +191,7 @@ async fn pair(
     mut identity: Option<&mut LocalIdentity>,
     device_name: &str,
     yes: bool,
+    mut countdown: Option<Countdown>,
 ) -> anyhow::Result<Outcome> {
     // The new side's key, which the holder shows before it approves.
     let mut own_key = None;
@@ -198,14 +207,32 @@ async fn pair(
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut second = tokio::time::interval(Duration::from_secs(1));
+    second.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let frame = tokio::select! {
             frame = ws.next() => frame,
+            _ = second.tick(), if countdown.is_some() => {
+                if let Some(countdown) = &countdown {
+                    countdown.draw();
+                }
+                continue;
+            }
             _ = ping.tick() => {
                 send_ping(ws).await?;
                 continue;
             }
         };
+        // A frame from the other device (or the socket ending) ends the
+        // wait, and the line has to be gone before this loop prints or asks
+        // anything. Text frames are the server's answers to our keep-alive
+        // pings and are skipped below like the other control frames.
+        if !matches!(
+            frame,
+            Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_)))
+        ) {
+            countdown = None;
+        }
         let bytes = match frame {
             Some(Ok(Message::Binary(bytes))) => bytes,
             Some(Ok(Message::Close(frame))) => {
@@ -318,6 +345,7 @@ async fn ask(
 /// What the new device does with a grant. `old_person` is the person this
 /// machine was before, if any.
 async fn joined(
+    ctx: &Ctx,
     grant: Grant,
     origin: &str,
     replace: bool,
@@ -361,8 +389,17 @@ async fn joined(
         "paired, but this device could not join your personal space, so your projects will not sync",
     )?;
     sync_server(origin).await;
-    if catalog()?.is_empty() {
+    let entries = catalog()?;
+    if entries.is_empty() {
         println!("The other device has no projects yet.");
+    } else if crate::term::interactive()
+        && entries
+            .iter()
+            .any(|entry| entry.dir.is_none() && entry.state == State::Listed)
+    {
+        println!("Pick a project to clone now, or press q to do it later with `typstry list`.");
+        // Without a link, clone shows the picker itself.
+        Box::pin(clone::run(ctx, clone::Args::default())).await?;
     } else {
         println!("Your projects (copy one with `typstry clone <number>`):");
         print_catalog(false)?;

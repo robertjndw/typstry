@@ -88,7 +88,7 @@ pub async fn ask(running: &SyncRunning, request: &Request) -> anyhow::Result<()>
                 let response: Response = serde_json::from_slice(&bytes).map_err(|err| {
                     anyhow::anyhow!("{OTHER_VERSION} (cannot read its answer: {err})")
                 })?;
-                for line in &response.lines {
+                for line in response.lines {
                     line.print();
                 }
                 return match response.error {
@@ -227,7 +227,7 @@ impl Mailbox {
     pub fn answer(&self, id: &str, response: &Response) {
         let path = self.dir.join(format!("{id}{RESPONSE}"));
         if let Err(err) = write_json(&path, response) {
-            eprintln!("sync: cannot answer a request: {err:#}");
+            say_err!("sync: cannot answer a request: {err:#}");
         }
     }
 }

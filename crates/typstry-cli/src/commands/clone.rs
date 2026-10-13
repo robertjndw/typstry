@@ -13,9 +13,13 @@ use crate::git::{self, Repo};
 use crate::link::ShareLink;
 use crate::space::{sync_bound, sync_server};
 use crate::state::{STATE_DIR, StateDir};
+use crate::tui::picker::{Mode as PickMode, Outcome, pick};
 
 /// Copy a project into a new folder and link the folder to it.
-#[derive(Debug, clap::Args)]
+///
+/// Without a link, a terminal shows a picker over the projects that are
+/// not on this device yet.
+#[derive(Debug, Default, clap::Args)]
 #[command(after_long_help = "\
 The link holds the project key. On the command line it ends up in your \
 shell history and is visible to other users of the machine while clone \
@@ -41,7 +45,13 @@ pub struct Args {
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
-    let link = read_link(args.link.as_deref())?;
+    let link = match args.link.as_deref().filter(|l| !l.trim().is_empty()) {
+        None if crate::term::interactive() => match pick(PickMode::Clone, true).await? {
+            Outcome::Clone(link) => link,
+            Outcome::Sync(_) | Outcome::Quit => return Ok(()),
+        },
+        _ => read_link(args.link.as_deref())?,
+    };
     let link = ShareLink::parse(&resolve_listed(&link).await?)?;
     let explicit = args.dir.map(|dir| ctx.dir.join(dir));
     // Everything that can fail without the network fails before it.

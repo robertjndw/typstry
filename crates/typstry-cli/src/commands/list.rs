@@ -1,6 +1,6 @@
-use typstry_doc::directory::State;
-
+use super::{Ctx, clone, sync};
 use crate::space::sync_bound;
+use crate::tui::picker::{Mode, Outcome, pick};
 use crate::user::catalog;
 
 /// List your projects, including the ones other devices of yours have.
@@ -8,6 +8,10 @@ use crate::user::catalog;
 /// Projects that only exist on your other devices (handed over by
 /// `typstry pair`) show a `typstry clone` shortcut. Pass its number or the
 /// project title to `typstry clone` instead of the link.
+///
+/// In a terminal this is an interactive picker: filter by title, open a
+/// project in the browser, sync one that is here or clone one that is not.
+/// `--plain` prints the list instead.
 #[derive(Debug, clap::Args)]
 #[command(visible_alias = "ls")]
 pub struct Args {
@@ -16,7 +20,27 @@ pub struct Args {
     pub missing: bool,
 }
 
-pub async fn run(args: Args) -> anyhow::Result<()> {
+pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
+    if crate::term::interactive() {
+        // The picker has given the terminal back by the time these run.
+        return match pick(Mode::List, args.missing).await? {
+            Outcome::Sync(dir) => {
+                let ctx = Ctx {
+                    dir,
+                    name: ctx.name.clone(),
+                };
+                Box::pin(sync::run(&ctx, sync::Args::default())).await
+            }
+            Outcome::Clone(link) => {
+                let args = clone::Args {
+                    link: Some(link),
+                    ..Default::default()
+                };
+                Box::pin(clone::run(ctx, args)).await
+            }
+            Outcome::Quit => Ok(()),
+        };
+    }
     // Before reading, so projects the person's other devices added show up.
     sync_bound().await;
     print_catalog(args.missing)
@@ -39,12 +63,7 @@ pub fn print_catalog(missing: bool) -> anyhow::Result<()> {
             continue;
         }
         shown += 1;
-        let why = match entry.state {
-            State::Removed => Some("you were removed from this project"),
-            State::Gone => Some("the server no longer knows this project"),
-            State::Listed | State::Forgotten => None,
-        };
-        match (&entry.dir, why) {
+        match (&entry.dir, entry.unavailable()) {
             (Some(dir), None) => {
                 println!("{:>3}. {}\n       {}", i + 1, entry.title, dir.display())
             }

@@ -261,7 +261,7 @@ pub async fn drop_revoked(server: &str) -> anyhow::Result<Option<usize>> {
 /// just recorded something, so the person's other devices hear of it.
 pub async fn sync_server(server: &str) {
     for warning in sync_pass(server, PASS_BUDGET).await {
-        eprintln!("warning: {warning}");
+        say_err!("warning: {warning}");
     }
 }
 
@@ -270,7 +270,7 @@ pub async fn sync_bound() {
     let servers = match directory::bound_servers() {
         Ok(servers) => servers,
         Err(err) => {
-            eprintln!("warning: could not look for your personal spaces: {err:#}");
+            say_err!("warning: could not look for your personal spaces: {err:#}");
             return;
         }
     };
@@ -283,6 +283,6 @@ pub async fn sync_bound() {
         .into_iter()
         .flatten()
     {
-        eprintln!("warning: {warning}");
+        say_err!("warning: {warning}");
     }
 }
