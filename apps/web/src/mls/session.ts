@@ -717,6 +717,10 @@ export class MlsSession {
   private end(phase: MlsPhase, error: string | null = null): void {
     this.terminal = { phase, error };
     this.publish();
+    // A commit waiting for the socket to come back would wait out its whole
+    // timeout for links that lead nowhere.
+    if (phase === "lost")
+      for (const listener of [...this.permissionListeners]) listener();
   }
 
   private publish(): void {
@@ -1635,7 +1639,12 @@ export class MlsSession {
     const ds = this.ds;
     if (!group?.isActive || !ds) throw new Error("you are not a member");
     // Moving to new links: the socket has no permission until it is back.
-    if (this.permission === null) return { type: "unsettled" };
+    // A retired token is on its way there too, unless it leads nowhere.
+    if (this.permission === null || this.permission === "retired") {
+      if (this.terminal?.phase === "lost")
+        throw new Error("this link was replaced");
+      return { type: "unsettled" };
+    }
     if (this.permission !== "write")
       throw new Error("only editors can do that");
     // A group with a commit waiting cannot build another one.
@@ -1688,6 +1697,11 @@ export class MlsSession {
       group.discardPending();
       this.markSent(message.commit, "discarded");
       await tx.save({ settled: { commit: message.commit, confirmed: false } });
+      // Another tab or session rotated the links between our build and the
+      // send, and the news that this token is retired is still queued behind
+      // us. Nothing landed: the rotation moves us to the new links, and the
+      // commit loop builds again there.
+      if (reply.code === "retired") return { type: "unsettled" };
       throw new Error(refusalText(reply.code));
     }
     const rotation = group.confirmPending();
@@ -1733,9 +1747,14 @@ export class MlsSession {
     });
   }
 
-  /** Resolves once the socket is ready again, or after `settleMs`. */
+  /**
+   * Resolves once the socket is ready on live links again, or its links
+   * turned out to lead nowhere, or after `settleMs`.
+   */
   private untilPermission(): Promise<void> {
-    if (this.permission !== null || !this.running) return Promise.resolve();
+    const waiting = this.permission === null || this.permission === "retired";
+    if (!waiting || !this.running || this.terminal?.phase === "lost")
+      return Promise.resolve();
     return new Promise((resolve) => {
       const done = () => {
         clearTimeout(timer);

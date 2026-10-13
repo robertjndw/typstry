@@ -1261,6 +1261,31 @@ describe("MlsSession", () => {
     sessions.forEach((s) => s.stop());
   });
 
+  it("builds again on new links when another tab's rotation retired its token mid-commit", async () => {
+    const { creator, device, server, sessions, editSecret } = world();
+    const bus = new Bus();
+    const first = await creator({ bus });
+    const second = device("Alice", { backend: first.backend, bus });
+    await second.session.start({ token: EDIT, link: editSecret });
+    for (const d of [first, second])
+      await vi.waitFor(() =>
+        expect(d.session.getSnapshot().canCommit).toBe(true),
+      );
+
+    // The second tab's commit waits for the lock while the first rotates,
+    // and the news that its token is retired queues up behind it.
+    const epoch = server.head;
+    await Promise.all([
+      first.session.resetLinks(),
+      second.session.resetLinks(),
+    ]);
+
+    expect(server.head).toBe(epoch + 2);
+    expect(first.errors).toEqual([]);
+    expect(second.errors).toEqual([]);
+    sessions.forEach((s) => s.stop());
+  });
+
   it("asks the server for missed commits once for a burst of requests", async () => {
     const { creator, sessions } = world();
     const alice = await creator();
