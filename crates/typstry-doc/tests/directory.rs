@@ -285,6 +285,28 @@ fn rejects_what_the_reader_would_skip() {
     assert!(matches!(err, Err(DirectoryError::InvalidLink(_))));
 }
 
+/// Same cases as "normalizes titles like project titles" in
+/// directory.test.ts.
+#[test]
+fn sets_titles_like_the_browser() {
+    let doc = LoroDoc::new();
+    directory::init(&doc).unwrap();
+    add(&doc, 1, "p", EDIT[0], true, 100, None);
+    let title = |doc: &LoroDoc| directory::list(doc, NOW)[0].title.clone();
+    assert!(!set_title(&doc, "p", "\u{feff}").unwrap());
+    assert!(!set_title(&doc, "p", &"x".repeat(201)).unwrap());
+    assert!(set_title(&doc, "p", "\u{feff}Thesis\u{feff}").unwrap());
+    assert_eq!(title(&doc).as_deref(), Some("Thesis"));
+    assert!(set_title(&doc, "p", "\u{85}").unwrap());
+    assert_eq!(title(&doc).as_deref(), Some("\u{85}"));
+    // A modified client can store anything; reads apply the same rules.
+    doc.get_map(directory::root::TITLES)
+        .insert("p", "x".repeat(201))
+        .unwrap();
+    doc.commit();
+    assert_eq!(title(&doc), None);
+}
+
 /// The JS side reads `directory.rust.loro`. Snapshots carry change
 /// timestamps, so the files are only rewritten on request; otherwise this
 /// checks that the committed ones still hold what Rust would write now.

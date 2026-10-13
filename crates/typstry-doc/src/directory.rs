@@ -21,7 +21,7 @@ use typstry_wire::crypto::LinkSecret;
 use typstry_wire::owner::OwnerSecret;
 use typstry_wire::token;
 
-use crate::{kind, meta, root as doc_root, schema_version, string_value};
+use crate::{kind, meta, normalize_title, root as doc_root, schema_version, string_value};
 
 /// Bumped when an older client writing into the directory would corrupt it,
 /// same rules as [`crate::SCHEMA_VERSION`]. Must match
@@ -125,7 +125,7 @@ pub struct LinkRef {
     pub retired: bool,
 }
 
-// The secret must never end up in logs.
+// Keeps the secret out of logs.
 impl std::fmt::Debug for LinkRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinkRef")
@@ -407,8 +407,7 @@ pub fn list(doc: &LoroDoc, now: i64) -> Vec<Entry> {
         .filter_map(|(project_id, mine)| {
             let best = pick(&mine, &retired)?;
             let title = string_value(titles.get(project_id))
-                .map(|t| t.trim().to_owned())
-                .filter(|t| !t.is_empty());
+                .and_then(|t| normalize_title(&t).map(str::to_owned));
             Some(Entry {
                 project_id: project_id.to_owned(),
                 title,
@@ -527,11 +526,14 @@ pub fn retire(doc: &LoroDoc, token: &str, now: i64) -> LoroResult<bool> {
     Ok(true)
 }
 
-/// Sets the title the person sees, trimmed. Empty titles are ignored.
+/// Sets the title the person sees, normalized with [`normalize_title`].
+/// Titles it rejects are ignored.
 pub fn set_title(doc: &LoroDoc, project_id: &str, title: &str) -> LoroResult<bool> {
-    let title = title.trim();
+    let Some(title) = normalize_title(title) else {
+        return Ok(false);
+    };
     let titles = doc.get_map(root::TITLES);
-    if title.is_empty() || string_value(titles.get(project_id)).as_deref() == Some(title) {
+    if string_value(titles.get(project_id)).as_deref() == Some(title) {
         return Ok(false);
     }
     titles.insert(project_id, title)?;
