@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-web
       - run: pnpm build
       - uses: actions/upload-artifact@v7
@@ -35,7 +37,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-web
+      - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
@@ -47,6 +52,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -99,6 +106,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # rust-toolchain.toml selects the toolchain and components
       - run: rustup show
       # e2e restores this cache too. Only saved on main since PR caches
@@ -111,11 +120,33 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # The oldest Rust we promise to build with: rust-version in Cargo.toml,
+  # keep the two in sync.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Overrides rust-toolchain.toml for every step, rust-cache's included,
+      # so stable is never downloaded here.
+      RUSTUP_TOOLCHAIN: "1.94"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace --locked
+
   docker:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v7
         with:

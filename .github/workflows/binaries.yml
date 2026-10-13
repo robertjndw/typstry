@@ -42,6 +42,11 @@ jobs:
             runner: macos-26-intel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      # Both for the provenance attestation.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -49,19 +54,44 @@ jobs:
           persist-credentials: false
       # rust-toolchain.toml selects the toolchain
       - run: rustup show
+      # A release whose tag doesn't match the crates would ship binaries that
+      # report the wrong version.
+      - name: Check version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "typstry-cli") | .version')
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match the workspace version $version"
+            exit 1
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
           # Caches saved from a tag are only visible to that tag.
           save-if: ${{ github.event_name == 'workflow_run' }}
-      - run: cargo build --release --locked -p typstry-cli
+      # Nightly builds put the commit into `typstry --version`. Releases leave
+      # TYPSTRY_BUILD_SHA unset: an empty value would still count as set.
+      - name: Build
+        env:
+          SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+        run: |
+          if [ -n "$SHA" ]; then
+            export TYPSTRY_BUILD_SHA="${SHA:0:7}"
+          fi
+          cargo build --release --locked -p typstry-cli
       - name: Package
         run: |
           name="typstry-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/typstry README.md "$name/"
+          cp target/release/typstry README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      # Lets users check a download with `gh attestation verify`.
+      - uses: actions/attest@v4
+        with:
+          subject-path: typstry-${{ matrix.target }}.tar.gz
       - uses: actions/upload-artifact@v7
         with:
           name: typstry-${{ matrix.target }}
