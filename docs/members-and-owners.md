@@ -38,7 +38,9 @@ The owner is a person, not a single device. Any valid device of the owner's pers
 
 There are two checks, one by the members and one by the server.
 
-**Members check the owner tag.** The group state names the owner by a tag. The tag is computed from the owner's person and a key that only members have, and it is different in every project, so the server cannot tell that two projects have the same owner. When a device tries to remove someone, every member checks that it belongs to the owner's person.
+**Members check the owner tag.** The group state names the owner by a tag. The tag is computed from the owner's person and a key derived from the project's first document key, and it is different in every project, so the server alone cannot tell that two projects have the same owner. When a device tries to remove someone, every member checks that it belongs to the owner's person.
+
+The tag hides the owner from the server, not from link holders. Everyone who ever held a link to the project has the first document key, including removed members and people who had a link but never joined. Together with the server they can test a guessed person against the tag.
 
 **The server checks the owner key.** The server cannot read the group, so it cannot use the tag. Instead every project has an **owner key**: an Ed25519 key made from a random secret that only the owner's devices have. The server keeps the public half. It replaces a project's links only when the request is signed with the owner key, and every rotation replaces the owner key with a new one.
 

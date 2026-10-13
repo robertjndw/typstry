@@ -71,14 +71,15 @@ Every message also says which generation it belongs to, so a reader knows which 
 Encryption keeps the content secret, but it doesn't say who wrote it. typstry uses signatures for that.
 
 - Every device has its own **device key**. It never leaves the device. See [Devices and accounts](devices-and-accounts.md).
-- Every document record is signed with the author's device key.
-- Every record also carries an **attestation**: a signature by the attestation key over the device key and the generation. Only someone with the edit link can make one.
+- In each project, a device has a separate **member key** (its MLS leaf, see [Members and owners](members-and-owners.md)). The device key signs the member key once, and never signs records itself.
+- Every document record is signed with the author's member key.
+- Every record also carries an **attestation**: a signature by the attestation key over the member key and the generation. Only someone with the edit link can make one.
 
 Other clients refuse records without a valid attestation. So a view link stays read-only even if the server is hostile and passes its changes along, and the author names you see in the history are real.
 
 ## Presence
 
-Cursors and the names of the people currently online are called presence. Presence is not stored. It is encrypted with a key from the project's current member group (see [Members and owners](members-and-owners.md)), not with the document key, and it is signed by each device. When someone is removed, the group key changes, so they stop seeing cursors.
+Cursors and the names of the people currently online are called presence. Presence is not stored. It is encrypted with a key from the project's current member group (see [Members and owners](members-and-owners.md)), not with the document key, and it is signed with the sender's member key. When someone is removed, the group key changes, so they stop seeing cursors.
 
 ## What the encryption does not hide
 

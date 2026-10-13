@@ -27,7 +27,7 @@ The person is identified by the first entry of the graph. There is no shared "pe
 
 In every project, each member carries its person graph, encrypted so that only members can read it. That is how other members see that your laptop and your phone are both you, with one name and color.
 
-A graph holds at most 48 entries. Adding a device, revoking one and changing your name or color each use one.
+A graph holds at most 48 entries. Adding a device, revoking one and changing your name or color each use one. Only 40 are open to every kind of entry: the last 8 (and part of the graph's size limit) are kept for revokes and for entries made with a recovery key. So even after a stolen device has filled the graph, another device can still revoke it, and a recovery key can still add a new device and revoke the others. A thief that deliberately fills those last 8 as well (with revokes, or with a recovery key of its own, which any of your devices can add) can still block that.
 
 ## Adding a device (pairing)
 

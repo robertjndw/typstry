@@ -23,15 +23,19 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 
 ## Quick start
 
-The easiest way to run typstry is Docker Compose:
+The quickest way to run typstry is the published image:
 
 ```sh
-docker compose up -d
+docker run -d -p 8787:8787 -v typstry-data:/data ghcr.io/robertjndw/typstry:latest
 ```
 
-Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume. The first build compiles tinymist to wasm, so expect it to take several minutes. See [Self-hosting](docs/self-hosting.md) for configuration and backups.
+Then open <http://localhost:8787>. Data is stored in the `typstry-data` volume. `latest` is the newest release, `nightly` follows `main`, and every release also has its own version tag.
 
-Or build and run the image directly:
+The repository's `compose.yaml` runs the same image with `docker compose up -d`.
+
+Browsers only give typstry the APIs it needs on `localhost` or over HTTPS, so anywhere else run it behind a reverse proxy that terminates TLS. For an instance on the internet, `compose.prod.yaml` puts it behind Traefik with a Let's Encrypt certificate and per-address rate limits: set your domain in `.env` and run `docker compose -f compose.prod.yaml up -d`, see [Production with Traefik](docs/self-hosting.md#production-with-traefik). Anyone who can reach the server can create projects, see [Who can use your instance](docs/self-hosting.md#who-can-use-your-instance). [Self-hosting](docs/self-hosting.md) also covers configuration, backups and upgrading.
+
+To build the image from a checkout instead (the first build compiles tinymist to wasm, so expect it to take several minutes):
 
 ```sh
 docker build -t typstry .
@@ -63,7 +67,21 @@ The `typstry` CLI links a folder to a project, so you can write in your own edit
 curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh | sh
 ```
 
-It puts `typstry` in `~/.local/bin`. `TYPSTRY_VERSION=nightly` gives you the latest `main` build, or pass a release tag to pin one. To build from a checkout instead you need [Rust](https://rustup.rs) 1.94 or newer:
+It puts `typstry` in `~/.local/bin`. To get the latest `main` build, or to pin a release, set `TYPSTRY_VERSION` for `sh` (not for `curl`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh | TYPSTRY_VERSION=nightly sh
+```
+
+Every release archive comes with a build provenance attestation. To check that a download was built by this repository's workflow, use the [GitHub CLI](https://cli.github.com):
+
+```sh
+gh attestation verify typstry-x86_64-unknown-linux-gnu.tar.gz --repo robertjndw/typstry
+```
+
+The images can be checked the same way with `gh attestation verify oci://ghcr.io/robertjndw/typstry:latest --repo robertjndw/typstry`.
+
+To build from a checkout instead you need [Rust](https://rustup.rs) 1.94 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli
@@ -79,7 +97,7 @@ See [the CLI guide](docs/cli.md) for a typical day with git, all commands and th
 
 ## Configuration
 
-The server is configured through environment variables such as `TYPSTRY_ADDR` and `TYPSTRY_DATA_DIR`. [Self-hosting](docs/self-hosting.md) lists them all and explains backups.
+The server is configured through environment variables such as `TYPSTRY_ADDR`, `TYPSTRY_DATA_DIR` and `TYPSTRY_MAX_UPLOAD_BYTES`. [Self-hosting](docs/self-hosting.md#configuration) lists them all, including the [abuse limits](docs/self-hosting.md#abuse-limits), and explains [backups](docs/self-hosting.md#backups). Limits per client address are the reverse proxy's job; `compose.prod.yaml` sets them up in Traefik, see [the limits](docs/self-hosting.md#the-limits).
 
 ## Development
 
@@ -120,7 +138,9 @@ This starts the Vite dev server for the frontend and the Rust server on port 878
 | Server binary  | `cargo build --release -p typstry-server`               |
 | CLI binary     | `cargo build --release -p typstry-cli`                  |
 
-CI runs on every push to `main` and on pull requests: everything in the table except `pnpm format:check` and the release builds, plus a Docker build with a smoke test.
+`pnpm format` must leave `fixtures/` alone, so it is in `.prettierignore`: those files are frozen as typstry wrote them (see [Compatibility](docs/compatibility.md#frozen-fixtures)).
+
+CI runs on every push to `main` and on pull requests: everything in the table except the release builds, plus `cargo check` on the minimum supported Rust version (1.94) and a Docker build with a smoke test.
 
 The end-to-end tests drive the production build in Chromium through [Playwright](https://playwright.dev). They start the server on port 4787 with a throwaway data directory, or reuse one already running there. Install the browser once with `pnpm --filter web exec playwright install chromium`.
 
@@ -140,7 +160,7 @@ The document schema exists on both sides. Changes to one must be reflected in th
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR, please make sure formatting, linting and tests pass locally (see [Common tasks](#common-tasks)). Commit messages follow [Conventional Commits](https://www.conventionalcommits.org).
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks to run and the commit message format.
 
 Please report security issues privately as described in [SECURITY.md](SECURITY.md).
 
