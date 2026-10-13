@@ -404,6 +404,7 @@ mod tests {
             dir: dir.map(PathBuf::from),
             project_id: None,
             state,
+            recency: None,
         }
     }
 

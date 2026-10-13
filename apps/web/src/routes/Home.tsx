@@ -417,14 +417,28 @@ export function Home() {
 /** The favicon's glyph, drawn in theme colors rather than the OS scheme. */
 function LogoMark() {
   return (
-    <svg
-      viewBox="0 0 32 32"
-      aria-hidden
-      className="size-6 shrink-0 rounded-md bg-foreground text-background"
-    >
+    <svg viewBox="0 0 32 32" aria-hidden className="size-6 shrink-0">
+      <rect width="32" height="32" rx="7" className="fill-foreground" />
       <path
-        fill="currentColor"
-        d="M13.2 7.5h3.4v4.2h5v3h-5v6.6c0 1.4.7 2 1.9 2 .9 0 1.8-.2 2.7-.6l.6 2.9c-1.2.5-2.6.8-4 .8-3.1 0-4.6-1.7-4.6-4.8v-6.9H10.4v-3h2.8z"
+        d="M12 6.5v12.7c0 1.7.9 2.6 2.6 2.6h.9M7.5 11.8h9"
+        className="fill-none stroke-background"
+        strokeWidth={2.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M19.3 19.3v-1.2a2.2 2.2 0 0 1 4.4 0v1.2"
+        className="fill-none stroke-background"
+        strokeWidth={1.5}
+        strokeLinecap="round"
+      />
+      <rect
+        x="17.6"
+        y="19.3"
+        width="7.8"
+        height="6.2"
+        rx="1.6"
+        className="fill-background"
       />
     </svg>
   );

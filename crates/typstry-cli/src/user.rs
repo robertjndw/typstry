@@ -95,6 +95,9 @@ pub struct CatalogEntry {
     /// Removed and gone projects stay listed so the person can see why
     /// they cannot open them.
     pub state: State,
+    /// When the directory last saw the project opened, then when it first
+    /// learned of it. None for a folder the directory has no entry for.
+    pub recency: Option<(Option<i64>, i64)>,
 }
 
 impl CatalogEntry {
@@ -438,9 +441,10 @@ fn remember_project_in(
     write_versioned(&path, PROJECTS_VERSION, ProjectList { projects })
 }
 
-/// Every project this person has: those with a folder here first, then
-/// the ones only the directory knows, e.g. from another device. Projects
-/// the person dropped are left out unless a folder here has them.
+/// Every project this person has, most recently opened first: those with a
+/// folder here and the ones only the directory knows, e.g. from another
+/// device. Projects the person dropped are left out unless a folder here
+/// has them.
 pub fn catalog() -> anyhow::Result<Vec<CatalogEntry>> {
     catalog_with(false)
 }
@@ -504,6 +508,7 @@ fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry
         let entry = project
             .and_then(|key| listed[*index.get(&key)?].take())
             .map(|(_, e)| e);
+        let recency = entry.as_ref().map(|e| (e.opened_at, e.added_at));
         let title = entry
             .as_ref()
             .and_then(|e| e.title.clone())
@@ -516,6 +521,7 @@ fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry
             dir: Some(known.dir),
             project_id: None,
             state: entry.map_or(State::Listed, |e| e.state),
+            recency,
         });
     }
     for (server, entry) in listed.into_iter().flatten() {
@@ -532,8 +538,14 @@ fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry
             dir: None,
             project_id: Some(entry.project_id),
             state: entry.state,
+            recency: Some((entry.opened_at, entry.added_at)),
         });
     }
+    // Most recent first, whether or not a folder is here. The numbers
+    // `clone` accepts are positions in this order, so it is fixed here
+    // rather than in `list`. The sort is stable: folders the directory
+    // does not know keep their place, after the rest.
+    entries.sort_by(|a, b| b.recency.cmp(&a.recency));
     Ok(entries)
 }
 

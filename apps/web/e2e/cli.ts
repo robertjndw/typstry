@@ -1,5 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -29,8 +31,12 @@ export function gitEnv() {
   };
 }
 
-/** Also keeps TYPSTRY_LINK out, which would make `clone` ignore its argument. */
-function cleanEnv(author: string) {
+/**
+ * Also keeps TYPSTRY_LINK out, which would make `clone` ignore its argument.
+ * `config` is the person's own config dir: without one the binary falls back
+ * to the real one and the test's projects pile up in the developer's list.
+ */
+function cleanEnv(author: string, config: string) {
   const env: NodeJS.ProcessEnv = gitEnv();
   for (const key of Object.keys(env)) {
     if (key.startsWith("TYPSTRY_")) delete env[key];
@@ -39,6 +45,7 @@ function cleanEnv(author: string) {
     ...env,
     // A command that tries to open a browser fails instead.
     TYPSTRY_BROWSER: "/nonexistent/typstry-test-browser",
+    TYPSTRY_CONFIG_DIR: config,
     GIT_AUTHOR_NAME: author,
     GIT_AUTHOR_EMAIL: `${author.toLowerCase()}@example.com`,
     GIT_COMMITTER_NAME: author,
@@ -54,6 +61,7 @@ export class Cli {
 
   readonly binary: string;
   readonly name: string;
+  private readonly config = mkdtempSync(path.join(os.tmpdir(), "typstry-cfg-"));
 
   constructor(binary: string, name: string) {
     this.binary = binary;
@@ -69,7 +77,7 @@ export class Cli {
     try {
       const { stdout, stderr } = await run(this.binary, this.args(dir, args), {
         cwd: dir,
-        env: cleanEnv(this.name),
+        env: cleanEnv(this.name, this.config),
         timeout: 60_000,
       });
       return { stdout, stderr, code: 0 };
@@ -109,7 +117,7 @@ export class Cli {
   async sync(dir: string) {
     const child = spawn(this.binary, this.args(dir, ["sync"]), {
       cwd: dir,
-      env: cleanEnv(this.name),
+      env: cleanEnv(this.name, this.config),
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.running.add(child);
@@ -171,5 +179,6 @@ export class Cli {
         return gone;
       }),
     );
+    rmSync(this.config, { recursive: true, force: true });
   }
 }

@@ -4,6 +4,7 @@
 # keep one visitor from using up the instance (see docs/self-hosting.md).
 services:
   typstry:
+    build: .
     image: ghcr.io/robertjndw/typstry:latest
     ports:
       - "8787:8787"
