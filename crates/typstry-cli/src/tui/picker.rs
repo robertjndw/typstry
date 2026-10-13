@@ -343,6 +343,10 @@ pub async fn pick(mode: Mode, missing_only: bool) -> anyhow::Result<Outcome> {
         let mut finished = false;
         let action = tokio::select! {
             event = events.next() => match event {
+                Some(Ok(Event::Key(key))) if super::is_suspend(&key) => {
+                    super::suspend_full_screen(&mut terminal)?;
+                    Action::None
+                }
                 Some(Ok(Event::Key(key))) => picker.on_key(key),
                 Some(Ok(_)) => Action::None,
                 Some(Err(err)) => return Err(err.into()),

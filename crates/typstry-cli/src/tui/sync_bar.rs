@@ -280,12 +280,42 @@ impl Screen {
         if std::mem::replace(&mut self.restored, true) {
             return;
         }
+        self.release();
+    }
+
+    fn release(&mut self) {
         let top = self.terminal.get_frame().area().as_position();
         let backend = self.terminal.backend_mut();
         let _ = backend.set_cursor_position(top);
         let _ = backend.clear_region(ClearType::AfterCursor);
         let _ = self.terminal.show_cursor();
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+
+    /// Gives the terminal back to the shell for a Ctrl+Z and, once the
+    /// process is resumed, puts the bar under wherever the shell left the
+    /// cursor. Sync itself is stopped along with the process meanwhile.
+    fn suspend(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.release();
+        super::stop_self();
+        if crossterm::terminal::enable_raw_mode().is_err() {
+            return;
+        }
+        let options = TerminalOptions {
+            viewport: Viewport::Inline(BAR_HEIGHT),
+        };
+        // Not ratatui::init again, which would stack another panic hook
+        // on every suspend.
+        match ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            options,
+        ) {
+            Ok(terminal) => self.terminal = terminal,
+            Err(err) => tracing::debug!("status bar not redrawn after resuming: {err}"),
+        }
     }
 }
 
@@ -351,6 +381,7 @@ pub async fn run(ctx: &Ctx, args: Args, mut screen: Screen) -> anyhow::Result<()
                 Some(Action::Open) => open_in_browser(&ctx.dir),
                 Some(Action::Links) => print_links(&ctx.dir),
                 Some(Action::Stop) => stop(&control, &mut state),
+                Some(Action::Suspend) => screen.suspend(),
                 None => {}
             }
         }
@@ -455,12 +486,14 @@ enum Action {
     Links,
     Stop,
     Interrupt,
+    Suspend,
 }
 
 fn action(key: KeyEvent) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('c') if ctrl => Some(Action::Interrupt),
+        _ if super::is_suspend(&key) => Some(Action::Suspend),
         _ if ctrl => None,
         KeyCode::Char('p' | 'P') => Some(Action::Publish),
         KeyCode::Char('o' | 'O') => Some(Action::Open),
@@ -642,5 +675,9 @@ mod tests {
         );
         assert_eq!(action(key(KeyCode::Char('p'), KeyModifiers::CONTROL)), None);
         assert_eq!(action(key(KeyCode::Enter, none)), None);
+        assert_eq!(
+            action(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            cfg!(unix).then_some(Action::Suspend)
+        );
     }
 }

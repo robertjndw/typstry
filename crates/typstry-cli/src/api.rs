@@ -140,6 +140,29 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// The slowest upload rate still worth waiting for, see `upload_blob`.
 const MIN_UPLOAD_BYTES_PER_SEC: u64 = 32 * 1024;
 
+/// How often a 429 is retried before the command gives up on it.
+const RATE_LIMIT_RETRIES: u32 = 3;
+
+/// The first wait after a 429 without Retry-After; it doubles each time.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// A Retry-After can ask for minutes (a proxy's rate limit may refill
+/// slowly). Failing with a clear message beats a command that sits
+/// there silently that long.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+const RATE_LIMITED: &str =
+    "the server is getting too many requests from this address; try again in a moment";
+
+/// What a Retry-After header asks for. Only the delta-seconds form, which
+/// is what Traefik's rate limiter sends; a date falls back to the usual
+/// backoff.
+fn retry_after(res: &reqwest::Response) -> Option<Duration> {
+    let value = res.headers().get(reqwest::header::RETRY_AFTER)?;
+    let secs = value.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
 #[derive(Debug, Clone)]
 pub struct Api {
     http: reqwest::Client,
@@ -149,6 +172,7 @@ pub struct Api {
     /// deadline scaled to the body instead.
     upload: reqwest::Client,
     origin: String,
+    rate_limit_backoff: Duration,
 }
 
 fn client(read_timeout: Option<Duration>) -> anyhow::Result<reqwest::Client> {
@@ -181,6 +205,7 @@ impl Api {
             http: client(Some(READ_TIMEOUT))?,
             upload: client(None)?,
             origin: origin.trim_end_matches('/').to_owned(),
+            rate_limit_backoff: RATE_LIMIT_BACKOFF,
         })
     }
 
@@ -195,6 +220,39 @@ impl Api {
         let res = req.send().await.map_err(redact).with_context(what)?;
         if res.status() == StatusCode::UPGRADE_REQUIRED {
             return Err(SyncError::protocol_too_old(&self.origin).into());
+        }
+        Ok(res)
+    }
+
+    /// [`Self::send`] for calls the reverse proxy in front of the server
+    /// may rate limit per address (the provided `compose.prod.yaml` does): a
+    /// 429 is sent again a few times, after Retry-After or a doubling
+    /// backoff, and then becomes an error that says so. A 429 means the
+    /// request was turned away before it did anything, so sending it again
+    /// is safe.
+    async fn send_retrying(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: impl Fn() -> String,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut backoff = self.rate_limit_backoff;
+        for _ in 0..RATE_LIMIT_RETRIES {
+            // Only a streamed body cannot be cloned, and none of ours is.
+            let Some(attempt) = req.try_clone() else {
+                break;
+            };
+            let res = self.send(attempt, &what).await?;
+            if res.status() != StatusCode::TOO_MANY_REQUESTS {
+                return Ok(res);
+            }
+            let wait = retry_after(&res).unwrap_or(backoff).min(MAX_RETRY_WAIT);
+            tracing::debug!(?wait, "rate limited, retrying");
+            tokio::time::sleep(wait).await;
+            backoff *= 2;
+        }
+        let res = self.send(req, what).await?;
+        if res.status() == StatusCode::TOO_MANY_REQUESTS {
+            bail!("{RATE_LIMITED}");
         }
         Ok(res)
     }
@@ -219,7 +277,7 @@ impl Api {
     pub async fn create_space(&self) -> anyhow::Result<CreatedSpace> {
         let req = self.http.post(format!("{}/api/spaces", self.origin));
         let res = self
-            .send(req, || format!("cannot reach {}", self.origin))
+            .send_retrying(req, || format!("cannot reach {}", self.origin))
             .await?;
         if !res.status().is_success() {
             bail!("creating the project failed: HTTP {}", res.status());
@@ -231,7 +289,7 @@ impl Api {
     pub async fn allocate_relay(&self) -> anyhow::Result<RelayChannel> {
         let req = self.http.post(format!("{}{RELAY_API_PATH}", self.origin));
         let res = self
-            .send(req, || format!("cannot reach {}", self.origin))
+            .send_retrying(req, || format!("cannot reach {}", self.origin))
             .await?;
         match res.status() {
             s if s.is_success() => Ok(res.json().await.map_err(redact)?),
@@ -329,7 +387,9 @@ impl Api {
             .timeout(deadline)
             .header("content-type", "application/octet-stream")
             .body(sealed);
-        let res = self.send(req, || "uploading an asset".to_owned()).await?;
+        let res = self
+            .send_retrying(req, || "uploading an asset".to_owned())
+            .await?;
         match res.status() {
             StatusCode::FORBIDDEN => bail!("this link is read-only"),
             StatusCode::PAYLOAD_TOO_LARGE => {
@@ -337,6 +397,11 @@ impl Api {
                     "the asset is larger than the server's {} MB limit",
                     MAX_UPLOAD_BYTES / 1024 / 1024
                 )
+            }
+            // Not retried: the quota only grows if the server's operator
+            // raises it.
+            StatusCode::INSUFFICIENT_STORAGE => {
+                bail!("this project's storage on the server is full")
             }
             s if !s.is_success() => bail!("uploading an asset failed: HTTP {s}"),
             _ => {
@@ -381,17 +446,30 @@ pub(crate) mod tests {
     pub(crate) async fn fake_server(
         response: &'static [u8],
     ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        fake_server_answering(vec![response]).await
+    }
+
+    /// [`fake_server`] answering with each of `responses` in turn, and with
+    /// the last one from then on.
+    async fn fake_server_answering(
+        responses: Vec<&'static [u8]>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let (seen, requests) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let mut responses = responses.into_iter().peekable();
+            let mut response = responses.next().unwrap();
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = [0; 1024];
                 let n = socket.read(&mut request).await.unwrap_or(0);
                 let _ = seen.send(String::from_utf8_lossy(&request[..n]).to_lowercase());
                 let _ = socket.write_all(response).await;
+                if let Some(next) = responses.next() {
+                    response = next;
+                }
             }
         });
         (origin, requests)
@@ -500,5 +578,89 @@ pub(crate) mod tests {
         let other = BlobHash::of(b"xyz");
         let err = api.get_blob("tok", other.as_str()).await.unwrap_err();
         assert!(format!("{err:#}").contains("different content"), "{err:#}");
+    }
+
+    const RATE_LIMITED_NOW: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\n\
+          content-length: 0\r\nconnection: close\r\n\r\n";
+
+    const SPACE_CREATED: &[u8] = b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\n\
+          content-length: 47\r\nconnection: close\r\n\r\n\
+          {\"spaceId\":\"p\",\"editToken\":\"e\",\"viewToken\":\"v\"}";
+
+    fn count(requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> usize {
+        std::iter::from_fn(|| requests.try_recv().ok()).count()
+    }
+
+    #[tokio::test]
+    async fn a_429_is_retried_after_retry_after() {
+        // The backoff alone would take seconds; Retry-After: 0 takes none.
+        let (origin, mut requests) =
+            fake_server_answering(vec![RATE_LIMITED_NOW, RATE_LIMITED_NOW, SPACE_CREATED]).await;
+        let started = std::time::Instant::now();
+        let created = Api::new(&origin).unwrap().create_space().await.unwrap();
+        assert_eq!(created.edit_token, "e");
+        assert_eq!(count(&mut requests), 3);
+        assert!(started.elapsed() < RATE_LIMIT_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn a_429_without_retry_after_backs_off() {
+        let (origin, mut requests) = fake_server_answering(vec![
+            b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            SPACE_CREATED,
+        ])
+        .await;
+        let mut api = Api::new(&origin).unwrap();
+        api.rate_limit_backoff = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        api.create_space().await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(count(&mut requests), 2);
+    }
+
+    #[tokio::test]
+    async fn a_lasting_429_gives_up_with_a_clear_message() {
+        let (origin, mut requests) = fake_server(RATE_LIMITED_NOW).await;
+        let api = Api::new(&origin).unwrap();
+        for err in [
+            api.create_space().await.unwrap_err(),
+            api.allocate_relay().await.unwrap_err(),
+            api.upload_blob("tok", vec![1]).await.unwrap_err(),
+        ] {
+            assert_eq!(format!("{err:#}"), RATE_LIMITED);
+        }
+        assert_eq!(count(&mut requests), 3 * (RATE_LIMIT_RETRIES as usize + 1));
+    }
+
+    #[tokio::test]
+    async fn a_full_project_is_not_retried() {
+        let (origin, mut requests) = fake_server(
+            b"HTTP/1.1 507 Insufficient Storage\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let err = Api::new(&origin)
+            .unwrap()
+            .upload_blob("tok", vec![1])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "this project's storage on the server is full"
+        );
+        assert_eq!(count(&mut requests), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_upload_names_the_limit() {
+        let (origin, _) = fake_server(
+            b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let err = Api::new(&origin)
+            .unwrap()
+            .upload_blob("tok", vec![1])
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("25 MB limit"), "{err:#}");
     }
 }

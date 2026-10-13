@@ -56,12 +56,13 @@ pub struct KnownProject {
 impl KnownProject {
     /// The title, else the folder's name.
     pub fn display_title(&self) -> String {
-        self.title.clone().unwrap_or_else(|| {
+        let title = self.title.clone().unwrap_or_else(|| {
             self.dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Untitled".to_owned())
-        })
+        });
+        crate::term::printable(&title).into_owned()
     }
 }
 
@@ -508,8 +509,9 @@ fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry
             .and_then(|e| e.title.clone())
             .or_else(|| known.title.clone())
             .unwrap_or_else(|| known.display_title());
+        // Titles come from other people; every caller prints them.
         entries.push(CatalogEntry {
-            title,
+            title: crate::term::printable(&title).into_owned(),
             link: known.link,
             dir: Some(known.dir),
             project_id: None,
@@ -524,7 +526,8 @@ fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry
         }
         let link = ShareLink::new(server, &entry.link.token, &entry.link.secret);
         entries.push(CatalogEntry {
-            title: entry.title.unwrap_or_else(|| "Untitled".to_owned()),
+            title: crate::term::printable(entry.title.as_deref().unwrap_or("Untitled"))
+                .into_owned(),
             link: link.to_string(),
             dir: None,
             project_id: Some(entry.project_id),

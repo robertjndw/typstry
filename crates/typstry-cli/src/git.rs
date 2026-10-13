@@ -176,8 +176,13 @@ fn read_appended(file: &mut fs::File, read: &mut ReadReflog, mtime: Option<Syste
 
 impl Repo {
     /// The repository `start` belongs to, walking up the way git does.
+    /// With `GIT_DIR` or `GIT_WORK_TREE` set, git looks there instead of
+    /// for a `.git`, so git itself is asked.
     pub fn discover(start: &Path) -> Option<Self> {
         let start = start.canonicalize().ok()?;
+        if std::env::var_os("GIT_DIR").is_some() || std::env::var_os("GIT_WORK_TREE").is_some() {
+            return Self::discover_with_git(&start);
+        }
         let mut current = Some(start.as_path());
         while let Some(dir) = current {
             let dot_git = dir.join(".git");
@@ -197,6 +202,46 @@ impl Repo {
             current = dir.parent();
         }
         None
+    }
+
+    /// [`Self::discover`] by `git rev-parse`, which knows the environment
+    /// and `core.worktree`. None without git or outside a work tree.
+    fn discover_with_git(start: &Path) -> Option<Self> {
+        let mut command = git();
+        command
+            .args([
+                "rev-parse",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ])
+            .current_dir(start);
+        // Relative to where typstry was started, not to `start` (`-C`).
+        let cwd = std::env::current_dir().ok()?;
+        for var in ["GIT_DIR", "GIT_WORK_TREE"] {
+            if let Some(value) = std::env::var_os(var) {
+                command.env(var, cwd.join(value));
+            }
+        }
+        let out = command.output().ok().filter(|out| out.status.success())?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        let mut lines = text.lines();
+        let git_dir = PathBuf::from(lines.next()?).canonicalize().ok()?;
+        // Relative to the folder git ran in.
+        let common_dir = start.join(lines.next()?).canonicalize().ok()?;
+        let workdir = PathBuf::from(lines.next()?).canonicalize().ok()?;
+        start.starts_with(&workdir).then(|| Self {
+            workdir,
+            git_dir,
+            common_dir,
+            reflog: ReflogCache::default(),
+        })
+    }
+
+    /// Whether `refs/heads/<branch>` points at a commit, loose or packed.
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        self.commit_of(&format!("ref: refs/heads/{branch}"))
+            .is_some()
     }
 
     pub fn head(&self) -> Head {
@@ -346,7 +391,8 @@ impl Repo {
         }
         next.push_str(&pattern);
         next.push('\n');
-        fs::write(&path, next).with_context(|| format!("writing {}", path.display()))
+        // A crash halfway must not cost the user their own exclude rules.
+        crate::state::atomic_write(&path, next.as_bytes(), false)
     }
 }
 

@@ -133,14 +133,28 @@ impl Worktree {
 
     /// Whether a file or folder named exactly `path`, case included, is on
     /// disk. On a case-insensitive file system [`Self::exists`] also
-    /// answers yes for a case variant.
+    /// answers yes for a case variant. Every folder on the way counts too:
+    /// `fig/b.png` is not there when the folder on disk is `Fig`, since
+    /// writing it would land in `Fig/`.
     pub fn exists_exact(&self, path: &str) -> bool {
-        let abs = self.abs(path);
-        let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
-            return false;
-        };
-        fs::read_dir(parent)
-            .is_ok_and(|mut entries| entries.any(|e| e.is_ok_and(|e| e.file_name() == name)))
+        let mut dir = self.root.clone();
+        for segment in path.split('/') {
+            let mut parts = Path::new(segment).components();
+            if !matches!(
+                (parts.next(), parts.next()),
+                (Some(Component::Normal(_)), None)
+            ) {
+                return false;
+            }
+            let found = fs::read_dir(&dir).is_ok_and(|mut entries| {
+                entries.any(|e| e.is_ok_and(|e| e.file_name() == segment))
+            });
+            if !found {
+                return false;
+            }
+            dir.push(segment);
+        }
+        true
     }
 
     pub fn root(&self) -> &Path {
@@ -799,8 +813,13 @@ mod tests {
         fs::write(wt.abs("Notes.typ"), "x").unwrap();
         assert!(wt.exists_exact("Notes.typ"));
         assert!(!wt.exists_exact("notes.typ"));
+        fs::create_dir(wt.abs("Fig")).unwrap();
+        fs::write(wt.abs("Fig/a.png"), "x").unwrap();
+        assert!(wt.exists_exact("Fig/a.png"));
+        assert!(!wt.exists_exact("fig/a.png"));
+        assert!(!wt.exists_exact("../Notes.typ"));
         assert_eq!(wt.exists("notes.typ"), wt.case_insensitive());
         // The probe leaves nothing behind.
-        assert_eq!(fs::read_dir(wt.root()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(wt.root()).unwrap().count(), 2);
     }
 }

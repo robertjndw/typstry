@@ -763,6 +763,13 @@ impl SpaceCore {
                 None => build(group).map_err(|err| match err.downcast_ref::<MlsError>() {
                     Some(MlsError::NotOwner) => anyhow::anyhow!(NOT_OWNER),
                     Some(MlsError::NoOwnerKey) => anyhow::anyhow!(NO_OWNER_KEY),
+                    // Following fetches the keyring after a rotation, so
+                    // this only happens when the server's lags the group.
+                    Some(MlsError::KeyringBehind) => anyhow::anyhow!(
+                        "this folder does not have the project's current keys yet, so the \
+                         links cannot be replaced now; run `typstry pull` and try again in a \
+                         moment"
+                    ),
                     _ => err,
                 })?,
             };

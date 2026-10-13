@@ -36,10 +36,27 @@ use crate::state::SyncRunning;
 use crate::watch::GitState;
 use crate::worktree::Skipped;
 
+/// `--version`: the crate version, plus the commit for a nightly build,
+/// which has the same version number as the release before it. The
+/// release workflow sets `TYPSTRY_BUILD_SHA` for those.
+fn version_text() -> &'static str {
+    static TEXT: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| describe_version(option_env!("TYPSTRY_BUILD_SHA")));
+    TEXT.as_str()
+}
+
+fn describe_version(sha: Option<&str>) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match sha.map(str::trim).filter(|sha| !sha.is_empty()) {
+        Some(sha) => format!("{version} (nightly {})", sha.get(..7).unwrap_or(sha)),
+        None => version.to_owned(),
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "typstry",
-    version,
+    version = version_text(),
     about = "Sync a typstry project with a local folder",
     long_about = "Sync a typstry project with a local folder.\n\n\
         The folder can be a git repository you fully control: typstry only \
@@ -55,9 +72,9 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub name: Option<String>,
     /// Print plain lines instead of the interactive views of `list`,
-    /// `clone`, `sync`, `members`, `devices`, `version list` and `pair`,
-    /// and skip the confirmations. They are plain anyway when not run in
-    /// a terminal.
+    /// `clone`, `sync`, `members`, `devices`, `version list` and `pair`.
+    /// They are plain anyway when not run in a terminal. Confirmations are
+    /// still asked; skip them with `--yes`.
     #[arg(long, global = true, env = "TYPSTRY_PLAIN", value_parser = clap::builder::FalseyValueParser::new())]
     pub plain: bool,
     #[command(subcommand)]
@@ -280,8 +297,19 @@ pub enum Line {
 }
 
 impl Line {
+    /// Prints the line, or hands it to the view that captures output. Bidi
+    /// controls are neutralized on the way, since lines quote paths and
+    /// names from the project, which could otherwise reorder what is shown.
     pub fn print(self) {
-        let Err(line) = crate::term::send(self) else {
+        let clean = |text: String| match crate::term::without_bidi(&text) {
+            std::borrow::Cow::Borrowed(_) => text,
+            std::borrow::Cow::Owned(clean) => clean,
+        };
+        let line = match self {
+            Self::Stdout(text) => Self::Stdout(clean(text)),
+            Self::Stderr(text) => Self::Stderr(clean(text)),
+        };
+        let Err(line) = crate::term::send(line) else {
             return;
         };
         match line {
@@ -322,7 +350,6 @@ impl Output {
     }
 }
 
-/// Prints `label` and the paths under it, if there are any.
 /// Shortest fingerprint prefix taken as one, so a short device name is not
 /// mistaken for the start of a fingerprint.
 const MIN_PREFIX: usize = 4;
@@ -339,6 +366,7 @@ fn unique<T>(
     }
 }
 
+/// Prints `label` and the paths under it, if there are any.
 fn print_list(out: &mut Output, label: &str, items: impl IntoIterator<Item = String>) {
     let items: Vec<String> = items.into_iter().collect();
     if items.is_empty() {
@@ -418,6 +446,21 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn nightly_builds_name_their_commit() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(describe_version(None), version);
+        assert_eq!(describe_version(Some("")), version);
+        assert_eq!(
+            describe_version(Some("abc1234def5678")),
+            format!("{version} (nightly abc1234)")
+        );
+        assert_eq!(
+            describe_version(Some("abc")),
+            format!("{version} (nightly abc)")
+        );
+    }
 
     #[test]
     fn cli_is_well_formed() {

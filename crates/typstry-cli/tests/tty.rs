@@ -477,9 +477,11 @@ async fn share_reset_asks_first_and_keeps_the_links_on_no() {
     let mut tty = me.tty(&alpha, &["share", "reset"]);
     tty.wait_for("[y/N]");
     tty.send("n\r");
-    assert!(tty.wait_exit());
+    // Declining is an abort, like for every other question.
+    assert!(!tty.wait_exit());
     assert!(
-        tty.screen().contains("Nothing replaced."),
+        tty.screen()
+            .contains("cancelled; the links were not replaced"),
         "{}",
         tty.screen()
     );

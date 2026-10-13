@@ -36,8 +36,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         "Replace the project's links? Members switch over on their next sync; \
          anyone with only an old link loses access.",
     )? {
-        out.out("Nothing replaced.");
-        return Ok(());
+        anyhow::bail!("cancelled; the links were not replaced");
     }
     session.reset_links().await?;
     publish_rotation(&mut session, &mut out).await

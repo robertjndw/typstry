@@ -41,7 +41,10 @@ pub async fn print_info(
 
     out.out(format!(
         "Title:       {}",
-        typstry_doc::title(doc).unwrap_or_else(|| "(untitled)".to_owned())
+        typstry_doc::title(doc).map_or_else(
+            || "(untitled)".to_owned(),
+            |title| crate::term::printable(&title).into_owned()
+        )
     ));
     out.out(format!("Folder:      {}", session.root().display()));
     out.out(format!("Server:      {}", config.server));

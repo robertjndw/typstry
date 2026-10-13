@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use typstry_doc::directory::State;
+use typstry_doc::names::{MAX_NAME_BYTES, is_device_name, validate_name};
 use typstry_wire::identity::person_fingerprint;
 
 use super::init::absolute;
@@ -131,8 +132,13 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                     target.display()
                 );
             }
-            fs::rename(&staging, &target)
-                .with_context(|| format!("moving the clone to {}", target.display()))?;
+            if let Err(err) = fs::rename(&staging, &target) {
+                // The staging folder holds the key; it must not stay behind
+                // under a name nobody looks at.
+                let _ = fs::remove_dir_all(&staging);
+                return Err(err)
+                    .with_context(|| format!("moving the clone to {}", target.display()));
+            }
             target
         }
     };
@@ -264,8 +270,14 @@ pub(super) fn check_empty(dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Longest folder name made from a title, in characters. File systems
+/// take up to 255 bytes, which [`MAX_NAME_BYTES`] caps on top.
+const MAX_FOLDER_CHARS: usize = 100;
+
 /// A folder name for a project title: path separators, control
-/// characters and leading dots go, whitespace becomes a hyphen.
+/// characters and leading dots go, whitespace becomes a hyphen, and what
+/// is left must be a name the project itself would accept, so it works on
+/// every system the clone might be moved to.
 fn folder_name(title: Option<&str>) -> String {
     let name: String = title
         .unwrap_or("")
@@ -282,10 +294,24 @@ fn folder_name(title: Option<&str>) -> String {
         })
         .collect();
     let name = name.trim_start_matches('.').trim_matches('-');
+    let mut end = 0;
+    for (i, c) in name.char_indices().take(MAX_FOLDER_CHARS) {
+        if i + c.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    // Windows drops a trailing dot or space, which a cut can leave.
+    let name = name[..end].trim_end_matches(['.', ' ', '-']);
     if name.is_empty() {
         "typstry-project".to_owned()
+    } else if is_device_name(name) {
+        // Windows ignores the extension, so only a prefix helps.
+        format!("typstry-{name}")
+    } else if validate_name(name).is_ok() {
+        name.to_owned()
     } else {
-        name.chars().take(100).collect()
+        "typstry-project".to_owned()
     }
 }
 
@@ -325,5 +351,21 @@ mod tests {
         assert_eq!(folder_name(Some("  ")), "typstry-project");
         assert_eq!(folder_name(None), "typstry-project");
         assert_eq!(folder_name(Some(".hidden")), "hidden");
+        assert_eq!(folder_name(Some("con")), "typstry-con");
+        assert_eq!(folder_name(Some("NUL.txt")), "typstry-NUL.txt");
+        assert_eq!(folder_name(Some("GIT~1")), "typstry-project");
+        assert_eq!(folder_name(Some("Draft.")), "Draft");
+    }
+
+    #[test]
+    fn long_folder_names_fit_the_file_system() {
+        // 100 four-byte characters would be 400 bytes.
+        let name = folder_name(Some(&"\u{1F4D6}".repeat(120)));
+        assert!(name.len() <= MAX_NAME_BYTES, "{}", name.len());
+        assert_eq!(name, "\u{1F4D6}".repeat(63));
+        assert_eq!(folder_name(Some(&"a".repeat(300))).len(), MAX_FOLDER_CHARS);
+        // A cut right before a dot leaves no trailing dot.
+        let dotted = format!("{}.x", "a".repeat(MAX_FOLDER_CHARS - 1));
+        assert_eq!(folder_name(Some(&dotted)), "a".repeat(MAX_FOLDER_CHARS - 1));
     }
 }

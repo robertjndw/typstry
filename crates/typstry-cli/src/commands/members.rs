@@ -10,7 +10,7 @@ use super::link::write_links;
 use super::{Ctx, MIN_PREFIX, Output, connected, print_warnings, unique};
 use crate::engine::Session;
 use crate::mls::profile_name;
-use crate::term;
+use crate::term::{self, printable};
 use crate::tui::chooser::{Item, Key, choose};
 
 /// List the people with access to the project, or remove one.
@@ -158,6 +158,7 @@ fn groups<'a>(session: &Session, members: &'a [MemberInfo]) -> Vec<Group<'a>> {
             .iter()
             .find_map(|m| m.person_profile.as_deref())
             .and_then(profile_name)
+            .map(|name| printable(&name).into_owned())
             .or_else(|| devices.first().map(|m| display_name(m)));
         groups.push(Group {
             heading: format!(
@@ -261,12 +262,16 @@ fn people(members: &[MemberInfo]) -> Vec<PersonId> {
     people
 }
 
+/// The member's name, safe to print: each member picks their own.
 fn display_name(member: &MemberInfo) -> String {
     member
         .profile
         .as_deref()
         .and_then(profile_name)
-        .unwrap_or_else(|| "(unnamed)".to_owned())
+        .map_or_else(
+            || "(unnamed)".to_owned(),
+            |name| printable(&name).into_owned(),
+        )
 }
 
 const CONSEQUENCE: &str =
@@ -278,18 +283,21 @@ enum Target {
     Person(PersonId),
 }
 
-/// What `query` names: a leaf number, else a person's fingerprint (a
-/// unique prefix is enough), else a device name.
+/// What `query` names: a leaf number (`12` or `#12`, as the list shows
+/// it), else a person's fingerprint (a unique prefix is enough), else a
+/// device name.
 fn find(members: &[MemberInfo], query: &str) -> anyhow::Result<Target> {
-    if let Ok(leaf) = query.parse::<u32>() {
-        return members
-            .iter()
-            .find(|m| m.leaf == leaf)
-            .cloned()
-            .map(Target::Device)
-            .with_context(|| format!("no member #{leaf}; see `typstry members`"));
-    }
     let query = query.trim();
+    let leaf = query.strip_prefix('#').unwrap_or(query).parse::<u32>().ok();
+    if let Some(leaf) = leaf {
+        if let Some(member) = members.iter().find(|m| m.leaf == leaf) {
+            return Ok(Target::Device(member.clone()));
+        }
+        if query.starts_with('#') {
+            bail!("no member #{leaf}; see `typstry members`");
+        }
+        // A fingerprint or a name can be all digits too.
+    }
     if query.len() >= MIN_PREFIX {
         let matching = people(members)
             .into_iter()
@@ -313,7 +321,10 @@ fn find(members: &[MemberInfo], query: &str) -> anyhow::Result<Target> {
     })?
     .cloned()
     .map(Target::Device)
-    .with_context(|| format!("no member named {query:?}; see `typstry members`"))
+    .with_context(|| match leaf {
+        Some(leaf) => format!("no member #{leaf} or named {query:?}; see `typstry members`"),
+        None => format!("no member named {query:?}; see `typstry members`"),
+    })
 }
 
 async fn remove(
@@ -338,8 +349,7 @@ async fn remove(
                 yes,
                 &format!("Remove #{} {name}? {CONSEQUENCE}", target.leaf),
             )? {
-                out.out("Nothing removed.");
-                return Ok(());
+                bail!("cancelled; nothing was removed");
             }
             session.remove_members(&[target.sig_pub]).await?;
             out.out(format!("Removed #{} {name}.", target.leaf));
@@ -367,8 +377,7 @@ async fn remove(
                     names.join(", ")
                 ),
             )? {
-                out.out("Nothing removed.");
-                return Ok(());
+                bail!("cancelled; nothing was removed");
             }
             session.remove_person(&person).await?;
             out.out(format!(

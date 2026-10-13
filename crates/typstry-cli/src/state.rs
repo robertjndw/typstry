@@ -15,7 +15,7 @@ use loro::{Frontiers, LoroDoc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use typstry_wire::crypto::LinkSecret;
+use typstry_wire::crypto::{CryptoError, LinkSecret};
 use typstry_wire::identity::PersonId;
 use typstry_wire::mls::{LeafKeys, MlsError, OwnerSecrets, SpaceGroup};
 
@@ -27,14 +27,34 @@ use crate::link::ShareLink;
 pub const STATE_DIR: &str = ".typstry";
 
 /// The owner keys a store holds, as `owner.bin` and the machine's
-/// per-project files keep them ([`OwnerSecrets::encode`]). A damaged file
-/// reads as empty, like a missing device: the group hands the key over
-/// again if another owner device holds it.
+/// per-project files keep them ([`OwnerSecrets::encode`]). A file this build
+/// cannot read, damaged or written by a newer typstry, reads as empty, like
+/// a missing device: the group hands the key over again if another owner
+/// device holds it. Whether it may also be written over is up to
+/// [`stored_owner_keys`].
 pub fn read_owner_keys(path: &Path) -> OwnerSecrets {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
-        .unwrap_or_default()
+    stored_owner_keys(path).unwrap_or_default()
+}
+
+/// [`read_owner_keys`] for a caller about to write the store back. Damage
+/// is written over, but a file whose version byte is newer than this build
+/// is an error rather than empty: written over, the keys in it would be gone
+/// for the newer typstry that still reads them, as after a downgrade. Damage
+/// that happens to start with such a byte cannot be told apart from that, so
+/// it is refused too and stays until someone deletes the file; the error
+/// says when that is safe.
+fn stored_owner_keys(path: &Path) -> anyhow::Result<OwnerSecrets> {
+    match OwnerSecrets::decode_kept(fs::read(path).ok().as_deref()) {
+        Ok(keys) => Ok(keys),
+        Err(CryptoError::NewerVersion(version)) => bail!(
+            "{} has owner key format {version}, which this typstry does not know: either a \
+             newer typstry wrote it or the file is damaged. Update typstry to keep using it. \
+             If no newer typstry ever ran on this machine and another device also holds this \
+             project's owner keys, delete the file and sync again",
+            path.display()
+        ),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Adds `held` to the store at `path`, writing only when that changed
@@ -44,7 +64,7 @@ pub fn read_owner_keys(path: &Path) -> OwnerSecrets {
 /// is ever replaced, so a folder that lags behind cannot push out what a
 /// newer one put there either (see [`OwnerSecrets::merge`]).
 pub fn merge_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> {
-    let mut keys = read_owner_keys(path);
+    let mut keys = stored_owner_keys(path)?;
     if keys.merge(held) {
         atomic_write(path, &keys.encode(), true)?;
     }
@@ -56,7 +76,7 @@ pub fn merge_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> 
 /// who can write it controls, like the directory: they must not push out a
 /// key this machine already holds.
 pub fn fill_owner_keys(path: &Path, held: &OwnerSecrets) -> anyhow::Result<()> {
-    let mut keys = read_owner_keys(path);
+    let mut keys = stored_owner_keys(path)?;
     let before = keys.encode();
     keys.extend_older(held);
     let after = keys.encode();
@@ -1067,8 +1087,33 @@ pub(crate) mod tests {
         merge_owner_keys(&path, &held).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
 
-        fs::write(&path, b"damaged").unwrap();
+        fs::write(&path, b"\0damaged").unwrap();
         assert!(read_owner_keys(&path).is_empty());
+        // Damage may be written over...
+        merge_owner_keys(&path, &held).unwrap();
+        assert_eq!(read_owner_keys(&path).iter().count(), 2);
+    }
+
+    #[test]
+    fn owner_keys_of_a_newer_format_are_never_written_over() {
+        use typstry_wire::mls::{Origin, OwnerSecret};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.bin");
+        let held: OwnerSecrets = [(OwnerSecret::generate(), Origin::Made)]
+            .into_iter()
+            .collect();
+        // ...but what a newer typstry wrote may hold keys it still needs.
+        let mut newer = held.encode();
+        newer[0] += 1;
+        fs::write(&path, &newer).unwrap();
+        assert!(read_owner_keys(&path).is_empty());
+        let err = merge_owner_keys(&path, &held).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("newer typstry"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("delete the file"), "{err}");
+        assert!(fill_owner_keys(&path, &held).is_err());
+        assert_eq!(fs::read(&path).unwrap(), *newer);
     }
 
     #[test]

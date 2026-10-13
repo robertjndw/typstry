@@ -4,6 +4,7 @@
 //! Everything interactive falls back to the plain line output when this
 //! says no, so scripts, pipes, CI and the tests never see a TUI.
 
+use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +101,40 @@ impl Drop for LogWriter {
     }
 }
 
+/// `text` from someone else (a title, a name), safe to print. Control
+/// characters could move the cursor, recolor or retitle the terminal, and
+/// bidi overrides could make a name read as something else, so both become
+/// U+FFFD.
+pub fn printable(text: &str) -> Cow<'_, str> {
+    replace(text, |c| c.is_control() || is_bidi(c))
+}
+
+/// `text` with the bidi controls of [`printable`] replaced, but line
+/// breaks and tabs kept: for whole lines of output, which may quote file
+/// names from the project. The name rules refuse control characters in
+/// those but not bidi ones, which are format characters.
+pub fn without_bidi(text: &str) -> Cow<'_, str> {
+    replace(text, is_bidi)
+}
+
+fn is_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn replace(text: &str, unsafe_char: impl Fn(char) -> bool) -> Cow<'_, str> {
+    if text.chars().any(&unsafe_char) {
+        text.chars()
+            .map(|c| if unsafe_char(c) { '\u{FFFD}' } else { c })
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
+}
+
 /// Drops the color codes the log formatter adds: the view draws text
 /// itself and would show them as garbage.
 fn strip_ansi(text: &str) -> String {
@@ -132,6 +167,23 @@ mod tests {
         assert!(!decide(true, false, Some("xterm"), false));
         assert!(!decide(true, true, Some("dumb"), false));
         assert!(!decide(true, true, Some("xterm"), true));
+    }
+
+    #[test]
+    fn printable_neutralizes_terminal_controls() {
+        assert_eq!(printable("Thesis"), "Thesis");
+        assert_eq!(printable("Ünïcode 论文"), "Ünïcode 论文");
+        assert_eq!(
+            printable("a\x1b]0;pwned\x07b"),
+            "a\u{FFFD}]0;pwned\u{FFFD}b"
+        );
+        assert_eq!(printable("x\ny\r\u{9b}"), "x\u{FFFD}y\u{FFFD}\u{FFFD}");
+        assert_eq!(printable("evil\u{202E}fdp.exe"), "evil\u{FFFD}fdp.exe");
+        assert_eq!(printable("\u{2066}a\u{2069}"), "\u{FFFD}a\u{FFFD}");
+        assert_eq!(
+            without_bidi("\u{2193} a\u{202E}b.typ\n\tnext"),
+            "\u{2193} a\u{FFFD}b.typ\n\tnext"
+        );
     }
 
     #[test]

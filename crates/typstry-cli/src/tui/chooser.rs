@@ -101,11 +101,6 @@ impl<T: Clone> Chooser<T> {
             KeyCode::Down | KeyCode::Char('j') => self.step(true),
             KeyCode::Char('?') => self.help = !self.help,
             KeyCode::Esc | KeyCode::Char('q') => return Action::Done(None),
-            KeyCode::Enter => {
-                if let Some(first) = self.keys.first() {
-                    return self.pick(first.key);
-                }
-            }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && self.keys.iter().any(|k| k.key == c) =>
@@ -126,13 +121,13 @@ impl<T: Clone> Chooser<T> {
         hints
     }
 
+    // Enter does nothing on purpose: every key offered here removes or
+    // revokes something, and Enter is pressed out of habit.
     fn help_text(&self) -> String {
-        match self.keys.first() {
-            Some(first) => format!(
-                "up/down or j/k move, enter does the same as {}, esc or q leaves without doing anything",
-                first.key
-            ),
-            None => "up/down or j/k move, esc or q leaves".to_owned(),
+        if self.keys.is_empty() {
+            "up/down or j/k move, esc or q leaves".to_owned()
+        } else {
+            "up/down or j/k move, esc or q leaves without doing anything".to_owned()
         }
     }
 }
@@ -172,8 +167,9 @@ fn render<T: Clone>(frame: &mut Frame, chooser: &Chooser<T>) {
 
 /// Shows the rows until the person presses one of `keys` on a selectable
 /// row (the key and the row's value come back) or leaves (`None`). Enter
-/// counts as the first key. `note` is shown on the status line, e.g. to say
-/// why there are no keys. The terminal is restored before this returns.
+/// is not a shortcut for any key, since they are all destructive. `note` is
+/// shown on the status line, e.g. to say why there are no keys. The terminal
+/// is restored before this returns.
 pub async fn choose<T: Clone>(
     title: &str,
     items: Vec<Item<T>>,
@@ -259,8 +255,9 @@ mod tests {
             press(&mut c, KeyCode::Char('d')),
             Action::Done(Some(('d', 2)))
         );
-        // Enter is the first key.
-        assert_eq!(press(&mut c, KeyCode::Enter), Action::Done(Some(('d', 2))));
+        // Enter never stands in for a key, which would make removing
+        // someone one habitual keystroke away.
+        assert_eq!(press(&mut c, KeyCode::Enter), Action::None);
         // Keys that are not offered do nothing.
         assert_eq!(press(&mut c, KeyCode::Char('x')), Action::None);
     }

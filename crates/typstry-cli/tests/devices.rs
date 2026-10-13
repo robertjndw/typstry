@@ -65,7 +65,7 @@ async fn revoking_a_device_removes_it_from_owned_and_edited_projects() {
 
     let devices = stdout(&run_as(&own, &holder_cfg, &["devices"]).await);
     assert!(devices.contains("Tester"), "{devices}");
-    let out = run_as(&own, &holder_cfg, &["devices", "revoke", "Tester"]).await;
+    let out = run_as(&own, &holder_cfg, &["devices", "revoke", "Tester", "--yes"]).await;
     let text = stdout(&out);
     // Only the owner rotates: the edited project gets the revoke in this
     // device's leaf and waits for its owner.
@@ -184,7 +184,7 @@ async fn revoking_resets_an_owned_project_without_a_folder_and_rotates_the_perso
     fs::remove_dir_all(&mine).unwrap();
     let a_device = other_device(&work, &b_cfg).await;
 
-    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device]).await;
+    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device, "--yes"]).await;
     let text = stdout(&out);
     assert!(text.contains("personal space"), "{text}");
     assert!(text.contains("Replaced the links of mine"), "{text}");
@@ -238,7 +238,7 @@ async fn revoking_resets_a_project_the_revoked_device_made_and_this_one_never_cl
     );
     let a_device = other_device(&work, &b_cfg).await;
 
-    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device]).await;
+    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device, "--yes"]).await;
     let text = stdout(&out);
     assert!(text.contains("Cleaned theirs"), "{text}");
     assert!(!stderr(&out).contains("theirs"), "{}", stderr(&out));
@@ -265,7 +265,7 @@ async fn revoking_replaces_the_links_of_an_owned_folder_the_revoked_device_never
     let old_link = link_of(&mine, &b_cfg).await;
     let a_device = other_device(&work, &b_cfg).await;
 
-    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device]).await;
+    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device, "--yes"]).await;
     let text = stdout(&out);
     assert!(text.contains("Replaced the links of mine"), "{text}");
     assert!(!stderr(&out).contains("Not reached"), "{}", stderr(&out));
@@ -298,11 +298,12 @@ async fn project_links_stay_when_the_personal_space_could_not_be_secured() {
     }
     let a_device = other_device(&work, &b_cfg).await;
 
-    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device]).await;
-    let err = stderr(&out);
+    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device, "--yes"]).await;
+    // Incomplete, so a script must not take it for done.
+    let err = failed(&out);
     assert!(err.contains("could not be secured"), "{err}");
     assert!(err.contains("no project links"), "{err}");
-    let text = stdout(&out);
+    let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("Cleaned"), "{text}");
     assert!(!text.contains("Replaced the links of mine"), "{text}");
     // Nothing was rotated, so the link still opens.
@@ -344,8 +345,8 @@ async fn a_folder_joined_before_the_key_was_listed_takes_it_from_the_directory()
     let listing = stdout(&run_as(&b_own, &b_cfg, &["members"]).await);
     assert!(!listing.contains("no owner key"), "{listing}");
     let leaf = other_leaf(&listing, "editor");
-    stdout(&run_as(&b_own, &b_cfg, &["members", "remove", &leaf]).await);
-    stdout(&run_as(&b_own, &b_cfg, &["share", "reset"]).await);
+    stdout(&run_as(&b_own, &b_cfg, &["members", "remove", &leaf, "--yes"]).await);
+    stdout(&run_as(&b_own, &b_cfg, &["share", "reset", "--yes"]).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -366,7 +367,7 @@ async fn revoking_removes_the_device_from_an_owned_project_without_a_folder() {
     fs::remove_dir_all(&b_own).unwrap();
     let a_device = other_device(&work, &b_cfg).await;
 
-    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device]).await;
+    let out = run_as(&work, &b_cfg, &["devices", "revoke", &a_device, "--yes"]).await;
     let text = stdout(&out);
     assert!(text.contains("Cleaned own"), "{text}");
     assert!(!stderr(&out).contains("Not reached"), "{}", stderr(&out));
@@ -389,9 +390,16 @@ async fn a_device_cannot_revoke_itself_or_an_unknown_one() {
         .find(|l| l.contains("(this device)"))
         .unwrap_or_else(|| panic!("{devices}"));
     let fingerprint = mine.split_whitespace().nth(1).unwrap();
-    let err = failed(&run_as(&work, &new_cfg, &["devices", "revoke", fingerprint]).await);
+    let err = failed(
+        &run_as(
+            &work,
+            &new_cfg,
+            &["devices", "revoke", fingerprint, "--yes"],
+        )
+        .await,
+    );
     assert!(err.contains("this device"), "{err}");
-    let err = failed(&run_as(&work, &new_cfg, &["devices", "revoke", "nobody"]).await);
+    let err = failed(&run_as(&work, &new_cfg, &["devices", "revoke", "nobody", "--yes"]).await);
     assert!(err.contains("no device matches"), "{err}");
     let devices = stdout(&run_as(&work, &new_cfg, &["devices"]).await);
     assert!(!devices.contains("revoked"), "{devices}");
@@ -408,15 +416,18 @@ async fn projects_that_cannot_be_cleaned_are_reported() {
     clone_as(&holder_cfg, &view, &work, "viewed").await;
     pair(&server, &work, &own, &holder_cfg, &new_cfg).await;
 
-    let out = run_as(&own, &holder_cfg, &["devices", "revoke", "Tester"]).await;
-    stdout(&out);
-    let err = stderr(&out);
+    let out = run_as(&own, &holder_cfg, &["devices", "revoke", "Tester", "--yes"]).await;
+    let err = failed(&out);
     assert!(err.contains("Not reached"), "{err}");
     assert!(err.contains("view-only"), "{err}");
+    assert!(err.contains("not removed everywhere"), "{err}");
 
-    // Running it again says the device is revoked already.
-    let again = stdout(&run_as(&own, &holder_cfg, &["devices", "revoke", "Tester"]).await);
-    assert!(again.contains("already revoked"), "{again}");
+    // Running it again says the device is revoked already, and fails as
+    // long as the project stays out of reach.
+    let again = run_as(&own, &holder_cfg, &["devices", "revoke", "Tester", "--yes"]).await;
+    failed(&again);
+    let text = String::from_utf8_lossy(&again.stdout);
+    assert!(text.contains("already revoked"), "{text}");
 }
 
 /// The 17 words `devices recovery` printed.
@@ -513,8 +524,8 @@ async fn a_recovery_key_takes_the_account_back_after_every_device_is_lost() {
     assert!(!listing.contains("revoked"), "{listing}");
     assert!(listing.contains("(owner)"), "{listing}");
     let member = common::other_leaf(&listing, "editor");
-    stdout(&run_as(&fresh, &fresh_cfg, &["members", "remove", &member]).await);
-    stdout(&run_as(&fresh, &fresh_cfg, &["share", "reset"]).await);
+    stdout(&run_as(&fresh, &fresh_cfg, &["members", "remove", &member, "--yes"]).await);
+    stdout(&run_as(&fresh, &fresh_cfg, &["share", "reset", "--yes"]).await);
     let err = failed(&run_as(&lost, &lost_cfg, &["pull"]).await);
     assert!(err.contains("you were removed"), "{err}");
 }
@@ -526,7 +537,7 @@ async fn fingerprints_that_start_with_a_hyphen_are_taken_as_names() {
     // They are base64url, so one in 64 starts this way. It has to reach the
     // lookup instead of being parsed as a flag.
     for query in ["-1abc", "-ab"] {
-        let err = failed(&run_as(&work, &cfg, &["devices", "revoke", query]).await);
+        let err = failed(&run_as(&work, &cfg, &["devices", "revoke", query, "--yes"]).await);
         assert!(!err.contains("unexpected argument"), "{err}");
     }
 }

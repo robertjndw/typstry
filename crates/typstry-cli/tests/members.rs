@@ -68,9 +68,9 @@ async fn clone_joins_the_group_and_members_lists_everyone() {
     // A viewer joins too and reads the same list, but cannot remove anyone.
     let from_view = stdout(&binary(&v, &["members"]).await);
     assert!(from_view.contains("Members (4)"), "{from_view}");
-    let err = failed(&binary(&v, &["members", "remove", "0"]).await);
+    let err = failed(&binary(&v, &["members", "remove", "0", "--yes"]).await);
     assert!(err.contains("only the project owner"), "{err}");
-    let err = failed(&binary(&v, &["share", "reset"]).await);
+    let err = failed(&binary(&v, &["share", "reset", "--yes"]).await);
     assert!(err.contains("only the project owner"), "{err}");
 }
 
@@ -85,7 +85,7 @@ async fn a_removed_folder_is_told_so_and_the_others_follow() {
     let old = config(&b);
 
     let leaf = own_leaf(&c);
-    typstry(&a, &["members", "remove", &leaf.to_string()])
+    typstry(&a, &["members", "remove", &leaf.to_string(), "--yes"])
         .await
         .unwrap();
 
@@ -133,22 +133,48 @@ async fn removing_by_name_and_self_removal() {
     let a = clone(&edit, &work, "a").await;
 
     let own = own_leaf(&a);
-    let err = typstry(&a, &["members", "remove", &own.to_string()])
+    let err = typstry(&a, &["members", "remove", &own.to_string(), "--yes"])
         .await
         .unwrap_err();
     assert!(
         format!("{err:#}").contains("cannot remove itself"),
         "{err:#}"
     );
-    let err = typstry(&a, &["members", "remove", "nobody"])
+    let err = typstry(&a, &["members", "remove", "nobody", "--yes"])
         .await
         .unwrap_err();
     assert!(format!("{err:#}").contains("no member named"), "{err:#}");
-    let err = typstry(&a, &["members", "remove", "99"]).await.unwrap_err();
+    let err = typstry(&a, &["members", "remove", "99", "--yes"])
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("no member #99"), "{err:#}");
+    let err = typstry(&a, &["members", "remove", "#99", "--yes"])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("no member #99"), "{err:#}");
+    // As the list shows it.
+    let err = typstry(&a, &["members", "remove", &format!("#{own}"), "--yes"])
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("cannot remove itself"),
+        "{err:#}"
+    );
+
+    // Without a terminal to ask on, nothing happens without --yes, plain
+    // mode or not.
+    let before = config(&a);
+    for args in [
+        &["members", "remove", "browser"][..],
+        &["--plain", "share", "reset"],
+    ] {
+        let err = failed(&binary(&a, args).await);
+        assert!(err.contains("pass --yes"), "{err}");
+    }
+    assert_eq!(config(&a).token, before.token);
 
     let before = config(&a);
-    typstry(&a, &["members", "remove", "browser"])
+    typstry(&a, &["members", "remove", "browser", "--yes"])
         .await
         .unwrap();
     assert_ne!(config(&a).token, before.token);
@@ -167,10 +193,13 @@ async fn a_folder_offline_during_a_rotation_follows_it_on_the_next_sync() {
     let before = config(&b);
 
     // Two rotations while b does not run.
-    typstry(&a, &["members", "remove", &own_leaf(&c).to_string()])
-        .await
-        .unwrap();
-    typstry(&a, &["share", "reset"]).await.unwrap();
+    typstry(
+        &a,
+        &["members", "remove", &own_leaf(&c).to_string(), "--yes"],
+    )
+    .await
+    .unwrap();
+    typstry(&a, &["share", "reset", "--yes"]).await.unwrap();
     fs::write(a.join("late.typ"), "written under the newest keys\n").unwrap();
     typstry(&a, &["push"]).await.unwrap();
     let latest = config(&a);
@@ -199,7 +228,7 @@ async fn resetting_the_links_invalidates_the_old_ones() {
     let v = clone(&view, &work, "v").await;
     let old_edit = ShareLink::parse(&edit).unwrap();
 
-    let out = stdout(&binary(&a, &["share", "reset"]).await);
+    let out = stdout(&binary(&a, &["share", "reset", "--yes"]).await);
     assert!(out.contains("Edit: "), "{out}");
     assert!(out.contains("View: "), "{out}");
     let new_edit = stdout(&binary(&a, &["link", "--edit"]).await);
@@ -289,7 +318,7 @@ async fn a_rotation_that_never_left_is_sent_again_not_rebuilt() {
 
     let payload = interrupted_rotation(&a, false).await;
     let rotate = payload.rotate.unwrap();
-    typstry(&a, &["share", "reset"]).await.unwrap();
+    typstry(&a, &["share", "reset", "--yes"]).await.unwrap();
     assert_eq!(config(&a).token, rotate.edit_token);
 }
 
@@ -303,7 +332,7 @@ async fn a_reset_does_not_rotate_twice_when_the_earlier_one_landed() {
 
     let payload = interrupted_rotation(&a, true).await;
     let rotate = payload.rotate.unwrap();
-    typstry(&a, &["share", "reset"]).await.unwrap();
+    typstry(&a, &["share", "reset", "--yes"]).await.unwrap();
     assert_eq!(config(&a).token, rotate.edit_token);
 }
 
@@ -327,9 +356,12 @@ async fn removing_a_member_names_it_by_key_not_by_a_leaf_that_was_reused() {
         .sig_pub;
 
     // c goes, and d takes the freed leaf.
-    typstry(&b, &["members", "remove", &own_leaf(&c).to_string()])
-        .await
-        .unwrap();
+    typstry(
+        &b,
+        &["members", "remove", &own_leaf(&c).to_string(), "--yes"],
+    )
+    .await
+    .unwrap();
     let d = clone(&config(&b).link().to_string(), &work, "d").await;
 
     let err = stale.remove_members(&[c_key]).await.unwrap_err();
@@ -458,7 +490,12 @@ async fn devices_of_one_person_are_listed_together_and_removed_together() {
     assert_eq!(listing.matches("(this device)").count(), 1, "{listing}");
 
     // A prefix is enough, and the owner removes both.
-    let out = as_person(&c, &other_cfg, &["members", "remove", &fingerprint[..6]]).await;
+    let out = as_person(
+        &c,
+        &other_cfg,
+        &["members", "remove", &fingerprint[..6], "--yes"],
+    )
+    .await;
     let text = stdout(&out);
     assert!(text.contains("Removed person"), "{text}");
     for dir in [&a, &b] {
@@ -478,9 +515,9 @@ async fn removing_a_person_needs_a_unique_fingerprint_and_another_device() {
 
     let listing = stdout(&as_person(&a, &cfg, &["members"]).await);
     let fingerprint = own_fingerprint(&listing);
-    let err = failed(&as_person(&a, &cfg, &["members", "remove", &fingerprint]).await);
+    let err = failed(&as_person(&a, &cfg, &["members", "remove", &fingerprint, "--yes"]).await);
     assert!(err.contains("cannot remove itself"), "{err}");
-    let err = failed(&as_person(&a, &cfg, &["members", "remove", "zzzzzzzz"]).await);
+    let err = failed(&as_person(&a, &cfg, &["members", "remove", "zzzzzzzz", "--yes"]).await);
     assert!(err.contains("no member named"), "{err}");
 }
 
@@ -504,7 +541,7 @@ async fn clones_are_recorded_in_the_project_list() {
 
     // A rotation moves the stored link along. It takes the owner to make one.
     let owner = clone(&edit, &work, "owner").await;
-    stdout(&binary(&owner, &["share", "reset"]).await);
+    stdout(&binary(&owner, &["share", "reset", "--yes"]).await);
     stdout(&as_person(&a, &cfg, &["pull"]).await);
     let file: serde_json::Value =
         serde_json::from_slice(&fs::read(cfg.join("projects.json")).unwrap()).unwrap();
@@ -594,21 +631,21 @@ async fn only_the_owner_removes_members_or_resets_links() {
     let listing = stdout(&as_person(&e, &editor_cfg, &["members"]).await);
     assert!(listing.contains("editor"), "{listing}");
     let leaf = other_leaf(&listing, "owner");
-    let err = failed(&as_person(&e, &editor_cfg, &["members", "remove", &leaf]).await);
+    let err = failed(&as_person(&e, &editor_cfg, &["members", "remove", &leaf, "--yes"]).await);
     assert!(
         err.contains("Only the project owner can remove members or reset links."),
         "{err}"
     );
-    let err = failed(&as_person(&e, &editor_cfg, &["share", "reset"]).await);
+    let err = failed(&as_person(&e, &editor_cfg, &["share", "reset", "--yes"]).await);
     assert!(err.contains("Only the project owner"), "{err}");
 
     // Nothing moved, and the owner can.
     let before = config(&e).token;
     let listing = stdout(&as_person(&o, &owner_cfg, &["members"]).await);
     let leaf = other_leaf(&listing, "editor");
-    stdout(&as_person(&o, &owner_cfg, &["members", "remove", &leaf]).await);
+    stdout(&as_person(&o, &owner_cfg, &["members", "remove", &leaf, "--yes"]).await);
     assert_ne!(config(&o).token, before);
-    stdout(&as_person(&o, &owner_cfg, &["share", "reset"]).await);
+    stdout(&as_person(&o, &owner_cfg, &["share", "reset", "--yes"]).await);
     drop(x);
 }
 
@@ -668,8 +705,8 @@ async fn another_folder_of_the_same_machine_rotates_without_waiting_for_the_key(
     let again = clone_as(edit.trim(), &work, "again", &cfg).await;
     let listing = stdout(&as_person(&again, &cfg, &["members"]).await);
     assert!(!listing.contains("no owner key"), "{listing}");
-    stdout(&as_person(&again, &cfg, &["share", "reset"]).await);
-    stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
+    stdout(&as_person(&again, &cfg, &["share", "reset", "--yes"]).await);
+    stdout(&as_person(&o, &cfg, &["share", "reset", "--yes"]).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -690,7 +727,7 @@ async fn a_damaged_group_state_keeps_the_owner_key() {
     let listing = stdout(&as_person(&o, &cfg, &["members"]).await);
     assert!(listing.contains("Members (1)"), "{listing}");
     assert!(!listing.contains("no owner key"), "{listing}");
-    stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
+    stdout(&as_person(&o, &cfg, &["share", "reset", "--yes"]).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -734,7 +771,7 @@ async fn the_owner_key_survives_a_rejoin_after_the_log_was_pruned() {
     assert_eq!(state(&o).epoch(), head.epoch() + 1);
     assert!(o.join(STATE_DIR).join("owner.bin").exists());
 
-    stdout(&as_person(&o, &cfg, &["share", "reset"]).await);
+    stdout(&as_person(&o, &cfg, &["share", "reset", "--yes"]).await);
     typstry(&f, &["pull"]).await.unwrap();
     assert_eq!(config(&f).token, config(&o).token);
 }
@@ -755,7 +792,7 @@ async fn a_project_the_person_was_removed_from_is_unavailable_in_the_list() {
         &stdout(&run_as(&a, &owner_cfg, &["members"]).await),
         "editor",
     );
-    stdout(&run_as(&a, &owner_cfg, &["members", "remove", &leaf]).await);
+    stdout(&run_as(&a, &owner_cfg, &["members", "remove", &leaf, "--yes"]).await);
 
     // The removed folder finds out on its next sync, and the directory with it.
     let pulled = run_as(&b, &member_cfg, &["pull"]).await;
