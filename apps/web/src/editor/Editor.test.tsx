@@ -18,7 +18,11 @@ describe("Editor", () => {
   it("mounts a bound view, swaps it per text container and cleans up", () => {
     const { doc, main, other, undoManager } = setup();
     const ready: EditorView[] = [];
-    const onReady = (v: EditorView) => ready.push(v);
+    const calls: (EditorView | null)[] = [];
+    const onReady = (v: EditorView | null) => {
+      calls.push(v);
+      if (v) ready.push(v);
+    };
 
     const { rerender, unmount, container } = render(
       <Editor
@@ -53,6 +57,9 @@ describe("Editor", () => {
     );
     expect(ready).toHaveLength(2);
     const view = ready[1]!;
+    // The old view is reported gone before the new one arrives, so nobody
+    // acts on a destroyed view in between.
+    expect(calls).toEqual([ready[0], null, view]);
     expect(view.state.doc.toString()).toBe("= Other\n");
     view.dispatch({ changes: { from: view.state.doc.length, insert: "text" } });
     expect(other.toString()).toBe("= Other\ntext");
@@ -60,6 +67,7 @@ describe("Editor", () => {
 
     unmount();
     expect(container.querySelector(".cm-editor")).toBeNull();
+    expect(calls.at(-1)).toBeNull();
     other.insert(0, "x");
     doc.commit();
     expect(view.state.doc.toString()).toBe("= Other\ntext");

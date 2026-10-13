@@ -8,6 +8,7 @@ import {
 import { EditorState, type Extension } from "@codemirror/state";
 import { EditorView, ViewPlugin } from "@codemirror/view";
 import type { ContainerID, TreeID } from "loro-crdt";
+import { toast } from "sonner";
 
 import type { ProjectAssets } from "@/assets/project-assets";
 import { getText } from "@/doc/fs-ops";
@@ -55,10 +56,23 @@ export type TinymistWorker = Pick<
 >;
 
 export interface TinymistClientOptions {
+  /** A worker owned by the caller; the client does not replace it. */
   worker?: TinymistWorker;
+  /** Creates (and recreates, once, after a failure) the client's worker. */
+  createWorker?: () => TinymistWorker;
 }
 
-function workerTransport(worker: TinymistWorker): Transport {
+function createTinymistWorker(): TinymistWorker {
+  return new Worker(new URL("./tinymist.worker.ts", import.meta.url), {
+    type: "module",
+    name: "tinymist",
+  });
+}
+
+function workerTransport(
+  worker: TinymistWorker,
+  onInitError: (message: string) => void,
+): Transport {
   const handlers = new Map<
     (value: string) => void,
     (event: MessageEvent<TinymistResponse>) => void
@@ -69,8 +83,7 @@ function workerTransport(worker: TinymistWorker): Transport {
     subscribe(handler) {
       const listener = ({ data }: MessageEvent<TinymistResponse>) => {
         if (data.type === "lsp") handler(data.message);
-        else if (data.type === "initError")
-          console.error("[tinymist] failed to start:", data.message);
+        else if (data.type === "initError") onInitError(data.message);
       };
       handlers.set(handler, listener);
       worker.addEventListener("message", listener);
@@ -103,7 +116,12 @@ interface AssetFile {
  */
 export class TinymistClient {
   readonly lsp: LSPClient;
-  private readonly worker: TinymistWorker;
+  private worker: TinymistWorker;
+  /** Null for a caller-owned worker. */
+  private readonly spawnWorker: (() => TinymistWorker) | null;
+  /** The worker was replaced once already; the next failure is final. */
+  private restarted = false;
+  private failed = false;
   private readonly project: ProjectDoc;
   private readonly assets: ProjectAssets | null;
   private readonly index: ProjectIndex;
@@ -134,13 +152,11 @@ export class TinymistClient {
   ) {
     this.project = project;
     this.assets = assets;
-    this.worker =
-      options.worker ??
-      new Worker(new URL("./tinymist.worker.ts", import.meta.url), {
-        type: "module",
-        name: "tinymist",
-      });
-    this.worker.addEventListener("message", this.onWorkerMessage);
+    this.spawnWorker = options.worker
+      ? null
+      : (options.createWorker ?? createTinymistWorker);
+    this.worker = options.worker ?? this.spawnWorker!();
+    this.attach(this.worker);
     this.lsp = new LSPClient({
       rootUri: PROJECT_ROOT_URI,
       timeout: REQUEST_TIMEOUT_MS,
@@ -153,7 +169,7 @@ export class TinymistClient {
         projectResolution: "singleFile",
       },
       extensions: [serverCompletion(), hoverTooltips(), signatureHelp()],
-    }).connect(workerTransport(this.worker));
+    }).connect(this.transport());
 
     this.index = projectIndex(project);
     this.unsubscribeIndex = this.index.subscribe((change) =>
@@ -203,13 +219,68 @@ export class TinymistClient {
     this.unsubscribeIndex();
     this.retry.dispose();
     if (this.syncTimer !== null) clearTimeout(this.syncTimer);
-    this.worker.removeEventListener("message", this.onWorkerMessage);
+    this.detach(this.worker);
     this.lsp.disconnect();
     this.worker.terminate();
   }
 
+  private transport(): Transport {
+    return workerTransport(this.worker, (message) =>
+      this.onFailure(`failed to start: ${message}`),
+    );
+  }
+
+  private attach(worker: TinymistWorker): void {
+    worker.addEventListener("message", this.onWorkerMessage);
+    worker.addEventListener("error", this.onWorkerError);
+  }
+
+  private detach(worker: TinymistWorker): void {
+    worker.removeEventListener("message", this.onWorkerMessage);
+    worker.removeEventListener("error", this.onWorkerError);
+  }
+
+  private readonly onWorkerError = (event: Event) => {
+    this.onFailure(event instanceof ErrorEvent ? event.message : "crashed");
+  };
+
+  /**
+   * One fresh worker covers a crash or a start that hit a flaky
+   * connection. A second failure is likely to repeat, and the editor works
+   * fine without completion, so it just says so.
+   */
+  private onFailure(reason: string): void {
+    if (this.disposed || this.failed) return;
+    console.error(`[tinymist] ${reason}`);
+    this.detach(this.worker);
+    this.lsp.disconnect();
+    this.worker.terminate();
+    if (this.spawnWorker && !this.restarted) {
+      this.restarted = true;
+      this.worker = this.spawnWorker();
+      this.attach(this.worker);
+      // The new worker knows no files; mirror everything again. Assets wait
+      // for tinymist to ask, as before.
+      this.textsById.clear();
+      this.assetsByUri.clear();
+      this.dirty.clear();
+      this.pinnedMain = null;
+      this.syncStructure(this.index.state);
+      // Reconnecting also reopens the files shown in editors.
+      this.lsp.connect(this.transport());
+      return;
+    }
+    this.failed = true;
+    toast.warning("Language features are unavailable", {
+      id: "tinymist-unavailable",
+      description:
+        "Completion and hover docs could not start. Editing and the preview still work; reload the page to try again.",
+    });
+  }
+
   private post(message: TinymistRequest, transfer?: Transferable[]): void {
-    if (!this.disposed) this.worker.postMessage(message, transfer ?? []);
+    if (!this.disposed && !this.failed)
+      this.worker.postMessage(message, transfer ?? []);
   }
 
   private onWorkerMessage = ({ data }: MessageEvent<TinymistResponse>) => {

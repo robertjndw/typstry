@@ -2,6 +2,13 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
 const PAGE_START = '<g class="typst-page"';
 
+/**
+ * Marks the element the preview pages live in. typst.ts ships its CSS with
+ * global selectors (a bare `svg { fill: none }` among them, which would
+ * blank icons across the app), so the defs' styles are scoped under it.
+ */
+export const PREVIEW_SCOPE_CLASS = "typst-preview";
+
 export interface PreviewPage {
   /** Content hash typst.ts assigns to the page; equal tid, equal content. */
   tid: string;
@@ -144,8 +151,52 @@ function parseSvg(markup: string): SVGSVGElement {
   return root as unknown as SVGSVGElement;
 }
 
+/**
+ * Prefixes every selector of a top-level style rule with `scope`. At-rules
+ * (typst.ts has two @keyframes) are kept as they are. This is a brace
+ * counter, not a CSS parser: enough for the fixed stylesheet typst.ts
+ * emits, which has no comments or braces inside strings.
+ */
+export function scopeCss(css: string, scope: string): string {
+  let out = "";
+  let at = 0;
+  while (at < css.length) {
+    const open = css.indexOf("{", at);
+    if (open < 0) {
+      out += css.slice(at);
+      break;
+    }
+    // Find the matching close brace, so nested blocks stay inside.
+    let depth = 0;
+    let close = open;
+    for (; close < css.length; close++) {
+      if (css[close] === "{") depth++;
+      else if (css[close] === "}" && --depth === 0) break;
+    }
+    const prelude = css.slice(at, open).trim();
+    const body = css.slice(open, close + 1);
+    if (prelude.startsWith("@")) {
+      out += `${prelude} ${body}\n`;
+    } else {
+      const selectors = prelude
+        .split(",")
+        .map((sel) => `${scope} ${sel.trim()}`)
+        .join(", ");
+      out += `${selectors} ${body}\n`;
+    }
+    at = close + 1;
+  }
+  return out;
+}
+
 function createDefs(rootTag: string, source: string): SVGSVGElement {
   const parsed = parseSvg(rootTag + source + "</svg>");
+  for (const style of Array.from(parsed.querySelectorAll("style"))) {
+    style.textContent = scopeCss(
+      style.textContent ?? "",
+      `.${PREVIEW_SCOPE_CLASS}`,
+    );
+  }
   const defs = document.createElementNS(SVG_NS, "svg");
   defs.setAttribute("aria-hidden", "true");
   defs.setAttribute("width", "0");

@@ -15,6 +15,7 @@ import { newProject } from "@/doc/test-utils";
 import { CompilerClient } from "./compiler-client";
 import type {
   ArtifactUpdate,
+  WorkerEvents,
   WorkerLike,
   WorkerRequest,
   WorkerResponse,
@@ -23,26 +24,37 @@ import type { PreviewRenderer } from "./renderer";
 
 class FakeWorker implements WorkerLike {
   sent: WorkerRequest[] = [];
-  private listeners = new Set<(e: MessageEvent<WorkerResponse>) => void>();
+  terminated = false;
+  private listeners = new Map<string, Set<(e: never) => void>>();
   postMessage(message: WorkerRequest) {
     this.sent.push(message);
   }
-  addEventListener(
-    _type: "message",
-    l: (e: MessageEvent<WorkerResponse>) => void,
+  addEventListener<K extends keyof WorkerEvents>(
+    type: K,
+    l: (e: WorkerEvents[K]) => void,
   ) {
-    this.listeners.add(l);
+    const set = this.listeners.get(type) ?? new Set();
+    set.add(l);
+    this.listeners.set(type, set);
   }
-  removeEventListener(
-    _type: "message",
-    l: (e: MessageEvent<WorkerResponse>) => void,
+  removeEventListener<K extends keyof WorkerEvents>(
+    type: K,
+    l: (e: WorkerEvents[K]) => void,
   ) {
-    this.listeners.delete(l);
+    this.listeners.get(type)?.delete(l);
   }
-  terminate() {}
+  terminate() {
+    this.terminated = true;
+  }
   emit(message: WorkerResponse) {
-    for (const l of this.listeners)
-      l({ data: message } as MessageEvent<WorkerResponse>);
+    for (const l of this.listeners.get("message") ?? [])
+      (l as (e: MessageEvent<WorkerResponse>) => void)({
+        data: message,
+      } as MessageEvent<WorkerResponse>);
+  }
+  crash() {
+    for (const l of this.listeners.get("error") ?? [])
+      (l as (e: Event) => void)(new Event("error"));
   }
   /** Returns and clears what was sent so far. */
   take(): WorkerRequest[] {
@@ -377,7 +389,7 @@ describe("CompilerClient asset retries", () => {
       if (fail) throw new TypeError("Failed to fetch");
       return new Uint8Array([1, 2, 3]);
     });
-    new CompilerClient(project, {
+    const client = new CompilerClient(project, {
       worker,
       assetLoader: loader,
       createRenderer: async () => fakeRenderer().renderer,
@@ -391,6 +403,7 @@ describe("CompilerClient asset retries", () => {
     const setAssets = () => worker.take().filter((m) => m.type === "setAsset");
     return {
       project,
+      client,
       worker,
       loader,
       logo,
@@ -411,6 +424,23 @@ describe("CompilerClient asset retries", () => {
     expect(setAssets()).toEqual([
       { type: "setAsset", path: "/logo.png", data: new Uint8Array([1, 2, 3]) },
     ]);
+  });
+
+  it("retries right away when asked to refresh its assets", async () => {
+    const { client, loader, setAssets, heal } = retrySetup();
+    await settle();
+    expect(loader).toHaveBeenCalledTimes(1);
+
+    heal();
+    client.refreshAssets();
+    await settle();
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(setAssets()).toHaveLength(1);
+
+    // Nothing failed any more, so another refresh loads nothing.
+    client.refreshAssets();
+    await settle();
+    expect(loader).toHaveBeenCalledTimes(2);
   });
 
   it("retries right away once the browser is back online", async () => {
@@ -752,5 +782,211 @@ describe("CompilerClient PDF export", () => {
     const other = setup();
     deleteNode(other.project, mainId(other.project));
     await expect(other.client.exportPdf()).rejects.toThrow("no main file");
+  });
+});
+
+describe("CompilerClient superseded results", () => {
+  const error = {
+    path: "/main.typ",
+    package: "",
+    severity: "error" as const,
+    message: "unknown variable: x",
+    range: { startLine: 0, startCol: 1, endLine: 0, endCol: 2 },
+  };
+
+  it("keeps the diagnostics of the newest compile only", async () => {
+    const { worker, client, setSvg } = setup();
+    setSvg(svgDoc("p1"));
+    worker.emit({ type: "ready" });
+    worker.emit({ type: "compiling", id: 1 });
+    worker.emit({ type: "compiling", id: 2 });
+    const published = vi.fn();
+    client.subscribe(published);
+    worker.emit({
+      type: "result",
+      id: 1,
+      mainPath: "/main.typ",
+      diagnostics: [error],
+      compileMs: 1,
+    });
+    await settle();
+    expect(published).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        diagnostics: [expect.objectContaining({ message: error.message })],
+      }),
+    );
+    expect(client.getState()).toMatchObject({
+      status: "compiling",
+      diagnostics: [],
+    });
+
+    emitResult(worker, 2);
+    await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
+    expect(client.getState().diagnostics).toEqual([]);
+  });
+
+  it("drops a result for the previous main file", async () => {
+    const { project, worker, client, setSvg, applied } = setup();
+    const other = createFile(project, null, "other.typ", "text");
+    setMainFile(project, other);
+    project.doc.commit();
+    await settle();
+    expect(client.getState().mainPath).toBe("other.typ");
+
+    setSvg(svgDoc("old"));
+    worker.emit({ type: "compiling", id: 1 });
+    worker.emit({
+      type: "result",
+      id: 1,
+      mainPath: "/main.typ",
+      diagnostics: [error],
+      update: { action: "reset", data: new Uint8Array([1]) },
+      compileMs: 1,
+    });
+    await settle();
+    // The renderer still gets the update, later deltas build on it.
+    expect(applied).toHaveLength(1);
+    expect(client.getState().diagnostics).toEqual([]);
+    expect(client.getState().document).toBeNull();
+  });
+});
+
+describe("CompilerClient worker failures", () => {
+  function crashSetup() {
+    const project = initProject(newProject(1), { title: "T" });
+    const workers: FakeWorker[] = [];
+    const client = new CompilerClient(project, {
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w;
+      },
+      createRenderer: async () => fakeRenderer().renderer,
+    });
+    workers[0]!.emit({ type: "ready" });
+    return { project, client, workers };
+  }
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("replaces a crashed worker and mirrors the project into the new one", async () => {
+    const { client, workers } = crashSetup();
+    const pdf = client.exportPdf();
+    await settle();
+
+    workers[0]!.crash();
+    await expect(pdf).rejects.toThrow("crashed");
+    expect(workers[0]!.terminated).toBe(true);
+    expect(workers).toHaveLength(2);
+    expect(workers[1]!.sent).toEqual([
+      { type: "setText", path: "/main.typ", text: expect.any(String) },
+      { type: "compile", mainPath: "/main.typ" },
+    ]);
+    expect(client.getState()).toMatchObject({
+      status: "error",
+      error: expect.stringMatching(/crashed/),
+    });
+
+    workers[1]!.emit({ type: "ready" });
+    expect(client.getState()).toMatchObject({ status: "idle", error: null });
+  });
+
+  it("flags a long silent compile without killing the worker", async () => {
+    const { client, workers } = crashSetup();
+    workers[0]!.emit({ type: "compiling", id: 1 });
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(client.getState().stalled).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(client.getState()).toMatchObject({
+      status: "compiling",
+      stalled: true,
+      error: null,
+    });
+
+    // Like a big package download: slow, but it finishes.
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(workers).toHaveLength(1);
+    expect(workers[0]!.terminated).toBe(false);
+    emitResult(workers[0]!, 1);
+    expect(client.getState().stalled).toBe(false);
+  });
+
+  it("restarts a stalled worker when asked, without counting it as a crash", async () => {
+    const { client, workers } = crashSetup();
+    for (let i = 0; i < 2; i++) workers.at(-1)!.crash();
+    expect(workers).toHaveLength(3);
+    workers[2]!.emit({ type: "ready" });
+    workers[2]!.emit({ type: "compiling", id: 1 });
+    const pdf = client.exportPdf();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(client.getState().stalled).toBe(true);
+
+    client.retry();
+    await expect(pdf).rejects.toThrow("restarted");
+    expect(workers[2]!.terminated).toBe(true);
+    expect(workers).toHaveLength(4);
+    expect(workers[3]!.sent).toContainEqual({
+      type: "compile",
+      mainPath: "/main.typ",
+    });
+    expect(client.getState().stalled).toBe(false);
+
+    // Two crashes so far without a finished compile; had the manual restart
+    // counted, this third crash would make the client give up.
+    workers[3]!.crash();
+    expect(workers).toHaveLength(5);
+    expect(client.getState().error).toMatch(/Restarting it/);
+  });
+
+  it("does not time out while idle", async () => {
+    const { workers } = crashSetup();
+    workers[0]!.emit({ type: "compiling", id: 1 });
+    emitResult(workers[0]!, 1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(workers).toHaveLength(1);
+  });
+
+  it("gives up after repeated crashes until retried", async () => {
+    const { client, workers } = crashSetup();
+    for (let i = 0; i < 4; i++) workers.at(-1)!.crash();
+    expect(workers).toHaveLength(4);
+    expect(workers[3]!.terminated).toBe(true);
+    expect(client.getState().error).toMatch(/4 times in a row/);
+    await expect(client.exportPdf()).rejects.toThrow("not running");
+
+    client.retry();
+    expect(workers).toHaveLength(5);
+    expect(workers[4]!.sent).toContainEqual({
+      type: "compile",
+      mainPath: "/main.typ",
+    });
+  });
+
+  it("asks the worker to restart a compiler that failed to start", async () => {
+    const project = initProject(newProject(1), { title: "T" });
+    const worker = new FakeWorker();
+    const client = new CompilerClient(project, {
+      worker,
+      createRenderer: async () => fakeRenderer().renderer,
+    });
+    worker.emit({ type: "initError", message: "TypeError: Failed to fetch" });
+    expect(client.getState()).toMatchObject({
+      status: "error",
+      error: expect.stringMatching(/Failed to fetch/),
+    });
+    worker.take();
+
+    window.dispatchEvent(new Event("online"));
+    expect(worker.take()).toEqual([{ type: "restart" }]);
+    worker.emit({ type: "ready" });
+    expect(client.getState()).toMatchObject({ status: "idle", error: null });
+
+    // The manual retry does the same.
+    worker.emit({ type: "initError", message: "offline" });
+    worker.take();
+    client.retry();
+    expect(worker.take()).toEqual([{ type: "restart" }]);
   });
 });

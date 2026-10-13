@@ -136,6 +136,10 @@ export function EditorPane({
   const revealed = useRef(-1);
   useEffect(() => {
     if (!view || !reveal || reveal.fileId !== openFileId) return;
+    // Opening another file and revealing in it land in one render, while
+    // `view` still holds the previous file's editor, already destroyed.
+    // Marking the reveal done here would skip it once the new view arrives.
+    if (!view.dom.isConnected) return;
     if (revealed.current === reveal.seq) return;
     revealed.current = reveal.seq;
     const range = diagnosticRange(reveal.diagnostic, view.state.doc);

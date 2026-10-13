@@ -1,4 +1,3 @@
-import { cn } from "cn";
 import {
   AlertCircle,
   AlertTriangle,
@@ -45,10 +44,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { formatShortcut } from "@/lib/platform";
+import { cn } from "@/lib/utils";
 import type { CompilerClient, PreviewState } from "@/typst/compiler-client";
 import { formatLocation, type ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewState } from "@/typst/hooks";
-import type { PreviewPage } from "@/typst/svg-pages";
+import { PREVIEW_SCOPE_CLASS, type PreviewPage } from "@/typst/svg-pages";
 
 export interface PreviewPaneProps {
   client: CompilerClient | null;
@@ -78,6 +78,8 @@ const VIEWER_PADDING = 32;
 // Room below the last page for the viewer's floating controls.
 const VIEWER_CONTROLS_SPACE = 56;
 const INDICATOR_IDLE_MS = 1000;
+const STALLED_TEXT =
+  "Still compiling. Downloading packages or a large document can take a while.";
 
 /** "fit" fits the page width, "page" whole pages. */
 type Zoom =
@@ -357,12 +359,37 @@ export function PreviewPane({
         </div>
       )}
 
+      {(state?.error || state?.stalled) && pages.length > 0 && (
+        <div
+          role={state.error ? "alert" : "status"}
+          className="flex shrink-0 items-center gap-2 border-b bg-background px-3 py-1.5 text-xs"
+        >
+          {state.error ? (
+            <AlertCircle className="size-3.5 shrink-0 text-destructive" />
+          ) : (
+            <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+          )}
+          <span
+            className="min-w-0 flex-1 truncate"
+            title={state.error || STALLED_TEXT}
+          >
+            {state.error || STALLED_TEXT}
+          </span>
+          <Button variant="outline" size="xs" onClick={() => client?.retry()}>
+            {state.error ? "Retry" : "Restart"}
+          </Button>
+        </div>
+      )}
+
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div
           ref={viewportRef}
           tabIndex={0}
           aria-label="Document preview"
-          className="relative min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+          className={cn(
+            PREVIEW_SCOPE_CLASS,
+            "relative min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          )}
           data-testid="preview-viewport"
           onScroll={onScroll}
           onKeyDown={onKeyDown}
@@ -382,7 +409,7 @@ export function PreviewPane({
               ))}
             </div>
           ) : (
-            <EmptyState state={state} />
+            <EmptyState state={state} onRetry={() => client?.retry()} />
           )}
         </div>
         {viewer && (
@@ -549,7 +576,13 @@ function WithTooltip({
   );
 }
 
-function EmptyState({ state }: { state: PreviewState | null }) {
+function EmptyState({
+  state,
+  onRetry,
+}: {
+  state: PreviewState | null;
+  onRetry: () => void;
+}) {
   let text = "Loading the Typst compiler";
   let icon = <Loader2 className="size-5 animate-spin" />;
   if (state?.error) {
@@ -561,6 +594,8 @@ function EmptyState({ state }: { state: PreviewState | null }) {
   } else if (state?.status === "error") {
     text = "The document has errors and nothing has rendered yet.";
     icon = <AlertCircle className="size-5 text-destructive" />;
+  } else if (state?.stalled) {
+    text = STALLED_TEXT;
   } else if (state && state.status !== "starting") {
     text = "Rendering";
   }
@@ -573,6 +608,11 @@ function EmptyState({ state }: { state: PreviewState | null }) {
         {icon}
       </span>
       <p className="max-w-xs text-balance">{text}</p>
+      {(state?.error || state?.stalled) && (
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          {state.error ? "Retry" : "Restart"}
+        </Button>
+      )}
     </div>
   );
 }

@@ -15,6 +15,17 @@ export async function contentHash(bytes: Uint8Array): Promise<string> {
 // megabytes. Most projects fit their working set well under this.
 const DEFAULT_MAX_BYTES = 128 * 1024 * 1024;
 
+// Cache Storage outlives the page, so without a bound it keeps every blob
+// of every project ever opened. Entries carry their last access time and
+// size in headers, so a prune can rank them without reading any bodies.
+const DEFAULT_MAX_STORED_BYTES = 512 * 1024 * 1024;
+const MAX_STORED_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+/** Rewriting an entry costs a copy of the blob, so access times are coarse. */
+const TOUCH_AFTER_MS = 24 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 1000;
+const ACCESSED_HEADER = "x-typstry-accessed";
+const SIZE_HEADER = "x-typstry-size";
+
 interface Entry {
   bytes: Promise<Uint8Array>;
   /** Null while loading; pending entries are never evicted. */
@@ -26,21 +37,30 @@ export interface AssetCacheOptions {
   baseUrl?: string;
   /** How many bytes of recent blobs stay in memory. */
   maxBytes?: number;
+  /** How many bytes of blobs Cache Storage keeps across reloads. */
+  maxStoredBytes?: number;
   /** Injection points for tests. `null` disables Cache Storage. */
   fetch?: typeof fetch;
   caches?: CacheStorage | null;
+  now?: () => number;
 }
 
 /**
  * Blob bytes by content hash, as stored on the server (encrypted). Blobs
  * are immutable, so anything fetched once is kept in Cache Storage and
- * survives reloads; concurrent requests for the same hash share one fetch.
+ * survives reloads, until it goes unused for long or the stored total
+ * outgrows its budget; concurrent requests for the same hash share one
+ * fetch.
  */
 export class AssetCache {
   private readonly baseUrl: string;
   private readonly maxBytes: number;
   private readonly fetchFn: typeof fetch;
   private readonly storage: CacheStorage | null;
+  private readonly maxStoredBytes: number;
+  private readonly now: () => number;
+  private lastPrune = -Infinity;
+  private pruning = false;
   private store: Promise<Cache | null> | null = null;
   // Map iteration order is insertion order, so re-inserting on every hit
   // makes the first key the least recently used one.
@@ -51,6 +71,8 @@ export class AssetCache {
     this.baseUrl = opts.baseUrl ?? "";
     this.maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
     this.fetchFn = opts.fetch ?? ((...args) => fetch(...args));
+    this.maxStoredBytes = opts.maxStoredBytes ?? DEFAULT_MAX_STORED_BYTES;
+    this.now = opts.now ?? Date.now;
     this.storage =
       opts.caches !== undefined
         ? opts.caches
@@ -97,10 +119,72 @@ export class AssetCache {
   private openStore(): Promise<Cache | null> {
     // Cache Storage throws in insecure contexts (plain http on a LAN IP) and
     // in some private modes; plain fetches still work there.
-    this.store ??= this.storage
-      ? this.storage.open(BLOB_CACHE).catch(() => null)
-      : Promise.resolve(null);
+    if (!this.store) {
+      this.store = this.storage
+        ? this.storage.open(BLOB_CACHE).catch(() => null)
+        : Promise.resolve(null);
+      // Also once per page: a session that only reads from the cache would
+      // otherwise never drop what has gone stale.
+      void this.store.then((store) => store && this.schedulePrune(store));
+    }
     return this.store;
+  }
+
+  private persist(
+    store: Cache,
+    key: string,
+    bytes: Uint8Array,
+    contentType: string | null,
+  ): void {
+    // Response copies the bytes, and nobody needs to wait for the write.
+    const entry = new Response(ownBuffer(bytes), {
+      headers: {
+        "content-type": contentType ?? "application/octet-stream",
+        [ACCESSED_HEADER]: String(this.now()),
+        [SIZE_HEADER]: String(bytes.byteLength),
+      },
+    });
+    void store
+      .put(key, entry)
+      .then(() => this.schedulePrune(store))
+      .catch(() => undefined);
+  }
+
+  private schedulePrune(store: Cache): void {
+    const now = this.now();
+    if (this.pruning || now - this.lastPrune < PRUNE_INTERVAL_MS) return;
+    this.pruning = true;
+    this.lastPrune = now;
+    void this.prune(store)
+      .catch(() => undefined)
+      .finally(() => (this.pruning = false));
+  }
+
+  /**
+   * Drops entries unused for longer than the maximum age, then the least
+   * recently used ones until the rest fit the budget.
+   */
+  private async prune(store: Cache): Promise<void> {
+    const now = this.now();
+    const entries: { key: Request; accessed: number; size: number }[] = [];
+    for (const key of await store.keys()) {
+      const res = await store.match(key);
+      if (!res) continue;
+      entries.push({
+        key,
+        // Entries without the headers rank as oldest and go first.
+        accessed: Number(res.headers.get(ACCESSED_HEADER)) || 0,
+        size: Number(res.headers.get(SIZE_HEADER)) || 0,
+      });
+    }
+    entries.sort((a, b) => a.accessed - b.accessed);
+    let total = entries.reduce((sum, e) => sum + e.size, 0);
+    for (const { key, accessed, size } of entries) {
+      if (now - accessed <= MAX_STORED_AGE_MS && total <= this.maxStoredBytes)
+        break;
+      await store.delete(key);
+      total -= size;
+    }
   }
 
   private async load(token: string, hash: string): Promise<Uint8Array> {
@@ -112,7 +196,13 @@ export class AssetCache {
     ).href;
     const store = await this.openStore();
     const cached = await store?.match(key).catch(() => undefined);
-    if (cached) return new Uint8Array(await cached.arrayBuffer());
+    if (store && cached) {
+      const bytes = new Uint8Array(await cached.arrayBuffer());
+      const accessed = Number(cached.headers.get(ACCESSED_HEADER)) || 0;
+      if (this.now() - accessed > TOUCH_AFTER_MS)
+        this.persist(store, key, bytes, cached.headers.get("content-type"));
+      return bytes;
+    }
 
     const res = await apiFetch(
       blobUrl(token, hash, { baseUrl: this.baseUrl }),
@@ -135,16 +225,7 @@ export class AssetCache {
         `loading blob ${hash} failed: the server sent different content`,
       );
     }
-    if (store) {
-      // Response copies the bytes, and nobody needs to wait for the write.
-      const entry = new Response(bytes, {
-        headers: {
-          "content-type":
-            res.headers.get("content-type") ?? "application/octet-stream",
-        },
-      });
-      void store.put(key, entry).catch(() => undefined);
-    }
+    if (store) this.persist(store, key, bytes, res.headers.get("content-type"));
     return bytes;
   }
 }

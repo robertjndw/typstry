@@ -1,4 +1,4 @@
-import { splitSvgPages } from "./svg-pages";
+import { scopeCss, splitSvgPages } from "./svg-pages";
 
 const root =
   '<svg class="typst-doc" viewBox="0 0 596 1684" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">';
@@ -26,7 +26,9 @@ describe("splitSvgPages", () => {
       second.querySelector("g.typst-page")?.hasAttribute("transform"),
     ).toBe(false);
     expect(doc.defs.querySelector("#g1")).not.toBeNull();
-    expect(doc.defs.querySelector("style")).not.toBeNull();
+    expect(doc.defs.querySelector("style")?.textContent).toBe(
+      ".typst-preview .typst-text {}\n",
+    );
   });
 
   it("reuses unchanged pages and defs from the previous render", () => {
@@ -161,5 +163,33 @@ describe("sanitizing", () => {
       el.getAttributeNS(XLINK, "href"),
     );
     expect(hrefs).toEqual(["#g1", null, "data:image/png;base64,AAAA", null]);
+  });
+});
+
+describe("scopeCss", () => {
+  it("keeps typst.ts' global rules inside the preview", () => {
+    const css = `
+.tsel span,
+.tsel {
+  left: 0;
+}
+svg {
+  fill: none;
+}
+.tsel::selection { color: transparent; }
+@keyframes typst-jump-ripple-effect {
+  to {
+    width: 10vw;
+  }
+}
+`;
+    const scoped = scopeCss(css, ".p");
+    expect(scoped).toContain(".p .tsel span, .p .tsel {");
+    expect(scoped).toContain(".p svg {\n  fill: none;\n}");
+    expect(scoped).toContain(".p .tsel::selection {");
+    expect(scoped).toContain(
+      "@keyframes typst-jump-ripple-effect {\n  to {\n    width: 10vw;\n  }\n}",
+    );
+    expect(scoped).not.toMatch(/(^|\n)svg/);
   });
 });

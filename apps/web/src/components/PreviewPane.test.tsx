@@ -4,24 +4,33 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { initProject } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
 import { CompilerClient } from "@/typst/compiler-client";
-import type { WorkerLike, WorkerResponse } from "@/typst/protocol";
+import type {
+  WorkerEvents,
+  WorkerLike,
+  WorkerRequest,
+  WorkerResponse,
+} from "@/typst/protocol";
 
 import { PreviewPane } from "./PreviewPane";
 
 class FakeWorker implements WorkerLike {
+  sent: WorkerRequest[] = [];
   private listeners = new Set<(e: MessageEvent<WorkerResponse>) => void>();
-  postMessage() {}
-  addEventListener(
-    _type: "message",
-    l: (e: MessageEvent<WorkerResponse>) => void,
-  ) {
-    this.listeners.add(l);
+  postMessage(message: WorkerRequest) {
+    this.sent.push(message);
   }
-  removeEventListener(
-    _type: "message",
-    l: (e: MessageEvent<WorkerResponse>) => void,
+  addEventListener<K extends keyof WorkerEvents>(
+    type: K,
+    l: (e: WorkerEvents[K]) => void,
   ) {
-    this.listeners.delete(l);
+    if (type === "message")
+      this.listeners.add(l as (e: MessageEvent<WorkerResponse>) => void);
+  }
+  removeEventListener<K extends keyof WorkerEvents>(
+    _type: K,
+    l: (e: WorkerEvents[K]) => void,
+  ) {
+    this.listeners.delete(l as (e: MessageEvent<WorkerResponse>) => void);
   }
   terminate() {}
   emit(message: WorkerResponse) {
@@ -89,6 +98,58 @@ function setup(onDiagnosticClick = vi.fn()) {
 }
 
 describe("PreviewPane", () => {
+  it("offers a retry when the compiler could not start", async () => {
+    const { worker } = setup();
+    act(() => {
+      worker.emit({ type: "initError", message: "TypeError: Failed to fetch" });
+    });
+    expect(
+      screen.getByText(/Could not start the Typst compiler/),
+    ).toBeInTheDocument();
+    worker.sent = [];
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(worker.sent).toEqual([{ type: "restart" }]);
+  });
+
+  it("offers a restart while a compile runs long", () => {
+    vi.useFakeTimers();
+    try {
+      const workers: FakeWorker[] = [];
+      const client = new CompilerClient(
+        initProject(newProject(1), { title: "T" }),
+        {
+          createWorker: () => {
+            const w = new FakeWorker();
+            workers.push(w);
+            return w;
+          },
+          createRenderer: () => new Promise(() => {}),
+        },
+      );
+      render(
+        <TooltipProvider>
+          <PreviewPane client={client} />
+        </TooltipProvider>,
+      );
+      act(() => {
+        workers[0]!.emit({ type: "ready" });
+        workers[0]!.emit({ type: "compiling", id: 1 });
+      });
+      expect(screen.queryByText(/Still compiling/)).not.toBeInTheDocument();
+
+      act(() => vi.advanceTimersByTime(61_000));
+      expect(screen.getByText(/Still compiling/)).toBeInTheDocument();
+      expect(workers).toHaveLength(1);
+
+      fireEvent.click(screen.getByRole("button", { name: "Restart" }));
+      expect(workers).toHaveLength(2);
+      expect(screen.queryByText(/Still compiling/)).not.toBeInTheDocument();
+      client.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows pages, compile time and diagnostics", async () => {
     const { worker, onDiagnosticClick } = setup();
     expect(screen.getByText("Loading the Typst compiler")).toBeInTheDocument();
