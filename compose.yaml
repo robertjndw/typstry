@@ -1,7 +1,10 @@
+# typstry on its own at http://localhost:8787, for trying it out or a
+# private network. For an instance reachable from the internet use
+# compose.prod.yaml instead: it adds TLS and the per-address limits that
+# keep one visitor from using up the instance (see docs/self-hosting.md).
 services:
   typstry:
-    build: .
-    image: typstry:latest
+    image: ghcr.io/robertjndw/typstry:latest
     ports:
       - "8787:8787"
     environment:
@@ -9,8 +12,9 @@ services:
     volumes:
       - typstry-data:/data
     restart: unless-stopped
-    # The server compacts room logs into snapshots on shutdown, so give it
-    # time to finish before Docker kills it.
+    # On shutdown the server lets running requests finish (up to 10 s),
+    # closes WebSockets (up to 5 s) and lets each project handle what is
+    # already queued, so give it time before Docker kills it.
     stop_grace_period: 30s
 
 volumes:

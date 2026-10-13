@@ -42,6 +42,10 @@ RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
 COPY apps/web apps/web
 COPY --from=tinymist /src/apps/web/vendor/tinymist apps/web/vendor/tinymist
 COPY --from=typstry-wasm /src/apps/web/vendor/typstry-wasm apps/web/vendor/typstry-wasm
+# Optional font mirrors (see docs/self-hosting.md). Left unset, the app
+# loads the fonts from jsDelivr.
+ARG VITE_TYPST_FONT_BASE
+ARG VITE_TYPST_DEV_FONT_BASE
 RUN pnpm --filter web build
 
 FROM rust:1.98-slim-trixie AS chef
@@ -72,11 +76,16 @@ RUN mkdir /src/data
 # The server only needs glibc and libgcc_s, which the cc variant has. It
 # makes no outbound TLS connections, so no CA certificates either.
 FROM gcr.io/distroless/cc-debian13
-# Not distroless's nonroot user (65532): volumes from the old Debian-based
-# image are owned by 10001.
+LABEL org.opencontainers.image.title="typstry" \
+      org.opencontainers.image.description="Self-hostable, end-to-end encrypted collaborative Typst editor" \
+      org.opencontainers.image.source="https://github.com/robertjndw/typstry" \
+      org.opencontainers.image.licenses="MIT"
+# A fixed uid that stays the same across image updates, so a host directory
+# bind-mounted to /data can be chowned to 10001 once and keeps working.
 COPY --from=server --chown=10001:10001 /src/data /data
 COPY --from=server /src/target/release/typstry-server /usr/local/bin/typstry-server
 COPY --from=web /src/apps/web/dist /app/web
+COPY LICENSE /usr/share/doc/typstry/LICENSE
 ENV TYPSTRY_ADDR=0.0.0.0:8787 \
     TYPSTRY_DATA_DIR=/data \
     TYPSTRY_WEB_DIST=/app/web \
