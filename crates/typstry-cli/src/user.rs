@@ -545,7 +545,7 @@ fn catalog_in(config: &Path, forgotten: bool) -> anyhow::Result<Vec<CatalogEntry
     // `clone` accepts are positions in this order, so it is fixed here
     // rather than in `list`. The sort is stable: folders the directory
     // does not know keep their place, after the rest.
-    entries.sort_by(|a, b| b.recency.cmp(&a.recency));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.recency));
     Ok(entries)
 }
 

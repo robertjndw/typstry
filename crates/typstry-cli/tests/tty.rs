@@ -261,8 +261,8 @@ async fn list_opens_a_picker_and_gives_the_terminal_back() {
     let mut tty = me.tty(&me.work, &["list"]);
     tty.wait_for("not on this device");
     let screen = tty.screen();
-    assert!(screen.contains("1. Alpha"), "{screen}");
-    assert!(screen.contains("2. Gone"), "{screen}");
+    assert!(screen.contains("2. Alpha"), "{screen}");
+    assert!(screen.contains("1. Gone"), "{screen}");
     assert!(screen.contains("q quit"), "{screen}");
     assert!(tty.alternate_screen());
 
@@ -279,11 +279,11 @@ async fn the_picker_filters_by_title_and_keeps_the_numbers() {
     me.init(&server, "beta", "Beta").await;
 
     let mut tty = me.tty(&me.work, &["list"]);
-    tty.wait_for("2. Beta");
+    tty.wait_for("2. Alpha");
     tty.send("/");
-    tty.send("bet");
-    tty.wait_until("only Beta left", |s| {
-        s.contains("2. Beta") && !s.contains("Alpha")
+    tty.send("alp");
+    tty.wait_until("only Alpha left", |s| {
+        s.contains("2. Alpha") && !s.contains("Beta")
     });
     // Enter ends the typing; the filter stays until Esc.
     tty.send("\r");
@@ -364,7 +364,7 @@ async fn clone_without_a_link_clones_the_picked_project() {
 
     let mut tty = me.tty(&me.work, &["clone"]);
     // Only the projects without a folder here.
-    tty.wait_for("2. Gone");
+    tty.wait_for("1. Gone");
     assert!(!tty.screen().contains("Alpha"), "{}", tty.screen());
     tty.send("\r");
     assert!(tty.wait_exit(), "{}", tty.screen());
