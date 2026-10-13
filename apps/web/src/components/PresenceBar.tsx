@@ -49,7 +49,7 @@ export function PresenceBar() {
                 aria-label={path ? `${peer.name}, in ${path}` : peer.name}
                 disabled={!path}
                 onClick={() => peer.fileId && openFile(peer.fileId)}
-                className="rounded-full outline-none focus-visible:ring-3 focus-visible:ring-ring/50 enabled:cursor-pointer"
+                className="animate-in rounded-full duration-200 fade-in-0 outline-none zoom-in-50 focus-visible:ring-3 focus-visible:ring-ring/50 enabled:cursor-pointer"
               >
                 <PersonAvatar identity={peer} />
               </button>

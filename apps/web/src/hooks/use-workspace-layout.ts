@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   useDefaultLayout,
   usePanelRef,
@@ -12,6 +12,9 @@ import { useProject } from "@/project/context";
 
 export type WorkspaceView = "files" | "editor" | "preview";
 export type CollapsiblePanel = "files" | "preview";
+
+/** Keep in sync with the `[data-animating]` transition in index.css. */
+const TOGGLE_MS = 200;
 
 /** Percentages of the group; also what a panel reopens to after a reload. */
 export const DEFAULT_SIZES: Record<WorkspaceView, number> = {
@@ -70,6 +73,16 @@ export function useWorkspaceLayout(id: string) {
   // expand() know where to go back to; otherwise it would open at minSize.
   const hadSize = useRef({ files: false, preview: false });
   const [view, setView] = useState<WorkspaceView>("editor");
+  // Only animate toggles. With the transition always on, dragging a handle
+  // lags behind the pointer. During a toggle the panel's content keeps a
+  // fixed width and gets clipped. Otherwise the preview refits its pages on
+  // every frame and you watch them shrink.
+  const [pinned, setPinned] = useState<{
+    panel: CollapsiblePanel;
+    width: number;
+  } | null>(null);
+  const animationTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(animationTimer.current), []);
 
   // On a phone, opening a file from anywhere (the tree, quick open, a
   // diagnostic) should show it rather than leave you on another view.
@@ -97,9 +110,30 @@ export function useWorkspaceLayout(id: string) {
     }
     const handle = refs[panel].current;
     if (!handle) return;
-    if (!handle.isCollapsed()) handle.collapse();
-    else if (hadSize.current[panel]) handle.expand();
-    else handle.resize(String(DEFAULT_SIZES[panel]));
+    // The content keeps the panel's open width. When closing, that's the
+    // width it has now. When opening, it's the width it's about to get.
+    let width = handle.getSize().inPixels;
+    if (!handle.isCollapsed()) {
+      handle.collapse();
+    } else {
+      if (hadSize.current[panel]) handle.expand();
+      else handle.resize(String(DEFAULT_SIZES[panel]));
+      // inPixels still reads the old width from the DOM at this point, but
+      // the percentage is already the new one.
+      const panels = document
+        .getElementById(id)
+        ?.querySelectorAll(":scope > [data-panel]");
+      const total = Array.from(panels ?? []).reduce(
+        (sum, el) => sum + el.getBoundingClientRect().width,
+        0,
+      );
+      width = (handle.getSize().asPercentage / 100) * total;
+    }
+    setPinned({ panel, width });
+    clearTimeout(animationTimer.current);
+    // Not transitionend: if the size doesn't actually change, it never
+    // fires and the pin would stick.
+    animationTimer.current = setTimeout(() => setPinned(null), TOGGLE_MS + 50);
   }
 
   return {
@@ -111,7 +145,15 @@ export function useWorkspaceLayout(id: string) {
     isHidden: (panel: CollapsiblePanel) =>
       isMobile ? view !== panel : collapsed[panel],
     toggle,
-    group: { id, defaultLayout, onLayoutChanged },
+    /** Set only while a toggle is animating. */
+    pinnedWidth: (panel: CollapsiblePanel) =>
+      pinned?.panel === panel ? pinned.width : undefined,
+    group: {
+      id,
+      defaultLayout,
+      onLayoutChanged,
+      "data-animating": pinned !== null || undefined,
+    },
     panels: {
       files: { panelRef: filesRef, onResize: onResize("files") },
       preview: { panelRef: previewRef, onResize: onResize("preview") },

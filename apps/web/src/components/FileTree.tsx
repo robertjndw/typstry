@@ -394,7 +394,10 @@ export function FileTree({ className }: { className?: string }) {
             </ContextMenu>
           )}
           {isDir && expanded && (
-            <div role="group">
+            <div
+              role="group"
+              className="animate-in duration-150 fade-in-0 slide-in-from-top-1"
+            >
               {createRow(entry.id, depth + 1)}
               {renderEntries(entry.children, depth + 1)}
             </div>

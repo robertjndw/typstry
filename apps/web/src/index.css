@@ -142,6 +142,12 @@
   }
 }
 
+/* Only set while a panel is toggled from a button or shortcut. The library
+   sizes panels with inline flex-grow, which is why that's what transitions. */
+[data-animating] > [data-panel] {
+  transition: flex-grow 200ms ease-out;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

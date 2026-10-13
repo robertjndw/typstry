@@ -362,7 +362,7 @@ export function PreviewPane({
       {(state?.error || state?.stalled) && pages.length > 0 && (
         <div
           role={state.error ? "alert" : "status"}
-          className="flex shrink-0 items-center gap-2 border-b bg-background px-3 py-1.5 text-xs"
+          className="flex shrink-0 animate-in items-center gap-2 border-b bg-background px-3 py-1.5 text-xs duration-150 fade-in-0 slide-in-from-top-1"
         >
           {state.error ? (
             <AlertCircle className="size-3.5 shrink-0 text-destructive" />
@@ -693,7 +693,7 @@ function ProblemsPanel({
 
   return (
     <section
-      className="flex max-h-[40%] min-h-0 shrink-0 flex-col border-t bg-background"
+      className="flex max-h-[40%] min-h-0 shrink-0 animate-in flex-col border-t bg-background duration-200 fade-in-0 slide-in-from-bottom-2"
       aria-label="Diagnostics"
     >
       <button
@@ -726,8 +726,23 @@ function ProblemsPanel({
           )}
         </span>
       </button>
-      {!collapsed && (
-        <ul id={listId} className="min-h-0 overflow-auto border-t text-xs">
+      {/* Kept mounted so collapsing animates too. Height can't transition
+          to auto, but grid rows can go from 0fr to 1fr. */}
+      <div
+        inert={collapsed}
+        className={cn(
+          "grid min-h-0 transition-[grid-template-rows] duration-200 ease-out",
+          collapsed ? "grid-rows-[0fr]" : "grid-rows-[1fr]",
+        )}
+      >
+        <ul
+          id={listId}
+          // The border would leave a 1px sliver when collapsed.
+          className={cn(
+            "min-h-0 overflow-auto text-xs",
+            !collapsed && "border-t",
+          )}
+        >
           {diagnostics.map((d, i) => {
             const Icon = d.severity === "error" ? AlertCircle : AlertTriangle;
             return (
@@ -757,7 +772,7 @@ function ProblemsPanel({
             );
           })}
         </ul>
-      )}
+      </div>
     </section>
   );
 }

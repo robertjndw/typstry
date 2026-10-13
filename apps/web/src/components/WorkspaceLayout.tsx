@@ -82,6 +82,8 @@ export function WorkspaceLayout({
 
   const filesHidden = layout.isHidden("files");
   const previewHidden = layout.isHidden("preview");
+  const filesWidth = layout.pinnedWidth("files");
+  const previewWidth = layout.pinnedWidth("preview");
   return (
     <ResizablePanelGroup
       orientation="horizontal"
@@ -94,10 +96,17 @@ export function WorkspaceLayout({
         minSize="160px"
         collapsible
         collapsedSize="0"
+        style={filesWidth === undefined ? undefined : { overflow: "hidden" }}
         {...layout.panels.files}
       >
-        {/* inert keeps Tab from wandering into a panel squeezed to zero. */}
-        <section aria-label="Files" className="h-full" inert={filesHidden}>
+        {/* inert keeps Tab from wandering into a panel squeezed to zero.
+            ml-auto makes it slide out to the left, toward the edge. */}
+        <section
+          aria-label="Files"
+          className="ml-auto h-full"
+          style={{ width: filesWidth }}
+          inert={filesHidden}
+        >
           {files}
         </section>
       </ResizablePanel>
@@ -118,9 +127,15 @@ export function WorkspaceLayout({
         minSize="20"
         collapsible
         collapsedSize="0"
+        style={previewWidth === undefined ? undefined : { overflow: "hidden" }}
         {...layout.panels.preview}
       >
-        <section aria-label="Preview" className="h-full" inert={previewHidden}>
+        <section
+          aria-label="Preview"
+          className="h-full"
+          style={{ width: previewWidth }}
+          inert={previewHidden}
+        >
           {preview}
         </section>
       </ResizablePanel>

@@ -287,7 +287,7 @@ describe("PreviewPane", () => {
 
     fireEvent.click(header);
     expect(header).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText("a warning")).not.toBeInTheDocument();
+    expect(screen.getByText("a warning").closest("[inert]")).not.toBeNull();
 
     // A changed but still nonzero error count keeps the manual collapse.
     await compile(worker, [diagnostic("error", "first error")]);
