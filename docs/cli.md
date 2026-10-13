@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh 
 
 For the latest build of `main` instead of the latest release, set the version for `sh`: `curl -fsSL https://raw.githubusercontent.com/robertjndw/typstry/main/install.sh | TYPSTRY_VERSION=nightly sh`. `typstry --version` names the commit of a nightly build.
 
-To build it from source, use a checkout and [Rust](https://rustup.rs) 1.94 or newer:
+To build it from source, use a checkout and [Rust](https://rustup.rs) 1.99 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli

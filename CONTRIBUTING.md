@@ -22,7 +22,7 @@ cargo test --workspace
 
 `pnpm format` and `cargo fmt --all` fix formatting. For changes that touch the editor, sync or the CLI, also run the end-to-end tests with `pnpm build && pnpm test:e2e`.
 
-The code has to build with Rust 1.94, the `rust-version` in `Cargo.toml`. CI checks this, so avoid newer standard library APIs or bump the version on purpose.
+The whole project uses one Rust version, 1.99. To move to a newer one, change it everywhere in the same pull request: `rust-toolchain.toml`, `rust-version` in `Cargo.toml`, the `rust:` images in the `Dockerfile`, and the version mentioned in the README and `docs/cli.md`.
 
 ## Formats and fixtures
 

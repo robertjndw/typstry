@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.98-slim-trixie AS wasm-tools
+FROM rust:1.99-slim-trixie AS wasm-tools
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -48,14 +48,14 @@ ARG VITE_TYPST_FONT_BASE
 ARG VITE_TYPST_DEV_FONT_BASE
 RUN pnpm --filter web build
 
-FROM rust:1.98-slim-trixie AS chef
+FROM rust:1.99-slim-trixie AS chef
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src
 
-# rust-toolchain.toml is left out on purpose here and below: it pins "stable",
-# which would make rustup download a second toolchain instead of using the one
-# in the image.
+# rust-toolchain.toml is left out on purpose here and below: the image already
+# has that Rust version, and with the file rustup would download it a second
+# time. Keep the image tags in sync with it.
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates

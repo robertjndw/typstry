@@ -81,7 +81,7 @@ gh attestation verify typstry-x86_64-unknown-linux-gnu.tar.gz --repo robertjndw/
 
 The images can be checked the same way with `gh attestation verify oci://ghcr.io/robertjndw/typstry:latest --repo robertjndw/typstry`.
 
-To build from a checkout instead you need [Rust](https://rustup.rs) 1.94 or newer:
+To build from a checkout instead you need [Rust](https://rustup.rs) 1.99 or newer:
 
 ```sh
 cargo install --path crates/typstry-cli
@@ -103,7 +103,7 @@ The server is configured through environment variables such as `TYPSTRY_ADDR`, `
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs) (stable, see `rust-toolchain.toml`; MSRV 1.94)
+- [Rust](https://rustup.rs) 1.99, pinned in `rust-toolchain.toml`
 - [Node.js](https://nodejs.org) 26 or newer
 - [pnpm](https://pnpm.io) 12 (`corepack enable` picks up the pinned version)
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist and the crypto code for the browser
@@ -140,7 +140,7 @@ This starts the Vite dev server for the frontend and the Rust server on port 878
 
 `pnpm format` must leave `fixtures/` alone, so it is in `.prettierignore`: those files are frozen as typstry wrote them (see [Compatibility](docs/compatibility.md#frozen-fixtures)).
 
-CI runs on every push to `main` and on pull requests: everything in the table except the release builds, plus `cargo check` on the minimum supported Rust version (1.94) and a Docker build with a smoke test.
+CI runs on every push to `main` and on pull requests: everything in the table except the release builds, plus a Docker build with a smoke test.
 
 The end-to-end tests drive the production build in Chromium through [Playwright](https://playwright.dev). They start the server on port 4787 with a throwaway data directory, or reuse one already running there. Install the browser once with `pnpm --filter web exec playwright install chromium`.
 

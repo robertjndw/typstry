@@ -41,25 +41,14 @@ impl ConnCeiling {
 
     /// A slot for one more WebSocket, if there is room.
     pub fn connect(&self) -> Result<ConnPermit, Full> {
-        // Spelled out because `fetch_update` is deprecated and its
-        // replacement `try_update` is not stable on the MSRV (1.94).
-        let mut n = self.open.load(Ordering::Acquire);
-        loop {
-            if n >= self.max {
-                return Err(Full);
-            }
-            match self
-                .open
-                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    return Ok(ConnPermit {
-                        open: self.open.clone(),
-                    });
-                }
-                Err(current) => n = current,
-            }
-        }
+        self.open
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max).then_some(n + 1)
+            })
+            .map_err(|_| Full)?;
+        Ok(ConnPermit {
+            open: self.open.clone(),
+        })
     }
 
     #[cfg(test)]
