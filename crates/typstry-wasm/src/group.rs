@@ -7,6 +7,7 @@
 //! after every change, and never run two operations on one group at once.
 
 use serde::{Deserialize, Serialize};
+use typstry_wire::crypto::CryptoError;
 use typstry_wire::identity::{self, person_fingerprint};
 use typstry_wire::mls::{
     self, LocalIdentity, Outcome, OwnerSecrets, PersonSpace, Role, SpaceGroup,
@@ -126,16 +127,15 @@ pub fn person_spaces_for_recovery(
 /// to `kept` (the copy saved beside the state), as the bytes to save in
 /// its place. Nothing in `kept` is dropped for what `held` lacks: which key
 /// is current is only what the server says, and a copy must keep the one
-/// it might have lied about. A damaged `kept` counts as empty. Undefined
-/// when both are empty.
+/// it might have lied about. A damaged `kept` counts as empty, but one a
+/// newer typstry wrote throws `NewerVersion`: saving over it would lose
+/// what it holds. Undefined when both are empty.
 #[wasm_bindgen(js_name = mergeOwnerSecrets)]
 pub fn merge_owner_secrets(
     kept: Option<Vec<u8>>,
     held: Option<Vec<u8>>,
 ) -> Result<Option<Vec<u8>>, JsValue> {
-    let mut merged = kept
-        .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
-        .unwrap_or_default();
+    let mut merged = kept_owner_secrets(kept).map_err(from_crypto)?;
     merged.merge(&owner_secrets(held)?);
     Ok((!merged.is_empty()).then(|| merged.encode().to_vec()))
 }
@@ -165,8 +165,8 @@ pub fn owner_secret_list(bytes: Option<Vec<u8>>) -> Result<Vec<js_sys::Uint8Arra
 /// as `ownerPublicKeyOf` takes) added in place of `bytes`, only as far as
 /// there is room: what `bytes` holds is never evicted, so a planted or stale
 /// directory entry cannot push out a key this device already has. Nothing in
-/// `bytes` is dropped; a damaged `bytes` counts as empty. Undefined when the
-/// result is empty.
+/// `bytes` is dropped; a damaged `bytes` counts as empty, and one a newer
+/// typstry wrote throws `NewerVersion`. Undefined when the result is empty.
 #[wasm_bindgen(js_name = withOwnerSecrets)]
 pub fn with_owner_secrets(
     bytes: Option<Vec<u8>>,
@@ -180,9 +180,7 @@ pub fn with_owner_secrets(
                 .map_err(from_crypto)
         })
         .collect::<Result<OwnerSecrets, _>>()?;
-    let mut merged = bytes
-        .and_then(|bytes| OwnerSecrets::decode(&bytes).ok())
-        .unwrap_or_default();
+    let mut merged = kept_owner_secrets(bytes).map_err(from_crypto)?;
     merged.extend_older(&added);
     Ok((!merged.is_empty()).then(|| merged.encode().to_vec()))
 }
@@ -236,6 +234,12 @@ fn owner_secrets(bytes: Option<Vec<u8>>) -> Result<OwnerSecrets, JsValue> {
         || Ok(OwnerSecrets::default()),
         |bytes| OwnerSecrets::decode(&bytes).map_err(from_crypto),
     )
+}
+
+/// A saved copy for [`merge_owner_secrets`] and [`with_owner_secrets`] to
+/// add to; see [`OwnerSecrets::decode_kept`].
+fn kept_owner_secrets(bytes: Option<Vec<u8>>) -> Result<OwnerSecrets, CryptoError> {
+    OwnerSecrets::decode_kept(bytes.as_deref())
 }
 
 /// A public owner key as the server hands it out.
@@ -1125,5 +1129,25 @@ mod tests {
         let json = serde_json::to_value(RotationDto::from(rotation())).unwrap();
         assert!(json.get("type").is_none());
         assert_eq!(json["tokens"]["view"], "v");
+    }
+
+    #[test]
+    fn a_newer_saved_copy_is_refused_rather_than_written_over() {
+        let set = OwnerSecrets::received(OwnerSecret::generate());
+        let bytes = set.encode().to_vec();
+        assert_eq!(kept_owner_secrets(Some(bytes.clone())).unwrap(), set);
+        assert!(kept_owner_secrets(None).unwrap().is_empty());
+        // Damage leaves nothing to keep.
+        assert!(
+            kept_owner_secrets(Some(bytes[..bytes.len() - 1].to_vec()))
+                .unwrap()
+                .is_empty()
+        );
+        let mut newer = bytes;
+        newer[0] = 2;
+        assert!(matches!(
+            kept_owner_secrets(Some(newer)),
+            Err(CryptoError::NewerVersion(2))
+        ));
     }
 }
