@@ -26,19 +26,19 @@ import {
 import { FONT_CACHE } from "./cache-names";
 import { CompileScheduler } from "./scheduler";
 
-// typst.ts 0.7 fetches its default fonts from typst-assets on jsdelivr. Point
-// it at the release matching the bundled Typst 0.14.2 (its own default is
-// v0.13.1) so the preview uses the same fonts as a native typst 0.14.2 build,
+// typst.ts 0.8 fetches its default fonts from typst-assets on jsdelivr. Point
+// it at the release matching the bundled Typst 0.15.0 (its own default is
+// v0.13.1) so the preview uses the same fonts as a native typst 0.15.0 build,
 // which matters once PDFs are also exported server-side.
 const FONT_PREFIX = {
   text: fontBase(
     import.meta.env.VITE_TYPST_FONT_BASE,
-    "https://cdn.jsdelivr.net/gh/typst/typst-assets@v0.14.2/files/fonts/",
+    "https://cdn.jsdelivr.net/gh/typst/typst-assets@v0.15.0/files/fonts/",
   ),
   // The CJK and emoji bundles, which the app does not load by default.
   _: fontBase(
     import.meta.env.VITE_TYPST_DEV_FONT_BASE,
-    "https://cdn.jsdelivr.net/gh/typst/typst-dev-assets@v0.13.1/files/fonts/",
+    "https://cdn.jsdelivr.net/gh/typst/typst-dev-assets@v0.15.0/files/fonts/",
   ),
 };
 
