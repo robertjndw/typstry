@@ -95,6 +95,8 @@ typstry sync   # keep running and edit with any editor
 
 See [the CLI guide](docs/cli.md) for a typical day with git, all commands and the things to know.
 
+typstry also builds as plain static files that need no server and keep projects in the browser, see [Static hosting](docs/static-hosting.md).
+
 In Chromium browsers you can also keep a project in sync with a local folder without installing anything. See [Local folders in the browser](docs/local-folders.md).
 
 ## Configuration
