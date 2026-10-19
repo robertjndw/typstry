@@ -11,7 +11,10 @@ on:
       - "crates/typstry-wasm/**"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/setup-web/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 

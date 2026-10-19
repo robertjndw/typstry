@@ -67,22 +67,39 @@ const base = process.env.TYPSTRY_BASE ?? "/";
 // Mirrors app_csp in crates/typstry-server/src/http/mod.rs, which the server
 // sends as a header. Pages cannot set headers, and the SVG preview relies on
 // this policy since imported zips can be hostile. frame-ancestors is left out
-// because a meta tag cannot set it. The font origin is the one
-// compile.worker.ts fetches from.
-const STATIC_CSP = [
-  "default-src 'self'",
-  "script-src 'self' 'wasm-unsafe-eval'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' blob: data:",
-  "font-src 'self' blob: data:",
-  "media-src 'self' blob:",
-  "connect-src 'self' https://cdn.jsdelivr.net https://packages.typst.org",
-  "worker-src 'self' blob:",
-  "frame-src 'self' blob:",
-  "object-src blob:",
-  "base-uri 'none'",
-  "form-action 'self'",
-].join("; ");
+// because a meta tag cannot set it.
+function staticCsp(fontOrigins: string[]): string {
+  return [
+    "default-src 'self'",
+    "script-src 'self' 'wasm-unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' blob: data:",
+    "font-src 'self' blob: data:",
+    "media-src 'self' blob:",
+    `connect-src 'self' ${fontOrigins.join(" ")} https://packages.typst.org`,
+    "worker-src 'self' blob:",
+    "frame-src 'self' blob:",
+    "object-src blob:",
+    "base-uri 'none'",
+    "form-action 'self'",
+  ].join("; ");
+}
+
+/**
+ * The origins compile.worker.ts fetches fonts from. A build pointed at a
+ * font mirror has to allow that mirror instead of jsdelivr, or every font
+ * fetch is blocked. A relative base is same-origin, which 'self' covers.
+ */
+function fontOrigins(env: Record<string, string>): string[] {
+  const origins = [env.VITE_TYPST_FONT_BASE, env.VITE_TYPST_DEV_FONT_BASE].map(
+    (base) => {
+      const trimmed = base?.trim();
+      if (!trimmed) return "https://cdn.jsdelivr.net";
+      return URL.canParse(trimmed) ? new URL(trimmed).origin : null;
+    },
+  );
+  return [...new Set(origins.filter((o): o is string => o !== null))];
+}
 
 /**
  * The static build has no server to fall back to index.html, and GitHub
@@ -91,11 +108,13 @@ const STATIC_CSP = [
  */
 function staticHosting(): Plugin {
   let outDir = "";
+  let csp = "";
   return {
     name: "typstry:static-hosting",
     apply: "build",
     configResolved(config) {
       outDir = path.resolve(config.root, config.build.outDir);
+      csp = staticCsp(fontOrigins(config.env));
     },
     transformIndexHtml() {
       return [
@@ -103,7 +122,7 @@ function staticHosting(): Plugin {
           tag: "meta",
           attrs: {
             "http-equiv": "Content-Security-Policy",
-            content: STATIC_CSP,
+            content: csp,
           },
           injectTo: "head-prepend",
         },

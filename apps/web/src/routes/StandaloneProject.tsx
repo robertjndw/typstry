@@ -5,7 +5,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { useState } from "react";
-import { useParams } from "react-router";
+import { useLocation, useParams } from "react-router";
 
 import { AccountMenu } from "@/components/AccountMenu";
 import { Notice, StartPageButton } from "@/components/Notice";
@@ -22,15 +22,27 @@ import { useStandaloneSession } from "@/project/useStandaloneSession";
  */
 export function StandaloneProject() {
   const { token = "" } = useParams();
+  const { hash } = useLocation();
   // Keyed so that a different project never reuses the previous one's doc.
-  return <StandaloneView key={token} projectId={token} />;
+  return (
+    <StandaloneView key={token} projectId={token} secret={hash.slice(1)} />
+  );
 }
 
-function StandaloneView({ projectId }: { projectId: string }) {
+function StandaloneView({
+  projectId,
+  secret,
+}: {
+  projectId: string;
+  secret: string;
+}) {
   const stored = useStoredIdentity();
   const [provisional] = useState(() => provisionalIdentity());
   const identity = stored ?? provisional;
-  const { state, project, saveLocally } = useStandaloneSession(projectId);
+  const { state, project, saveLocally } = useStandaloneSession(
+    projectId,
+    secret,
+  );
 
   switch (state.phase) {
     case "loading":

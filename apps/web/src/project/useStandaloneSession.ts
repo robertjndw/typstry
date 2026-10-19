@@ -5,7 +5,8 @@ import {
   localProjectAssets,
   type ProjectAssets,
 } from "@/assets/project-assets";
-import { recordTitle } from "@/directory/record";
+import { isEditSecret } from "@/crypto/secret";
+import { recordOpened, recordTitle } from "@/directory/record";
 import {
   isForeignKind,
   isSchemaTooNew,
@@ -34,9 +35,13 @@ export interface StandaloneSession {
  * picture: the doc comes from the local store and every edit goes back to
  * it. Mount it with the id as `key`, since the doc is tied to one project
  * for good. The doc outlives a StrictMode effect cycle; only the store
- * binding is re-created.
+ * binding is re-created. `key` is the edit secret from the link, which the
+ * project list keeps next to the id.
  */
-export function useStandaloneSession(projectId: string): StandaloneSession {
+export function useStandaloneSession(
+  projectId: string,
+  key = "",
+): StandaloneSession {
   const [project] = useState(() => new ProjectDoc(new LoroDoc()));
   const storeRef = useRef<LocalDocStore | null>(null);
   const [state, setState] = useState<StandalonePhase>({ phase: "loading" });
@@ -48,9 +53,9 @@ export function useStandaloneSession(projectId: string): StandaloneSession {
       try {
         const backend = await defaultBackend();
         store = new LocalDocStore(projectId, project.doc, backend);
-        storeRef.current = store;
         const found = await store.load();
         if (cancelled) return;
+        storeRef.current = store;
         if (!found || project.schemaVersion === null) {
           setState({ phase: "not-found" });
           return;
@@ -87,10 +92,18 @@ export function useStandaloneSession(projectId: string): StandaloneSession {
   const ready = state.phase === "ready";
   useEffect(() => {
     if (!ready) return;
+    // Opening is what moves a project to the top of the start page's list,
+    // and it lists the project again if the list lost track of it.
+    if (isEditSecret(key))
+      void recordOpened(
+        projectId,
+        { token: projectId, secret: key, edit: true },
+        project.title || "Untitled",
+      );
     return project.meta.subscribe(
       () => void recordTitle(projectId, project.title || "Untitled"),
     );
-  }, [ready, projectId, project]);
+  }, [ready, projectId, key, project]);
 
   const saveLocally = useCallback(
     () => storeRef.current?.flush() ?? Promise.resolve(),

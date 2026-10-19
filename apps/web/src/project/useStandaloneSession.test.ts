@@ -70,4 +70,22 @@ describe("useStandaloneSession", () => {
       expect((await directory()).list(Date.now())[0]?.title).toBe("Renamed"),
     );
   });
+
+  it("lists the project as opened when the link carries its secret", async () => {
+    const mem = new MemoryBackend();
+    backend.current = mem;
+    const id = token(1);
+    await store(id, "Saved", mem);
+    const secret = editSecret();
+
+    const { result } = renderHook(() => useStandaloneSession(id, secret));
+    await waitFor(() => expect(result.current.state.phase).toBe("ready"));
+
+    await waitFor(async () =>
+      expect((await directory()).list(Date.now())).toMatchObject([
+        { projectId: id, title: "Saved", link: { token: id, secret } },
+      ]),
+    );
+    expect((await directory()).list(Date.now())[0]?.openedAt).not.toBeNull();
+  });
 });
