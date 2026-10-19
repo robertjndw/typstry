@@ -3,6 +3,7 @@ import type { TreeID } from "loro-crdt";
 import { getText } from "@/doc/fs-ops";
 import { extensionOf } from "@/doc/names";
 import type { ProjectDoc } from "@/doc/schema";
+import { FOLDER_ORIGIN } from "@/folder/origin";
 import {
   projectIndex,
   type IndexedText,
@@ -16,13 +17,18 @@ import { toProjectDiagnostic, type ProjectDiagnostic } from "./diagnostics";
 import {
   DEFAULT_FONTS,
   type FontConfig,
+  type RenderError,
+  type RenderPayload,
   type WorkerEvents,
   type WorkerLike,
   type WorkerRequest,
   type WorkerResponse,
 } from "./protocol";
-import { createPreviewRenderer, type PreviewRenderer } from "./renderer";
-import { splitSvgPages, type PreviewDocument } from "./svg-pages";
+import {
+  buildPreviewDocument,
+  type PageChange,
+  type PreviewDocument,
+} from "./svg-pages";
 
 export type PreviewStatus = "starting" | "idle" | "compiling" | "error";
 
@@ -38,7 +44,7 @@ export interface PreviewState {
   diagnostics: ProjectDiagnostic[];
   /** Worker-side compile time of the last finished compile. */
   compileMs: number | null;
-  /** Compile plus render time, from compile start to the DOM-ready pages. */
+  /** Compile, render and parse time, from compile start to the DOM-ready pages. */
   totalMs: number | null;
   document: PreviewDocument | null;
   /**
@@ -52,6 +58,32 @@ export interface PreviewState {
    * takes that long, so it keeps going; retry() restarts it if it is hung.
    */
   stalled: boolean;
+  /**
+   * Set when the latest document differs from the previous one in a place
+   * the user probably just edited. `seq` grows with every such document, so
+   * a consumer can tell a new one from a state update that carries the same
+   * value.
+   */
+  follow: { seq: number; changes: PageChange[] } | null;
+  /**
+   * How the document that was just shown should animate, set on every shown
+   * document so a page swapped later does not replay an old one. Null when
+   * nobody edited for the change (a font finishing loading), and for the
+   * first document.
+   */
+  animation: PreviewAnimation | null;
+}
+
+/**
+ * "typed" is the user's own edit in the editor. "external" is a change they
+ * did not type: a collaborator's edit, or the linked folder's.
+ */
+export type AnimationKind = "typed" | "external";
+
+export interface PreviewAnimation {
+  seq: number;
+  kind: AnimationKind;
+  changes: PageChange[];
 }
 
 /**
@@ -68,7 +100,6 @@ export interface CompilerClientOptions {
   worker?: WorkerLike;
   /** Creates (and recreates, after a crash) the client's own worker. */
   createWorker?: () => WorkerLike;
-  createRenderer?: () => Promise<PreviewRenderer>;
   assetLoader?: AssetLoader;
 }
 
@@ -82,6 +113,20 @@ const WATCHDOG_MS = 60_000;
 
 /** Automatic restarts after crashes in a row before the client gives up. */
 const MAX_RESTARTS = 3;
+
+/**
+ * New or changed errors wait this long after the last local edit before they
+ * show. Half-typed syntax (an unclosed bracket) is an error for a moment, and
+ * showing it makes the status, the problems panel and the lint underlines
+ * flash on every sentence.
+ */
+const ERROR_SETTLE_MS = 1000;
+
+/**
+ * A document change this soon after a local edit is taken to come from it,
+ * which covers a compile that only finishes after the next edit began.
+ */
+const FOLLOW_WINDOW_MS = 2000;
 
 /** Coalesces bursts of text events per file before sending them. */
 const TEXT_DEBOUNCE_MS = 16;
@@ -121,7 +166,6 @@ export class CompilerClient {
   private worker: WorkerLike;
   /** Null for a caller-owned worker, which is never terminated or replaced. */
   private readonly spawnWorker: (() => WorkerLike) | null;
-  private readonly createRenderer: () => Promise<PreviewRenderer>;
   private readonly assetLoader: AssetLoader | undefined;
 
   private readonly index: ProjectIndex;
@@ -170,16 +214,47 @@ export class CompilerClient {
     document: null,
     error: null,
     stalled: false,
+    follow: null,
+    animation: null,
   };
+  /** Edit sources since the last shown result; "typed" wins over "external". */
+  private pendingKind: AnimationKind | null = null;
+  /** The source of the latest edit, for results that arrive a bit later. */
+  private recentKind: { kind: AnimationKind; at: number } | null = null;
+  /** When the user (or the folder sync) last edited a text file; ms. */
+  private lastLocalEditAt = -Infinity;
+  /** When the last pending asset or font load finished; ms. */
+  private loadsSettledAt = -Infinity;
+  /** A local edit happened since the last result that was shown. */
+  private editedSinceResult = false;
+  /**
+   * Changes of documents that were assembled but superseded before they
+   * were shown, so that the next shown document can still report them.
+   */
+  private carriedChanges: PageChange[] = [];
+  /** Errors from a compile that finished too soon after an edit to show. */
+  private held: {
+    mainPath: string;
+    diagnostics: ProjectDiagnostic[];
+    compileMs: number;
+    totalMs: number | null;
+  } | null = null;
+  private settleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly listeners = new Set<(state: PreviewState) => void>();
-  private renderer: Promise<PreviewRenderer> | null = null;
-  /** Set while a resync waits for the browser to come back online. */
+  /**
+   * The last document built from a worker render, whether or not it was
+   * shown: the worker leaves out what the last render it sent contained, so
+   * the next one is only meaningful against this. Kept apart from
+   * `state.document`, which only follows the newest compile of the current
+   * main file.
+   */
+  private assembled: PreviewDocument | null = null;
+  /** The shown error comes from a failed render, not from the compiler. */
+  private renderFailed = false;
+  /** Set while a rerender waits for the browser to come back online. */
   private onlineWait: AbortController | null = null;
-  private renderQueue: Promise<void> = Promise.resolve();
   private compileStartedAt = new Map<number, number>();
   private latestCompileId = 0;
-  /** The renderer session holds a newer document than `state.document`. */
-  private unrendered = false;
   private disposed = false;
   private readonly unsubscribeIndex: () => void;
   private nextPdfId = 1;
@@ -194,7 +269,6 @@ export class CompilerClient {
       ? null
       : (options.createWorker ?? createCompileWorker);
     this.worker = options.worker ?? this.spawnWorker!();
-    this.createRenderer = options.createRenderer ?? createPreviewRenderer;
     this.assetLoader = options.assetLoader;
 
     this.attach(this.worker);
@@ -206,9 +280,6 @@ export class CompilerClient {
     this.files = state;
     if (this.syncStructure(state, [], [...state.texts.values()], true))
       this.requestCompile();
-    // Fetched alongside the compiler instead of on the first result, which
-    // narrows the window where a dropped connection leaves no renderer.
-    void this.loadRenderer().catch(() => undefined);
   }
 
   getState = (): PreviewState => this.state;
@@ -268,7 +339,7 @@ export class CompilerClient {
     } else if (this.initFailed) {
       this.post({ type: "restart" });
     } else {
-      this.post({ type: "resync" });
+      this.post({ type: "rerender" });
       this.requestCompile();
     }
   }
@@ -363,9 +434,9 @@ export class CompilerClient {
     this.retries.dispose();
     if (this.flushTimer !== null) clearTimeout(this.flushTimer);
     this.clearWatchdog();
+    this.dropHeld();
     this.detach(this.worker);
     if (this.spawnWorker) this.worker.terminate();
-    void this.renderer?.then((r) => r.dispose()).catch(() => undefined);
     this.onlineWait?.abort();
     this.listeners.clear();
   }
@@ -461,8 +532,8 @@ export class CompilerClient {
     this.attach(this.worker);
     this.workerStarted = false;
     this.initFailed = false;
-    // The new worker counts compiles from 1 again, and its first update is
-    // a full reset for the renderer.
+    // The new worker counts compiles from 1 again, and its first render is
+    // a full one.
     this.compileStartedAt.clear();
     this.latestCompileId = 0;
 
@@ -483,25 +554,11 @@ export class CompilerClient {
     this.requestCompile();
   }
 
-  private loadRenderer(): Promise<PreviewRenderer> {
-    if (!this.renderer) {
-      const loading = this.createRenderer();
-      this.renderer = loading;
-      // Usually a fetch that failed while offline. Keeping the rejected
-      // promise would leave the preview broken until a reload.
-      loading.catch(() => {
-        if (this.renderer === loading) this.renderer = null;
-      });
-    }
-    return this.renderer;
-  }
-
   /**
-   * A resync right away would recompile straight into the same failed
-   * renderer load, over and over while offline. If a later edit gets the
-   * renderer loaded first, its merge fails and resyncs on its own.
+   * A rerender right away would recompile straight into the same failed
+   * renderer load, over and over while offline.
    */
-  private resyncWhenOnline(): void {
+  private rerenderWhenOnline(): void {
     if (this.onlineWait) return;
     const wait = new AbortController();
     this.onlineWait = wait;
@@ -509,7 +566,7 @@ export class CompilerClient {
       "online",
       () => {
         this.onlineWait = null;
-        this.post({ type: "resync" });
+        this.post({ type: "rerender" });
       },
       { once: true, signal: wait.signal },
     );
@@ -526,6 +583,23 @@ export class CompilerClient {
   }
 
   private onIndexChange(change: ProjectIndexChange): void {
+    // A collaborator's edits arrive as "import" and are not the user's to be
+    // followed or to hold errors back for. Edits from the folder sync count:
+    // they are this user's changes on disk.
+    if (change.edited.size > 0 && change.by !== "checkout") {
+      // The folder sync commits locally but is not the user typing.
+      const kind: AnimationKind =
+        change.by === "local" && change.origin !== FOLDER_ORIGIN
+          ? "typed"
+          : "external";
+      if (this.pendingKind !== "typed") this.pendingKind = kind;
+      this.recentKind = { kind: this.pendingKind, at: Date.now() };
+    }
+    if (change.by === "local" && change.edited.size > 0) {
+      this.lastLocalEditAt = Date.now();
+      this.editedSinceResult = true;
+      if (this.held) this.scheduleSettle();
+    }
     let edited = false;
     for (const id of change.edited) {
       if (!this.files.texts.has(id)) continue;
@@ -676,7 +750,14 @@ export class CompilerClient {
   /** `load` must not reject; failures are reported where they happen. */
   private track(load: Promise<void>): void {
     this.loading.add(load);
-    void load.finally(() => this.loading.delete(load));
+    void load.finally(() => {
+      this.loading.delete(load);
+      if (this.loading.size > 0) return;
+      this.loadsSettledAt = Date.now();
+      // A load that worked asks for a compile, whose result replaces the
+      // held one. One that failed does not, and its errors are real.
+      if (this.held) this.scheduleSettle();
+    });
   }
 
   /** Project path of the main file, if it is a mirrored text file. */
@@ -692,6 +773,7 @@ export class CompilerClient {
     const mainPath = this.mainPath();
     if (mainPath === undefined) {
       this.post({ type: "cancel" });
+      this.dropHeld();
       if (this.state.mainPath !== null || this.state.document !== null) {
         this.setState({
           status: "idle",
@@ -741,6 +823,9 @@ export class CompilerClient {
         this.restarts = 0;
         this.handleResult(msg);
         break;
+      case "render":
+        this.handleRender(msg);
+        break;
       case "pdf": {
         const request = this.pdfRequests.get(msg.id);
         this.pdfRequests.delete(msg.id);
@@ -757,69 +842,244 @@ export class CompilerClient {
     const startedAt = this.compileStartedAt.get(msg.id);
     this.compileStartedAt.delete(msg.id);
     const fresh = msg.diagnostics.map(toProjectDiagnostic);
-    // Most compiles while typing report the same diagnostics again. Keeping
-    // the old array lets the editor skip re-applying its lint state.
-    const diagnostics =
-      JSON.stringify(fresh) === JSON.stringify(this.state.diagnostics)
-        ? this.state.diagnostics
-        : fresh;
-    const failed = diagnostics.some((d) => d.severity === "error");
-    // Renders apply in order: every update, even a stale one, has to reach
-    // the renderer session, because later deltas build on it.
-    this.renderQueue = this.renderQueue.then(async () => {
-      let document = this.state.document;
-      let error: string | null = null;
-      const last = msg.id === this.latestCompileId;
-      // A compile of the previous main file, finished after the switch. Its
-      // update still goes to the renderer, but nothing of it is shown.
-      const current =
-        this.state.mainPath !== null &&
-        typstPath(this.state.mainPath) === msg.mainPath;
-      let loadFailed = false;
-      try {
-        if (msg.update) {
-          const renderer = await this.loadRenderer().catch((err: unknown) => {
-            loadFailed = true;
-            throw err;
-          });
-          renderer.apply(msg.update);
-          this.unrendered = true;
-        }
-        // SVG work is skipped while a newer compile is already running. If
-        // that one fails, its result still lands here and renders this state.
-        if (last && current && this.unrendered && this.renderer) {
-          const svg = await (await this.renderer).renderSvg();
-          document = splitSvgPages(svg, document);
-          this.unrendered = false;
-        }
-      } catch (err) {
-        console.error("preview render failed", err);
-        if (loadFailed) {
-          error =
-            "Could not load the preview. It retries once the connection is back.";
-          this.resyncWhenOnline();
-        } else {
-          error = `Rendering failed: ${String(err)}`;
-          this.post({ type: "resync" });
-        }
-      }
-      if (this.disposed) return;
-      // The main file may have gone away or changed while this compile ran.
-      if (!current) return;
-      // A superseded compile's diagnostics are already out of date, and
-      // showing them would make errors flicker back in while typing.
-      if (!last) {
-        if (error) this.setState({ error });
-        return;
-      }
-      this.setState({
-        status: failed || error ? "error" : "idle",
+    const last = msg.id === this.latestCompileId;
+    // A compile of the previous main file, finished after the switch. Its
+    // render still has to be assembled, later renders build on it, but
+    // nothing of it is shown.
+    const current = this.isCurrent(msg.mainPath);
+    // Every render is assembled, even a superseded one: the worker sent
+    // only what changed against it.
+    const assembled = this.assemble(msg.render, msg.renderError, true);
+    if (this.disposed || !current) return;
+    // A superseded compile's diagnostics are already out of date, and
+    // showing them would make errors flicker back in while typing.
+    if (!last) {
+      if (assembled.document)
+        this.carriedChanges.push(...assembled.document.changes);
+      if (assembled.error) this.setState({ error: assembled.error });
+      return;
+    }
+    if (!assembled.error) this.renderFailed = false;
+
+    const now = Date.now();
+    const shownFailed = this.state.diagnostics.some(isError);
+    const totalMs =
+      startedAt !== undefined ? performance.now() - startedAt : null;
+    // Images and fonts still on their way show up as "file not found" when
+    // a project opens, which would flash errors that fix themselves.
+    const settling =
+      !assembled.error &&
+      errorsKey(fresh) !== "[]" &&
+      errorsKey(fresh) !== errorsKey(this.state.diagnostics) &&
+      (this.loading.size > 0 ||
+        now - Math.max(this.lastLocalEditAt, this.loadsSettledAt) <
+          ERROR_SETTLE_MS);
+
+    let patch: Partial<PreviewState>;
+    if (settling) {
+      // Keep what is shown until typing pauses. The status goes back to what
+      // it was before this compile started.
+      this.held = {
+        mainPath: msg.mainPath,
+        diagnostics: fresh,
+        compileMs: msg.compileMs,
+        totalMs,
+      };
+      this.scheduleSettle();
+      patch = { status: shownFailed ? "error" : "idle" };
+    } else {
+      this.dropHeld();
+      const diagnostics = this.reuseDiagnostics(fresh);
+      patch = {
+        status: diagnostics.some(isError) || assembled.error ? "error" : "idle",
         diagnostics,
         compileMs: msg.compileMs,
-        totalMs: startedAt !== undefined ? performance.now() - startedAt : null,
-        document,
-        error,
-      });
+        totalMs,
+      };
+    }
+
+    let follow = this.state.follow;
+    let animation = this.state.animation;
+    if (assembled.document) {
+      const changes = mergeChanges([
+        ...this.carriedChanges,
+        ...assembled.document.changes,
+      ]);
+      this.carriedChanges = [];
+      if (
+        changes.length > 0 &&
+        (this.editedSinceResult ||
+          now - this.lastLocalEditAt < FOLLOW_WINDOW_MS)
+      )
+        follow = { seq: (follow?.seq ?? 0) + 1, changes };
+      const recent = this.recentKind;
+      const kind =
+        this.pendingKind ??
+        (recent && now - recent.at < FOLLOW_WINDOW_MS ? recent.kind : null);
+      animation =
+        kind && changes.length > 0
+          ? { seq: (animation?.seq ?? 0) + 1, kind, changes }
+          : null;
+    }
+    this.editedSinceResult = false;
+    if (assembled.document) this.pendingKind = null;
+
+    this.setState({
+      ...patch,
+      document: assembled.document ?? this.state.document,
+      error: assembled.error,
+      follow,
+      animation,
     });
   }
+
+  /**
+   * Most compiles while typing report the same diagnostics again. Keeping
+   * the old array lets the editor skip re-applying its lint state.
+   */
+  private reuseDiagnostics(fresh: ProjectDiagnostic[]): ProjectDiagnostic[] {
+    return JSON.stringify(fresh) === JSON.stringify(this.state.diagnostics)
+      ? this.state.diagnostics
+      : fresh;
+  }
+
+  /**
+   * (Re)starts the wait for typing to pause, counted from the last edit or
+   * finished load. While loads are pending there is nothing to wait for
+   * yet; the last one to finish starts it.
+   */
+  private scheduleSettle(): void {
+    if (this.settleTimer !== null) clearTimeout(this.settleTimer);
+    this.settleTimer = null;
+    if (this.loading.size > 0) return;
+    const since = Math.max(this.lastLocalEditAt, this.loadsSettledAt);
+    const wait = ERROR_SETTLE_MS - (Date.now() - since);
+    this.settleTimer = setTimeout(() => this.publishHeld(), Math.max(0, wait));
+  }
+
+  private dropHeld(): void {
+    if (this.settleTimer !== null) clearTimeout(this.settleTimer);
+    this.settleTimer = null;
+    this.held = null;
+  }
+
+  private publishHeld(): void {
+    const held = this.held;
+    this.dropHeld();
+    if (!held || this.disposed || !this.isCurrent(held.mainPath)) return;
+    this.setState({
+      // A compile that started meanwhile reports its own status.
+      status: this.compileStartedAt.size > 0 ? "compiling" : "error",
+      diagnostics: this.reuseDiagnostics(held.diagnostics),
+      compileMs: held.compileMs,
+      totalMs: held.totalMs,
+    });
+  }
+
+  /** The answer to a rerender: only the document, no compile finished. */
+  private handleRender(msg: Extract<WorkerResponse, { type: "render" }>): void {
+    const assembled = this.assemble(msg.render, msg.renderError, false);
+    // A compile in flight delivers a newer document and status itself.
+    if (
+      this.disposed ||
+      this.compileStartedAt.size > 0 ||
+      !this.isCurrent(msg.mainPath)
+    )
+      return;
+    if (assembled.error) {
+      this.setState({ status: "error", error: assembled.error });
+    } else if (assembled.document) {
+      const failed = this.state.diagnostics.some((d) => d.severity === "error");
+      this.setState({
+        status: failed ? "error" : "idle",
+        document: assembled.document,
+        error: this.renderFailed ? null : this.state.error,
+      });
+      this.renderFailed = false;
+    }
+  }
+
+  private isCurrent(typstMainPath: string): boolean {
+    return (
+      this.state.mainPath !== null &&
+      typstPath(this.state.mainPath) === typstMainPath
+    );
+  }
+
+  /**
+   * Builds the document of a worker render. `error` is what the preview
+   * shows for a render that failed in the worker or here; `document` is
+   * null if there is nothing new to show.
+   */
+  private assemble(
+    render: RenderPayload | undefined,
+    renderError: RenderError | undefined,
+    mayRerender: boolean,
+  ): { document: PreviewDocument | null; error: string | null } {
+    if (renderError) {
+      console.error("preview render failed", renderError.message);
+      this.renderFailed = true;
+      if (renderError.kind === "load") {
+        this.rerenderWhenOnline();
+        return {
+          document: null,
+          error:
+            "Could not load the preview. It retries once the connection is back.",
+        };
+      }
+      return {
+        document: null,
+        error: `Rendering failed: ${renderError.message}`,
+      };
+    }
+    if (!render) return { document: null, error: null };
+    try {
+      const document = buildPreviewDocument(render, this.assembled);
+      if (document) {
+        this.assembled = document;
+        return { document, error: null };
+      }
+    } catch (err) {
+      // Parsing the same markup again would fail the same way, so there is
+      // no rerender; the next compile starts from what is left.
+      console.error("preview render failed", err);
+      this.assembled = null;
+      this.renderFailed = true;
+      return { document: null, error: `Rendering failed: ${String(err)}` };
+    }
+    // The render builds on a page or the defs this client never received
+    // (a restarted worker, a lost message).
+    this.assembled = null;
+    if (mayRerender) this.post({ type: "rerender" });
+    return { document: null, error: null };
+  }
+}
+
+const isError = (d: ProjectDiagnostic) => d.severity === "error";
+
+/** Identity of the errors alone, so warnings changing does not count. */
+function errorsKey(diagnostics: readonly ProjectDiagnostic[]): string {
+  return JSON.stringify(diagnostics.filter(isError));
+}
+
+/**
+ * The changes in page and then top order, with ranges that overlap or touch
+ * on the same page joined. Separate spots on a page stay separate, so a
+ * highlight does not spread over the text between them.
+ */
+function mergeChanges(changes: PageChange[]): PageChange[] {
+  const sorted = [...changes].sort((a, b) => a.page - b.page || a.top - b.top);
+  const merged: PageChange[] = [];
+  for (const c of sorted) {
+    const last = merged.at(-1);
+    if (last && last.page === c.page && c.top <= last.bottom) {
+      merged[merged.length - 1] = {
+        ...last,
+        bottom: Math.max(last.bottom, c.bottom),
+      };
+    } else {
+      merged.push(c);
+    }
+  }
+  return merged;
 }

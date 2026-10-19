@@ -51,6 +51,11 @@ export class CompileScheduler<T> {
     return this.running;
   }
 
+  /** A request is scheduled or queued behind the running job. */
+  get hasWaiting(): boolean {
+    return this.pending !== null || this.queued !== null;
+  }
+
   request(value: T): void {
     this.pending = { value };
     if (this.mode === "debounce") {
@@ -60,8 +65,13 @@ export class CompileScheduler<T> {
     }
     if (this.timer !== null) return; // already scheduled; it picks up the latest
     const wait = Math.max(0, this.lastStart + this.delayMs - this.clock.now());
-    if (wait === 0) this.fire();
-    else this.timer = this.clock.setTimeout(() => this.fire(), wait);
+    // Never started right here, even with no wait. In the worker a request
+    // is a message, and a job blocks the thread: started inside the first
+    // keystroke's message, it left the next keystrokes' messages waiting
+    // until it was done, then took them one per job, so the preview
+    // replayed the typing letter by letter. A timer runs once the messages
+    // already queued are handled, so the job gets the latest text.
+    this.timer = this.clock.setTimeout(() => this.fire(), wait);
   }
 
   /** Drops the scheduled and queued requests; a running job finishes. */
@@ -94,7 +104,12 @@ export class CompileScheduler<T> {
       this.running = false;
       const next = this.queued;
       this.queued = null;
-      if (next) void this.start(next.value);
+      // Through a timer for the same reason as in request(): the edits made
+      // during the job are still waiting as messages.
+      if (next) {
+        this.pending ??= next;
+        this.timer ??= this.clock.setTimeout(() => this.fire(), 0);
+      }
     }
   }
 }

@@ -85,8 +85,10 @@ describe("CompileScheduler (debounce)", () => {
     expect(started).toEqual(["a"]);
 
     await finish();
+    await advance(0);
     expect(started).toEqual(["a", "d"]);
     await finish();
+    await advance(0);
     expect(started).toEqual(["a", "d"]);
   });
 
@@ -127,7 +129,7 @@ describe("CompileScheduler (debounce)", () => {
 });
 
 describe("CompileScheduler (throttle)", () => {
-  it("runs immediately when idle, then at most once per interval", async () => {
+  it("runs without delay when idle, then at most once per interval", async () => {
     const { clock, advance } = fakeClock();
     const { run, started, finish } = controlledRun();
     const s = new CompileScheduler(run, {
@@ -136,7 +138,9 @@ describe("CompileScheduler (throttle)", () => {
       clock,
     });
     s.request("a");
-    await flush();
+    // Not within the request itself, see the next test.
+    expect(started).toEqual([]);
+    await advance(0);
     expect(started).toEqual(["a"]);
     await finish();
 
@@ -147,6 +151,22 @@ describe("CompileScheduler (throttle)", () => {
     expect(started).toEqual(["a"]);
     await advance(50); // 200 ms after "a" started
     expect(started).toEqual(["a", "c"]);
+  });
+
+  it("takes the latest of the requests made in one turn", async () => {
+    const { clock, advance } = fakeClock();
+    const { run, started } = controlledRun();
+    const s = new CompileScheduler(run, {
+      delayMs: 40,
+      mode: "throttle",
+      clock,
+    });
+    // Keystrokes whose messages were all waiting behind the previous job.
+    s.request("a");
+    s.request("b");
+    s.request("c");
+    await advance(0);
+    expect(started).toEqual(["c"]);
   });
 
   it("queues behind a long job and runs the latest value when it ends", async () => {
@@ -165,6 +185,60 @@ describe("CompileScheduler (throttle)", () => {
     await advance(500);
     expect(started).toEqual(["a"]);
     await finish();
+    await advance(0);
     expect(started).toEqual(["a", "c"]);
+  });
+
+  it("lets requests that arrive as a job ends replace the queued one", async () => {
+    const { clock, advance } = fakeClock();
+    const { run, started, finish } = controlledRun();
+    const s = new CompileScheduler(run, {
+      delayMs: 40,
+      mode: "throttle",
+      clock,
+    });
+    s.request("a");
+    await flush();
+    await advance(500);
+    s.request("b"); // queued behind "a"
+    await finish();
+    // The edits typed during "a", handled only after it finished.
+    s.request("c");
+    s.request("d");
+    expect(started).toEqual(["a"]);
+    await advance(0);
+    expect(started).toEqual(["a", "d"]);
+  });
+});
+
+describe("CompileScheduler (waiting)", () => {
+  it("reports work that is scheduled or queued behind the running job", async () => {
+    const { clock, advance } = fakeClock();
+    const { run, finish } = controlledRun();
+    const s = new CompileScheduler(run, {
+      delayMs: 40,
+      mode: "throttle",
+      clock,
+    });
+    s.request("a");
+    await advance(0);
+    expect(s.hasWaiting).toBe(false);
+
+    s.request("b"); // waiting on the throttle
+    expect(s.hasWaiting).toBe(true);
+    await advance(40); // queued behind "a"
+    expect(s.hasWaiting).toBe(true);
+
+    await finish();
+    expect(s.hasWaiting).toBe(true); // about to start, after the event loop
+    await advance(0);
+    expect(s.hasWaiting).toBe(false);
+    expect(s.isRunning).toBe(true);
+
+    s.request("c");
+    s.cancel();
+    expect(s.hasWaiting).toBe(false);
+    await advance(100);
+    await finish();
   });
 });

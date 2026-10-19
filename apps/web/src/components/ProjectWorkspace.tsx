@@ -17,6 +17,10 @@ import { toast } from "sonner";
 import { PdfDownloadButton } from "@/components/DownloadButton";
 import { EditorPane, type RevealRequest } from "@/components/EditorPane";
 import { FileTree } from "@/components/FileTree";
+import {
+  FolderSyncNotice,
+  FolderSyncStatus,
+} from "@/components/FolderSyncStatus";
 import { HistoryPanel } from "@/components/HistoryPanel";
 import { PresenceBar } from "@/components/PresenceBar";
 import { PreviewPane } from "@/components/PreviewPane";
@@ -277,7 +281,12 @@ export function ProjectWorkspace({
       ) : (
         <WorkspaceLayout
           layout={layout}
-          files={<FileTree />}
+          files={
+            <FileTree
+              heading={<FolderSyncStatus />}
+              notice={<FolderSyncNotice />}
+            />
+          }
           editor={
             <EditorPane
               compiler={compiler}

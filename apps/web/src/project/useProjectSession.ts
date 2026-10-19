@@ -95,6 +95,10 @@ export interface ProjectSession {
   following: FollowedLinks | null;
   /** Saves locally and pushes pending edits to the server right away. */
   syncNow: () => Promise<SyncNowResult>;
+  /** Writes pending edits to this browser's store, without pushing them. */
+  saveLocally: () => Promise<void>;
+  /** The doc has caught up with the server at least once. */
+  synced: boolean;
 }
 
 /**
@@ -272,5 +276,7 @@ export function useProjectSession(
     mls,
     following,
     syncNow: session.syncNow,
+    saveLocally: session.saveLocally,
+    synced,
   };
 }

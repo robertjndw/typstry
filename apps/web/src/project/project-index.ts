@@ -30,6 +30,8 @@ export interface ProjectIndexState {
 export interface ProjectIndexChange {
   state: ProjectIndexState;
   by: LoroEventBatch["by"];
+  /** Commit origin of the batch, e.g. FOLDER_ORIGIN for the folder sync. */
+  origin?: string;
   /** Text files whose content was edited, by their id before this batch. */
   edited: ReadonlySet<TreeID>;
   /**
@@ -140,10 +142,16 @@ export class ProjectIndex {
     }
     const prev = this.current;
     const change: ProjectIndexChange = structural
-      ? { ...this.diff(prev, this.rebuild()), by: batch.by, edited }
+      ? {
+          ...this.diff(prev, this.rebuild()),
+          by: batch.by,
+          origin: batch.origin,
+          edited,
+        }
       : {
           state: prev,
           by: batch.by,
+          origin: batch.origin,
           edited,
           structural: false,
           textsRemoved: [],

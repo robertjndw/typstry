@@ -74,7 +74,17 @@ type Editing =
   | { mode: "rename"; id: TreeID }
   | { mode: "create"; parent: TreeID | null; kind: "text" | "dir" };
 
-export function FileTree({ className }: { className?: string }) {
+export function FileTree({
+  className,
+  heading,
+  notice,
+}: {
+  className?: string;
+  /** Replaces the plain "Files" label, e.g. with the linked folder. */
+  heading?: ReactNode;
+  /** Shown between the heading and the tree. */
+  notice?: ReactNode;
+}) {
   const { project, index, mainFile, openFileId, openFile, readOnly, assets } =
     useProject();
   const peers = usePresenceSummary();
@@ -410,9 +420,13 @@ export function FileTree({ className }: { className?: string }) {
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
       <div className="flex h-9 shrink-0 items-center gap-0.5 border-b pr-1 pl-3">
-        <span className="flex-1 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase select-none">
-          Files
-        </span>
+        <div className="flex min-w-0 flex-1 items-center gap-0.5">
+          {heading ?? (
+            <span className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase select-none">
+              Files
+            </span>
+          )}
+        </div>
         {!readOnly && (
           <>
             <ToolbarButton
@@ -470,6 +484,7 @@ export function FileTree({ className }: { className?: string }) {
           <ListCollapseIcon />
         </ToolbarButton>
       </div>
+      {notice}
       <ContextMenu>
         <ContextMenuTrigger asChild disabled={readOnly}>
           <ScrollArea

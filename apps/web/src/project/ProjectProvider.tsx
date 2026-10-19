@@ -1,4 +1,9 @@
-import { useMemo, useSyncExternalStore, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { toast } from "sonner";
 
 import type { ProjectAssets } from "@/assets/project-assets";
@@ -15,6 +20,13 @@ export interface ProjectProviderProps {
   readOnly?: boolean;
   /** Blobs of a synced project; enables uploads and asset previews. */
   assets?: ProjectAssets;
+  /** Remembers the open tabs in this browser under this id. */
+  projectId?: string;
+  /**
+   * False until the doc has caught up with the server. Saved tabs of files
+   * not loaded yet wait for it before they count as deleted.
+   */
+  synced?: boolean;
   children: ReactNode;
 }
 
@@ -22,6 +34,8 @@ export function ProjectProvider({
   doc: project,
   readOnly = false,
   assets,
+  projectId,
+  synced = true,
   children,
 }: ProjectProviderProps) {
   const store = useMemo(
@@ -29,10 +43,14 @@ export function ProjectProvider({
       new ProjectStore(project, {
         onOpenFileRemoved: (path) =>
           toast.info(`${path} was deleted by a collaborator`),
+        projectId,
       }),
-    [project],
+    [project, projectId],
   );
   useDisposeOnUnmount(store, disposeStore);
+  useEffect(() => {
+    if (synced) store.settle();
+  }, [store, synced]);
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
   const value = useMemo<ProjectContextValue>(

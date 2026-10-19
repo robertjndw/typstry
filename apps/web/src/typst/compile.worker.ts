@@ -24,6 +24,8 @@ import {
   type WorkerResponse,
 } from "./protocol";
 import { FONT_CACHE } from "./cache-names";
+import { createPreviewRenderer } from "./renderer";
+import { RenderHost, type RenderOutcome } from "./render-state";
 import { CompileScheduler } from "./scheduler";
 
 // typst.ts 0.8 fetches its default fonts from typst-assets on jsdelivr. Point
@@ -54,7 +56,8 @@ function fontBase(configured: string | undefined, fallback: string): string {
 }
 
 // False sends a full vector artifact on every compile. Deltas are much
-// smaller (a few KB instead of ~120 KB for 20 pages); the renderer takes both.
+// smaller (a few KB instead of ~120 KB for 20 pages) and cheaper to merge;
+// the renderer takes both.
 const INCREMENTAL = true;
 
 type IncrementalServer = Parameters<
@@ -133,6 +136,21 @@ let lastMainPath: string | null = null;
  * so a document that panics every time does not loop.
  */
 let retryingAfterPanic = false;
+/**
+ * Like retryingAfterPanic, for a render that failed: one recompile with a
+ * full reset update, and no more until a render works again.
+ */
+let retryingAfterRenderFailure = false;
+
+const rendering = new RenderHost(createPreviewRenderer);
+/**
+ * A render may be skipped for a newer compile that is already waiting, but
+ * only this soon after the last one went out. Otherwise a compile slower
+ * than the typing (a title used on every page) always has a successor
+ * waiting, and the preview would not move until the typing stops.
+ */
+const RENDER_SKIP_WINDOW_MS = 100;
+let lastRenderAt = Number.NEGATIVE_INFINITY;
 
 function applyFile(compiler: TypstCompiler, path: string, f: FileEntry): void {
   if (f.kind === "text") compiler.addSource(path, f.text);
@@ -266,26 +284,76 @@ async function compile(mainPath: string): Promise<void> {
       retryingAfterPanic = false;
     }
   }
-  const transfer: Transferable[] = [];
-  const data = update?.data;
-  if (
-    data &&
-    data.byteOffset === 0 &&
-    data.byteLength === data.buffer.byteLength
-  ) {
-    transfer.push(data.buffer as ArrayBuffer);
+  const compileMs = performance.now() - started;
+  // After the crash handling above: a crashed compile has nothing to render.
+  const rendered = crashed
+    ? null
+    : await rendering.update(
+        update,
+        mainPath,
+        () =>
+          scheduler.hasWaiting &&
+          performance.now() - lastRenderAt < RENDER_SKIP_WINDOW_MS,
+      );
+  if (rendered?.render) lastRenderAt = performance.now();
+  if (rendered) afterRender(rendered);
+  post({
+    type: "result",
+    id,
+    mainPath,
+    diagnostics,
+    ...renderFields(rendered),
+    compileMs,
+    renderMs: rendered?.renderMs ?? 0,
+  });
+}
+
+function renderFields(
+  outcome: RenderOutcome | null,
+): Pick<Extract<WorkerResponse, { type: "result" }>, "render" | "renderError"> {
+  return {
+    ...(outcome?.render ? { render: outcome.render } : {}),
+    ...(outcome?.error ? { renderError: outcome.error } : {}),
+  };
+}
+
+/**
+ * A failed render leaves the renderer without an update the compiler
+ * believes it has, so the compiler starts its stream over.
+ */
+function afterRender(outcome: RenderOutcome): void {
+  if (outcome.desynced && current?.incr) {
+    current.incr.server.reset();
+    current.needsReset = true;
   }
-  post(
-    {
-      type: "result",
-      id,
-      mainPath,
-      diagnostics,
-      update,
-      compileMs: performance.now() - started,
-    },
-    transfer,
-  );
+  if (!outcome.error) {
+    retryingAfterRenderFailure = false;
+  } else if (
+    // A failed load would only fail again right away; the client asks for a
+    // rerender once the connection is back.
+    outcome.error.kind === "render" &&
+    !retryingAfterRenderFailure &&
+    lastMainPath
+  ) {
+    retryingAfterRenderFailure = true;
+    scheduler.request(lastMainPath);
+  }
+}
+
+async function rerender(): Promise<void> {
+  const mainPath = lastMainPath;
+  const answer = await rendering.rerender(mainPath);
+  if (answer.kind === "compile") {
+    if (mainPath) scheduler.request(mainPath);
+    return;
+  }
+  afterRender(answer.outcome);
+  post({
+    type: "render",
+    mainPath: mainPath!,
+    ...renderFields(answer.outcome),
+    renderMs: answer.outcome.renderMs,
+  });
 }
 
 async function exportArtifact(
@@ -336,12 +404,15 @@ async function exportPdf(id: number, mainPath: string): Promise<void> {
   }
 }
 
-// Throttle, not a trailing debounce: a debounce adds the full 200 ms to every
-// keystroke and starves the preview while the user keeps typing (on a 20 page
-// doc: ~400 ms keystroke-to-paint, one update in 2.3 s of typing). Compiles
-// run at most every 200 ms with the latest text, one running and one queued.
+// Throttle, not a trailing debounce: a debounce adds its full delay to every
+// keystroke and starves the preview while the user keeps typing. A compile
+// starts as soon as the previous one has compiled and rendered, with the
+// latest text, one running and one queued. The floor only matters when
+// compiling is very fast: the client parses the pages of every result on the
+// main thread, and 40 ms (25 results a second) keeps that work and the
+// message traffic bounded without being perceptible while typing.
 const scheduler = new CompileScheduler<string>(compile, {
-  delayMs: 200,
+  delayMs: 40,
   mode: "throttle",
 });
 
@@ -373,12 +444,8 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
       lastMainPath = null;
       scheduler.cancel();
       break;
-    case "resync":
-      if (current?.incr) {
-        current.incr.server.reset();
-        current.needsReset = true;
-      }
-      if (lastMainPath) scheduler.request(lastMainPath);
+    case "rerender":
+      void rerender();
       break;
     case "reinit":
       fonts = msg.fonts;
@@ -391,3 +458,4 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
 });
 
 startSession(fonts);
+rendering.preload();

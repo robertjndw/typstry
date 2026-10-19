@@ -113,3 +113,16 @@ test("tabs close with their button and a middle click", async ({ page }) => {
     fileTree(page).getByRole("treeitem", { name: "a.typ" }),
   ).toBeVisible();
 });
+
+test("open tabs come back after a reload", async ({ page }) => {
+  await createProject(page, "Reopened");
+  await createEntry(page, "a.typ");
+  await createEntry(page, "b.typ");
+  await page.getByRole("button", { name: "Close b.typ" }).click();
+  await tab(page, "a.typ").click();
+  await expect(page.getByRole("tab")).toHaveCount(2);
+
+  await page.reload();
+  await expect(page.getByRole("tab")).toHaveText(["main.typ", "a.typ"]);
+  await expect(tab(page, "a.typ")).toHaveAttribute("aria-selected", "true");
+});

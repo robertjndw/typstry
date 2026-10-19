@@ -10,17 +10,17 @@ import {
   setMainFile,
 } from "@/doc/fs-ops";
 import { initProject, type ProjectDoc } from "@/doc/schema";
-import { newProject } from "@/doc/test-utils";
+import { fork, newProject, sync } from "@/doc/test-utils";
+import { FOLDER_ORIGIN } from "@/folder/origin";
 
 import { CompilerClient } from "./compiler-client";
 import type {
-  ArtifactUpdate,
+  RenderPayload,
   WorkerEvents,
   WorkerLike,
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
-import type { PreviewRenderer } from "./renderer";
 
 class FakeWorker implements WorkerLike {
   sent: WorkerRequest[] = [];
@@ -64,25 +64,34 @@ class FakeWorker implements WorkerLike {
   }
 }
 
-function fakeRenderer() {
-  const applied: ArtifactUpdate[] = [];
-  let svg = "";
-  const renderer: PreviewRenderer = {
-    apply: (u) => void applied.push(u),
-    renderSvg: async () => svg,
-    dispose: () => {},
-  };
-  return {
-    applied,
-    renderer,
-    setSvg: (s: string) => (svg = s),
-  };
-}
-
-const page = (tid: string) =>
+const pageMarkup = (tid: string) =>
   `<g class="typst-page" transform="translate(0, 0)" data-tid="${tid}" data-page-width="100" data-page-height="200"><g/></g>`;
-const svgDoc = (...tids: string[]) =>
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 200"><defs class="glyph"></defs>${tids.map(page).join("")}</svg>`;
+const rootTag =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 200">';
+
+/** A render with every page and the defs, as after a worker restart. */
+const fullRender = (...tids: string[]): RenderPayload => ({
+  rootTag,
+  defs: '<defs class="glyph"></defs>',
+  pages: tids.map((tid) => ({
+    tid,
+    width: 100,
+    height: 200,
+    markup: pageMarkup(tid),
+  })),
+});
+
+/** A render that only sends the given tids' markup, as the worker's diff does. */
+const deltaRender = (sent: string[], ...tids: string[]): RenderPayload => ({
+  rootTag,
+  defs: null,
+  pages: tids.map((tid) => ({
+    tid,
+    width: 100,
+    height: 200,
+    markup: sent.includes(tid) ? pageMarkup(tid) : null,
+  })),
+});
 
 /** Lets Loro events and the client's debounce timer run. */
 async function settle() {
@@ -90,34 +99,27 @@ async function settle() {
   await vi.advanceTimersByTimeAsync(50);
 }
 
-/** `createRenderer` gets the fake renderer, to resolve with or not. */
-function setup(
-  createRenderer: (
-    renderer: PreviewRenderer,
-  ) => Promise<PreviewRenderer> = async (renderer) => renderer,
-) {
+function setup() {
   const project = initProject(newProject(1), { title: "T" });
   const worker = new FakeWorker();
-  const r = fakeRenderer();
-  const client = new CompilerClient(project, {
-    worker,
-    createRenderer: () => createRenderer(r.renderer),
-  });
-  return { project, worker, client, ...r };
+  const client = new CompilerClient(project, { worker });
+  return { project, worker, client };
 }
 
 function emitResult(
   worker: FakeWorker,
   id: number,
-  action: "reset" | "merge" = "reset",
+  render?: RenderPayload,
+  mainPath = "/main.typ",
 ) {
   worker.emit({
     type: "result",
     id,
-    mainPath: "/main.typ",
+    mainPath,
     diagnostics: [],
-    update: { action, data: new Uint8Array([id]) },
+    ...(render ? { render } : {}),
     compileMs: 1,
+    renderMs: 1,
   });
 }
 
@@ -139,7 +141,6 @@ describe("CompilerClient mirroring", () => {
     const worker = new FakeWorker();
     new CompilerClient(project, {
       worker,
-      createRenderer: async () => fakeRenderer().renderer,
     });
 
     const sent = worker.take();
@@ -318,7 +319,6 @@ describe("CompilerClient mirroring", () => {
     new CompilerClient(project, {
       worker,
       assetLoader: loader,
-      createRenderer: async () => fakeRenderer().renderer,
     });
     worker.take();
     const { createAsset } = await import("@/doc/fs-ops");
@@ -350,7 +350,6 @@ describe("CompilerClient PDF export", () => {
     const client = new CompilerClient(project, {
       worker,
       assetLoader: () => new Promise((resolve) => (finish = resolve)),
-      createRenderer: async () => fakeRenderer().renderer,
     });
     worker.take();
 
@@ -373,7 +372,6 @@ describe("CompilerClient PDF export", () => {
     setMainFile(project, null);
     const client = new CompilerClient(project, {
       worker: new FakeWorker(),
-      createRenderer: async () => fakeRenderer().renderer,
     });
     await expect(client.exportPdf()).rejects.toThrow("no main file");
   });
@@ -392,7 +390,6 @@ describe("CompilerClient asset retries", () => {
     const client = new CompilerClient(project, {
       worker,
       assetLoader: loader,
-      createRenderer: async () => fakeRenderer().renderer,
     });
     worker.take();
     const logo = createAsset(project, null, "logo.png", {
@@ -502,7 +499,6 @@ describe("CompilerClient fonts", () => {
     new CompilerClient(project, {
       worker,
       assetLoader: loader,
-      createRenderer: async () => fakeRenderer().renderer,
     });
     worker.take();
     const reinits = () =>
@@ -572,7 +568,6 @@ describe("CompilerClient fonts", () => {
     const client = new CompilerClient(project, {
       worker,
       assetLoader: async (hash) => new TextEncoder().encode(hash),
-      createRenderer: async () => fakeRenderer().renderer,
     });
     createAsset(project, null, "A.ttf", { hash: "h-a", size: 1, mime: "" });
     await settle();
@@ -599,7 +594,6 @@ describe("CompilerClient fonts", () => {
         if (hash === "h-slow") await slow;
         return new TextEncoder().encode(hash);
       },
-      createRenderer: async () => fakeRenderer().renderer,
     });
     const slowId = createAsset(project, null, "S.ttf", {
       hash: "h-slow",
@@ -620,25 +614,16 @@ describe("CompilerClient fonts", () => {
 });
 
 describe("CompilerClient results", () => {
-  it("renders successful results and keeps the last good render on errors", async () => {
-    const { worker, client, applied, setSvg } = setup();
+  it("shows successful results and keeps the last good render on errors", async () => {
+    const { worker, client } = setup();
     worker.emit({ type: "ready" });
     worker.emit({ type: "compiling", id: 1 });
     expect(client.getState().status).toBe("compiling");
 
-    setSvg(svgDoc("p1", "p2"));
-    worker.emit({
-      type: "result",
-      id: 1,
-      mainPath: "/main.typ",
-      diagnostics: [],
-      update: { action: "reset", data: new Uint8Array([1]) },
-      compileMs: 5,
-    });
-    await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
+    emitResult(worker, 1, fullRender("p1", "p2"));
+    expect(client.getState().status).toBe("idle");
     const good = client.getState().document;
     expect(good?.pages.map((p) => p.tid)).toEqual(["p1", "p2"]);
-    expect(applied).toHaveLength(1);
 
     worker.emit({ type: "compiling", id: 2 });
     worker.emit({
@@ -655,8 +640,9 @@ describe("CompilerClient results", () => {
         },
       ],
       compileMs: 3,
+      renderMs: 0,
     });
-    await vi.waitFor(() => expect(client.getState().status).toBe("error"));
+    expect(client.getState().status).toBe("error");
     expect(client.getState().document).toBe(good);
     expect(client.getState().diagnostics).toEqual([
       expect.objectContaining({
@@ -666,83 +652,153 @@ describe("CompilerClient results", () => {
     ]);
   });
 
-  it("applies stale deltas but only renders the newest one", async () => {
-    const { worker, client, applied, setSvg } = setup();
+  it("reuses pages the worker left out and builds on superseded renders", () => {
+    const { worker, client } = setup();
     worker.emit({ type: "compiling", id: 1 });
     worker.emit({ type: "compiling", id: 2 });
-    setSvg(svgDoc("new"));
-    emitResult(worker, 1, "reset");
-    emitResult(worker, 2, "merge");
-    await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
-    expect(applied.map((u) => u.action)).toEqual(["reset", "merge"]);
-    expect(client.getState().document?.pages.map((p) => p.tid)).toEqual([
-      "new",
-    ]);
+    worker.emit({ type: "compiling", id: 3 });
+    emitResult(worker, 1, fullRender("a", "b"));
+    // Superseded, so not shown, but the next delta is relative to it.
+    expect(client.getState().document).toBeNull();
+    emitResult(worker, 2, deltaRender(["c"], "a", "c"));
+    expect(client.getState().document).toBeNull();
+    emitResult(worker, 3, deltaRender(["d"], "a", "c", "d"));
+
+    const doc = client.getState().document!;
+    expect(doc.pages.map((p) => p.tid)).toEqual(["a", "c", "d"]);
+    expect(worker.sent).not.toContainEqual({ type: "rerender" });
   });
 
-  it("asks the worker for a full resync when a merge fails", async () => {
-    const { worker, client, renderer } = setup();
+  it("keeps unchanged page elements between results", () => {
+    const { worker, client } = setup();
+    worker.emit({ type: "compiling", id: 1 });
+    emitResult(worker, 1, fullRender("a", "b"));
+    const first = client.getState().document!;
+    worker.emit({ type: "compiling", id: 2 });
+    emitResult(worker, 2, deltaRender(["c"], "a", "c"));
+    const second = client.getState().document!;
+    expect(second.defs).toBe(first.defs);
+    expect(second.pages[0]).toBe(first.pages[0]);
+  });
+
+  it("asks for a rerender when a render leaves out what it never had", () => {
+    const { worker, client } = setup();
+    worker.emit({ type: "compiling", id: 1 });
+    emitResult(worker, 1, deltaRender([], "a"));
+    expect(worker.sent).toContainEqual({ type: "rerender" });
+    expect(client.getState()).toMatchObject({ status: "idle", document: null });
+
+    // The worker's answer is the whole document.
+    worker.emit({
+      type: "render",
+      mainPath: "/main.typ",
+      render: fullRender("a"),
+      renderMs: 1,
+    });
+    expect(client.getState().document?.pages.map((p) => p.tid)).toEqual(["a"]);
+  });
+
+  it("does not show a rerender's document while a compile is running", () => {
+    const { worker, client } = setup();
+    worker.emit({ type: "compiling", id: 1 });
+    worker.emit({
+      type: "render",
+      mainPath: "/main.typ",
+      render: fullRender("a"),
+      renderMs: 1,
+    });
+    expect(client.getState().document).toBeNull();
+    // It still counts as the base of the next delta.
+    emitResult(worker, 1, deltaRender([], "a"));
+    expect(client.getState().document?.pages.map((p) => p.tid)).toEqual(["a"]);
+  });
+
+  it("shows a failed render and clears it with the next good one", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    renderer.apply = () => {
-      throw new Error("bad delta");
-    };
+    const { worker, client } = setup();
     worker.emit({ type: "compiling", id: 1 });
     worker.emit({
       type: "result",
       id: 1,
       mainPath: "/main.typ",
       diagnostics: [],
-      update: { action: "merge", data: new Uint8Array([1]) },
+      renderError: { kind: "render", message: "bad delta" },
       compileMs: 1,
+      renderMs: 0,
     });
-    await vi.waitFor(() => expect(client.getState().status).toBe("error"));
-    expect(client.getState().error).toMatch(/bad delta/);
-    expect(worker.sent).toContainEqual({ type: "resync" });
+    expect(client.getState().status).toBe("error");
+    expect(client.getState().error).toMatch(/Rendering failed: bad delta/);
+    // The worker recovers on its own; there is nothing to request.
+    expect(worker.sent).not.toContainEqual({ type: "rerender" });
+
+    worker.emit({ type: "compiling", id: 2 });
+    emitResult(worker, 2, fullRender("p1"));
+    expect(client.getState()).toMatchObject({ status: "idle", error: null });
   });
 
-  it("retries a failed renderer load and resyncs once back online", async () => {
+  it("explains a failed renderer load and rerenders once back online", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    let online = false;
-    const createRenderer = vi.fn(async (renderer: PreviewRenderer) => {
-      if (!online) throw new TypeError("Failed to fetch");
-      return renderer;
-    });
-    const { worker, client, setSvg } = setup(createRenderer);
-    setSvg(svgDoc("p1"));
+    const { worker, client } = setup();
     worker.take();
 
     worker.emit({ type: "compiling", id: 1 });
-    emitResult(worker, 1);
-    await vi.waitFor(() => expect(client.getState().status).toBe("error"));
+    worker.emit({
+      type: "result",
+      id: 1,
+      mainPath: "/main.typ",
+      diagnostics: [],
+      renderError: { kind: "load", message: "TypeError: Failed to fetch" },
+      compileMs: 1,
+      renderMs: 0,
+    });
+    expect(client.getState().status).toBe("error");
     expect(client.getState().error).toMatch(/Could not load the preview/);
-    // Resyncing now would only recompile into the same failure.
-    expect(worker.take()).not.toContainEqual({ type: "resync" });
+    // Rerendering now would only fail the same way.
+    expect(worker.take()).not.toContainEqual({ type: "rerender" });
 
-    online = true;
     window.dispatchEvent(new Event("online"));
-    expect(worker.take()).toContainEqual({ type: "resync" });
+    expect(worker.take()).toContainEqual({ type: "rerender" });
 
-    worker.emit({ type: "compiling", id: 2 });
-    emitResult(worker, 2);
-    await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
+    worker.emit({
+      type: "render",
+      mainPath: "/main.typ",
+      render: fullRender("p1"),
+      renderMs: 1,
+    });
+    expect(client.getState()).toMatchObject({ status: "idle", error: null });
     expect(client.getState().document?.pages.map((p) => p.tid)).toEqual(["p1"]);
-    // The eager load at startup, the failed one for result 1, the retry.
-    expect(createRenderer).toHaveBeenCalledTimes(3);
   });
 
-  it("stops waiting for the connection once disposed", async () => {
+  it("stops waiting for the connection once disposed", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const { worker, client } = setup(() =>
-      Promise.reject(new TypeError("Failed to fetch")),
-    );
+    const { worker, client } = setup();
     worker.emit({ type: "compiling", id: 1 });
-    emitResult(worker, 1);
-    await vi.waitFor(() => expect(client.getState().status).toBe("error"));
+    worker.emit({
+      type: "result",
+      id: 1,
+      mainPath: "/main.typ",
+      diagnostics: [],
+      renderError: { kind: "load", message: "Failed to fetch" },
+      compileMs: 1,
+      renderMs: 0,
+    });
+    expect(client.getState().status).toBe("error");
 
     client.dispose();
     worker.take();
     window.dispatchEvent(new Event("online"));
     expect(worker.take()).toEqual([]);
+  });
+
+  it("asks for a rerender and a compile on retry", () => {
+    const { worker, client } = setup();
+    worker.emit({ type: "ready" });
+    worker.take();
+    client.retry();
+    expect(worker.take()).toEqual([
+      { type: "rerender" },
+      { type: "compile", mainPath: "/main.typ" },
+    ]);
   });
 });
 
@@ -794,9 +850,8 @@ describe("CompilerClient superseded results", () => {
     range: { startLine: 0, startCol: 1, endLine: 0, endCol: 2 },
   };
 
-  it("keeps the diagnostics of the newest compile only", async () => {
-    const { worker, client, setSvg } = setup();
-    setSvg(svgDoc("p1"));
+  it("keeps the diagnostics of the newest compile only", () => {
+    const { worker, client } = setup();
     worker.emit({ type: "ready" });
     worker.emit({ type: "compiling", id: 1 });
     worker.emit({ type: "compiling", id: 2 });
@@ -808,8 +863,8 @@ describe("CompilerClient superseded results", () => {
       mainPath: "/main.typ",
       diagnostics: [error],
       compileMs: 1,
+      renderMs: 0,
     });
-    await settle();
     expect(published).not.toHaveBeenCalledWith(
       expect.objectContaining({
         diagnostics: [expect.objectContaining({ message: error.message })],
@@ -820,34 +875,39 @@ describe("CompilerClient superseded results", () => {
       diagnostics: [],
     });
 
-    emitResult(worker, 2);
-    await vi.waitFor(() => expect(client.getState().status).toBe("idle"));
+    emitResult(worker, 2, fullRender("p1"));
+    expect(client.getState().status).toBe("idle");
     expect(client.getState().diagnostics).toEqual([]);
   });
 
-  it("drops a result for the previous main file", async () => {
-    const { project, worker, client, setSvg, applied } = setup();
+  it("drops a result for the previous main file but builds on its render", async () => {
+    const { project, worker, client } = setup();
     const other = createFile(project, null, "other.typ", "text");
     setMainFile(project, other);
     project.doc.commit();
     await settle();
     expect(client.getState().mainPath).toBe("other.typ");
 
-    setSvg(svgDoc("old"));
     worker.emit({ type: "compiling", id: 1 });
     worker.emit({
       type: "result",
       id: 1,
       mainPath: "/main.typ",
       diagnostics: [error],
-      update: { action: "reset", data: new Uint8Array([1]) },
+      render: fullRender("old"),
       compileMs: 1,
+      renderMs: 1,
     });
-    await settle();
-    // The renderer still gets the update, later deltas build on it.
-    expect(applied).toHaveLength(1);
     expect(client.getState().diagnostics).toEqual([]);
     expect(client.getState().document).toBeNull();
+
+    // The worker diffs against that render, so this one reuses its page.
+    worker.emit({ type: "compiling", id: 2 });
+    emitResult(worker, 2, deltaRender([], "old"), "/other.typ");
+    expect(client.getState().document?.pages.map((p) => p.tid)).toEqual([
+      "old",
+    ]);
+    expect(worker.sent).not.toContainEqual({ type: "rerender" });
   });
 });
 
@@ -861,7 +921,6 @@ describe("CompilerClient worker failures", () => {
         workers.push(w);
         return w;
       },
-      createRenderer: async () => fakeRenderer().renderer,
     });
     workers[0]!.emit({ type: "ready" });
     return { project, client, workers };
@@ -909,7 +968,7 @@ describe("CompilerClient worker failures", () => {
     await vi.advanceTimersByTimeAsync(600_000);
     expect(workers).toHaveLength(1);
     expect(workers[0]!.terminated).toBe(false);
-    emitResult(workers[0]!, 1);
+    emitResult(workers[0]!, 1, fullRender("p1"));
     expect(client.getState().stalled).toBe(false);
   });
 
@@ -943,7 +1002,7 @@ describe("CompilerClient worker failures", () => {
   it("does not time out while idle", async () => {
     const { workers } = crashSetup();
     workers[0]!.emit({ type: "compiling", id: 1 });
-    emitResult(workers[0]!, 1);
+    emitResult(workers[0]!, 1, fullRender("p1"));
     await vi.advanceTimersByTimeAsync(120_000);
     expect(workers).toHaveLength(1);
   });
@@ -969,7 +1028,6 @@ describe("CompilerClient worker failures", () => {
     const worker = new FakeWorker();
     const client = new CompilerClient(project, {
       worker,
-      createRenderer: async () => fakeRenderer().renderer,
     });
     worker.emit({ type: "initError", message: "TypeError: Failed to fetch" });
     expect(client.getState()).toMatchObject({
@@ -988,5 +1046,355 @@ describe("CompilerClient worker failures", () => {
     worker.take();
     client.retry();
     expect(worker.take()).toEqual([{ type: "restart" }]);
+  });
+});
+
+/** A one page render whose blocks are given as [tid, y]. */
+const blockRender = (tid: string, ...blocks: [string, number][]) => ({
+  rootTag,
+  defs: '<defs class="glyph"></defs>',
+  pages: [
+    {
+      tid,
+      width: 100,
+      height: 200,
+      markup: `<g class="typst-page" data-tid="${tid}" data-page-width="100" data-page-height="200"><g class="typst-group">${blocks
+        .map(([t, y]) => `<g transform="translate(0, ${y})" data-tid="${t}"/>`)
+        .join("")}</g></g>`,
+    },
+  ],
+});
+
+const typeInto = (project: ProjectDoc, at = 0) => {
+  getText(project, mainId(project)).insert(at, "x");
+  project.doc.commit();
+};
+
+describe("CompilerClient following edits", () => {
+  const compileWith = (
+    worker: FakeWorker,
+    id: number,
+    render: RenderPayload,
+  ) => {
+    worker.emit({ type: "compiling", id });
+    emitResult(worker, id, render);
+  };
+
+  it("reports where the document changed after a local edit", async () => {
+    const { project, worker, client } = setup();
+    worker.emit({ type: "ready" });
+    compileWith(worker, 1, blockRender("p1", ["a", 10], ["b", 50]));
+    expect(client.getState().follow).toBeNull();
+
+    typeInto(project);
+    await settle();
+    compileWith(worker, 2, blockRender("p2", ["a", 10], ["B", 50]));
+    expect(client.getState().follow).toEqual({
+      seq: 1,
+      changes: [{ page: 0, top: 50, bottom: 200 }],
+    });
+
+    typeInto(project);
+    await settle();
+    compileWith(worker, 3, blockRender("p3", ["A", 10], ["B", 50]));
+    expect(client.getState().follow?.seq).toBe(2);
+  });
+
+  it("ignores changes nobody edited for", async () => {
+    const { project, worker, client } = setup();
+    worker.emit({ type: "ready" });
+    compileWith(worker, 1, blockRender("p1", ["a", 10]));
+    // A font or asset finishing loading changes the output without an edit.
+    await vi.advanceTimersByTimeAsync(5000);
+    compileWith(worker, 2, blockRender("p2", ["A", 10]));
+    expect(client.getState().follow).toBeNull();
+
+    // An edit that was compiled long ago does not claim later changes.
+    typeInto(project);
+    await settle();
+    compileWith(worker, 3, blockRender("p3", ["a", 10]));
+    expect(client.getState().follow?.seq).toBe(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    compileWith(worker, 4, blockRender("p4", ["b", 10]));
+    expect(client.getState().follow?.seq).toBe(1);
+  });
+
+  it("does not follow a collaborator's edits", async () => {
+    const { project, worker, client } = setup();
+    worker.emit({ type: "ready" });
+    compileWith(worker, 1, blockRender("p1", ["a", 10]));
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const remote = fork(project, 2);
+    typeInto(remote);
+    sync(project, remote);
+    await settle();
+    compileWith(worker, 2, blockRender("p2", ["A", 10]));
+    expect(client.getState().follow).toBeNull();
+  });
+
+  describe("animation kind", () => {
+    const shown = async (edit: (project: ProjectDoc) => void) => {
+      const { project, worker, client } = setup();
+      worker.emit({ type: "ready" });
+      compileWith(worker, 1, blockRender("p1", ["a", 10], ["b", 50]));
+      expect(client.getState().animation).toBeNull();
+      edit(project);
+      await settle();
+      compileWith(worker, 2, blockRender("p2", ["a", 10], ["B", 50]));
+      return { client, worker, project };
+    };
+
+    it("calls the user's own edit typed", async () => {
+      const { client } = await shown((p) => typeInto(p));
+      expect(client.getState().animation).toEqual({
+        seq: 1,
+        kind: "typed",
+        changes: [{ page: 0, top: 50, bottom: 200 }],
+      });
+    });
+
+    it("calls a folder sync commit external but still follows it", async () => {
+      const { client } = await shown((p) => {
+        getText(p, mainId(p)).insert(0, "x");
+        p.doc.commit({ origin: FOLDER_ORIGIN });
+      });
+      expect(client.getState().animation?.kind).toBe("external");
+      expect(client.getState().follow?.seq).toBe(1);
+    });
+
+    it("calls a collaborator's edit external", async () => {
+      const { project, worker, client } = setup();
+      worker.emit({ type: "ready" });
+      compileWith(worker, 1, blockRender("p1", ["a", 10]));
+      await vi.advanceTimersByTimeAsync(5000);
+      const remote = fork(project, 2);
+      typeInto(remote);
+      sync(project, remote);
+      await settle();
+      compileWith(worker, 2, blockRender("p2", ["A", 10]));
+      expect(client.getState().animation?.kind).toBe("external");
+      expect(client.getState().follow).toBeNull();
+    });
+
+    it("prefers typed when both happened before the result", async () => {
+      const { project, worker, client } = setup();
+      worker.emit({ type: "ready" });
+      compileWith(worker, 1, blockRender("p1", ["a", 10]));
+      const remote = fork(project, 2);
+      typeInto(remote);
+      sync(project, remote);
+      typeInto(project);
+      await settle();
+      compileWith(worker, 2, blockRender("p2", ["A", 10]));
+      expect(client.getState().animation?.kind).toBe("typed");
+    });
+
+    it("clears the animation when nobody edited for a change", async () => {
+      const { client, worker } = await shown((p) => typeInto(p));
+      await vi.advanceTimersByTimeAsync(5000);
+      compileWith(worker, 3, blockRender("p3", ["A", 10], ["B", 50]));
+      expect(client.getState().animation).toBeNull();
+    });
+  });
+
+  it("carries the changes of superseded results into the next one", async () => {
+    const { project, worker, client } = setup();
+    worker.emit({ type: "ready" });
+    compileWith(worker, 1, blockRender("p1", ["a", 10], ["b", 50]));
+
+    typeInto(project);
+    await settle();
+    worker.emit({ type: "compiling", id: 2 });
+    worker.emit({ type: "compiling", id: 3 });
+    emitResult(worker, 2, blockRender("p2", ["A", 10], ["b", 50]));
+    emitResult(worker, 3, blockRender("p3", ["A", 10], ["b", 50], ["c", 90]));
+    // Two separate spots on the page stay two ranges.
+    expect(client.getState().follow?.changes).toEqual([
+      { page: 0, top: 10, bottom: 50 },
+      { page: 0, top: 90, bottom: 200 },
+    ]);
+  });
+});
+
+describe("CompilerClient error settling", () => {
+  const typo = {
+    path: "/main.typ",
+    package: "",
+    severity: "error" as "error" | "warning",
+    message: "unclosed delimiter",
+    range: { startLine: 0, startCol: 1, endLine: 0, endCol: 2 },
+  };
+  const warning = { ...typo, severity: "warning" as const, message: "w" };
+  type Diagnostic = typeof typo;
+
+  let nextId = 1;
+  const compileWith = (
+    worker: FakeWorker,
+    diagnostics: Diagnostic[],
+    render?: RenderPayload,
+  ) => {
+    const id = nextId++;
+    worker.emit({ type: "compiling", id });
+    worker.emit({
+      type: "result",
+      id,
+      mainPath: "/main.typ",
+      diagnostics,
+      ...(render ? { render } : {}),
+      compileMs: 4,
+      renderMs: 0,
+    });
+  };
+
+  async function started() {
+    nextId = 1;
+    const ctx = setup();
+    ctx.worker.emit({ type: "ready" });
+    compileWith(ctx.worker, [warning], fullRender("p1"));
+    return ctx;
+  }
+
+  it("holds new errors back while the user types, then publishes them", async () => {
+    const { project, worker, client } = await started();
+    typeInto(project);
+    await settle();
+    const before = client.getState();
+
+    await vi.advanceTimersByTimeAsync(200);
+    compileWith(worker, [typo, warning]);
+    expect(client.getState().diagnostics).toBe(before.diagnostics);
+    expect(client.getState().status).toBe("idle");
+    expect(client.getState().document).toBe(before.document);
+
+    // The deadline counts from the last edit, so another keystroke moves it.
+    await vi.advanceTimersByTimeAsync(700);
+    typeInto(project);
+    await settle();
+    await vi.advanceTimersByTimeAsync(900);
+    expect(client.getState().status).toBe("idle");
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(client.getState().status).toBe("error");
+    expect(client.getState().diagnostics).toEqual([
+      expect.objectContaining({ message: "unclosed delimiter" }),
+      expect.objectContaining({ message: "w" }),
+    ]);
+    expect(client.getState().compileMs).toBe(4);
+  });
+
+  it("shows errors right away when typing has paused", async () => {
+    const { project, worker, client } = await started();
+    typeInto(project);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1000);
+    compileWith(worker, [typo]);
+    expect(client.getState().status).toBe("error");
+  });
+
+  it("shows fixes, and changes to warnings alone, immediately", async () => {
+    const { project, worker, client } = await started();
+    typeInto(project);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1000);
+    compileWith(worker, [typo]);
+    expect(client.getState().status).toBe("error");
+
+    typeInto(project);
+    await settle();
+    // Same error, different warnings.
+    compileWith(worker, [typo, warning]);
+    expect(client.getState().diagnostics).toHaveLength(2);
+    // The error goes away mid-typing.
+    compileWith(worker, [warning], fullRender("p2"));
+    expect(client.getState().status).toBe("idle");
+    expect(client.getState().diagnostics).toEqual([
+      expect.objectContaining({ message: "w" }),
+    ]);
+
+    // A fix also cancels an error that was still held back.
+    typeInto(project);
+    await settle();
+    compileWith(worker, [typo]);
+    compileWith(worker, [], fullRender("p3"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(client.getState().status).toBe("idle");
+    expect(client.getState().diagnostics).toEqual([]);
+  });
+
+  it("holds errors back while assets load, and drops them when the load fixes them", async () => {
+    nextId = 1;
+    const project = initProject(newProject(1), { title: "T" });
+    createAsset(project, null, "logo.png", {
+      hash: "abc",
+      size: 3,
+      mime: "image/png",
+    });
+    const worker = new FakeWorker();
+    let finish!: (data: Uint8Array) => void;
+    const client = new CompilerClient(project, {
+      worker,
+      assetLoader: () => new Promise((resolve) => (finish = resolve)),
+    });
+    worker.emit({ type: "ready" });
+    // The first compile runs before the image is there.
+    compileWith(worker, [{ ...typo, message: "file not found" }]);
+    expect(client.getState().status).not.toBe("error");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(client.getState().diagnostics).toEqual([]);
+
+    finish(new Uint8Array([1]));
+    await settle();
+    compileWith(worker, [], fullRender("p1"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(client.getState().status).toBe("idle");
+    expect(client.getState().diagnostics).toEqual([]);
+  });
+
+  it("shows held errors after a load that failed", async () => {
+    nextId = 1;
+    const project = initProject(newProject(1), { title: "T" });
+    createAsset(project, null, "logo.png", {
+      hash: "abc",
+      size: 3,
+      mime: "image/png",
+    });
+    const worker = new FakeWorker();
+    let fail!: (err: Error) => void;
+    const client = new CompilerClient(project, {
+      worker,
+      assetLoader: () => new Promise((_, reject) => (fail = reject)),
+    });
+    worker.emit({ type: "ready" });
+    compileWith(worker, [{ ...typo, message: "file not found" }]);
+    expect(client.getState().status).not.toBe("error");
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    fail(new Error("offline"));
+    await settle();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(client.getState().status).toBe("error");
+    expect(client.getState().diagnostics).toEqual([
+      expect.objectContaining({ message: "file not found" }),
+    ]);
+  });
+
+  it("does not hold errors back for a collaborator's typing", async () => {
+    const { project, worker, client } = await started();
+    const remote = fork(project, 2);
+    typeInto(remote);
+    sync(project, remote);
+    await settle();
+    compileWith(worker, [typo]);
+    expect(client.getState().status).toBe("error");
+  });
+
+  it("keeps the diagnostics array when nothing changed", async () => {
+    const { project, worker, client } = await started();
+    const shown = client.getState().diagnostics;
+    typeInto(project);
+    await settle();
+    compileWith(worker, [warning]);
+    expect(client.getState().diagnostics).toBe(shown);
   });
 });

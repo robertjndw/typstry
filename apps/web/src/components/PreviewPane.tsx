@@ -15,12 +15,24 @@ import {
   useEffectEvent,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
 
+import {
+  animationMode,
+  cancelAnimations,
+  captureBefore,
+  isVisible,
+  playAfter,
+  prefersReducedMotion,
+  showHighlight,
+  type AnimationKind,
+} from "@/components/preview/animate";
+import { followScrollTop } from "@/components/preview/follow";
 import {
   pointAt,
   positionOf,
@@ -48,7 +60,11 @@ import { cn } from "@/lib/utils";
 import type { CompilerClient, PreviewState } from "@/typst/compiler-client";
 import { formatLocation, type ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewState } from "@/typst/hooks";
-import { PREVIEW_SCOPE_CLASS, type PreviewPage } from "@/typst/svg-pages";
+import {
+  PREVIEW_SCOPE_CLASS,
+  type PageChange,
+  type PreviewPage,
+} from "@/typst/svg-pages";
 
 export interface PreviewPaneProps {
   client: CompilerClient | null;
@@ -78,6 +94,19 @@ const VIEWER_PADDING = 32;
 // Room below the last page for the viewer's floating controls.
 const VIEWER_CONTROLS_SPACE = 56;
 const INDICATOR_IDLE_MS = 1000;
+// Compiles faster than this never show the spinner, which would otherwise
+// flicker on every keystroke.
+const COMPILING_SHOWN_AFTER_MS = 300;
+// Keys that scroll a focused viewport.
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 const STALLED_TEXT =
   "Still compiling. Downloading packages or a large document can take a while.";
 
@@ -121,6 +150,10 @@ export function PreviewPane({
   // resize in fit mode can restore it after the scale has already changed.
   const centerPoint = useRef<DocPoint | null>(null);
   const idleTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  // When the user last scrolled by hand. Scroll events alone cannot tell
+  // that from our own scrolling, so this is fed by input events instead.
+  const lastManualScroll = useRef<number | null>(null);
+  const handledFollow = useRef(state?.follow?.seq ?? 0);
 
   useLayoutEffect(() => {
     const el = viewportRef.current;
@@ -146,6 +179,26 @@ export function PreviewPane({
     fitScale,
     Math.max(MIN_ZOOM, (viewportHeight - padding - bottomSpace) / tallest),
   );
+  // One request per changed page, kept as the same objects until the next
+  // animation so a memoized page only rerenders when it has something to do.
+  const animation = state?.animation ?? null;
+  const requests = useMemo(() => {
+    const byPage = new Map<number, PageAnimation>();
+    const changes = animation?.changes ?? [];
+    const changedPages = new Set(changes.map((c) => c.page)).size;
+    for (const change of changes) {
+      const have = byPage.get(change.page);
+      if (have) have.changes.push(change);
+      else
+        byPage.set(change.page, {
+          seq: animation!.seq,
+          kind: animation!.kind,
+          changes: [change],
+          changedPages,
+        });
+    }
+    return byPage;
+  }, [animation]);
   const scaleOf = (z: Zoom) =>
     z.mode === "fit" ? fitScale : z.mode === "page" ? pageScale : z.scale;
   const scale = scaleOf(zoom);
@@ -193,6 +246,33 @@ export function PreviewPane({
     // layoutFor and readCenter only close over pages, which is listed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scale, pages]);
+
+  // Brings an edit into view when it happened off screen. Declared after the
+  // anchoring effect so the viewport already sits where a zoom put it.
+  const follow = state?.follow ?? null;
+  useLayoutEffect(() => {
+    const el = viewportRef.current;
+    if (!follow || follow.seq === handledFollow.current) return;
+    handledFollow.current = follow.seq;
+    if (!el || pages.length === 0) return;
+    const top = followScrollTop({
+      changes: follow.changes,
+      pages,
+      layout: layoutFor(el, scale),
+      scrollTop: el.scrollTop,
+      viewportHeight: el.clientHeight,
+      lastManualScrollAt: lastManualScroll.current,
+      now: Date.now(),
+    });
+    if (top === null) return;
+    const near = Math.abs(top - el.scrollTop) < el.clientHeight;
+    const reduced = prefersReducedMotion();
+    if (near && !reduced && typeof el.scrollTo === "function")
+      el.scrollTo({ top, behavior: "smooth" });
+    else el.scrollTop = top;
+    // layoutFor only closes over padding, which is constant per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [follow]);
 
   /**
    * Applies a zoom while keeping the document point under `view` (viewport
@@ -258,6 +338,40 @@ export function PreviewPane({
     const listener = (e: WheelEvent) => onWheel(e);
     el.addEventListener("wheel", listener, { passive: false });
     return () => el.removeEventListener("wheel", listener);
+  }, []);
+
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const mark = () => {
+      lastManualScroll.current = Date.now();
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      // Only the scrollbar counts; a click on a page is not scrolling.
+      const rect = el.getBoundingClientRect();
+      if (
+        e.target === el &&
+        (e.clientX - rect.left >= el.clientWidth ||
+          e.clientY - rect.top >= el.clientHeight)
+      )
+        mark();
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (SCROLL_KEYS.has(e.key) && !e.altKey && !e.metaKey && !e.ctrlKey)
+        mark();
+    };
+    el.addEventListener("wheel", mark, { passive: true });
+    el.addEventListener("touchstart", mark, { passive: true });
+    el.addEventListener("touchmove", mark, { passive: true });
+    el.addEventListener("pointerdown", onPointerDown);
+    el.addEventListener("keydown", onKey);
+    return () => {
+      el.removeEventListener("wheel", mark);
+      el.removeEventListener("touchstart", mark);
+      el.removeEventListener("touchmove", mark);
+      el.removeEventListener("pointerdown", onPointerDown);
+      el.removeEventListener("keydown", onKey);
+    };
   }, []);
 
   const onScroll = () => {
@@ -405,7 +519,13 @@ export function PreviewPane({
               }}
             >
               {pages.map((page, i) => (
-                <PageView key={i} page={page} index={i} scale={scale} />
+                <PageView
+                  key={i}
+                  page={page}
+                  index={i}
+                  scale={scale}
+                  animation={requests.get(i) ?? null}
+                />
               ))}
             </div>
           ) : (
@@ -510,7 +630,25 @@ function ZoomMenu({
   );
 }
 
-function StatusIndicator({ state }: { state: PreviewState | null }) {
+function StatusIndicator({ state: live }: { state: PreviewState | null }) {
+  const compiling = live?.status === "compiling";
+  // The latest state that was not a compile in progress, shown instead of
+  // "Compiling" until the compile has run for a while.
+  const [settled, setSettled] = useState(live);
+  if (live && !compiling && settled !== live) setSettled(live);
+  const [slow, setSlow] = useState(false);
+  if (!compiling && slow) setSlow(false);
+  useEffect(() => {
+    if (!compiling) return;
+    const timer = setTimeout(() => setSlow(true), COMPILING_SHOWN_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, [compiling]);
+
+  // The first compile has no earlier result to show.
+  const hasEarlier =
+    settled !== null &&
+    (settled.status === "error" || settled.compileMs !== null);
+  const state = compiling && !slow && hasEarlier ? settled : live;
   if (!state || state.status === "starting") {
     return (
       <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -628,34 +766,78 @@ function DefsHost({ defs }: { defs: SVGSVGElement }) {
   );
 }
 
+interface PageAnimation {
+  seq: number;
+  kind: AnimationKind;
+  /** The changed ranges on this page, top first. */
+  changes: PageChange[];
+  /** Pages the update changed, which decides whether it is too big. */
+  changedPages: number;
+}
+
 const PageView = memo(function PageView({
   page,
   index,
   scale,
+  animation,
 }: {
   page: PreviewPage;
   index: number;
   scale: number;
+  animation: PageAnimation | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const renderedScale = useRef(scale);
+  const handledSeq = useRef(animation?.seq ?? 0);
+
+  // Runs between the old page leaving and the new one arriving, which is
+  // the only moment both exist. Measuring the old one first and the new one
+  // after keeps it to one read pass on each side of the swap.
+  const swap = useEffectEvent((slot: HTMLElement, el: SVGSVGElement) => {
+    const old = slot.firstChild;
+    const request = animation?.seq !== handledSeq.current ? animation : null;
+    handledSeq.current = animation?.seq ?? handledSeq.current;
+    const viewport = slot.closest(`.${PREVIEW_SCOPE_CLASS}`);
+    const mode =
+      request && old instanceof SVGSVGElement && viewport
+        ? animationMode(request.kind, {
+            reducedMotion: prefersReducedMotion(),
+            scaleChanged: renderedScale.current !== scale,
+            changedPages: request.changedPages,
+            visible: request.kind === "external" || isVisible(slot, viewport),
+          })
+        : null;
+    const captured =
+      mode === "typed" ? captureBefore(old as SVGSVGElement, el) : null;
+    slot.replaceChildren(el);
+    if (old instanceof SVGSVGElement) cancelAnimations(old);
+    if (captured) playAfter(captured, el);
+    else if (mode === "external" && overlayRef.current) {
+      for (const change of request!.changes)
+        showHighlight(overlayRef.current, change, page.width, scale);
+    }
+  });
+
   useLayoutEffect(() => {
     const el = page.element;
     el.setAttribute("width", "100%");
     el.setAttribute("height", "100%");
-    if (ref.current && ref.current.firstChild !== el) {
-      ref.current.replaceChildren(el);
-    }
+    if (ref.current && ref.current.firstChild !== el) swap(ref.current, el);
+    // swap is an effect event.
   }, [page]);
+  useLayoutEffect(() => {
+    renderedScale.current = scale;
+  });
   const width = page.width * scale;
   const height = page.height * scale;
   return (
     <div
-      ref={ref}
       role="img"
       aria-label={`Page ${index + 1}`}
       // Pages stay white paper in dark mode; the brighter ring keeps their
       // edge visible where a shadow alone vanishes against a dark canvas.
-      className="shrink-0 bg-white shadow-[0_1px_2px_rgb(0_0_0/0.08),0_4px_16px_rgb(0_0_0/0.08)] ring-1 ring-black/10 dark:shadow-[0_2px_8px_rgb(0_0_0/0.5)] dark:ring-white/15"
+      className="relative shrink-0 bg-white shadow-[0_1px_2px_rgb(0_0_0/0.08),0_4px_16px_rgb(0_0_0/0.08)] ring-1 ring-black/10 dark:shadow-[0_2px_8px_rgb(0_0_0/0.5)] dark:ring-white/15"
       style={{
         width,
         height,
@@ -663,7 +845,15 @@ const PageView = memo(function PageView({
         contentVisibility: "auto",
         containIntrinsicSize: `${width}px ${height}px`,
       }}
-    />
+    >
+      <div ref={ref} className="size-full" />
+      {/* Not part of the SVG slot, so a page swap does not wipe highlights. */}
+      <div
+        ref={overlayRef}
+        aria-hidden
+        className="pointer-events-none absolute inset-0 overflow-hidden"
+      />
+    </div>
   );
 });
 
@@ -681,14 +871,18 @@ function ProblemsPanel({
   const listId = useId();
   const errors = diagnostics.filter((d) => d.severity === "error").length;
   const warnings = diagnostics.length - errors;
-  const [collapsed, setCollapsed] = useState(false);
+  // Until the user toggles it, the panel is open for errors and collapsed
+  // for warnings alone, so warnings do not take space from the preview and
+  // fixed errors take the panel away again.
+  const [chosen, setChosen] = useState<boolean | null>(null);
+  const collapsed = chosen ?? errors === 0;
   // New errors after a clean (warnings only) build deserve attention even if
-  // the panel was collapsed. The panel unmounts at zero problems, which
-  // resets the manual collapse too.
+  // the user collapsed the panel. The panel unmounts at zero problems, which
+  // resets the choice too.
   const [prevErrors, setPrevErrors] = useState(errors);
   if (errors !== prevErrors) {
     setPrevErrors(errors);
-    if (prevErrors === 0 && errors > 0) setCollapsed(false);
+    if (prevErrors === 0 && errors > 0) setChosen(null);
   }
 
   return (
@@ -701,7 +895,7 @@ function ProblemsPanel({
         className="flex h-8 shrink-0 items-center gap-1.5 px-2 text-xs outline-none hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
         aria-expanded={!collapsed}
         aria-controls={listId}
-        onClick={() => setCollapsed((c) => !c)}
+        onClick={() => setChosen(!collapsed)}
       >
         <ChevronRight
           aria-hidden
