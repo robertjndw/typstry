@@ -27,9 +27,10 @@ export function RouteError() {
             <RotateCwIcon />
             Try again
           </Button>
-          {/* Plain link, a client-side navigation would reuse the broken router state. */}
+          {/* Not a router Link: it would reuse the broken router state.
+              A plain anchor still has to honor the subpath the app is served from. */}
           <Button asChild variant="outline">
-            <a href="/">Go to the start page</a>
+            <a href={import.meta.env.BASE_URL}>Go to the start page</a>
           </Button>
         </>
       }

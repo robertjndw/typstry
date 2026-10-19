@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -21,9 +22,11 @@ afterEach(() => {
 
 function openMenu() {
   render(
-    <TooltipProvider>
-      <AccountMenu identity={identity} />
-    </TooltipProvider>,
+    <MemoryRouter>
+      <TooltipProvider>
+        <AccountMenu identity={identity} />
+      </TooltipProvider>
+    </MemoryRouter>,
   );
   const trigger = screen.getByRole("button", {
     name: "You are Ada. Open the account menu",
@@ -45,19 +48,26 @@ describe("AccountMenu", () => {
     expect(loadIdentity()?.name).toBe("Grace");
   });
 
-  it("opens the add-device dialog", () => {
+  it("opens the add-device dialog", async () => {
     openMenu();
     expect(screen.queryByRole("dialog")).toBeNull();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Add a device…" }));
+    // The server-only entries load lazily.
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Add a device…" }),
+    );
 
-    expect(screen.getByRole("dialog", { name: "Add a device" })).toBeTruthy();
+    expect(
+      await screen.findByRole("dialog", { name: "Add a device" }),
+    ).toBeTruthy();
   });
 
   it("asks for a name right away on the first visit", () => {
     render(
-      <TooltipProvider>
-        <AccountMenu identity={identity} firstVisit />
-      </TooltipProvider>,
+      <MemoryRouter>
+        <TooltipProvider>
+          <AccountMenu identity={identity} firstVisit />
+        </TooltipProvider>
+      </MemoryRouter>,
     );
 
     expect(screen.getByRole("button", { name: "Join" })).toBeTruthy();

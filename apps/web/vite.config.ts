@@ -1,4 +1,4 @@
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { copyFile, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import zlib from "node:zlib";
@@ -59,8 +59,72 @@ function precompress(): Plugin {
   };
 }
 
+const localOnly = process.env.VITE_TYPSTRY_LOCAL_ONLY === "1";
+// Served from a subpath on GitHub Pages (/<repo>/).
+const base = process.env.TYPSTRY_BASE ?? "/";
+
+// Mirrors app_csp in crates/typstry-server/src/http/mod.rs, which the server
+// sends as a header. Pages cannot set headers, and the SVG preview relies on
+// this policy since imported zips can be hostile. frame-ancestors is left out
+// because a meta tag cannot set it. The font origin is the one
+// compile.worker.ts fetches from.
+const STATIC_CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' blob: data:",
+  "font-src 'self' blob: data:",
+  "media-src 'self' blob:",
+  "connect-src 'self' https://cdn.jsdelivr.net https://packages.typst.org",
+  "worker-src 'self' blob:",
+  "frame-src 'self' blob:",
+  "object-src blob:",
+  "base-uri 'none'",
+  "form-action 'self'",
+].join("; ");
+
+/**
+ * The static build has no server to fall back to index.html, and GitHub
+ * Pages serves 404.html for unknown paths. That keeps deep links and reloads
+ * of /p/<id> working until the service worker has installed.
+ */
+function staticHosting(): Plugin {
+  let outDir = "";
+  return {
+    name: "typstry:static-hosting",
+    apply: "build",
+    configResolved(config) {
+      outDir = path.resolve(config.root, config.build.outDir);
+    },
+    transformIndexHtml() {
+      return [
+        {
+          tag: "meta",
+          attrs: {
+            "http-equiv": "Content-Security-Policy",
+            content: STATIC_CSP,
+          },
+          injectTo: "head-prepend",
+        },
+      ];
+    },
+    async writeBundle() {
+      await copyFile(
+        path.join(outDir, "index.html"),
+        path.join(outDir, "404.html"),
+      );
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss(), precompress()],
+  base,
+  plugins: [
+    react(),
+    tailwindcss(),
+    // Pages compresses on its own.
+    localOnly ? staticHosting() : precompress(),
+  ],
   resolve: {
     alias: { "@": path.resolve(import.meta.dirname, "src") },
   },

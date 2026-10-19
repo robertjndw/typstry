@@ -484,3 +484,23 @@ describe("person graph writes on IndexedDB", () => {
     }
   });
 });
+
+describe.each(backends)("blobs on %s", (_name, makeBackend) => {
+  it("keeps blobs per project and drops them with the project", async () => {
+    const backend = await makeBackend();
+    const data = new Uint8Array([1, 2, 3]);
+    await backend.saveBlob("p1", "sha256:a", data);
+    await backend.saveBlob("p1", "sha256:b", new Uint8Array([4]));
+    await backend.saveBlob("p2", "sha256:a", new Uint8Array([9]));
+
+    expect(await backend.loadBlob("p1", "sha256:a")).toEqual(data);
+    expect(await backend.loadBlob("p1", "sha256:zz")).toBeNull();
+
+    await backend.remove("p1");
+    expect(await backend.loadBlob("p1", "sha256:a")).toBeNull();
+    expect(await backend.loadBlob("p1", "sha256:b")).toBeNull();
+    expect(await backend.loadBlob("p2", "sha256:a")).toEqual(
+      new Uint8Array([9]),
+    );
+  });
+});
