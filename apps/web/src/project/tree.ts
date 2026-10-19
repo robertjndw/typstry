@@ -7,6 +7,9 @@ import { FsError } from "@/doc/fs-ops";
 import { basename } from "@/doc/names";
 import type { PathIndex } from "@/doc/paths";
 import { NODE, type FileKind, type ProjectDoc } from "@/doc/schema";
+import { assertImportable, ImportError, writeSource } from "@/import/import";
+import { warnSkipped } from "@/import/skipped";
+import type { PendingImport } from "@/import/sources";
 
 export interface TreeEntry {
   id: TreeID;
@@ -104,6 +107,47 @@ export async function uploadReporting(
   } catch (err) {
     toast.error(friendlyFsError(err));
     return [];
+  }
+}
+
+/**
+ * Restores a folder or zip under `parent`, reporting progress and the outcome
+ * in one toast. Resolves to the created entries, or null when it failed.
+ */
+export async function uploadTreeReporting(
+  project: ProjectDoc,
+  assets: ProjectAssets,
+  pending: PendingImport,
+  parent: TreeID | null,
+): Promise<{ created: Map<string, TreeID>; top: TreeID[] } | null> {
+  const id = toast.loading(
+    pending.kind === "zip" ? "Unpacking zip…" : "Reading files…",
+  );
+  try {
+    const source = await pending.source;
+    assertImportable(source);
+    const result = await writeSource(
+      project,
+      source,
+      assets,
+      parent,
+      (uploaded, total) => {
+        if (total > 0)
+          toast.loading(`Uploading files (${uploaded} of ${total})…`, { id });
+      },
+    );
+    const count = source.files.size;
+    toast.success(`Uploaded ${count} ${count === 1 ? "file" : "files"}`, {
+      id,
+    });
+    warnSkipped(source.skipped);
+    return result;
+  } catch (err) {
+    toast.error(
+      err instanceof ImportError ? err.message : friendlyFsError(err),
+      { id },
+    );
+    return null;
   }
 }
 

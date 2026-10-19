@@ -13,6 +13,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   FolderPlusIcon,
+  FolderUpIcon,
   ListCollapseIcon,
   Loader2Icon,
   TriangleAlertIcon,
@@ -41,6 +42,12 @@ import {
   ContextMenuShortcut,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -56,6 +63,14 @@ import {
   setMainFile,
 } from "@/doc/fs-ops";
 import { stemLength } from "@/doc/names";
+import {
+  isTreeDrop,
+  isZip,
+  readDrop,
+  readFolderPick,
+  readPicked,
+  type PendingImport,
+} from "@/import/sources";
 import { fileCategory, type FileCategory } from "@/assets/file-types";
 import { cn } from "@/lib/utils";
 import { usePresenceSummary } from "@/presence/context";
@@ -65,6 +80,7 @@ import {
   attempt,
   buildTree,
   uploadReporting,
+  uploadTreeReporting,
   type TreeEntry,
 } from "@/project/tree";
 
@@ -110,6 +126,7 @@ export function FileTree({ className }: { className?: string }) {
   const [dropTarget, setDropTarget] = useState<TreeID | "root" | null>(null);
   const [uploading, setUploading] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
   const uploadTarget = useRef<TreeID | null>(null);
   // Uploads need the server (blob store), so local-only projects skip them.
   const canUpload = !readOnly && assets !== null;
@@ -185,9 +202,35 @@ export function FileTree({ className }: { className?: string }) {
     }
   }
 
+  async function uploadTree(pending: PendingImport, parent: TreeID | null) {
+    if (!canUpload || !assets) return;
+    if (parent) setExpanded(parent, true);
+    setUploading((n) => n + 1);
+    try {
+      const result = await uploadTreeReporting(
+        project,
+        assets,
+        pending,
+        parent,
+      );
+      const [first] = result?.top ?? [];
+      if (!first) return;
+      setSelectedId(first);
+      // Only dirs are ever in `collapsed`, so this is a no-op for a file.
+      setExpanded(first, true);
+    } finally {
+      setUploading((n) => n - 1);
+    }
+  }
+
   function startUpload(parent: TreeID | null) {
     uploadTarget.current = parent;
     fileInput.current?.click();
+  }
+
+  function startFolderUpload(parent: TreeID | null) {
+    uploadTarget.current = parent;
+    folderInput.current?.click();
   }
 
   async function copyPath(entry: TreeEntry) {
@@ -230,6 +273,12 @@ export function FileTree({ className }: { className?: string }) {
     e.preventDefault();
     e.stopPropagation();
     setDropTarget(null);
+    if (!id && canUpload && isTreeDrop(e.dataTransfer)) {
+      // The entries are only readable during the event itself.
+      const pending = readDrop(e.dataTransfer, { unwrap: false });
+      if (pending) void uploadTree(pending, target);
+      return;
+    }
     if (!id && e.dataTransfer.files.length > 0) {
       void upload(Array.from(e.dataTransfer.files), target);
       return;
@@ -376,6 +425,11 @@ export function FileTree({ className }: { className?: string }) {
                     Upload here
                   </ContextMenuItem>
                 )}
+                {entry.kind === "dir" && canUpload && (
+                  <ContextMenuItem onSelect={() => startFolderUpload(entry.id)}>
+                    Upload folder here
+                  </ContextMenuItem>
+                )}
                 {!readOnly && (
                   <EntryEditItems
                     entry={entry}
@@ -430,16 +484,42 @@ export function FileTree({ className }: { className?: string }) {
           </>
         )}
         {canUpload && (
-          <ToolbarButton
-            label={uploading > 0 ? "Uploading…" : "Upload files"}
-            onClick={() => startUpload(containerOf(selected))}
-          >
-            {uploading > 0 ? (
-              <Loader2Icon className="animate-spin" />
-            ) : (
-              <UploadIcon />
-            )}
-          </ToolbarButton>
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={uploading > 0 ? "Uploading…" : "Upload files"}
+                  >
+                    {uploading > 0 ? (
+                      <Loader2Icon className="animate-spin" />
+                    ) : (
+                      <UploadIcon />
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {uploading > 0 ? "Uploading…" : "Upload"}
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                onSelect={() => startUpload(containerOf(selected))}
+              >
+                <UploadIcon />
+                Upload files…
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => startFolderUpload(containerOf(selected))}
+              >
+                <FolderUpIcon />
+                Upload folder…
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         <input
           ref={fileInput}
@@ -451,7 +531,23 @@ export function FileTree({ className }: { className?: string }) {
             const files = Array.from(e.currentTarget.files ?? []);
             // Reset so picking the same file again still fires a change.
             e.currentTarget.value = "";
-            void upload(files, uploadTarget.current);
+            if (files.length === 1 && isZip(files[0]!.name))
+              void uploadTree(readPicked(files), uploadTarget.current);
+            else void upload(files, uploadTarget.current);
+          }}
+        />
+        <input
+          ref={folderInput}
+          type="file"
+          multiple
+          hidden
+          aria-label="Folder to upload"
+          {...{ webkitdirectory: "" }}
+          onChange={(e) => {
+            const files = Array.from(e.currentTarget.files ?? []);
+            e.currentTarget.value = "";
+            if (files.length > 0)
+              void uploadTree(readFolderPick(files), uploadTarget.current);
           }}
         />
         <ToolbarButton
@@ -515,9 +611,14 @@ export function FileTree({ className }: { className?: string }) {
             New folder
           </ContextMenuItem>
           {canUpload && (
-            <ContextMenuItem onSelect={() => startUpload(null)}>
-              Upload files
-            </ContextMenuItem>
+            <>
+              <ContextMenuItem onSelect={() => startUpload(null)}>
+                Upload files
+              </ContextMenuItem>
+              <ContextMenuItem onSelect={() => startFolderUpload(null)}>
+                Upload folder
+              </ContextMenuItem>
+            </>
           )}
         </ContextMenuContent>
       </ContextMenu>
@@ -562,7 +663,7 @@ function EmptyState({
         {!readOnly && (
           <p className="text-xs text-muted-foreground">
             {canUpload
-              ? "Create a file, or drop files here to upload them."
+              ? "Create a file, or drop files, folders or a zip here to upload them."
               : "Create a file to start writing."}
           </p>
         )}

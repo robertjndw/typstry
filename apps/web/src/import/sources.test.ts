@@ -3,7 +3,7 @@ import { strToU8, zipSync } from "fflate";
 import { describe, expect, it, vi } from "vitest";
 
 import { ImportError, MAX_IMPORT_BYTES } from "./import";
-import { readDrop, readPicked } from "./sources";
+import { isTreeDrop, readDrop, readFolderPick, readPicked } from "./sources";
 import { UnzipLimitError, unzipWithLimits } from "./unzip-limits";
 
 function fileEntry(fullPath: string, text: string): FileSystemEntry {
@@ -184,5 +184,60 @@ describe("zip limits", () => {
     const zip = new File([zipSync({})], "huge.zip");
     Object.defineProperty(zip, "size", { value: MAX_IMPORT_BYTES + 1 });
     await expect(readPicked([zip]).source).rejects.toBeInstanceOf(ImportError);
+  });
+});
+
+describe("isTreeDrop", () => {
+  it("is true for a folder", () => {
+    const folder = dirEntry("/thesis", []);
+    expect(isTreeDrop(transfer([{ entry: folder, file: null }]))).toBe(true);
+  });
+
+  it("is true for a single zip", () => {
+    const zip = new File([zipSync({})], "a.zip");
+    expect(
+      isTreeDrop(transfer([{ entry: fileEntry("/a.zip", ""), file: zip }])),
+    ).toBe(true);
+  });
+
+  it("is false for a zip dropped with other files", () => {
+    const zip = new File([zipSync({})], "a.zip");
+    const note = new File(["x"], "n.typ");
+    expect(
+      isTreeDrop(
+        transfer([
+          { entry: fileEntry("/a.zip", ""), file: zip },
+          { entry: fileEntry("/n.typ", "x"), file: note },
+        ]),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false for plain files", () => {
+    const note = new File(["x"], "n.typ");
+    expect(
+      isTreeDrop(transfer([{ entry: fileEntry("/n.typ", "x"), file: note }])),
+    ).toBe(false);
+    expect(isTreeDrop(transfer([{ entry: null, file: note }]))).toBe(false);
+  });
+});
+
+describe("readFolderPick", () => {
+  it("keeps the picked folder's name", async () => {
+    const main = new File(["= Hi"], "main.typ");
+    Object.defineProperty(main, "webkitRelativePath", {
+      value: "thesis/main.typ",
+    });
+    const pic = new File(["x"], "a.typ");
+    Object.defineProperty(pic, "webkitRelativePath", {
+      value: "thesis/figures/a.typ",
+    });
+    const picked = readFolderPick([main, pic]);
+    expect(picked.kind).toBe("files");
+    const source = await picked.source;
+    expect([...source.files.keys()].sort()).toEqual([
+      "thesis/figures/a.typ",
+      "thesis/main.typ",
+    ]);
   });
 });

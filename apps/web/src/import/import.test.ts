@@ -3,6 +3,7 @@ import { strToU8, unzipSync, zipSync } from "fflate";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ProjectAssets } from "@/assets/project-assets";
+import { createFile } from "@/doc/fs-ops";
 import { buildPathIndex } from "@/doc/paths";
 import { fileText } from "@/doc/restore";
 import { initProject, NODE } from "@/doc/schema";
@@ -16,6 +17,7 @@ import {
   pickMainFile,
   readZip,
   writeImport,
+  writeSource,
 } from "./import";
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
@@ -59,6 +61,26 @@ describe("collect", () => {
     ]);
     expect(source.name).toBe("archive");
     expect(source.files.has("figures/a.typ")).toBe(true);
+  });
+
+  it("keeps the wrapping folder with unwrap: false", () => {
+    const source = collect(
+      "x",
+      [file("thesis/main.typ"), file("thesis/figures/a.typ")],
+      { unwrap: false },
+    );
+    expect(source.name).toBe("x");
+    expect([...source.files.keys()].sort()).toEqual([
+      "thesis/figures/a.typ",
+      "thesis/main.typ",
+    ]);
+    expect([...source.dirs].sort()).toEqual(["thesis", "thesis/figures"]);
+  });
+
+  it("skips a reserved top-level folder with unwrap: false", () => {
+    const source = collect("x", [file("a:b/main.typ")], { unwrap: false });
+    expect(source.files.size).toBe(0);
+    expect(source.skipped).toEqual(["a:b/main.typ"]);
   });
 
   it("drops OS clutter and skips unsafe paths", () => {
@@ -162,5 +184,67 @@ describe("writeImport", () => {
       paths: ["logo.png"],
     });
     expect(buildPathIndex(project).byPath.size).toBe(0);
+  });
+});
+
+describe("writeSource", () => {
+  function nonEmpty() {
+    const project = initProject(newProject(1), { title: "x", starter: false });
+    const parent = createFile(project, null, "docs", "dir");
+    const figures = createFile(project, parent, "figures", "dir");
+    createFile(project, figures, "old.typ", "text", "old");
+    return { project, parent, figures };
+  }
+
+  it("restores a tree under a parent and renames a clashing folder", async () => {
+    const { project, parent, figures } = nonEmpty();
+    const assets = fakeAssets();
+    const source = collect(
+      "x",
+      [
+        file("figures/a.typ", "A"),
+        { path: "figures/deep/logo.png", bytes: PNG },
+        { path: "figures/empty/", bytes: null },
+      ],
+      { unwrap: false },
+    );
+
+    const { created, top } = await writeSource(project, source, assets, parent);
+
+    const index = buildPathIndex(project);
+    expect([...index.byPath.keys()].sort()).toEqual([
+      "docs",
+      "docs/figures",
+      "docs/figures (2)",
+      "docs/figures (2)/a.typ",
+      "docs/figures (2)/deep",
+      "docs/figures (2)/deep/logo.png",
+      "docs/figures (2)/empty",
+      "docs/figures/old.typ",
+    ]);
+    expect(index.byPath.get("docs/figures")).toBe(figures);
+    expect(top).toEqual([index.byPath.get("docs/figures (2)")]);
+    expect(created.get("figures/a.typ")).toBe(
+      index.byPath.get("docs/figures (2)/a.typ"),
+    );
+    expect(fileText(project, created.get("figures/a.typ")!)).toBe("A");
+  });
+
+  it("writes nothing when an upload fails", async () => {
+    const { project, parent } = nonEmpty();
+    const before = buildPathIndex(project).byPath.size;
+    const assets = fakeAssets();
+    assets.store = async () => {
+      throw new Error("offline");
+    };
+    const source = collect(
+      "x",
+      [file("p/a.typ", "A"), { path: "p/logo.png", bytes: PNG }],
+      { unwrap: false },
+    );
+    await expect(
+      writeSource(project, source, assets, parent),
+    ).rejects.toMatchObject({ paths: ["p/logo.png"] });
+    expect(buildPathIndex(project).byPath.size).toBe(before);
   });
 });
