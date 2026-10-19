@@ -251,8 +251,9 @@ export function FolderSyncNotice() {
 function Attention({ state }: { state: FolderSyncState | null }) {
   const report = state?.report ?? null;
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
-  // Every conflict ever shown, so a dismissed one that a later cycle reports
-  // again doesn't come back.
+  // Conflicts from the previous report only. A held view-only edit shows up
+  // in every report and shouldn't reappear once dismissed, but the same file
+  // conflicting again after a clean cycle is a new conflict.
   const known = useRef(new Set<string>());
 
   useEffect(() => {
@@ -260,8 +261,8 @@ function Attention({ state }: { state: FolderSyncState | null }) {
     const fresh = report.conflicts.filter(
       (c) => !known.current.has(conflictKey(c)),
     );
+    known.current = new Set(report.conflicts.map(conflictKey));
     if (fresh.length === 0) return;
-    for (const c of fresh) known.current.add(conflictKey(c));
     setConflicts((prev) => [...prev, ...fresh]);
     toast.warning(
       `${fresh.length} ${fresh.length === 1 ? "conflict" : "conflicts"} while syncing the folder`,

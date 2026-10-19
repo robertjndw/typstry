@@ -94,7 +94,14 @@ export async function scanFolder(
         continue;
       }
       if (isCompiledPdf(entry.name, names)) continue;
-      const stat = await entry.stat!();
+      let stat: FileStat;
+      try {
+        stat = await entry.stat!();
+      } catch (e) {
+        // Deleted after the listing, e.g. an editor's temp file.
+        if (e instanceof DOMException && e.name === "NotFoundError") continue;
+        throw e;
+      }
       if (stat.size > maxFileBytes) {
         result.skipped.push({
           path,

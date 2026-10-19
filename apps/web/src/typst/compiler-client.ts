@@ -989,7 +989,7 @@ export class CompilerClient {
     if (assembled.error) {
       this.setState({ status: "error", error: assembled.error });
     } else if (assembled.document) {
-      const failed = this.state.diagnostics.some((d) => d.severity === "error");
+      const failed = this.state.diagnostics.some(isError);
       this.setState({
         status: failed ? "error" : "idle",
         document: assembled.document,

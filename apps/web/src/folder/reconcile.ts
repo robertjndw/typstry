@@ -45,6 +45,12 @@ export interface ReconcileInput {
   mode?: FirstLinkMode;
   /** Binary uploads that settled, out of those this cycle needs. */
   onProgress?: (done: number, total: number) => void;
+  /**
+   * Called right before a file in the folder is written or removed. The file
+   * system observer can fire before the cycle ends, so the caller needs to
+   * know about its own writes by then.
+   */
+  onWrite?: (path: string) => void;
 }
 
 export interface Conflict {
@@ -296,7 +302,16 @@ async function cycle(
     toRead.push([path, stat]);
   }
   await mapConcurrent(toRead, CONCURRENCY, async ([path, stat]) => {
-    const bytes = await fs.read(path);
+    let bytes: Uint8Array;
+    try {
+      bytes = await fs.read(path);
+    } catch (e) {
+      // Deleted since the scan, e.g. an editor's temp file. Treat it as
+      // unchanged for now. A write to it below notices the stat changed and
+      // skips it, and the next scan picks up whatever is there.
+      if (isMissing(e)) return;
+      throw e;
+    }
     const file: LocalFile = {
       stat,
       bytes,
@@ -438,6 +453,13 @@ async function cycle(
       }
     }
 
+    if (l?.kind === "deleted" && r?.kind === "deleted") {
+      // Deleted on both sides, so there's nothing to hold back even on a
+      // view-only link.
+      outcomes.set(path, { t: "gone" });
+      continue;
+    }
+
     if (l && !canWrite) {
       report.heldLocal.push(path);
       outcomes.set(path, { t: "keep" });
@@ -494,9 +516,7 @@ async function cycle(
 
     // Changed on both sides.
     if (!l || !r) continue;
-    if (l.kind === "deleted" && r.kind === "deleted") {
-      outcomes.set(path, { t: "gone" });
-    } else if (l.kind === "deleted" && r.kind !== "deleted") {
+    if (l.kind === "deleted" && r.kind !== "deleted") {
       conflict(
         path,
         "deleted in the folder but edited in the project; restored it",
@@ -683,6 +703,7 @@ async function cycle(
         skipWrite(path, "changed on disk while syncing");
         return;
       }
+      input.onWrite?.(path);
       await fs.write(path, bytes);
       const stat = await fs.stat(path);
       if (!stat) return;
@@ -715,6 +736,7 @@ async function cycle(
         );
         continue;
       }
+      input.onWrite?.(path);
       await fs.remove(path);
       removed.add(path);
       report.deleted.push(path);
@@ -733,8 +755,13 @@ async function cycle(
   report.deleted.sort();
 
   if (!interrupted && (!fast || report.applied?.changed)) {
+    // fs.remove also deletes parent folders it leaves empty, and the project
+    // may still have those.
+    const emptied = (dir: string) =>
+      [...removed].some((path) => path.startsWith(`${dir}/`));
     for (const dir of materializeDirs(project)) {
-      if (scan.present.has(dir) || dropped.has(dir)) continue;
+      if ((scan.present.has(dir) && !emptied(dir)) || dropped.has(dir))
+        continue;
       if (scan.rules.classify(dir, true).kind !== "sync") continue;
       try {
         await fs.mkdir(dir);
@@ -810,6 +837,10 @@ async function remoteDiffers(
   const bytes = encoder.encode(r.text);
   if (bytes.length !== b.size) return true;
   return (await digest(bytes)) !== b.digest;
+}
+
+function isMissing(e: unknown): boolean {
+  return e instanceof DOMException && e.name === "NotFoundError";
 }
 
 /** The user took the folder's access away, or never gave it. */

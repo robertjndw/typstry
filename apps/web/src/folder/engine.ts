@@ -326,12 +326,10 @@ export class FolderSync {
         canWrite: this.opts.canWrite,
         signal: this.abort.signal,
         mode: this.opts.mode,
+        onWrite: (path) => this.recentlyWritten.set(path, Date.now()),
       });
 
       const at = Date.now();
-      for (const path of [...result.report.written, ...result.report.deleted]) {
-        this.recentlyWritten.set(path, at);
-      }
       // Base first: the doc may hold changes only it accounts for, even if the
       // write-back was cut short.
       await this.save(result.base, result.report);

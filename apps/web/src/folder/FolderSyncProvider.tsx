@@ -80,6 +80,12 @@ function Provider({
   useEffect(() => {
     live.current = { synced, saveLocally };
   }, [synced, saveLocally]);
+  // A first link waits for the server's copy. Sync as soon as it arrives,
+  // otherwise it sits there until the next poll, which is 30 s away when
+  // there's a file system observer.
+  useEffect(() => {
+    if (synced) void engine.current?.syncNow();
+  }, [synced]);
 
   useEffect(() => {
     let cancelled = false;
