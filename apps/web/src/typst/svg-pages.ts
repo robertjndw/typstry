@@ -1,6 +1,9 @@
+import { lcsMatch } from "@/lib/lcs";
+
+import type { RenderPayload } from "./protocol";
+
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
-const PAGE_START = '<g class="typst-page"';
 
 /**
  * Marks the element the preview pages live in. typst.ts ships its CSS with
@@ -17,6 +20,16 @@ export interface PreviewPage {
   element: SVGSVGElement;
 }
 
+/**
+ * The part of a page that differs from the previous document's page at the
+ * same index, as a vertical range in pt from the page's top.
+ */
+export interface PageChange {
+  page: number;
+  top: number;
+  bottom: number;
+}
+
 export interface PreviewDocument {
   /**
    * Hidden <svg> with the document's glyph and clip/gradient defs plus the
@@ -27,6 +40,11 @@ export interface PreviewDocument {
   /** Source markup of `defs`, used to skip reparsing when it is unchanged. */
   defsSource: string;
   pages: PreviewPage[];
+  /**
+   * Where this document differs from the one it was built against, in page
+   * order. Empty for the first document and when only reused pages remain.
+   */
+  changes: PageChange[];
 }
 
 // What typst.ts' SVG backend emits, plus a few harmless shapes. Anything
@@ -213,6 +231,55 @@ function createDefs(rootTag: string, source: string): SVGSVGElement {
   return defs;
 }
 
+/**
+ * Brings the live defs in line with `fresh` by adding and removing single
+ * glyphs and clip paths instead of swapping the whole element. Swapping makes
+ * the browser re-resolve every `<use>` on every page, which costs 100 ms and
+ * more in a long document, and typing often adds a glyph. Glyph ids are
+ * content hashes, but the markup is compared anyway since that's cheap next
+ * to the layout it saves.
+ *
+ * Returns false, leaving `live` alone, when the two differ in a way this
+ * doesn't handle, such as a different set of sections.
+ */
+function patchDefs(live: SVGSVGElement, fresh: SVGSVGElement): boolean {
+  const liveSections = Array.from(live.children);
+  const freshSections = Array.from(fresh.children);
+  if (
+    liveSections.length !== freshSections.length ||
+    liveSections.some(
+      (el, i) =>
+        el.localName !== freshSections[i]!.localName ||
+        el.getAttribute("class") !== freshSections[i]!.getAttribute("class"),
+    )
+  ) {
+    return false;
+  }
+  for (let i = 0; i < liveSections.length; i++) {
+    const have = liveSections[i]!;
+    const want = freshSections[i]!;
+    if (have.outerHTML === want.outerHTML) continue;
+    const wanted = Array.from(want.children);
+    if (have.localName !== "defs" || wanted.some((el) => !el.id)) {
+      // Styles and anything without ids: replace that one section. A style
+      // change restyles the pages anyway.
+      have.replaceWith(want);
+      continue;
+    }
+    const byId = new Map<string, Element>();
+    for (const el of Array.from(have.children)) byId.set(el.id, el);
+    for (const el of wanted) {
+      const old = byId.get(el.id);
+      byId.delete(el.id);
+      if (!old) have.appendChild(el);
+      else if (old.outerHTML !== el.outerHTML) old.replaceWith(el);
+    }
+    // No page uses these any more, so nothing has to re-resolve.
+    for (const el of byId.values()) el.remove();
+  }
+  return true;
+}
+
 function createPage(g: Element): PreviewPage {
   const tid = g.getAttribute("data-tid") ?? "";
   const width = Number(g.getAttribute("data-page-width")) || 0;
@@ -226,38 +293,80 @@ function createPage(g: Element): PreviewPage {
   return { tid, width, height, element };
 }
 
+const TRANSLATE_Y = /translate\(\s*[^,\s)]+[\s,]+([^)\s]+)\s*\)/;
+
+/** The top-level blocks of a page: its `.typst-group`'s positioned children. */
+export function pageBlocks(page: Element | null): { tid: string; y: number }[] {
+  const group = page?.querySelector(":scope > .typst-page > .typst-group");
+  if (!group) return [];
+  return Array.from(group.children, (el) => ({
+    tid: el.getAttribute("data-tid") ?? "",
+    y: Number(TRANSLATE_Y.exec(el.getAttribute("transform") ?? "")?.[1]) || 0,
+  }));
+}
+
 /**
- * Splits typst.ts' single stacked SVG into one <svg> per page so the preview
- * can lay pages out with gaps and shadows and skip work on pages that did
- * not change.
- *
- * Parsing dominates the cost (about 40 ms for 20 dense pages, 2.5 MB of
- * markup), so this works on the string first: the page tids are read off the
- * top-level `<g class="typst-page">` tags, pages already in `previous` keep
- * their element unparsed, and the defs are only reparsed when their markup
- * changed. Reused elements also let React and the browser leave those
- * pages alone.
+ * The vertical ranges of `next` that are not in `before`, one per run of
+ * blocks that have no partner in a diff of the two pages' blocks. A block's
+ * tid is a hash of its content, not of where it sits, so text pushed down
+ * by an edit above it does not count as changed. A diff and not a shared
+ * head and tail: a paragraph that grows also pushes a line off the end of
+ * the page, which would make everything in between look changed. Layout is
+ * not available here (and not worth forcing), so a run extends down to the
+ * next block, or to the end of the page.
  */
-export function splitSvgPages(
-  svg: string,
-  previous?: PreviewDocument | null,
-): PreviewDocument {
-  const rootTagEnd = svg.indexOf(">") + 1;
-  const firstPage = svg.indexOf(PAGE_START, rootTagEnd);
-  const end = svg.lastIndexOf("</svg>");
-  const rootTag = svg.slice(0, rootTagEnd);
-
-  if (firstPage < 0 || end < firstPage) {
-    // No pages (or an unexpected layout): parse everything as defs.
-    const source = svg.slice(rootTagEnd, end < 0 ? svg.length : end);
-    return { defs: createDefs(rootTag, source), defsSource: source, pages: [] };
+export function changedRanges(
+  before: PreviewPage | undefined,
+  next: PreviewPage,
+): { top: number; bottom: number }[] {
+  if (!before) return [{ top: 0, bottom: next.height }];
+  const old = pageBlocks(before.element);
+  const now = pageBlocks(next.element);
+  const matches = lcsMatch(
+    old.map((b) => b.tid),
+    now.map((b) => b.tid),
+  );
+  const ranges: { top: number; bottom: number }[] = [];
+  for (let j = 0; j < now.length;) {
+    if (matches[j] !== null) {
+      j++;
+      continue;
+    }
+    const start = j;
+    while (j < now.length && matches[j] === null) j++;
+    const ys = now.slice(start, j).map((b) => b.y);
+    ranges.push({
+      top: Math.min(...ys),
+      bottom: Math.max(...ys, now[j]?.y ?? next.height),
+    });
   }
+  if (ranges.length > 0) return ranges;
+  // Same blocks but a different page (positions or the page itself moved):
+  // nothing to narrow it down by.
+  if (old.length === now.length) return [{ top: 0, bottom: next.height }];
+  // Blocks were only removed: the spot is where the first gap closes, at
+  // the block that followed the first removed one.
+  const kept = new Set(matches);
+  const gone = old.findIndex((_, i) => !kept.has(i));
+  const after = matches.findIndex((m) => m !== null && m > gone);
+  const at = after < 0 ? next.height : now[after]!.y;
+  return [{ top: at, bottom: at }];
+}
 
-  const defsSource = svg.slice(rootTagEnd, firstPage);
-  const defs =
-    previous && previous.defsSource === defsSource
-      ? previous.defs
-      : createDefs(rootTag, defsSource);
+/**
+ * Builds the preview document from a worker render, the DOM half of what
+ * svg-split.ts starts. Pages whose tid is in `previous` keep their element
+ * unparsed, and the defs are only reparsed when their markup changed. Reused
+ * elements also let React and the browser leave those pages alone.
+ *
+ * Returns null when the render leaves out a page or the defs that `previous`
+ * doesn't have; the caller answers with a rerender.
+ */
+export function buildPreviewDocument(
+  render: RenderPayload,
+  previous: PreviewDocument | null,
+): PreviewDocument | null {
+  if (render.defs === null && !previous) return null;
 
   const reusable = new Map<string, PreviewPage[]>();
   for (const page of previous?.pages ?? []) {
@@ -266,41 +375,55 @@ export function splitSvgPages(
     else reusable.set(page.tid, [page]);
   }
 
-  // Page groups never nest, so each top-level page runs up to the next
-  // page start (or the closing </svg>).
-  const chunks: string[] = [];
-  for (let at = firstPage; at < end;) {
-    const next = svg.indexOf(PAGE_START, at + PAGE_START.length);
-    const stop = next < 0 || next > end ? end : next;
-    chunks.push(svg.slice(at, stop));
-    at = stop;
-  }
-
+  // Checked before the live defs are patched, which cannot be undone.
   const slots: (PreviewPage | null)[] = [];
   const fresh: string[] = [];
-  for (const chunk of chunks) {
-    const tagEnd = chunk.indexOf(">");
-    const tid = /data-tid="([^"]*)"/.exec(chunk.slice(0, tagEnd))?.[1] ?? "";
+  for (const { tid, markup } of render.pages) {
     const reused = tid ? reusable.get(tid)?.shift() : undefined;
     if (reused) {
       slots.push(reused);
+    } else if (markup === null) {
+      return null;
     } else {
       slots.push(null);
-      fresh.push(chunk);
+      fresh.push(markup);
+    }
+  }
+
+  let defs: SVGSVGElement;
+  let defsSource: string;
+  if (render.defs === null) {
+    ({ defs, defsSource } = previous!);
+  } else {
+    defsSource = render.defs;
+    if (previous && previous.defsSource === defsSource) {
+      defs = previous.defs;
+    } else {
+      defs = createDefs(render.rootTag, defsSource);
+      if (previous && patchDefs(previous.defs, defs)) defs = previous.defs;
     }
   }
 
   // All changed pages go through a single parse.
   const parsedPages =
     fresh.length > 0
-      ? Array.from(parseSvg(rootTag + fresh.join("") + "</svg>").children)
+      ? Array.from(
+          parseSvg(render.rootTag + fresh.join("") + "</svg>").children,
+        )
       : [];
   if (parsedPages.length !== fresh.length) {
     throw new Error("typst.ts returned malformed SVG pages");
   }
   let nextFresh = 0;
-  const pages = slots.map(
-    (slot) => slot ?? createPage(parsedPages[nextFresh++]!),
-  );
-  return { defs, defsSource, pages };
+  const changes: PageChange[] = [];
+  const pages = slots.map((slot, index) => {
+    if (slot) return slot;
+    const page = createPage(parsedPages[nextFresh++]!);
+    if (previous) {
+      for (const range of changedRanges(previous.pages[index], page))
+        changes.push({ page: index, ...range });
+    }
+    return page;
+  });
+  return { defs, defsSource, pages, changes };
 }

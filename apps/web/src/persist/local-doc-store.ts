@@ -12,6 +12,7 @@ import {
 } from "loro-crdt";
 
 import { sameBytes } from "@/crypto/bytes";
+import type { FolderLink } from "@/folder/base";
 import { onPageExit } from "@/lib/page-exit";
 import { createSerialQueue } from "@/lib/serial-queue";
 
@@ -123,6 +124,10 @@ export interface DocBackend {
   loadLabels(): Promise<Record<string, string>>;
   /** Sets the names given, by hex device key, keeping the others. */
   saveLabels(labels: Record<string, string>): Promise<void>;
+  /** The local folder linked to the project, if any. */
+  loadFolder(spaceId: string): Promise<FolderLink | null>;
+  saveFolder(link: FolderLink): Promise<void>;
+  removeFolder(spaceId: string): Promise<void>;
   /** Drops everything stored for the project. */
   remove(spaceId: string): Promise<void>;
 }
@@ -187,6 +192,7 @@ const SNAPSHOTS = "snapshots";
 const UPDATES = "updates";
 const MLS = "mls";
 const PERSON = "person";
+const FOLDERS = "folders";
 const DEVICE_ROW = "device";
 const GRAPH_ROW = "graph";
 const LABELS_ROW = "labels";
@@ -240,6 +246,9 @@ async function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
       updates.createIndex(BY_SPACE, "spaceId");
       db.createObjectStore(MLS, { keyPath: "spaceId" });
       db.createObjectStore(PERSON, { keyPath: "id" });
+      // Added before the first release, so it joins this step instead of
+      // getting a version of its own.
+      db.createObjectStore(FOLDERS, { keyPath: "spaceId" });
     }
   };
   // Fires while another tab still holds an older connection. Those tabs
@@ -504,12 +513,42 @@ export class IndexedDbBackend implements DocBackend {
     });
   }
 
+  async loadFolder(spaceId: string): Promise<FolderLink | null> {
+    return this.use(false, async (db) => {
+      const tx = db.transaction(FOLDERS, "readonly");
+      const row = await request<FolderLink | undefined>(
+        tx.objectStore(FOLDERS).get(spaceId),
+      );
+      return row ?? null;
+    });
+  }
+
+  async saveFolder(link: FolderLink): Promise<void> {
+    return this.use(true, async (db) => {
+      const tx = db.transaction(FOLDERS, "readwrite");
+      tx.objectStore(FOLDERS).put(link);
+      await done(tx);
+    });
+  }
+
+  async removeFolder(spaceId: string): Promise<void> {
+    return this.use(true, async (db) => {
+      const tx = db.transaction(FOLDERS, "readwrite");
+      tx.objectStore(FOLDERS).delete(spaceId);
+      await done(tx);
+    });
+  }
+
   async remove(spaceId: string): Promise<void> {
     return this.use(true, async (db) => {
-      const tx = db.transaction([SNAPSHOTS, UPDATES, MLS], "readwrite");
+      const tx = db.transaction(
+        [SNAPSHOTS, UPDATES, MLS, FOLDERS],
+        "readwrite",
+      );
       const committed = done(tx);
       tx.objectStore(SNAPSHOTS).delete(spaceId);
       tx.objectStore(MLS).delete(spaceId);
+      tx.objectStore(FOLDERS).delete(spaceId);
       const updates = tx.objectStore(UPDATES);
       const keys = await request(updates.index(BY_SPACE).getAllKeys(spaceId));
       for (const key of keys) updates.delete(key);
@@ -522,6 +561,7 @@ export class IndexedDbBackend implements DocBackend {
 export class MemoryBackend implements DocBackend {
   private readonly docs = new Map<string, StoredDoc>();
   private readonly groups = new Map<string, MlsRecord>();
+  private readonly folders = new Map<string, FolderLink>();
   private device: Uint8Array | null = null;
   private graph: Uint8Array | null = null;
   private labels: Record<string, string> = {};
@@ -589,9 +629,22 @@ export class MemoryBackend implements DocBackend {
     this.docs.set(spaceId, { snapshot, updates: [] });
   }
 
+  async loadFolder(spaceId: string): Promise<FolderLink | null> {
+    return this.folders.get(spaceId) ?? null;
+  }
+
+  async saveFolder(link: FolderLink): Promise<void> {
+    this.folders.set(link.spaceId, link);
+  }
+
+  async removeFolder(spaceId: string): Promise<void> {
+    this.folders.delete(spaceId);
+  }
+
   async remove(spaceId: string): Promise<void> {
     this.docs.delete(spaceId);
     this.groups.delete(spaceId);
+    this.folders.delete(spaceId);
   }
 }
 

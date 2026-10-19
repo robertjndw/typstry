@@ -1,14 +1,14 @@
 // @vitest-environment node
 import { strToU8, unzipSync, zipSync } from "fflate";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import type { ProjectAssets } from "@/assets/project-assets";
 import { createFile } from "@/doc/fs-ops";
 import { buildPathIndex } from "@/doc/paths";
 import { fileText } from "@/doc/restore";
 import { initProject, NODE } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
 import { exportZip } from "@/export/zip";
+import { fakeAssets } from "@/folder/test-utils";
 
 import {
   assertImportable,
@@ -24,19 +24,6 @@ const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 
 function file(path: string, text = "") {
   return { path, bytes: strToU8(text) };
-}
-
-function fakeAssets(): ProjectAssets & { blobs: Map<string, Uint8Array> } {
-  const blobs = new Map<string, Uint8Array>();
-  return {
-    blobs,
-    load: async (hash) => blobs.get(hash)!,
-    store: vi.fn(async (f: File) => {
-      const hash = `sha256:${f.name}`;
-      blobs.set(hash, new Uint8Array(await f.arrayBuffer()));
-      return { hash, size: f.size, mime: "image/png" };
-    }),
-  };
 }
 
 describe("collect", () => {

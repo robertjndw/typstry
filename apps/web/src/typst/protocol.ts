@@ -28,10 +28,12 @@ export type WorkerRequest =
   /** Builds the compiler again with the same fonts, after a failed start. */
   | { type: "restart" }
   /**
-   * The renderer lost track of the incremental stream (e.g. a merge failed);
-   * the next result must be a full "reset" update.
+   * The client could not use a render (it lacks a page or the defs the
+   * worker left out, or the preview failed to load). The worker forgets what
+   * it sent and answers with the current document in full, compiling only if
+   * the renderer does not hold it yet.
    */
-  | { type: "resync" };
+  | { type: "rerender" };
 
 /** A typst source range, 0-based lines and columns in Unicode code points. */
 export interface SourceRange {
@@ -54,13 +56,45 @@ export interface WorkerDiagnostic {
 }
 
 /**
- * Incremental vector data for the renderer session. "reset" carries a full
- * document, "merge" a delta against everything sent since the last reset.
- * The renderer must apply every update in order.
+ * Incremental vector data for the renderer session, which lives in the
+ * worker next to the compiler. "reset" carries a full document, "merge" a
+ * delta against everything sent since the last reset. The renderer must
+ * apply every update in order.
  */
 export interface ArtifactUpdate {
   action: "reset" | "merge";
   data: Uint8Array;
+}
+
+export interface RenderPage {
+  /** Content hash typst.ts assigns to the page; equal tid, equal content. */
+  tid: string;
+  width: number;
+  height: number;
+  /**
+   * The page's `<g class="typst-page">` markup, or null when the last render
+   * sent already had a page with this tid (counted per occurrence).
+   */
+  markup: string | null;
+}
+
+/**
+ * A rendered document, minus what the client already holds from the last
+ * render the worker sent: unchanged pages and defs never cross the thread
+ * boundary again.
+ */
+export interface RenderPayload {
+  /** Opening tag of typst.ts' stacked SVG, needed to parse any fragment. */
+  rootTag: string;
+  /** Glyph, clip path and style markup, or null when unchanged. */
+  defs: string | null;
+  pages: RenderPage[];
+}
+
+export interface RenderError {
+  /** "load": the renderer wasm could not be fetched, usually offline. */
+  kind: "load" | "render";
+  message: string;
 }
 
 export type WorkerResponse =
@@ -73,8 +107,18 @@ export type WorkerResponse =
       mainPath: string;
       diagnostics: WorkerDiagnostic[];
       /** Absent when the compile failed; the last good render stays valid. */
-      update?: ArtifactUpdate;
+      render?: RenderPayload;
+      renderError?: RenderError;
       compileMs: number;
+      renderMs: number;
+    }
+  /** The answer to "rerender", when the renderer already held the document. */
+  | {
+      type: "render";
+      mainPath: string;
+      render?: RenderPayload;
+      renderError?: RenderError;
+      renderMs: number;
     }
   | ({ type: "pdf"; id: number } & ({ data: Uint8Array } | { error: string }));
 

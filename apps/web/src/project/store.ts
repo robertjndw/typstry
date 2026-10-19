@@ -2,7 +2,9 @@ import { UndoManager, type LoroEventBatch, type TreeID } from "loro-crdt";
 
 import type { PathIndex } from "@/doc/paths";
 import { PEER_INFO_ORIGIN, type FileKind, type ProjectDoc } from "@/doc/schema";
+import { FOLDER_ORIGIN } from "@/folder/origin";
 
+import { loadOpenTabs, saveOpenTabs, type OpenTabs } from "./open-tabs";
 import {
   projectIndex,
   type ProjectIndex,
@@ -26,6 +28,11 @@ export interface ProjectSnapshot {
 export interface ProjectStoreOptions {
   /** Called when a remote change removes the file that is open here. */
   onOpenFileRemoved?: (path: string) => void;
+  /**
+   * Remembers the tabs under this id in the browser and reopens them the
+   * next time. Without it every store starts with just the main file.
+   */
+  projectId?: string;
 }
 
 /**
@@ -42,16 +49,64 @@ export class ProjectStore {
   private readonly listeners = new Set<() => void>();
   private unsubscribeIndex: (() => void) | null = null;
   private readonly options: ProjectStoreOptions;
+  /** What was last written to storage, to skip writes that change nothing. */
+  private saved: Pick<ProjectSnapshot, "tabs" | "openFileId">;
+  /**
+   * Saved tabs not all restored yet. Nothing is saved meanwhile, or the
+   * partial set would overwrite them.
+   */
+  private pending: OpenTabs | null = null;
 
   constructor(project: ProjectDoc, options: ProjectStoreOptions = {}) {
     this.project = project;
     this.options = options;
     this.undoManager = new UndoManager(project.doc, {
-      excludeOriginPrefixes: [PEER_INFO_ORIGIN],
+      excludeOriginPrefixes: [PEER_INFO_ORIGIN, FOLDER_ORIGIN],
     });
     this.index = projectIndex(project);
-    const main = project.mainFile;
-    this.snapshot = this.compute(this.index.state, main, main ? [main] : []);
+    this.snapshot = this.initial();
+    this.saved = this.pending
+      ? { tabs: this.pending.tabs, openFileId: this.pending.open }
+      : this.snapshot;
+  }
+
+  private initial(): ProjectSnapshot {
+    const state = this.index.state;
+    const main = this.project.mainFile;
+    const fallback = this.compute(state, main, main ? [main] : []);
+    const saved =
+      this.options.projectId !== undefined
+        ? loadOpenTabs(this.options.projectId)
+        : null;
+    if (!saved) return fallback;
+    const restored = this.restore(state, saved);
+    // The doc this browser kept can lag behind the server, so a saved tab
+    // may only be missing until the first sync. Deleted is decided then.
+    if (restored?.tabs.length !== saved.tabs.length) this.pending = saved;
+    return restored ? { ...fallback, ...restored } : fallback;
+  }
+
+  /**
+   * The saved tabs that exist in `state`, or null when none of them do: an
+   * empty editor would look like the project lost its files.
+   */
+  private restore(
+    state: ProjectIndexState,
+    saved: OpenTabs,
+  ): Pick<ProjectSnapshot, "tabs" | "openFileId"> | null {
+    const { tabs, openFileId } = this.compute(state, saved.open, saved.tabs);
+    if (tabs.length === 0 && saved.tabs.length > 0) return null;
+    return { tabs, openFileId: openFileId ?? tabs[0] ?? null };
+  }
+
+  /**
+   * Call once the project has caught up with the server. Saved tabs still
+   * missing by then were deleted, and the tabs start being saved again.
+   */
+  settle(): void {
+    if (!this.pending) return;
+    this.pending = null;
+    this.save();
   }
 
   getSnapshot = (): ProjectSnapshot => this.snapshot;
@@ -100,6 +155,8 @@ export class ProjectStore {
   }
 
   private activate(id: TreeID | null, tabs: readonly TreeID[]): void {
+    // Picking tabs by hand settles what the saved ones were for.
+    this.pending = null;
     // Undo history is per session of one file: undoing in a file you just
     // switched to must not revert edits in one you can no longer see.
     if (id !== this.snapshot.openFileId) this.undoManager.clear();
@@ -123,6 +180,17 @@ export class ProjectStore {
     )
       return;
     this.snapshot = this.compute(state, prev.openFileId, prev.tabs);
+    if (this.pending) {
+      const restored = this.restore(state, this.pending);
+      if (restored?.tabs.length === this.pending.tabs.length)
+        this.pending = null;
+      if (restored) {
+        if (restored.openFileId !== prev.openFileId) this.undoManager.clear();
+        this.snapshot = { ...this.snapshot, ...restored };
+        this.emit();
+        return;
+      }
+    }
     const removed = prev.openFileId;
     if (removed === null || this.snapshot.openFileId !== null) {
       this.emit();
@@ -153,7 +221,18 @@ export class ProjectStore {
   }
 
   private emit(): void {
+    this.save();
     for (const listener of this.listeners) listener();
+  }
+
+  private save(): void {
+    const { projectId } = this.options;
+    const { tabs, openFileId } = this.snapshot;
+    if (projectId === undefined || this.pending) return;
+    if (tabs === this.saved.tabs && openFileId === this.saved.openFileId)
+      return;
+    this.saved = { tabs, openFileId };
+    saveOpenTabs(projectId, { tabs, open: openFileId });
   }
 
   /** Lets go of the doc. The store is unusable afterwards. */

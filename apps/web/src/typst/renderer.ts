@@ -7,7 +7,7 @@ import rendererWasmUrl from "@myriaddreamin/typst-ts-renderer/pkg/typst_ts_rende
 import type { ArtifactUpdate } from "./protocol";
 import { wasmModuleRef } from "./wasm-module";
 
-/** What compiler-client needs from a renderer; tests substitute a fake. */
+/** What the worker's RenderHost needs from a renderer; tests substitute a fake. */
 export interface PreviewRenderer {
   /** Applies an update; throws if a merge does not fit the session state. */
   apply(update: ArtifactUpdate): void;
@@ -17,11 +17,11 @@ export interface PreviewRenderer {
 }
 
 /**
- * Renders on the main thread. The worker's incremental server ships vector
- * deltas, and the session here merges them, so only a few KB cross the
- * thread boundary per edit. SVG generation itself is cheap (about 10 ms for
- * 20 dense pages); the per-page DOM diff in svg-pages.ts keeps unchanged
- * pages untouched.
+ * Renders in the compile worker. The incremental server ships vector
+ * deltas, and the session here merges them. SVG generation itself is cheap,
+ * but the string is big (embedded images are base64-encoded on every
+ * render), so it stays in the worker: render-state.ts splits it into pages
+ * and sends the main thread only the ones that changed.
  *
  * typst.ts also has an in-place DOM patcher (renderToSvg / render_svg), but
  * it owns the container's markup and lays all pages out as one stacked SVG,

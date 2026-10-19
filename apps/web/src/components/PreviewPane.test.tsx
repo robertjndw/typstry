@@ -1,10 +1,12 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { initProject } from "@/doc/schema";
+import { getText } from "@/doc/fs-ops";
+import { initProject, type ProjectDoc } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
 import { CompilerClient } from "@/typst/compiler-client";
 import type {
+  RenderPayload,
   WorkerEvents,
   WorkerLike,
   WorkerRequest,
@@ -39,7 +41,16 @@ class FakeWorker implements WorkerLike {
   }
 }
 
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 400"><defs class="glyph"></defs><g class="typst-page" data-tid="a" data-page-width="100" data-page-height="200"></g><g class="typst-page" data-tid="b" data-page-width="100" data-page-height="200"></g></svg>`;
+const fullRender: RenderPayload = {
+  rootTag: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 400">',
+  defs: '<defs class="glyph"></defs>',
+  pages: ["a", "b"].map((tid) => ({
+    tid,
+    width: 100,
+    height: 200,
+    markup: `<g class="typst-page" data-tid="${tid}" data-page-width="100" data-page-height="200"></g>`,
+  })),
+};
 
 type WorkerDiagnostic = Extract<
   WorkerResponse,
@@ -60,7 +71,7 @@ function diagnostic(
 }
 
 let nextId = 1;
-/** Emits a compile result and waits for the client's async render queue. */
+/** Emits a compile result and lets the client build the document. */
 async function compile(worker: FakeWorker, diagnostics: WorkerDiagnostic[]) {
   const id = nextId++;
   await act(async () => {
@@ -71,8 +82,9 @@ async function compile(worker: FakeWorker, diagnostics: WorkerDiagnostic[]) {
       id,
       mainPath: "/main.typ",
       diagnostics,
-      update: { action: "reset", data: new Uint8Array() },
+      render: fullRender,
       compileMs: 1,
+      renderMs: 1,
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
@@ -83,18 +95,13 @@ function setup(onDiagnosticClick = vi.fn()) {
   const worker = new FakeWorker();
   const client = new CompilerClient(project, {
     worker,
-    createRenderer: async () => ({
-      apply: () => {},
-      renderSvg: async () => svg,
-      dispose: () => {},
-    }),
   });
   render(
     <TooltipProvider>
       <PreviewPane client={client} onDiagnosticClick={onDiagnosticClick} />
     </TooltipProvider>,
   );
-  return { worker, onDiagnosticClick };
+  return { worker, project, onDiagnosticClick };
 }
 
 describe("PreviewPane", () => {
@@ -123,7 +130,6 @@ describe("PreviewPane", () => {
             workers.push(w);
             return w;
           },
-          createRenderer: () => new Promise(() => {}),
         },
       );
       render(
@@ -162,8 +168,9 @@ describe("PreviewPane", () => {
         id: 1,
         mainPath: "/main.typ",
         diagnostics: [],
-        update: { action: "reset", data: new Uint8Array() },
+        render: fullRender,
         compileMs: 12.4,
+        renderMs: 1,
       });
     });
     expect(
@@ -187,6 +194,7 @@ describe("PreviewPane", () => {
           },
         ],
         compileMs: 3,
+        renderMs: 0,
       });
     });
     const item = await screen.findByText("unknown variable: x");
@@ -304,5 +312,232 @@ describe("PreviewPane", () => {
 
     await compile(worker, []);
     expect(screen.queryByLabelText("Diagnostics")).not.toBeInTheDocument();
+  });
+
+  it("starts a warnings only panel collapsed and respects the toggle", async () => {
+    const { worker } = setup();
+    await compile(worker, [diagnostic("warning", "a warning")]);
+    const header = screen.getByRole("button", { name: /Problems/ });
+    expect(header).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    // Other warnings do not undo what the user chose.
+    await compile(worker, [
+      diagnostic("warning", "a warning"),
+      diagnostic("warning", "another"),
+    ]);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(header);
+
+    // Errors open it.
+    await compile(worker, [diagnostic("error", "broken")]);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("collapses again on its own once errors are fixed", async () => {
+    const { worker } = setup();
+    // The first compile of a project that opens with errors.
+    await compile(worker, [
+      diagnostic("error", "broken"),
+      diagnostic("warning", "a warning"),
+    ]);
+    const header = screen.getByRole("button", { name: /Problems/ });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    await compile(worker, [diagnostic("warning", "a warning")]);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+  });
+
+  describe("status indicator", () => {
+    it("shows the spinner only for compiles that run long", async () => {
+      vi.useFakeTimers();
+      try {
+        const { worker } = setup();
+        act(() => {
+          worker.emit({ type: "ready" });
+          worker.emit({ type: "compiling", id: 1 });
+        });
+        // The very first compile has no earlier result to show instead.
+        expect(screen.getByRole("status")).toHaveTextContent("Compiling");
+        act(() => {
+          worker.emit({
+            type: "result",
+            id: 1,
+            mainPath: "/main.typ",
+            diagnostics: [],
+            render: fullRender,
+            compileMs: 12,
+            renderMs: 1,
+          });
+        });
+        expect(screen.getByRole("status")).toHaveTextContent("12 ms");
+
+        act(() => {
+          worker.emit({ type: "compiling", id: 2 });
+        });
+        act(() => vi.advanceTimersByTime(250));
+        expect(screen.getByRole("status")).toHaveTextContent("12 ms");
+        act(() => vi.advanceTimersByTime(60));
+        expect(screen.getByRole("status")).toHaveTextContent("Compiling");
+
+        act(() => {
+          worker.emit({
+            type: "result",
+            id: 2,
+            mainPath: "/main.typ",
+            diagnostics: [],
+            compileMs: 7,
+            renderMs: 0,
+          });
+        });
+        expect(screen.getByRole("status")).toHaveTextContent("7 ms");
+
+        // A quick compile that finishes in time never flickers.
+        act(() => {
+          worker.emit({ type: "compiling", id: 3 });
+          vi.advanceTimersByTime(100);
+          worker.emit({
+            type: "result",
+            id: 3,
+            mainPath: "/main.typ",
+            diagnostics: [],
+            compileMs: 8,
+            renderMs: 0,
+          });
+          vi.advanceTimersByTime(500);
+        });
+        expect(screen.getByRole("status")).toHaveTextContent("8 ms");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("following edits", () => {
+    const sizes = { width: 400, height: 300 };
+    const blocks = (tid: string, y: number) => ({
+      tid,
+      width: 100,
+      height: 200,
+      markup: `<g class="typst-page" data-tid="${tid}" data-page-width="100" data-page-height="200"><g class="typst-group"><g transform="translate(0, ${y})" data-tid="${tid}b"/></g></g>`,
+    });
+    const render = (...tids: string[]): RenderPayload => ({
+      ...fullRender,
+      pages: tids.map((t) => blocks(t, 10)),
+    });
+    let id = 0;
+    const compileEdit = (
+      worker: FakeWorker,
+      project: ProjectDoc,
+      payload: RenderPayload,
+    ) => {
+      act(() => {
+        getText(project, project.mainFile!).insert(0, "x");
+        project.doc.commit();
+        worker.emit({ type: "compiling", id: ++id });
+        worker.emit({
+          type: "result",
+          id,
+          mainPath: "/main.typ",
+          diagnostics: [],
+          render: payload,
+          compileMs: 1,
+          renderMs: 0,
+        });
+      });
+    };
+
+    beforeEach(() => {
+      id = 0;
+      // jsdom has no layout, so give the viewport a size and a scrollTop
+      // that keeps what it is given.
+      vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(
+        sizes.width,
+      );
+      vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(
+        sizes.height,
+      );
+      const tops = new WeakMap<Element, number>();
+      vi.spyOn(HTMLElement.prototype, "scrollTop", "get").mockImplementation(
+        function (this: HTMLElement) {
+          return tops.get(this) ?? 0;
+        },
+      );
+      vi.spyOn(HTMLElement.prototype, "scrollTop", "set").mockImplementation(
+        function (this: HTMLElement, v: number) {
+          tops.set(this, v);
+        },
+      );
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it("scrolls to an edit on a page that is out of view", async () => {
+      const { worker, project } = setup();
+      await act(async () => {
+        worker.emit({ type: "ready" });
+        worker.emit({ type: "compiling", id: ++id });
+        worker.emit({
+          type: "result",
+          id,
+          mainPath: "/main.typ",
+          diagnostics: [],
+          render: render("a", "b"),
+          compileMs: 1,
+          renderMs: 0,
+        });
+      });
+      const viewport = screen.getByTestId("preview-viewport");
+      expect(viewport.scrollTop).toBe(0);
+
+      // Page 2 starts at 16 + 736 + 16 = 768 in a 368 wide column.
+      compileEdit(worker, project, render("a", "c"));
+      expect(viewport.scrollTop).toBeCloseTo(768 + 10 * 3.68 - 100);
+    });
+
+    it("leaves the preview alone after the user scrolled it", async () => {
+      const { worker, project } = setup();
+      await act(async () => {
+        worker.emit({ type: "ready" });
+        worker.emit({ type: "compiling", id: ++id });
+        worker.emit({
+          type: "result",
+          id,
+          mainPath: "/main.typ",
+          diagnostics: [],
+          render: render("a", "b"),
+          compileMs: 1,
+          renderMs: 0,
+        });
+      });
+      const viewport = screen.getByTestId("preview-viewport");
+      fireEvent.wheel(viewport, { deltaY: 10 });
+      compileEdit(worker, project, render("a", "c"));
+      expect(viewport.scrollTop).toBe(0);
+    });
+
+    it("does not count its own scrolling as the user's", async () => {
+      const { worker, project } = setup();
+      await act(async () => {
+        worker.emit({ type: "ready" });
+        worker.emit({ type: "compiling", id: ++id });
+        worker.emit({
+          type: "result",
+          id,
+          mainPath: "/main.typ",
+          diagnostics: [],
+          render: render("a", "b", "c"),
+          compileMs: 1,
+          renderMs: 0,
+        });
+      });
+      const viewport = screen.getByTestId("preview-viewport");
+      compileEdit(worker, project, render("a", "x", "c"));
+      const first = viewport.scrollTop;
+      expect(first).toBeGreaterThan(0);
+      fireEvent.scroll(viewport);
+      compileEdit(worker, project, render("a", "x", "y"));
+      expect(viewport.scrollTop).toBeGreaterThan(first);
+    });
   });
 });

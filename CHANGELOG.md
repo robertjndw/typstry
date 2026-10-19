@@ -15,11 +15,12 @@ The first release.
 - Typst compilation in the browser with a live SVG preview, inline diagnostics and Typst Universe packages.
 - Autocompletion, hover docs and signature help through tinymist, including completion of project file paths.
 - Offline-first editing: projects are kept in IndexedDB, open without the server and sync once the connection comes back.
-- Multi-file projects with a file tree, tabs, and uploads for images, fonts and data files, including paste and drop into the editor.
+- Multi-file projects with a file tree, tabs that reopen where you left off, and uploads for images, fonts and data files, including paste and drop into the editor.
 - History: browse edits, tag versions, preview, diff and restore.
 - Separate edit and view links, an MLS member group per project, and an owner who can remove members and reset the links.
 - Devices without accounts: pairing with a short code, a synced project list, revoking lost devices and 17-word recovery keys.
 - Import from a ZIP or a folder, export of the compiled PDF or the whole project as a ZIP.
+- Local folders in Chromium browsers: open a folder as a project, or link a project to a folder, and keep the two in sync live with merging of edits made on both sides.
 - The `typstry` CLI, which syncs a project with a local folder so it can be edited in any editor and kept in git.
 - A self-hostable server with Docker images on `ghcr.io/robertjndw/typstry`, and prebuilt CLI binaries for Linux and macOS with build provenance attestations.
 

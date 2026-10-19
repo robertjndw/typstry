@@ -17,6 +17,7 @@ import { RemovedNotice } from "@/components/RemovedNotice";
 import { ShareDialog } from "@/components/ShareDialog";
 import { WorkspaceSkeleton } from "@/components/WorkspaceSkeleton";
 import { Button } from "@/components/ui/button";
+import { FolderSyncProvider } from "@/folder/FolderSyncProvider";
 import { RosterProvider } from "@/mls/RosterProvider";
 import { provisionalIdentity, useStoredIdentity } from "@/presence/identity";
 import { PresenceProvider } from "@/presence/PresenceProvider";
@@ -66,6 +67,8 @@ function ProjectSessionView({
     mls,
     following,
     syncNow,
+    saveLocally,
+    synced,
   } = useProjectSession(token, linkKey, { identity });
   const navigate = useNavigate();
 
@@ -170,38 +173,53 @@ function ProjectSessionView({
       const { share, assets, crypto, canWrite } = state;
       return (
         <div className="h-svh">
-          <ProjectProvider doc={project} assets={assets} readOnly={!canWrite}>
-            <RosterProvider mls={mls} signers={crypto.signers}>
-              <PresenceProvider
-                ephemeral={ephemeral}
-                identity={identity}
-                crypto={crypto}
-              >
-                <ProjectWorkspace
-                  documentTitle
-                  onSyncNow={syncNow}
-                  status={
-                    <ConnectionStatus status={status} problem={syncProblem} />
-                  }
-                  share={
-                    <ShareDialog
-                      projectId={share.spaceId}
-                      token={token}
-                      crypto={crypto}
-                      permission={share.permission}
-                      viewToken={share.viewToken}
-                      mls={mls}
-                    />
-                  }
-                  identity={
-                    <AccountMenu
-                      identity={identity}
-                      firstVisit={stored === null}
-                    />
-                  }
-                />
-              </PresenceProvider>
-            </RosterProvider>
+          <ProjectProvider
+            doc={project}
+            assets={assets}
+            readOnly={!canWrite}
+            projectId={share.spaceId}
+            synced={synced}
+          >
+            <FolderSyncProvider
+              spaceId={share.spaceId}
+              project={project}
+              assets={assets}
+              canWrite={canWrite}
+              synced={synced}
+              saveLocally={saveLocally}
+            >
+              <RosterProvider mls={mls} signers={crypto.signers}>
+                <PresenceProvider
+                  ephemeral={ephemeral}
+                  identity={identity}
+                  crypto={crypto}
+                >
+                  <ProjectWorkspace
+                    documentTitle
+                    onSyncNow={syncNow}
+                    status={
+                      <ConnectionStatus status={status} problem={syncProblem} />
+                    }
+                    share={
+                      <ShareDialog
+                        projectId={share.spaceId}
+                        token={token}
+                        crypto={crypto}
+                        permission={share.permission}
+                        viewToken={share.viewToken}
+                        mls={mls}
+                      />
+                    }
+                    identity={
+                      <AccountMenu
+                        identity={identity}
+                        firstVisit={stored === null}
+                      />
+                    }
+                  />
+                </PresenceProvider>
+              </RosterProvider>
+            </FolderSyncProvider>
           </ProjectProvider>
         </div>
       );

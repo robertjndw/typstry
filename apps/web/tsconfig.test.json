@@ -26,5 +26,10 @@
     "erasableSyntaxOnly": true,
     "paths": { "@/*": ["./src/*"] }
   },
-  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-setup.ts"]
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/test-setup.ts",
+    "src/**/*.d.ts"
+  ]
 }

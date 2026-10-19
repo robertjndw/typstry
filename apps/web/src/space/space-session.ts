@@ -224,6 +224,7 @@ export class SpaceSession {
   private opened = "";
   private teardown: (() => void) | null = null;
   private flushAndSync: (() => Promise<SyncNowResult>) | null = null;
+  private local: LocalDocStore | null = null;
   private reconciling = false;
 
   constructor(opts: SpaceSessionOptions) {
@@ -306,6 +307,11 @@ export class SpaceSession {
   /** Saves locally and pushes pending edits to the server right away. */
   syncNow = async (): Promise<SyncNowResult> =>
     (await this.flushAndSync?.()) ?? "offline";
+
+  /** Writes pending edits to this browser's store, without pushing them. */
+  saveLocally = async (): Promise<void> => {
+    await this.local?.flush();
+  };
 
   /**
    * Keeps the secret that opened the space, once that is proven enough.
@@ -569,6 +575,7 @@ export class SpaceSession {
         found = await local.load();
         if (!active) return;
         local.start();
+        this.local = local;
       }
       this.set({
         crypto,
@@ -657,6 +664,7 @@ export class SpaceSession {
     return () => {
       active = false;
       this.flushAndSync = null;
+      if (this.local === local) this.local = null;
       // Said of this connection; the next one gets to try again.
       this.s.syncProblem = null;
       close?.();

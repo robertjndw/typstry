@@ -3,6 +3,8 @@ import { IDBFactory, IDBObjectStore } from "fake-indexeddb";
 import { LoroDoc } from "loro-crdt";
 import { describe, expect, it, vi } from "vitest";
 
+import type { FolderLink } from "@/folder/base";
+
 import {
   IndexedDbBackend,
   LocalDocStore,
@@ -366,6 +368,45 @@ describe.each(backends)("pinned owner on %s", (_name, makeBackend) => {
     const loaded = await backend.loadMls("p1");
     expect(loaded?.ownerPerson).toEqual(new Uint8Array([9]));
     expect(loaded?.ownerSecrets).toEqual(new Uint8Array([7]));
+  });
+});
+
+function link(spaceId: string, name = "thesis"): FolderLink {
+  // Real handles are structured-cloneable in browsers, but not in fake-indexeddb.
+  const handle = {
+    kind: "directory",
+    name,
+  } as unknown as FileSystemDirectoryHandle;
+  return { spaceId, v: 1, handle, name, base: null };
+}
+
+describe.each(backends)("folder links on %s", (_name, makeBackend) => {
+  it("round-trips a row", async () => {
+    const backend = await makeBackend();
+    expect(await backend.loadFolder("p1")).toBeNull();
+    const withBase: FolderLink = {
+      ...link("p1"),
+      base: {
+        frontiers: [{ peer: "1", counter: 4 }],
+        files: {
+          "main.typ": { kind: "text", digest: "d", size: 3, mtime: 9 },
+        },
+      },
+    };
+    await backend.saveFolder(withBase);
+    expect(await backend.loadFolder("p1")).toEqual(withBase);
+    expect(await backend.loadFolder("p2")).toBeNull();
+  });
+
+  it("is dropped by removeFolder and by removing the project", async () => {
+    const backend = await makeBackend();
+    await backend.saveFolder(link("p1"));
+    await backend.saveFolder(link("p2"));
+    await backend.removeFolder("p1");
+    expect(await backend.loadFolder("p1")).toBeNull();
+    expect(await backend.loadFolder("p2")).not.toBeNull();
+    await backend.remove("p2");
+    expect(await backend.loadFolder("p2")).toBeNull();
   });
 });
 

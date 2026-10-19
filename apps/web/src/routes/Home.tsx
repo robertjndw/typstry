@@ -2,6 +2,7 @@ import {
   ArrowRightIcon,
   CloudOffIcon,
   FileTextIcon,
+  FolderOpenIcon,
   ImportIcon,
   KeyRoundIcon,
   Loader2Icon,
@@ -31,6 +32,12 @@ import { cn } from "@/lib/utils";
 import { warnSkipped } from "@/import/skipped";
 import { readDrop, readPicked, type PendingImport } from "@/import/sources";
 import { assertImportable, ImportError, writeImport } from "@/import/import";
+import { handleFs } from "@/folder/folder-fs";
+import { scanFolder } from "@/folder/scan";
+import { seedFromFolder } from "@/folder/seed";
+import { folderSyncSupported, pickFolder } from "@/folder/support";
+import type { FolderBase } from "@/folder/base";
+import { defaultBackend } from "@/persist/local-doc-store";
 import { provisionalIdentity, useStoredIdentity } from "@/presence/identity";
 import { formatAbsolute, formatRelative } from "@/project/history-items";
 import { createLocalProject, deleteLocalProject } from "@/project/create";
@@ -40,6 +47,15 @@ import { projectUrl } from "@/project/recent";
 import { RateLimitedError } from "@/sync/api";
 
 const TITLE_MAX_LENGTH = 120;
+
+/** The typed title, else the source's own name cut to the title limit. */
+function titleFor(typed: string, sourceName: string): string {
+  return (
+    typed.trim() ||
+    [...sourceName.trim()].slice(0, TITLE_MAX_LENGTH).join("") ||
+    "Untitled"
+  );
+}
 
 /** Why a listed project cannot be opened, by state. */
 const UNAVAILABLE: Partial<Record<Entry["state"], string>> = {
@@ -78,6 +94,7 @@ export function Home() {
   const dragDepth = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const busy = creating || importing;
+  const [folderSupported] = useState(folderSyncSupported);
   const [error, setError] = useState<string | null>(null);
   const entries = useDirectory();
   const projects = useMemo(
@@ -130,10 +147,7 @@ export function Home() {
       const source = await pending.source;
       assertImportable(source);
       setImportStatus("Creating project…");
-      const projectTitle =
-        title.trim() ||
-        [...source.name.trim()].slice(0, TITLE_MAX_LENGTH).join("") ||
-        "Untitled";
+      const projectTitle = titleFor(title, source.name);
       const created = await createLocalProject(projectTitle, {
         seed: (project, assets) =>
           writeImport(project, source, assets, (uploaded, total) => {
@@ -149,6 +163,66 @@ export function Home() {
         err instanceof ImportError || err instanceof RateLimitedError
           ? err.message
           : "Could not import the project. Is the server running?",
+      );
+      setImportStatus(null);
+    }
+  }
+
+  async function openFolder() {
+    // First, before any await: the picker needs the click's activation.
+    const picking = pickFolder();
+    try {
+      const handle = await picking;
+      if (!handle) return;
+      setImportStatus("Reading folder…");
+      setError(null);
+      const fs = handleFs(handle);
+      const scan = await scanFolder(fs);
+      if (scan.files.size === 0 && scan.dirs.size === 0) {
+        throw new ImportError(
+          scan.skipped.length > 0
+            ? "None of the files can be imported"
+            : "There is nothing to import",
+          scan.skipped.map((s) => s.path),
+        );
+      }
+      setImportStatus("Creating project…");
+      const projectTitle = titleFor(title, handle.name);
+      let base: FolderBase | null = null;
+      const created = await createLocalProject(projectTitle, {
+        seed: async (project, assets) => {
+          base = await seedFromFolder(project, assets, fs, {
+            onProgress: (uploaded, total) => {
+              if (total > 0)
+                setImportStatus(`Uploading files (${uploaded} of ${total})…`);
+            },
+          });
+        },
+      });
+      try {
+        await (
+          await defaultBackend()
+        ).saveFolder({
+          spaceId: created.projectId,
+          v: 1,
+          handle,
+          name: handle.name,
+          base,
+        });
+      } catch (err) {
+        // The project exists with its files, it just is not linked.
+        console.error(err);
+        toast.error("Could not link the folder", {
+          description: "The project was created without it.",
+        });
+      }
+      navigate(projectUrl(created.editToken, created.key, ""));
+    } catch (err) {
+      console.error(err);
+      setError(
+        err instanceof ImportError || err instanceof RateLimitedError
+          ? err.message
+          : "Could not open the folder. Is the server running?",
       );
       setImportStatus(null);
     }
@@ -299,6 +373,19 @@ export function Home() {
               )}
               {importing ? "Importing…" : "Import"}
             </Button>
+            {folderSupported && (
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                disabled={busy}
+                title="Open a folder on this computer and keep it in sync"
+                onClick={() => void openFolder()}
+              >
+                <FolderOpenIcon />
+                Open local folder
+              </Button>
+            )}
           </form>
           <input
             ref={fileInput}
