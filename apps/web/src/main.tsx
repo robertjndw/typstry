@@ -6,6 +6,7 @@ import { RouterProvider } from "react-router/dom";
 
 import { refreshDirectoryService } from "@/directory/service";
 import { LOCAL_ONLY } from "@/mode";
+import { UpdatePrompt } from "@/components/UpdatePrompt";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { StorageNotice } from "@/persist/StorageNotice";
@@ -38,6 +39,7 @@ createRoot(document.getElementById("root")!).render(
           <StorageNotice />
         </div>
         <Toaster />
+        <UpdatePrompt />
       </TooltipProvider>
     </ThemeProvider>
   </StrictMode>,

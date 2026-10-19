@@ -5,6 +5,7 @@ import zlib from "node:zlib";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin } from "vite";
+import { VitePWA } from "vite-plugin-pwa";
 import { defineConfig } from "vitest/config";
 
 // Overridable for running next to something else on the default port.
@@ -124,6 +125,42 @@ export default defineConfig({
     tailwindcss(),
     // Pages compresses on its own.
     localOnly ? staticHosting() : precompress(),
+    VitePWA({
+      // The user decides when to swap versions, since a reload would drop
+      // unsaved state in other tabs.
+      registerType: "prompt",
+      manifest: {
+        name: "typstry",
+        short_name: "typstry",
+        description: localOnly
+          ? "Typst editor that keeps your projects in this browser"
+          : "Collaborative, end-to-end encrypted Typst editor",
+        start_url: base,
+        scope: base,
+        display: "standalone",
+        theme_color: "#18181b",
+        background_color: "#18181b",
+        icons: [
+          { src: "pwa-192x192.png", sizes: "192x192", type: "image/png" },
+          { src: "pwa-512x512.png", sizes: "512x512", type: "image/png" },
+          {
+            src: "maskable-icon-512x512.png",
+            sizes: "512x512",
+            type: "image/png",
+            purpose: "maskable",
+          },
+        ],
+      },
+      workbox: {
+        globPatterns: ["**/*.{js,css,html,svg,wasm,woff2,png}"],
+        // Never precache the .br/.gz copies, and 404.html duplicates index.html.
+        globIgnores: ["**/*.br", "**/*.gz", "404.html"],
+        // The compiler and tinymist wasm are about 30 MB each uncompressed.
+        maximumFileSizeToCacheInBytes: 40 * 1024 * 1024,
+        navigateFallback: "index.html",
+        navigateFallbackDenylist: [/^\/api\//, /^\/ws/, /^\/healthz/],
+      },
+    }),
   ],
   resolve: {
     alias: { "@": path.resolve(import.meta.dirname, "src") },
