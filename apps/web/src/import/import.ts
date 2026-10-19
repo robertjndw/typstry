@@ -1,11 +1,12 @@
 import type { TreeID } from "loro-crdt";
 
 import { MAX_ASSET_BYTES, type ProjectAssets } from "@/assets/project-assets";
-import { decodeText } from "@/assets/upload";
+import { decodeText, freeName } from "@/assets/upload";
 import { createAsset, createFile, isSafePath, setMainFile } from "@/doc/fs-ops";
 import { basename, dirname, extensionOf, stemLength } from "@/doc/names";
 import {
   DEFAULT_MAIN_FILE,
+  NODE,
   type AssetInfo,
   type ProjectDoc,
 } from "@/doc/schema";
@@ -95,13 +96,14 @@ export async function readZip(file: File): Promise<ImportSource> {
 /** Loose files and folders by path; a null `file` is a folder. */
 export async function readFiles(
   entries: { path: string; file: File | null }[],
+  { unwrap = true }: { unwrap?: boolean } = {},
 ): Promise<ImportSource> {
   if (entries.length > MAX_IMPORT_ENTRIES) throw tooManyEntries();
   // Sizes are known up front, so limits fail before anything is read, and
   // files collect() would drop anyway are never read at all.
   const wanted = entries.map(({ path, file }) => ({
     path,
-    file: file && !dropped(segmentsOf(path)) ? file : null,
+    file: file && !dropped(segmentsOf(path), unwrap) ? file : null,
     isFile: file !== null,
   }));
   const tooLarge = wanted
@@ -131,15 +133,17 @@ export async function readFiles(
           : null,
     }),
   );
-  return collect("", raw);
+  return collect("", raw, { unwrap });
 }
 
 /**
  * Whether collect() would drop a file at these segments no matter how the
- * import is wrapped: clutter, or a reserved name below the top level.
+ * import is wrapped: clutter, or a reserved name below the top level. The
+ * top level only gets a pass while it may still be stripped.
  */
-function dropped(segments: string[]): boolean {
-  return isJunk(segments) || segments.slice(1).some((s) => !isSafePath(s));
+function dropped(segments: string[], unwrap: boolean): boolean {
+  const kept = unwrap ? segments.slice(1) : segments;
+  return isJunk(segments) || kept.some((s) => !isSafePath(s));
 }
 
 function segmentsOf(path: string): string[] {
@@ -149,9 +153,14 @@ function segmentsOf(path: string): string[] {
 /**
  * Normalizes paths and drops clutter. A zip of a folder, and every folder
  * pick, wraps everything in one top-level folder; that folder becomes the
- * project, so it is stripped and names the project instead.
+ * project, so it is stripped and names the project instead. Uploads into an
+ * open project pass `unwrap: false` to keep a dropped folder's own name.
  */
-export function collect(fallbackName: string, raw: RawEntry[]): ImportSource {
+export function collect(
+  fallbackName: string,
+  raw: RawEntry[],
+  { unwrap = true }: { unwrap?: boolean } = {},
+): ImportSource {
   const entries = raw
     .map((e) => ({ segments: segmentsOf(e.path), bytes: e.bytes }))
     .filter(({ segments }) => segments.length > 0 && !isJunk(segments));
@@ -159,6 +168,7 @@ export function collect(fallbackName: string, raw: RawEntry[]): ImportSource {
   let name = fallbackName;
   const root = entries[0]?.segments[0];
   const wrapped =
+    unwrap &&
     root !== undefined &&
     entries.every(
       (e) =>
@@ -222,17 +232,22 @@ export function assertImportable(source: ImportSource): void {
 }
 
 /**
- * Writes `source` into a freshly initialized `project`. Binary files are
- * uploaded first and the doc is only touched once all of them made it, so
- * a failed import leaves the doc empty rather than missing images.
+ * Writes `source` into `parent` of `project`. Binary files are uploaded first
+ * and the doc is only touched once all of them made it, so a failed import
+ * leaves the doc as it was rather than missing images.
+ *
+ * Top-level entries that clash with a sibling already in `parent` are renamed
+ * (`figures` becomes `figures (2)`); everything below them is restored as is.
+ * `created` is keyed by the source path, before any renaming.
  */
-export async function writeImport(
+export async function writeSource(
   project: ProjectDoc,
   source: ImportSource,
   assets: ProjectAssets,
+  parent: TreeID | null,
   /** Called as binary files finish uploading. */
   onProgress?: (uploaded: number, total: number) => void,
-): Promise<void> {
+): Promise<{ created: Map<string, TreeID>; top: TreeID[] }> {
   const texts = new Map<string, string>();
   const binaries: [string, Uint8Array][] = [];
   for (const [path, bytes] of source.files) {
@@ -264,25 +279,68 @@ export async function writeImport(
     );
   }
 
+  // Picked after the uploads, so names peers took meanwhile are avoided.
+  const topNames = [
+    ...new Set(
+      [...source.dirs, ...source.files.keys()].map((p) => p.split("/")[0]!),
+    ),
+  ].sort();
+  const renamed = new Map(
+    topNames.map((name) => [name, freeName(project, parent, name)]),
+  );
+  const target = (path: string) => {
+    const [head, ...rest] = path.split("/");
+    return [renamed.get(head!)!, ...rest].join("/");
+  };
+
   // Sorted, a parent always comes before its children.
-  const dirIds = new Map<string, TreeID>();
-  const parentOf = (path: string) => dirIds.get(dirname(path)) ?? null;
+  const created = new Map<string, TreeID>();
+  const parentOf = (path: string) => created.get(dirname(path)) ?? parent;
+  const make = (path: string, id: () => TreeID) => created.set(path, id());
   for (const dir of [...source.dirs].sort()) {
-    dirIds.set(dir, createFile(project, parentOf(dir), basename(dir), "dir"));
+    make(dir, () =>
+      createFile(project, parentOf(dir), basename(target(dir)), "dir"),
+    );
   }
-  const textIds = new Map<string, TreeID>();
   for (const [path, text] of texts) {
-    textIds.set(
-      path,
-      createFile(project, parentOf(path), basename(path), "text", text),
+    make(path, () =>
+      createFile(project, parentOf(path), basename(target(path)), "text", text),
     );
   }
   for (const [path, asset] of stored) {
-    createAsset(project, parentOf(path), basename(path), asset);
+    make(path, () =>
+      createAsset(project, parentOf(path), basename(target(path)), asset),
+    );
   }
 
-  const main = pickMainFile([...textIds.keys()]);
-  if (main) setMainFile(project, textIds.get(main)!);
+  return { created, top: topNames.map((name) => created.get(name)!) };
+}
+
+/**
+ * Writes `source` into a freshly initialized `project`, then points the
+ * project at the Typst file it most likely compiles from.
+ */
+export async function writeImport(
+  project: ProjectDoc,
+  source: ImportSource,
+  assets: ProjectAssets,
+  onProgress?: (uploaded: number, total: number) => void,
+): Promise<void> {
+  const { created } = await writeSource(
+    project,
+    source,
+    assets,
+    null,
+    onProgress,
+  );
+  // Large .typ files are stored as assets, which cannot be the main file.
+  const textPaths = [...source.files.keys()].filter(
+    (path) =>
+      project.fs.getNodeByID(created.get(path)!)?.data.get(NODE.kind) ===
+      "text",
+  );
+  const main = pickMainFile(textPaths);
+  if (main) setMainFile(project, created.get(main)!);
 }
 
 /**

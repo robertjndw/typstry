@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Page } from "@playwright/test";
-import { unzipSync } from "fflate";
+import { strToU8, unzipSync, zipSync } from "fflate";
 
 import {
   appendLine,
@@ -101,4 +101,44 @@ test("the compiled document downloads as a PDF", async ({ page }) => {
     page.getByRole("button", { name: "Download PDF" }),
   );
   expect(name).toMatch(/\.pdf$/);
+});
+
+test("uploading a zip restores its folders without the wrapper", async ({
+  page,
+}) => {
+  await createProject(page, "Zip upload");
+  const png = await readFile(RED_PNG);
+  const zip = zipSync({
+    "wrap/chapters/intro.typ": strToU8("= Intro\n"),
+    "wrap/img/red.png": png,
+    "wrap/empty/": new Uint8Array(),
+  });
+
+  await page.getByRole("button", { name: "New folder" }).click();
+  await page.getByLabel("New folder name").fill("book");
+  await page.keyboard.press("Enter");
+  const tree = fileTree(page);
+  await tree.getByRole("treeitem", { name: "book" }).click({ button: "right" });
+  const chooser = page.waitForEvent("filechooser");
+  await page.getByRole("menuitem", { name: "Upload here" }).click();
+  await (
+    await chooser
+  ).setFiles({
+    name: "wrap.zip",
+    mimeType: "application/zip",
+    buffer: Buffer.from(zip),
+  });
+
+  // Levels pin the nesting: book/chapters/intro.typ, book/img/red.png.
+  const level = (name: string, depth: number) =>
+    expect(tree.getByRole("treeitem", { name, exact: true })).toHaveAttribute(
+      "aria-level",
+      String(depth),
+    );
+  await level("chapters", 2);
+  await level("img", 2);
+  await level("empty", 2);
+  await level("intro.typ", 3);
+  await level("red.png", 3);
+  await expect(tree.getByRole("treeitem", { name: "wrap" })).toHaveCount(0);
 });

@@ -16,7 +16,7 @@ export interface PendingImport {
   source: Promise<ImportSource>;
 }
 
-function isZip(name: string): boolean {
+export function isZip(name: string): boolean {
   return /\.zip$/i.test(name);
 }
 
@@ -42,9 +42,13 @@ type Dropped =
  * Turns a drop into an import: a single zip is unpacked, anything else
  * (files, folders, or both) is imported as it is. Has to be called during
  * the drop event; the browser empties `dataTransfer` once the handler
- * returns, so the items are captured before anything async happens.
+ * returns, so the items are captured before anything async happens. A zip
+ * is always unwrapped; `unwrap` is for folders and loose files.
  */
-export function readDrop(data: DataTransfer): PendingImport | null {
+export function readDrop(
+  data: DataTransfer,
+  { unwrap = true }: { unwrap?: boolean } = {},
+): PendingImport | null {
   const dropped: Dropped[] = [];
   for (const item of data.items) {
     if (item.kind !== "file") continue;
@@ -67,9 +71,40 @@ export function readDrop(data: DataTransfer): PendingImport | null {
       if (d.kind === "file") files.push({ path: d.file.name, file: d.file });
       else await walk(d.entry, files);
     }
-    return readFiles(files);
+    return readFiles(files, { unwrap });
   })();
   return { kind: "files", source };
+}
+
+/**
+ * Whether a drop is a tree to restore (a folder or a single zip) rather than
+ * loose files. Synchronous, so it can run inside the drop event.
+ */
+export function isTreeDrop(data: DataTransfer): boolean {
+  const files = [...data.items].filter((item) => item.kind === "file");
+  const isDir = (item: DataTransferItem) =>
+    item.webkitGetAsEntry()?.isDirectory === true;
+  if (files.some(isDir)) return true;
+  const [only] = data.files;
+  return files.length === 1 && only !== undefined && isZip(only.name);
+}
+
+/**
+ * Files from a folder picker (`webkitdirectory`). Each file's relative path
+ * starts with the picked folder, which is kept. Browsers leave empty folders
+ * out of a pick.
+ */
+export function readFolderPick(files: File[]): PendingImport {
+  return {
+    kind: "files",
+    source: readFiles(
+      files.map((file) => ({
+        path: file.webkitRelativePath || file.name,
+        file,
+      })),
+      { unwrap: false },
+    ),
+  };
 }
 
 function isDirectory(d: Dropped): boolean {

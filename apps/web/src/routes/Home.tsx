@@ -29,6 +29,7 @@ import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { warnSkipped } from "@/import/skipped";
 import { readDrop, readPicked, type PendingImport } from "@/import/sources";
 import { assertImportable, ImportError, writeImport } from "@/import/import";
 import { handleFs } from "@/folder/folder-fs";
@@ -154,13 +155,7 @@ export function Home() {
               setImportStatus(`Uploading files (${uploaded} of ${total})…`);
           }),
       });
-      if (source.skipped.length > 0) {
-        const count = source.skipped.length;
-        toast.warning(
-          `Left out ${count} ${count === 1 ? "file" : "files"} with names a project cannot hold`,
-          { description: source.skipped.slice(0, 5).join(", ") },
-        );
-      }
+      warnSkipped(source.skipped);
       navigate(projectUrl(created.editToken, created.key, ""));
     } catch (err) {
       console.error(err);
