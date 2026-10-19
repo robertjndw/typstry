@@ -11,6 +11,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:static": "playwright test -c playwright.static.config.ts",
     "fixtures": "TYPSTRY_WRITE_FIXTURES=1 vitest run src/doc/fixture.test.ts src/directory/fixture.test.ts",
     "wasm": "bash scripts/build-wasm.sh",
     "pwa-assets": "pwa-assets-generator"

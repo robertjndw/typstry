@@ -1,0 +1,54 @@
+name: Pages
+
+# Deploys the static, local-only build (see docs/static-hosting.md). One-time
+# setup: Settings > Pages > Source: GitHub Actions.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - "crates/typstry-wire/**"
+      - "crates/typstry-wasm/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "Cargo.lock"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A deploy that is already running finishes; the next one queues behind it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-web
+      - run: pnpm --filter web build:static
+        env:
+          # Project pages live under /<repo>/.
+          TYPSTRY_BASE: /${{ github.event.repository.name }}/
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: apps/web/dist-static
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
