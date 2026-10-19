@@ -1,9 +1,8 @@
-// One sync cycle between the linked folder and the project doc, a port of
-// the CLI's reconcile (crates/typstry-cli/src/engine/reconcile.rs). It looks
-// at what changed on each side since the base (see base.ts), applies one
-// side's change to the other, merges text both sides edited and reports what
-// it could not decide on its own. Everything that reaches the doc lands in
-// a single local commit, so the normal sync pushes it like any edit.
+// One sync cycle between the linked folder and the doc, a port of the CLI's
+// reconcile (crates/typstry-cli/src/engine/reconcile.rs). Compares each side
+// with the base (base.ts), applies changes across, merges text both sides
+// edited and reports what it couldn't decide. Everything that reaches the doc
+// is one local commit, so the normal sync pushes it like any edit.
 import type { OpId } from "loro-crdt";
 
 import { MAX_ASSET_BYTES, type ProjectAssets } from "@/assets/project-assets";
@@ -54,20 +53,13 @@ export interface Conflict {
 }
 
 export interface ReconcileReport {
-  /** Paths where one side's change had to give way to the other's. */
   conflicts: Conflict[];
-  /** Folder files that cannot be synced, with the reason. */
   skipped: { path: string; reason: string }[];
   warnings: string[];
-  /** Files written to the folder. */
   written: string[];
-  /** Files removed from the folder. */
   deleted: string[];
-  /** Text files both sides edited, merged without losing either edit. */
   merged: string[];
-  /** Null when nothing needed to go into the doc. */
   applied: ApplyReport | null;
-  /** Local changes not applied because the link is view-only. */
   heldLocal: string[];
 }
 
@@ -84,7 +76,6 @@ export interface ReconcileResult {
 export interface FirstLinkPreview {
   onlyFolder: number;
   onlyProject: number;
-  /** Files with different content on both sides. */
   differing: string[];
 }
 
@@ -196,9 +187,9 @@ function skipText(reason: SkipReason): string {
 }
 
 /**
- * The one cycle. Nothing outside the folder or the doc is touched before the
- * commit, so aborting or failing until then leaves both as they were; after
- * it the cycle finishes writing regardless, to leave folder and doc agreeing.
+ * The one cycle. Nothing outside the folder or doc is touched before the
+ * commit, so failing until then leaves both as they were. After it the cycle
+ * finishes writing anyway, so folder and doc agree.
  */
 export async function reconcile(
   input: ReconcileInput,
@@ -600,8 +591,8 @@ async function cycle(
   }
   signal?.throwIfAborted();
 
-  // Everything from here to the commit is synchronous, so the doc cannot
-  // move under us. If it did while we were awaiting, the cycle restarts.
+  // Synchronous from here to the commit, so the doc can't move under us. If it
+  // did while we were awaiting, the cycle restarts.
   doc.commit();
   if (!sameFrontiers(doc.oplogFrontiers(), seen)) throw new Stale();
 
@@ -654,12 +645,11 @@ async function cycle(
   }
   const synced = doc.oplogFrontiers();
 
-  // Write back. Past the commit nothing may throw: the doc then holds
-  // changes (merges especially) that only the new base accounts for, and
-  // losing it would apply them a second time. A fatal error (the folder's
-  // permission going away) stops the remaining work and is handed back
-  // next to the base. Nor does it abort: stopping halfway would leave a
-  // merged doc whose merge is not on disk.
+  // Past the commit nothing may throw: the doc holds changes (merges
+  // especially) that only the new base accounts for, and losing it would apply
+  // them twice. A fatal error (permission gone) stops the remaining work and
+  // is handed back next to the base. Stopping halfway for any other reason
+  // would leave a merged doc whose merge is not on disk.
   let interrupted: unknown;
   const outdated = new Set<string>();
   const written = new Map<string, BaseFile>();

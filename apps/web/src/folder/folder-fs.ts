@@ -5,12 +5,10 @@ export const CASE_PROBE_PREFIX = ".typstry-case-probe-";
 
 export interface FileStat {
   size: number;
-  /** Milliseconds since the epoch, as `File.lastModified`. */
   mtime: number;
 }
 
 export interface FolderEntry {
-  /** Relative to the folder, "/" separated, no leading slash. */
   path: string;
   name: string;
   kind: "file" | "dir";
@@ -19,17 +17,14 @@ export interface FolderEntry {
 }
 
 /**
- * The folder as the sync engine sees it. Paths are relative with "/"
- * separators. Kept narrow so tests can swap the browser's handles for a
- * fake.
+ * The folder as the sync engine sees it, kept narrow so tests can swap the
+ * browser's handles for a fake.
  */
 export interface FolderFs {
   /** The direct children of `dir` ("" is the root), in no set order. */
   readdir(dir: string): Promise<FolderEntry[]>;
-  /** Null when there is no such file. */
   stat(path: string): Promise<FileStat | null>;
   read(path: string): Promise<Uint8Array>;
-  /** Creates missing parent folders. */
   write(path: string, bytes: Uint8Array): Promise<void>;
   mkdir(path: string): Promise<void>;
   /**
@@ -37,7 +32,6 @@ export interface FolderFs {
    * are left empty, never the root. A missing path is not an error.
    */
   remove(path: string): Promise<void>;
-  /** Whether names that differ only in case are the same file here. */
   caseInsensitive(): Promise<boolean>;
 }
 

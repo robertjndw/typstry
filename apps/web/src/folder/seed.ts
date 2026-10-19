@@ -9,11 +9,9 @@ import { materialize } from "./materialize";
 import { reconcile } from "./reconcile";
 
 /**
- * Fills a fresh project doc from a folder, for opening a folder as a new
- * project. Returns the base to store with the link: the doc and the folder
- * match at it, so the first cycle after navigating has nothing to redo.
- * Call it from the `seed` of `createLocalProject`, which stores the doc
- * once this returns.
+ * Fills a fresh project doc from a folder. Returns the base to store with the
+ * link, so the first cycle after navigating has nothing to redo. Call it from
+ * the `seed` of `createLocalProject`, which stores the doc after it returns.
  */
 export async function seedFromFolder(
   project: ProjectDoc,

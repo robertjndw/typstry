@@ -94,10 +94,9 @@ const VIEWER_PADDING = 32;
 // Room below the last page for the viewer's floating controls.
 const VIEWER_CONTROLS_SPACE = 56;
 const INDICATOR_IDLE_MS = 1000;
-// Compiles faster than this never show the spinner, which would otherwise
-// flicker on every keystroke.
+// Compiles faster than this never show the spinner, so it doesn't flicker on
+// every keystroke.
 const COMPILING_SHOWN_AFTER_MS = 300;
-// Keys that scroll a focused viewport.
 const SCROLL_KEYS = new Set([
   "ArrowUp",
   "ArrowDown",
@@ -150,8 +149,8 @@ export function PreviewPane({
   // resize in fit mode can restore it after the scale has already changed.
   const centerPoint = useRef<DocPoint | null>(null);
   const idleTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  // When the user last scrolled by hand. Scroll events alone cannot tell
-  // that from our own scrolling, so this is fed by input events instead.
+  // When the user last scrolled by hand. Scroll events can't tell that from
+  // our own scrolling, so this is fed by input events instead.
   const lastManualScroll = useRef<number | null>(null);
   const handledFollow = useRef(state?.follow?.seq ?? 0);
 
@@ -180,7 +179,7 @@ export function PreviewPane({
     Math.max(MIN_ZOOM, (viewportHeight - padding - bottomSpace) / tallest),
   );
   // One request per changed page, kept as the same objects until the next
-  // animation so a memoized page only rerenders when it has something to do.
+  // animation so a memoized page only rerenders when it has work to do.
   const animation = state?.animation ?? null;
   const requests = useMemo(() => {
     const byPage = new Map<number, PageAnimation>();
@@ -247,8 +246,8 @@ export function PreviewPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scale, pages]);
 
-  // Brings an edit into view when it happened off screen. Declared after the
-  // anchoring effect so the viewport already sits where a zoom put it.
+  // Brings an off-screen edit into view. Declared after the anchoring effect so
+  // the viewport already sits where a zoom put it.
   const follow = state?.follow ?? null;
   useLayoutEffect(() => {
     const el = viewportRef.current;
@@ -632,7 +631,7 @@ function ZoomMenu({
 
 function StatusIndicator({ state: live }: { state: PreviewState | null }) {
   const compiling = live?.status === "compiling";
-  // The latest state that was not a compile in progress, shown instead of
+  // The latest state that wasn't a compile in progress, shown instead of
   // "Compiling" until the compile has run for a while.
   const [settled, setSettled] = useState(live);
   if (live && !compiling && settled !== live) setSettled(live);
@@ -644,7 +643,6 @@ function StatusIndicator({ state: live }: { state: PreviewState | null }) {
     return () => clearTimeout(timer);
   }, [compiling]);
 
-  // The first compile has no earlier result to show.
   const hasEarlier =
     settled !== null &&
     (settled.status === "error" || settled.compileMs !== null);
@@ -769,9 +767,7 @@ function DefsHost({ defs }: { defs: SVGSVGElement }) {
 interface PageAnimation {
   seq: number;
   kind: AnimationKind;
-  /** The changed ranges on this page, top first. */
   changes: PageChange[];
-  /** Pages the update changed, which decides whether it is too big. */
   changedPages: number;
 }
 
@@ -791,9 +787,8 @@ const PageView = memo(function PageView({
   const renderedScale = useRef(scale);
   const handledSeq = useRef(animation?.seq ?? 0);
 
-  // Runs between the old page leaving and the new one arriving, which is
-  // the only moment both exist. Measuring the old one first and the new one
-  // after keeps it to one read pass on each side of the swap.
+  // Runs between the old page leaving and the new one arriving, the only
+  // moment both exist, so measuring takes one read pass on each side.
   const swap = useEffectEvent((slot: HTMLElement, el: SVGSVGElement) => {
     const old = slot.firstChild;
     const request = animation?.seq !== handledSeq.current ? animation : null;
@@ -871,14 +866,12 @@ function ProblemsPanel({
   const listId = useId();
   const errors = diagnostics.filter((d) => d.severity === "error").length;
   const warnings = diagnostics.length - errors;
-  // Until the user toggles it, the panel is open for errors and collapsed
-  // for warnings alone, so warnings do not take space from the preview and
-  // fixed errors take the panel away again.
+  // Until the user toggles it, the panel is open for errors and collapsed for
+  // warnings alone, so warnings don't eat preview space.
   const [chosen, setChosen] = useState<boolean | null>(null);
   const collapsed = chosen ?? errors === 0;
-  // New errors after a clean (warnings only) build deserve attention even if
-  // the user collapsed the panel. The panel unmounts at zero problems, which
-  // resets the choice too.
+  // New errors after a clean (warnings only) build reopen the panel even if the
+  // user collapsed it. The panel unmounts at zero problems, which resets this.
   const [prevErrors, setPrevErrors] = useState(errors);
   if (errors !== prevErrors) {
     setPrevErrors(errors);

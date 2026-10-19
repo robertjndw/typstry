@@ -80,9 +80,7 @@ export function FileTree({
   notice,
 }: {
   className?: string;
-  /** Replaces the plain "Files" label, e.g. with the linked folder. */
   heading?: ReactNode;
-  /** Shown between the heading and the tree. */
   notice?: ReactNode;
 }) {
   const { project, index, mainFile, openFileId, openFile, readOnly, assets } =

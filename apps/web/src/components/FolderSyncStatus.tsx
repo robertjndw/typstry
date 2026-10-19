@@ -55,11 +55,9 @@ const conflictKey = (c: Conflict) => `${c.path}\n${c.reason}`;
 
 /**
  * The file tree's heading: the linked folder's name and state, with the
- * folder actions behind it. Where folders cannot be linked it is just the
- * pane's label.
- *
- * Deliberately not a `role="status"` region: the toolbar's one status is
- * the connection indicator.
+ * folder actions behind it. Without folder support it's just the pane's
+ * label. Not a `role="status"` region, since the toolbar's connection
+ * indicator is the one status.
  */
 export function FolderSyncStatus() {
   const folder = useFolderSync();
@@ -87,8 +85,8 @@ function LinkMenu({ folder }: { folder: FolderSyncApi }) {
         <DropdownMenuLabel className="font-normal">
           Keep the project in sync with a folder on this computer.
         </DropdownMenuLabel>
-        {/* The picker has to open from this click, so nothing may run
-            before it. */}
+        {/* The picker has to open from this click, so nothing may run before
+            it. */}
         <DropdownMenuItem onSelect={() => void folder.link()}>
           <FolderInputIcon />
           Link to local folder…
@@ -192,8 +190,8 @@ function StatusIcon({ status }: { status: FolderSyncState["status"] }) {
 }
 
 /**
- * A strip under the file tree's heading while the sync is stalled, with
- * the one action that unblocks it. Quiet states show nothing.
+ * A strip under the heading while the sync is stalled, with the one action
+ * that unblocks it. Nothing shows in quiet states.
  */
 export function FolderSyncNotice() {
   const folder = useFolderSync();
@@ -205,13 +203,13 @@ export function FolderSyncNotice() {
   switch (status) {
     case "needs-permission":
       message = `Allow access to keep ${folder.linkName} in sync.`;
-      // Straight from the click: the browser only shows its permission
-      // prompt to a call made before the first await.
+      // Straight from the click: the browser only shows its permission prompt
+      // to a call made before the first await.
       action = { label: "Reconnect", run: folder.reconnect };
       break;
     case "missing":
       message = `${folder.linkName} was moved, renamed or deleted.`;
-      // Retrying cannot find a renamed folder; linking it again can.
+      // Retrying can't find a renamed folder, linking it again can.
       action = { label: "Unlink", run: folder.unlink };
       break;
     case "error":
@@ -247,15 +245,14 @@ export function FolderSyncNotice() {
 }
 
 /**
- * Conflicts and warnings of the sync, kept after the cycle that found
- * them: a later quiet cycle replaces the report but not the question of
- * which edit lost.
+ * Conflicts and warnings of the sync, kept after the cycle that found them so
+ * a later quiet cycle doesn't hide which edit lost.
  */
 function Attention({ state }: { state: FolderSyncState | null }) {
   const report = state?.report ?? null;
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
-  // Of every conflict ever shown, so a dismissed one that a later cycle
-  // reports again does not come back.
+  // Every conflict ever shown, so a dismissed one that a later cycle reports
+  // again doesn't come back.
   const known = useRef(new Set<string>());
 
   useEffect(() => {

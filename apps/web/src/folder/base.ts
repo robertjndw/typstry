@@ -1,30 +1,20 @@
-// What the folder sync remembers about the last time doc and folder agreed.
-// Lives in IndexedDB next to the doc (persist/local-doc-store.ts), never in
-// the synced doc.
+// What the sync remembers about the last time doc and folder agreed. Stored in
+// IndexedDB next to the doc (persist/local-doc-store.ts), never in the doc.
 import type { LoroDoc, OpId } from "loro-crdt";
 
 export type BaseFile =
   | {
       kind: "text";
-      /** Hash of the bytes on disk. */
       digest: string;
       size: number;
       mtime: number;
-      /**
-       * Set when the write to disk was skipped mid-cycle: the file still
-       * matches the doc at this version, not at the base frontiers.
-       */
+      /** Set when the disk write was skipped mid-cycle: the file matches the doc at this version, not the base frontiers. */
       at?: OpId[];
-      /**
-       * Set when the doc took in this disk text through a merge but the
-       * merged result was not written back. It is the base of the next
-       * merge, since no doc version holds exactly this text.
-       */
+      /** Set when a merge was taken into the doc but not written back. Base of the next merge, since no doc version holds this text. */
       text?: string;
     }
   | {
       kind: "asset";
-      /** Blob hash the doc references. */
       hash: string;
       digest: string;
       size: number;
@@ -58,9 +48,9 @@ function known(doc: LoroDoc, frontiers: OpId[]): boolean {
 }
 
 /**
- * The base when this doc still contains every version it refers to, else
- * null. A doc that lost history (a reset, a different project under the same
- * id) would otherwise be diffed against a state it never had.
+ * The base if this doc still contains every version it refers to, else null.
+ * A doc that lost history (reset, different project under the same id) would
+ * otherwise be diffed against a state it never had.
  */
 export function trustedBase(
   doc: LoroDoc,

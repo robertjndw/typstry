@@ -10,7 +10,6 @@ import {
 import type { FirstLinkMode, FirstLinkPreview } from "@/folder/engine";
 
 export interface LinkFolderDialogProps {
-  /** Null while closed. */
   preview: FirstLinkPreview | null;
   folderName: string;
   onChoose: (mode: FirstLinkMode) => void;
@@ -19,7 +18,7 @@ export interface LinkFolderDialogProps {
 
 /**
  * Asked before linking a folder whose files differ from the project's, since
- * one side's version of each of them is about to be replaced.
+ * one side's version of each is about to be replaced.
  */
 export function LinkFolderDialog({
   preview,

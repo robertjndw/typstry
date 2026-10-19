@@ -61,10 +61,10 @@ function sortedPaths(index: PathIndex): string[] {
 }
 
 /**
- * Every text file and asset in the current state, sorted by path. Folders
- * are only implied by the paths (see materializeDirs), assets without a hash
- * and files whose path is unsafe to write to a real file system are left
- * out. Works on a forked doc too, which is how the merge base is read.
+ * Every text file and asset in the current state, sorted by path. Folders are
+ * implied by the paths (see materializeDirs); assets without a hash and files
+ * with an unsafe path are left out. Works on a forked doc too, which is how
+ * the merge base is read.
  */
 export function materialize(
   source: Source,
@@ -81,7 +81,6 @@ export function materialize(
   return out;
 }
 
-/** Paths of every folder with a safe path, for creating empty ones on disk. */
 export function materializeDirs(
   source: Source,
   index: PathIndex = buildPathIndex(source),

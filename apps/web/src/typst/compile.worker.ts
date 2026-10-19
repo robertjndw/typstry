@@ -145,9 +145,9 @@ let retryingAfterRenderFailure = false;
 const rendering = new RenderHost(createPreviewRenderer);
 /**
  * A render may be skipped for a newer compile that is already waiting, but
- * only this soon after the last one went out. Otherwise a compile slower
- * than the typing (a title used on every page) always has a successor
- * waiting, and the preview would not move until the typing stops.
+ * only this soon after the last one went out. Otherwise a compile slower than
+ * the typing (a title used on every page) always has a successor waiting and
+ * the preview doesn't move until the typing stops.
  */
 const RENDER_SKIP_WINDOW_MS = 100;
 let lastRenderAt = Number.NEGATIVE_INFINITY;
@@ -406,11 +406,11 @@ async function exportPdf(id: number, mainPath: string): Promise<void> {
 
 // Throttle, not a trailing debounce: a debounce adds its full delay to every
 // keystroke and starves the preview while the user keeps typing. A compile
-// starts as soon as the previous one has compiled and rendered, with the
-// latest text, one running and one queued. The floor only matters when
-// compiling is very fast: the client parses the pages of every result on the
-// main thread, and 40 ms (25 results a second) keeps that work and the
-// message traffic bounded without being perceptible while typing.
+// starts as soon as the previous one has rendered, with the latest text, one
+// running and one queued. The floor only matters when compiling is very fast:
+// the client parses every result's pages on the main thread, and 40 ms (25
+// results a second) keeps that and the message traffic down without being
+// noticeable while typing.
 const scheduler = new CompileScheduler<string>(compile, {
   delayMs: 40,
   mode: "throttle",

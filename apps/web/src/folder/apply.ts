@@ -1,8 +1,6 @@
-// Writes a set of file changes into the doc, a port of apply_changes in
-// crates/typstry-doc/src/apply.rs. This is how edits from the linked folder
-// land in the project. Like restoreVersion (doc/restore.ts) it writes raw
-// tree ops so everything ends up in one commit, but the target is a list of
-// paths instead of another doc, so nodes are matched by path.
+// Port of apply_changes in crates/typstry-doc/src/apply.rs. Like restoreVersion
+// (doc/restore.ts) it writes raw tree ops so everything lands in one commit,
+// but nodes are matched by path instead of against another doc.
 import { LoroText, type LoroTreeNode, type TreeID } from "loro-crdt";
 
 import { FsError, isSafePath, validateName } from "@/doc/fs-ops";
@@ -25,23 +23,16 @@ export type Change =
 type Put = Exclude<Change, { kind: "delete" }>;
 
 export type SkipReason =
-  /** A path segment breaks the name rules. */
   | { kind: "invalid-name"; segment: string; message: string }
-  /** Another file sits at one of this path's parent folders. */
   | { kind: "inside-file"; file: string };
 
 export interface ApplyReport {
-  /** Files that did not exist (or were not visible to materialize). */
   created: string[];
-  /** Files whose content changed, including text/asset switches. */
   modified: string[];
-  /** Files that are gone. Folders are not listed. */
   deleted: string[];
-  /** Files that moved and kept their node, so history follows them. */
+  /** Kept their node, so history follows them. */
   renamed: { from: string; to: string }[];
-  /** Input entries that were ignored. */
   skipped: { path: string; reason: SkipReason }[];
-  /** Whether anything was written (and committed). */
   changed: boolean;
 }
 
@@ -50,13 +41,10 @@ export interface ApplyOptions {
   origin?: string;
 }
 
-/** Above this, a character diff gets slow enough to freeze the tab. */
+/** Above this a character diff can freeze the tab. */
 const LINE_DIFF_CHARS = 50_000;
 
-/**
- * Makes `t` read `want` with the smallest edit Loro finds, so concurrent
- * typing in the same file still merges instead of being overwritten.
- */
+/** Smallest edit Loro finds, so concurrent typing in the file still merges. */
 export function replaceText(t: LoroText, want: string): void {
   if (t.toString() === want) return;
   if (want.length > LINE_DIFF_CHARS || t.length > LINE_DIFF_CHARS) {
@@ -80,7 +68,6 @@ function depth(path: string): number {
   return n;
 }
 
-/** Proper ancestor folders of `path`, outermost first. */
 function ancestors(path: string): string[] {
   const out: string[] = [];
   for (let i = path.indexOf("/"); i >= 0; i = path.indexOf("/", i + 1))
@@ -92,7 +79,7 @@ function byPath(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** Read access to the doc's files by path, through an index built once. */
+/** Files by path, through an index built once. */
 class Current {
   private readonly files = new Map<string, MaterializedFile | null>();
   private under: Map<string, string[]> | null = null;
@@ -105,7 +92,6 @@ class Current {
     this.index = index;
   }
 
-  /** The node at `path`, unless materialize hides everything there. */
   node(path: string): { id: TreeID; kind: FileKind } | null {
     if (!isSafePath(path)) return null;
     const id = this.index.byPath.get(path);
@@ -113,7 +99,6 @@ class Current {
     return id !== undefined && kind !== undefined ? { id, kind } : null;
   }
 
-  /** The file materialize lists at `path`. */
   file(path: string): MaterializedFile | null {
     let file = this.files.get(path);
     if (file === undefined) {
@@ -124,12 +109,10 @@ class Current {
     return file;
   }
 
-  /** Whether materialize lists a file at `path`. */
   shows(path: string): boolean {
     return this.file(path) !== null;
   }
 
-  /** Paths of every node anywhere below `dir`. */
   nodesUnder(dir: string): string[] {
     if (!this.under) {
       this.under = new Map();
@@ -144,12 +127,10 @@ class Current {
     return this.under.get(dir) ?? [];
   }
 
-  /** Paths of the visible files anywhere below `dir`. */
   filesUnder(dir: string): string[] {
     return this.nodesUnder(dir).filter((path) => this.shows(path));
   }
 
-  /** Files below `dir` including the ones materialize hides. */
   nonDirsUnder(dir: string): string[] {
     return this.nodesUnder(dir).filter((path) => {
       const id = this.index.byPath.get(path);
@@ -160,9 +141,8 @@ class Current {
 
 /**
  * Sibling groups whose members came or went. A node that lost a same-name
- * clash shows a derived name; when the winner leaves, or a new node joins
- * the group, the shown names can shift. Pinning the names the caller saw
- * keeps every path stable, including those of files nobody touched.
+ * clash shows a derived name, and those names can shift when the group
+ * changes. Pinning the names the caller saw keeps every path stable.
  */
 class Names {
   private readonly touched = new Map<TreeID | null, Set<string>>();
@@ -243,26 +223,23 @@ function invalidSegment(path: string): SkipReason | null {
 
 /**
  * Writes `changes` on top of the doc's files: a text or asset entry creates
- * or replaces the file at that path, "delete" removes it. Paths that are
- * not mentioned stay as they are.
+ * or replaces the file, "delete" removes it, everything else stays.
  *
  * - Existing paths resolve through the path index, so a clash path like
- *   `main~3@42.typ` updates the node shown under that name. Nodes that stay
- *   keep their TreeID and text changes go through `replaceText`, so they
- *   merge with concurrent edits like typing would.
- * - A deleted file and a new file with identical content are treated as a
- *   rename when that content is unique among both, which keeps the node.
- * - A file that changes between text and asset is deleted and recreated.
- * - A folder is deleted when it had visible files and none are left. Folders
- *   that were empty to begin with are left alone, since a folder on disk
- *   cannot tell them apart from not existing.
+ *   `main~3@42.typ` updates the node shown under that name. Text edits go
+ *   through `replaceText` so they merge with concurrent typing.
+ * - A deleted file and a new one with identical content count as a rename
+ *   when that content is unique on both sides, which keeps the node.
+ * - A file that switches between text and asset is deleted and recreated.
+ * - A folder is deleted when it had visible files and none are left. Empty
+ *   folders are left alone, since a folder on disk can't tell them apart
+ *   from not existing.
  * - Nodes materialize hides (assets without a hash, unsafe names) are left
  *   alone unless a new file needs their path.
  * - `meta.mainFile` is cleared when its node is deleted.
  *
  * Everything lands in one commit, and nothing is written when the doc
- * already matches. Invalid paths are skipped and reported instead of failing
- * the whole batch.
+ * already matches. Invalid paths are skipped and reported.
  */
 export function applyChanges(
   project: ProjectDoc,
@@ -379,10 +356,9 @@ function applyValid(
     }
   }
 
-  // A folder goes with its last visible file. Folders that were empty to
-  // begin with never get here, and neither do ones that still hold a node
-  // materialize hides, such as an upload still in progress, which deleting
-  // the folder would take with it.
+  // Empty folders never get here, and neither do ones that still hold a node
+  // materialize hides (an upload in progress, say), since deleting the folder
+  // would take it too.
   const emptied = new Set<string>();
   for (const path of removed.keys())
     for (const dir of ancestors(path))
@@ -422,8 +398,7 @@ function applyValid(
   const renamedAway = new Set<TreeID>();
   for (const { from, to, id } of renames) {
     names.left(id);
-    // Targets are folders that stay or were just created, never one about
-    // to be deleted, which would take the moved file with it.
+    // Never a folder about to be deleted, it would take the moved file along.
     const parent = parentOf(to);
     const node = fs.getNodeByID(id)!;
     if ((node.parent()?.id ?? undefined) !== parent) fs.move(id, parent);
@@ -461,8 +436,7 @@ function applyValid(
     doomed.push({ depth: depth(path), id: file.id });
     report.deleted.push(path);
   }
-  // Parents first, so their subtrees are already gone when we get there
-  // and do not cost an op each.
+  // Parents first, so their subtrees are already gone and cost no op each.
   doomed.sort((a, b) => a.depth - b.depth);
   for (const { id } of doomed) {
     if (fs.isNodeDeleted(id)) continue;
@@ -494,8 +468,8 @@ function writeContent(node: LoroTreeNode, put: Put): void {
 
 /**
  * Pairs each vanished file with the new file holding the same content, when
- * that content occurs exactly once on both sides. Anything less certain
- * stays a delete plus a create.
+ * that content occurs exactly once on both sides. Anything less certain is a
+ * delete plus a create.
  */
 function pairRenames(
   gone: Map<string, MaterializedFile>,

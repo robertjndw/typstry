@@ -1,6 +1,5 @@
-// Runs a folder link while a project is open: decides when to sync, keeps
-// one cycle going at a time and saves the base afterwards. The cycle itself
-// is reconcile.ts.
+// Runs a folder link while a project is open: decides when to sync, runs one
+// cycle at a time and saves the base afterwards. The cycle is in reconcile.ts.
 import type { ProjectAssets } from "@/assets/project-assets";
 import type { ProjectDoc } from "@/doc/schema";
 import type { DocBackend } from "@/persist/local-doc-store";
@@ -41,15 +40,11 @@ export type FolderSyncStatus =
 
 export interface FolderSyncState {
   status: FolderSyncStatus;
-  /** Set with status "error". */
   error: string | null;
-  /** What the last finished cycle found. */
   report: ReconcileReport | null;
-  /** When the last cycle finished, in ms since the epoch. */
   lastSyncAt: number | null;
 }
 
-/** Takes the exclusive lock `name`, or returns null when someone holds it. */
 export type FolderLocker = (name: string) => Promise<(() => void) | null>;
 
 export function defaultFolderLocker(): FolderLocker {
@@ -85,7 +80,6 @@ export interface FolderSyncOptions {
   synced: () => boolean;
   onState: (state: FolderSyncState) => void;
   lock?: FolderLocker;
-  /** For a link that has no base yet. */
   mode?: FirstLinkMode;
 }
 
@@ -192,9 +186,8 @@ export class FolderSync {
   }
 
   /**
-   * Stops every trigger and the cycle in flight, and gives up the lock.
-   * Resolves once that cycle has settled, saving the base if it got past
-   * its commit, so a caller can remove the stored link afterwards without
+   * Stops every trigger and the cycle in flight and releases the lock. Resolves
+   * once the cycle has settled, so a caller can remove the stored link without
    * the cycle writing it back.
    */
   async stop(): Promise<void> {
@@ -210,16 +203,11 @@ export class FolderSync {
     this.release = null;
   }
 
-  /** Runs a cycle now, or right after the one in flight. */
   syncNow(): Promise<void> {
     return this.run();
   }
 
-  /**
-   * Asks for access again after the browser dropped it. The browser only
-   * shows its prompt for a call made synchronously inside a click, so the
-   * caller must not await anything before this.
-   */
+  /** Call synchronously from a click: the browser only prompts then. */
   async reconnect(): Promise<void> {
     const asked = this.link.handle.requestPermission({ mode: "readwrite" });
     try {
@@ -320,8 +308,7 @@ export class FolderSync {
 
       const { project } = this.opts;
       const base = trustedBase(project.doc, this.link.base);
-      // The first cycle merges the folder with the doc as it is; if the
-      // server's copy has not arrived yet, everything would look new.
+      // If the server's copy hasn't arrived yet, everything would look new.
       if (!base && !this.opts.synced()) {
         this.set({ status: "waiting", error: null });
         return;
@@ -345,8 +332,8 @@ export class FolderSync {
       for (const path of [...result.report.written, ...result.report.deleted]) {
         this.recentlyWritten.set(path, at);
       }
-      // The base first: the doc may already hold changes only it accounts
-      // for, even when the write-back was cut short.
+      // Base first: the doc may hold changes only it accounts for, even if the
+      // write-back was cut short.
       await this.save(result.base, result.report);
       if (result.interrupted) {
         this.set({ report: result.report });
@@ -368,11 +355,11 @@ export class FolderSync {
   private async save(base: FolderBase, report: ReconcileReport): Promise<void> {
     const text = JSON.stringify(base);
     if (text === this.saved) return;
-    // The base says the doc holds what the folder gave it, so the doc must
-    // be stored first: after a crash the base may lag, never lead.
+    // The doc must be stored before the base, so after a crash the base may
+    // lag but never lead.
     if (report.applied?.changed) await this.opts.saveLocally();
-    // In memory first: if storing fails, the next cycle must still start
-    // from this base, not from one the doc and folder have moved past.
+    // In memory first: if storing fails, the next cycle must still start from
+    // this base and not one the doc and folder have moved past.
     this.link = { ...this.link, base };
     await this.opts.backend.saveFolder(this.link);
     this.saved = text;

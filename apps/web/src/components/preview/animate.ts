@@ -1,12 +1,11 @@
-// Update animations for the live preview, in the spirit of Word's typing
-// animation. The planning is pure so it can be tested without layout; the
-// DOM half at the bottom only measures and starts animations.
+// Update animations for the live preview. The planning is pure so it can be
+// tested without layout; the DOM half at the bottom only measures and starts
+// animations.
 //
-// A page update replaces the page's element, so nothing can be done with CSS
-// on the old one. Instead it is FLIP: measure the glyphs before the swap,
-// measure the same ones after, and animate each from where it was to where it
-// is. Because "first" is read from the screen, a glyph that is still in
-// motion from the previous keystroke starts from where it visibly is.
+// A page update replaces the page's element, so CSS can't help. Instead it's
+// FLIP: measure the glyphs before the swap and after, then animate each from
+// where it was to where it is. "First" is read from the screen, so a glyph
+// still moving from the previous keystroke starts from where it visibly is.
 
 import { lcsMatch } from "@/lib/lcs";
 import type { AnimationKind } from "@/typst/compiler-client";
@@ -14,26 +13,22 @@ import { pageBlocks, type PageChange } from "@/typst/svg-pages";
 
 export type { AnimationKind };
 
-/** A glyph moving to its new place. */
 export const MOVE_MS = 110;
-/** A new glyph fading in. */
 export const INSERT_MS = 130;
-/** A line pushed down or up by a wrap. */
 export const SLIDE_MS = 140;
-/** The tint over text somebody else changed. */
 export const HIGHLIGHT_MS = 1200;
 
-// Beyond this the animation turns into noise (a pasted page, a global
-// replace) and the per-glyph measuring starts to cost real time. Counted per
-// page, on whichever of the old and new glyph sets is larger.
+// Past this the animation is just noise (a pasted page, a global replace) and
+// per-glyph measuring gets slow. Counted per page, on the larger of the old
+// and new glyph sets.
 export const MAX_GLYPHS = 300;
 // An edit touching more pages than this is a restructuring, not typing.
 export const MAX_PAGES = 2;
-// Lines that only shift get one measurement each; a long page full of them
+// Lines that only shift get one measurement each, so a long page full of them
 // is left to jump.
 export const MAX_MOVED_BLOCKS = 150;
-// Blocks on each side of the changed ones that join the matching, so the
-// rest of an edited paragraph moves with it.
+// Blocks on each side of the changed ones that join the matching, so the rest
+// of an edited paragraph moves with it.
 const WIDEN_BLOCKS = 1;
 // Glyphs that moved less than this are not worth an animation.
 const MIN_DELTA_PX = 0.5;
@@ -44,19 +39,16 @@ const HIGHLIGHT_MIN_HEIGHT_PX = 18;
 
 export interface Guards {
   reducedMotion: boolean;
-  /** The zoom changed since the page was last rendered. */
   scaleChanged: boolean;
-  /** How many pages the new document changed. */
   changedPages: number;
   /** Whether the page is on screen; irrelevant to highlights. */
   visible: boolean;
 }
 
 /**
- * What a page update should do, or null for a plain swap. Typed edits need
- * a visible page because they measure; highlights are computed from the
- * change ranges alone, and an off-screen one may be exactly where the
- * follow scroll is taking the viewer.
+ * What a page update should do, or null for a plain swap. Typed edits need a
+ * visible page because they measure. Highlights only need the change ranges,
+ * and an off-screen one may be where the follow scroll is heading.
  */
 export function animationMode(
   kind: AnimationKind | null,
@@ -72,7 +64,6 @@ export function withinGlyphBudget(oldCount: number, newCount: number) {
   return Math.max(oldCount, newCount) <= MAX_GLYPHS;
 }
 
-/** The linear part of a screen CTM, which is all a delta needs. */
 export interface Matrix {
   a: number;
   b: number;
@@ -81,10 +72,9 @@ export interface Matrix {
 }
 
 /**
- * A screen pixel delta in an element's own units: the inverse of the CTM's
- * linear part. Glyph text sits under `scale(0.012, -0.012)`, so `d` is
- * negative and a downward move on screen is an upward one locally. Null for
- * a singular matrix, which has no inverse.
+ * A screen pixel delta in an element's own units. Glyph text sits under
+ * `scale(0.012, -0.012)`, so `d` is negative and a downward move on screen is
+ * an upward one locally. Null for a singular matrix.
  */
 export function toLocal(
   m: Matrix | null,
@@ -102,21 +92,17 @@ export function toLocal(
 
 export interface GlyphBox {
   href: string;
-  /** Viewport px. */
   left: number;
   top: number;
 }
 
 export interface GlyphStep {
-  /** Index into the new glyphs. */
   index: number;
   kind: "move" | "insert";
-  /** Where to start, in the glyph's local units, relative to where it is. */
   x: number;
   y: number;
 }
 
-/** Matches old and new glyphs and works out where each new one starts from. */
 export function planGlyphs(
   old: readonly GlyphBox[],
   next: readonly (GlyphBox & { ctm: Matrix | null })[],
@@ -148,12 +134,10 @@ export function planGlyphs(
 }
 
 export interface SlideStep {
-  /** Index into the blocks that were measured. */
   index: number;
   y: number;
 }
 
-/** The vertical slide of blocks that kept their content but changed place. */
 export function planSlides(
   blocks: readonly { oldTop: number; newTop: number; ctm: Matrix | null }[],
 ): SlideStep[] {
@@ -168,24 +152,17 @@ export function planSlides(
 }
 
 export interface BlockPlan {
-  /** Sorted indexes of the blocks that take part in glyph matching. */
   oldWindow: number[];
   newWindow: number[];
-  /**
-   * Blocks outside the windows with the same content on both sides, as
-   * indexes into the old and new block lists. They are the ones that can
-   * only have moved.
-   */
   pairs: { old: number; next: number }[];
 }
 
 /**
- * Pairs two pages' top-level blocks by content hash, the same way
- * svg-pages decides what changed. Blocks without a partner, widened by a
- * block either way, are where glyphs are matched; the paired ones outside
- * that are candidates for sliding. A plain diff matters here: an edit that
- * lengthens a paragraph also pushes a line off the end of the page, and
- * trimming a shared head and tail would make everything in between count.
+ * Pairs two pages' top-level blocks by content hash, like svg-pages does.
+ * Unpaired blocks, widened by one block either way, are where glyphs get
+ * matched; paired ones outside that are candidates for sliding. It has to be
+ * a real diff: an edit that lengthens a paragraph also pushes a line off the
+ * page, and trimming a shared head and tail would count everything between.
  */
 export function planBlocks(
   oldTids: readonly string[],
@@ -227,7 +204,6 @@ export interface HighlightBox {
   height: number;
 }
 
-/** The tinted rect for a changed range, in px within the page's box. */
 export function highlightBox(
   change: Pick<PageChange, "top" | "bottom">,
   pageWidth: number,
@@ -243,8 +219,6 @@ export function highlightBox(
   };
 }
 
-// --- DOM ----------------------------------------------------------------
-
 const EASE = "ease-out";
 
 function blockElements(svg: SVGSVGElement): Element[] {
@@ -258,7 +232,6 @@ function glyphsOf(blocks: Element[], window: readonly number[]) {
   );
 }
 
-/** The block's own child group, which has no transform for CSS to override. */
 function slider(block: Element | undefined): SVGGraphicsElement | null {
   return (
     (Array.from(block?.children ?? []).find(
@@ -285,7 +258,6 @@ export function prefersReducedMotion(): boolean {
   return !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 }
 
-/** Whether the element's box overlaps the scroll viewport's. */
 export function isVisible(el: Element, viewport: Element): boolean {
   const a = el.getBoundingClientRect();
   const b = viewport.getBoundingClientRect();
@@ -294,8 +266,8 @@ export function isVisible(el: Element, viewport: Element): boolean {
 
 /**
  * The animations this module started, per page element. Asking the element
- * itself (`getAnimations({ subtree: true })`) walks every node of the page,
- * which cost 10 ms and more per keystroke on a dense page.
+ * (`getAnimations({ subtree: true })`) walks every node and cost 10 ms or
+ * more per keystroke on a dense page.
  */
 const started = new WeakMap<Element, Animation[]>();
 
@@ -313,14 +285,12 @@ export interface Captured {
   oldGlyphs: GlyphBox[];
   oldWindow: number[];
   newWindow: number[];
-  /** Shared blocks to slide: their index in the new list and old top. */
   slides: { next: number; oldTop: number }[];
 }
 
 /**
- * The read pass before the swap: where the old page's glyphs and moved
- * blocks are on screen right now. Returns null when the page is not worth
- * animating. Nothing here writes to the DOM, so layout is computed once.
+ * The read pass before the swap: where the old page's glyphs and moved blocks
+ * are on screen now. Returns null when the page isn't worth animating.
  */
 export function captureBefore(
   old: SVGSVGElement,
@@ -338,8 +308,8 @@ export function captureBefore(
   const newCount = glyphsOf(nextBlocks, plan.newWindow).length;
   if (!withinGlyphBudget(oldUses.length, newCount)) return null;
 
-  // Blocks still sliding from the previous keystroke have the same y on
-  // both sides but are not where that says; they have to be carried on.
+  // Blocks still sliding from the previous keystroke have the same y on both
+  // sides but aren't where that says, so carry them on.
   const inFlight = animating(old);
   const moved = plan.pairs.filter(
     (p) => inFlight || oldInfo[p.old]?.y !== nextInfo[p.next]?.y,
@@ -364,9 +334,8 @@ export function captureBefore(
 }
 
 /**
- * The read pass after the swap, then the writes. Animations run from the
- * old place to the new one and end on the element's real state, so nothing
- * has to be cleaned up when they finish.
+ * The read pass after the swap, then the writes. Animations end on the
+ * element's real state, so nothing needs cleaning up when they finish.
  */
 export function playAfter(before: Captured, next: SVGSVGElement): void {
   const nextBlocks = blockElements(next);
@@ -415,7 +384,6 @@ export function playAfter(before: Captured, next: SVGSVGElement): void {
   }
 }
 
-/** Stops what is still running on an element that is leaving the page. */
 export function cancelAnimations(el: Element): void {
   for (const animation of started.get(el) ?? []) animation.cancel();
   started.delete(el);
@@ -423,7 +391,7 @@ export function cancelAnimations(el: Element): void {
 
 /**
  * Fades a tint over a changed range. It lives in the page's overlay, outside
- * the SVG, so the next swap does not cut it short.
+ * the SVG, so the next swap doesn't cut it short.
  */
 export function showHighlight(
   overlay: HTMLElement,
@@ -441,8 +409,8 @@ export function showHighlight(
     width: `${box.width}px`,
     height: `${box.height}px`,
     borderRadius: "6px",
-    // The warning token has a light and a dark value; a low mix keeps the
-    // black text on the white page readable in both.
+    // The token has a light and a dark value; a low mix keeps the black page
+    // text readable in both.
     background: "color-mix(in oklab, var(--warning) 32%, transparent)",
   });
   overlay.appendChild(el);

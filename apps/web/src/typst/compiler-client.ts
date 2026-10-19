@@ -116,9 +116,9 @@ const MAX_RESTARTS = 3;
 
 /**
  * New or changed errors wait this long after the last local edit before they
- * show. Half-typed syntax (an unclosed bracket) is an error for a moment, and
- * showing it makes the status, the problems panel and the lint underlines
- * flash on every sentence.
+ * show. Half-typed syntax (an unclosed bracket) is briefly an error, and
+ * showing it makes the status, problems panel and lint underlines flash on
+ * every sentence.
  */
 const ERROR_SETTLE_MS = 1000;
 

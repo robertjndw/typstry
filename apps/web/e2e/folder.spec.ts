@@ -41,7 +41,6 @@ function folderName(page: Page): string {
   return folderOf.get(page)!;
 }
 
-/** Creates or replaces a file in the folder the picker hands out. */
 async function writeFile(page: Page, path: string, content: string) {
   await page.evaluate(
     async ({ folder, path, content }) => {
@@ -62,7 +61,6 @@ async function writeFile(page: Page, path: string, content: string) {
   );
 }
 
-/** The file's text, or null when it does not exist. */
 async function readFile(page: Page, path: string): Promise<string | null> {
   return page.evaluate(
     async ({ folder, path }) => {
@@ -100,7 +98,6 @@ async function linkFolder(page: Page) {
   await expect(chip(page)).toBeVisible();
 }
 
-/** The folder's name heading the file tree, which opens its menu. */
 function chip(page: Page) {
   return page.getByRole("button", { name: `Folder ${folderName(page)}:` });
 }

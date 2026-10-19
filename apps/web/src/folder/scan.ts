@@ -16,18 +16,15 @@ export interface Skipped {
 }
 
 export interface ScanResult {
-  /** The files to sync, with what a stat says. Contents are read later. */
   files: Map<string, FileStat>;
   /**
-   * Everything the walk saw on disk, synced or not, so a path that is
-   * absent from `files` can be told apart from one that was deleted. Files
-   * inside an ignored folder are not listed, but the folder is.
+   * Everything the walk saw on disk, synced or not, so a path missing from
+   * `files` can be told apart from a deleted one. Files inside an ignored
+   * folder aren't listed, but the folder is.
    */
   present: Set<string>;
-  /** Folders to sync, empty ones included. */
   dirs: Set<string>;
   skipped: Skipped[];
-  /** For asking about paths that are not on disk (yet). */
   rules: IgnoreRules;
 }
 

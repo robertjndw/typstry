@@ -7,9 +7,9 @@ import { GitignoreFile, parseGitignore } from "./gitignore";
 export const IGNORE_FILE = ".typstryignore";
 
 /**
- * Files that configure git or the local checkout rather than belong to the
- * document. Not synced unless `.typstryignore` re-includes them, e.g. with
- * `!.gitignore`. Same list as the CLI.
+ * Files that configure git or the checkout rather than belong to the
+ * document. Not synced unless `.typstryignore` re-includes them (`!.gitignore`).
+ * Same list as the CLI.
  */
 export const GIT_FILES = [
   ".gitignore",
@@ -23,17 +23,11 @@ export const GIT_FILE_REASON =
   "git file, not synced by default (opt in with a !pattern in .typstryignore)";
 
 export type PathVerdict =
-  /** Goes into the project. */
-  | { kind: "sync" }
-  /** Silently left alone: never read, written or deleted. */
-  | { kind: "ignored" }
-  /** Left alone too, but worth telling the user about. */
-  | { kind: "skipped"; reason: string };
+  { kind: "sync" } | { kind: "ignored" } | { kind: "skipped"; reason: string };
 
 const SYNC: PathVerdict = { kind: "sync" };
 const IGNORED: PathVerdict = { kind: "ignored" };
 
-/** Case-insensitive, since `.GITIGNORE` is `.gitignore` on macOS. */
 export function isGitFile(name: string): boolean {
   const lower = name.toLowerCase();
   return GIT_FILES.some((file) => file === lower);

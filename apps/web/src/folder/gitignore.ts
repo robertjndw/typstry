@@ -1,4 +1,3 @@
-/** What one ignore file says about a path. */
 export type IgnoreVerdict = "ignore" | "include";
 
 interface Rule {
@@ -17,7 +16,6 @@ export class GitignoreFile {
   private readonly rules: Rule[] = [];
   private readonly prefix: string;
 
-  /** `base` is the folder holding the file, "" for the root. */
   constructor(text: string, base = "") {
     this.prefix = base === "" ? "" : `${base}/`;
     for (const line of text.split(/\r?\n/)) {
@@ -31,10 +29,9 @@ export class GitignoreFile {
   }
 
   /**
-   * The verdict of the last rule that matches `path` (relative to the
-   * folder root), or null when none does or the path is outside the base.
-   * Only looks at the path itself; a caller that cares about ignored parent
-   * folders checks those too.
+   * Verdict of the last rule matching `path` (relative to the folder root),
+   * or null if none does or the path is outside the base. Doesn't look at
+   * parent folders; the caller checks those.
    */
   match(path: string, isDir: boolean): IgnoreVerdict | null {
     if (!path.startsWith(this.prefix)) return null;
@@ -83,7 +80,6 @@ function parseLine(raw: string): Rule | null {
 
 const escapeRegex = (c: string) => c.replace(/[\\^$.*+?()[\]{}|/-]/g, "\\$&");
 
-/** The regex source for a glob, or null when the pattern is invalid. */
 function translate(glob: string): string | null {
   if (glob === "**") return ".+";
   let out = "";
@@ -128,7 +124,6 @@ function translate(glob: string): string | null {
   return out;
 }
 
-/** A `[...]` class starting at `start`, or null when it is never closed. */
 function parseClass(
   glob: string,
   start: number,

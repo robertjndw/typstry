@@ -71,7 +71,7 @@ function diagnostic(
 }
 
 let nextId = 1;
-/** Emits a compile result and and lets the client build the document. */
+/** Emits a compile result and lets the client build the document. */
 async function compile(worker: FakeWorker, diagnostics: WorkerDiagnostic[]) {
   const id = nextId++;
   await act(async () => {

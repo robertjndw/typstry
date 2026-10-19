@@ -1,11 +1,9 @@
 /**
- * Paths that a case-insensitive file system stores as one file, because
- * they, or one of the folders on their way, differ only in case. With
- * `Fig/a.png` and `fig/b.png` both end up in one folder, so only one
- * spelling of each name is kept: the first one `prefer` accepts, else the
- * first in sorted order. Returns `[kept, dropped]` pairs, where `kept` is
- * the kept file, or the kept folder with a trailing `/` when the clash is
- * in a folder name. Same as the CLI's `case_clashes`.
+ * Paths that a case-insensitive file system would store as one file because
+ * they, or a folder on the way, differ only in case. Keeps one spelling per
+ * name (the first `prefer` accepts, else the first sorted) and returns
+ * `[kept, dropped]` pairs; `kept` has a trailing `/` when the clash is in a
+ * folder name. Port of the CLI's `case_clashes`.
  */
 export function caseClashes(
   paths: Iterable<string>,
@@ -14,8 +12,7 @@ export function caseClashes(
   const alive = new Set([...paths].sort());
   const depth = Math.max(0, ...[...alive].map((p) => p.split("/").length));
   const clashes: [string, string][] = [];
-  // Shallowest first, so a path under a dropped folder spelling is
-  // reported once, for the folder.
+  // Shallowest first, so a path under a dropped folder is reported once.
   for (let level = 1; level <= depth; level++) {
     const groups = new Map<string, Set<string>>();
     for (const path of alive) {
@@ -44,7 +41,6 @@ export function caseClashes(
   return clashes;
 }
 
-/** The first `level` segments of `path`, or null when it has fewer. */
 function prefix(path: string, level: number): string | null {
   const segments = path.split("/");
   return segments.length < level ? null : segments.slice(0, level).join("/");

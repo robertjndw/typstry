@@ -233,15 +233,14 @@ function createDefs(rootTag: string, source: string): SVGSVGElement {
 
 /**
  * Brings the live defs in line with `fresh` by adding and removing single
- * glyphs and clip paths, instead of swapping the whole element. Swapping it
- * makes the browser re-resolve every `<use>` on every page, which costs
- * 100 ms and more in a long document, and typing adds a glyph often (a new
- * character, or a known one at a new size). Glyph ids are content hashes,
- * so an id that stays also keeps its shape; the markup is compared anyway,
- * it is cheap next to the layout it saves.
+ * glyphs and clip paths instead of swapping the whole element. Swapping makes
+ * the browser re-resolve every `<use>` on every page, which costs 100 ms and
+ * more in a long document, and typing often adds a glyph. Glyph ids are
+ * content hashes, but the markup is compared anyway since that's cheap next
+ * to the layout it saves.
  *
  * Returns false, leaving `live` alone, when the two differ in a way this
- * does not handle, such as a different set of sections.
+ * doesn't handle, such as a different set of sections.
  */
 function patchDefs(live: SVGSVGElement, fresh: SVGSVGElement): boolean {
   const liveSections = Array.from(live.children);
@@ -357,12 +356,11 @@ export function changedRanges(
 /**
  * Builds the preview document from a worker render, the DOM half of what
  * svg-split.ts starts. Pages whose tid is in `previous` keep their element
- * unparsed, and the defs are only reparsed when their markup changed, so
- * parsing is limited to the pages that changed. Reused elements also let
- * React and the browser leave those pages alone.
+ * unparsed, and the defs are only reparsed when their markup changed. Reused
+ * elements also let React and the browser leave those pages alone.
  *
- * Returns null when the render leaves out a page or the defs that
- * `previous` does not have, which the caller answers with a rerender.
+ * Returns null when the render leaves out a page or the defs that `previous`
+ * doesn't have; the caller answers with a rerender.
  */
 export function buildPreviewDocument(
   render: RenderPayload,

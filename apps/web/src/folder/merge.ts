@@ -11,10 +11,9 @@ import { replaceText } from "./apply";
 import { fileOf } from "./materialize";
 
 /**
- * The text of `path` after merging `diskText` into the live doc, or null
- * when the base has no such file or it is another node than `liveNodeId`
- * (replaced or recreated since). The caller then treats the file as a
- * conflict. Nothing is written to `doc`; the caller applies the result.
+ * The text of `path` after merging `diskText` into the live doc, or null if
+ * the base has no such file or it is another node than `liveNodeId`. The
+ * caller then treats it as a conflict. Writes nothing to `doc`.
  */
 export function mergeText(
   doc: LoroDoc,

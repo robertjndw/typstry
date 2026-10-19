@@ -58,12 +58,11 @@ export type RerenderOutcome =
   | { kind: "compile" };
 
 /**
- * The worker's side of the preview: the renderer session that vector
- * updates are merged into, and the diff against what the client has.
- * Keeping the session here means a 12 MB SVG string (embedded images are
- * base64-encoded on every render) never leaves the worker. The session can
- * outlive a compiler restart, because a new compiler session starts with a
- * full reset update.
+ * The worker's side of the preview: the renderer session that vector updates
+ * are merged into, and the diff against what the client has. The session
+ * lives here so a 12 MB SVG string (embedded images are base64-encoded on
+ * every render) never leaves the worker. It can outlive a compiler restart,
+ * since a new compiler session starts with a full reset update.
  */
 export class RenderHost {
   private renderer: Promise<PreviewRenderer> | null = null;
