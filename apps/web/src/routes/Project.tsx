@@ -7,11 +7,11 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link, useLocation, useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 
 import { AccountMenu } from "@/components/AccountMenu";
 import { ConnectionStatus } from "@/components/ConnectionStatus";
-import { Notice } from "@/components/Notice";
+import { Notice, StartPageButton } from "@/components/Notice";
 import { ProjectWorkspace } from "@/components/ProjectWorkspace";
 import { RemovedNotice } from "@/components/RemovedNotice";
 import { ShareDialog } from "@/components/ShareDialog";
@@ -225,12 +225,4 @@ function ProjectSessionView({
       );
     }
   }
-}
-
-function StartPageButton({ label = "Go to the start page" }) {
-  return (
-    <Button asChild variant="outline">
-      <Link to="/">{label}</Link>
-    </Button>
-  );
 }

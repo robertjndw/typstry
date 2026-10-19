@@ -25,7 +25,9 @@ import {
   isForeignKind,
   isSchemaTooNew,
   migrate,
+  NOT_A_PROJECT,
   ProjectDoc,
+  TOO_NEW,
 } from "@/doc/schema";
 import type { MlsSession } from "@/mls/session";
 import {
@@ -37,15 +39,12 @@ import { loadShareLinks, loadSpaceKey } from "@/space/space-links";
 import {
   LINK_REPLACED,
   SpaceSession,
-  TOO_NEW,
   type FollowedLinks,
 } from "@/space/space-session";
 import type { ShareInfo } from "@/sync/api";
 import type { SyncNowResult, SyncStatus } from "@/sync/connection";
 
 import { useDisposeOnUnmount } from "./dispose";
-
-export const NOT_A_PROJECT = "This link does not open a project.";
 
 /** Matches the server's presence timeout. */
 const EPHEMERAL_TIMEOUT_MS = 30_000;

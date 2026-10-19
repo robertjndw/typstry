@@ -215,6 +215,13 @@ export function initProject(
   return project;
 }
 
+// What the editor shows when isForeignKind or isSchemaTooNew turns a doc
+// away. They say "project" because a project is the only kind of space
+// people see so far.
+export const NOT_A_PROJECT = "This link does not open a project.";
+export const TOO_NEW =
+  "This project was saved by a newer version of typstry. Reload the page to update.";
+
 /**
  * A doc this new must not be written to, since editing a layout we don't
  * know would corrupt it for everyone. Mirrors ensure_supported in Rust.
