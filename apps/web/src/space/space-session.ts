@@ -7,6 +7,7 @@ import {
 } from "@/crypto/space-crypto";
 import { isEditSecret, secretKind } from "@/crypto/secret";
 import { loadWasm } from "@/crypto/wasm";
+import { TOO_NEW } from "@/doc/schema";
 import { localIdentity, mergeOwnGraph } from "@/mls/identity";
 import {
   IDLE,
@@ -53,8 +54,6 @@ const RETRY_MAX_MS = 60_000;
 // see so far.
 const WRONG_KEY =
   "This link's key does not match the project. Check that the link was copied completely, including the part after #.";
-export const TOO_NEW =
-  "This project was saved by a newer version of typstry. Reload the page to update.";
 const UNREACHABLE = "The server could not be reached.";
 export const LINK_REPLACED =
   "This link was replaced, and this browser has no way to find the new one. Ask someone in the project for the current link.";

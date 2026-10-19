@@ -128,7 +128,13 @@ export interface DocBackend {
   loadFolder(spaceId: string): Promise<FolderLink | null>;
   saveFolder(link: FolderLink): Promise<void>;
   removeFolder(spaceId: string): Promise<void>;
-  /** Drops everything stored for the project. */
+  /**
+   * Binary files of a project that has no server to keep them, by content
+   * hash. Plaintext, like the doc.
+   */
+  saveBlob(spaceId: string, hash: string, data: Uint8Array): Promise<void>;
+  loadBlob(spaceId: string, hash: string): Promise<Uint8Array | null>;
+  /** Drops everything stored for the project, blobs included. */
   remove(spaceId: string): Promise<void>;
 }
 
@@ -193,6 +199,7 @@ const UPDATES = "updates";
 const MLS = "mls";
 const PERSON = "person";
 const FOLDERS = "folders";
+const BLOBS = "blobs";
 const DEVICE_ROW = "device";
 const GRAPH_ROW = "graph";
 const LABELS_ROW = "labels";
@@ -232,6 +239,18 @@ function keyOf(row: PersonRow | undefined): Uint8Array | null {
 
 type MlsRow = MlsRecord & { spaceId: string };
 
+interface BlobRow {
+  spaceId: string;
+  hash: string;
+  data: Uint8Array;
+}
+
+/** Every `[spaceId, hash]` key of one project. */
+function blobRange(spaceId: string): IDBKeyRange {
+  // Arrays sort after every string, so [spaceId, []] bounds all hashes.
+  return IDBKeyRange.bound([spaceId, ""], [spaceId, []]);
+}
+
 async function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
   const req = factory.open(DB_NAME, DB_VERSION);
   // Each schema change appends an `oldVersion < n` step and bumps
@@ -249,6 +268,8 @@ async function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
       // Added before the first release, so it joins this step instead of
       // getting a version of its own.
       db.createObjectStore(FOLDERS, { keyPath: "spaceId" });
+      // Keyed so that a project's blobs form one key range to delete.
+      db.createObjectStore(BLOBS, { keyPath: ["spaceId", "hash"] });
     }
   };
   // Fires while another tab still holds an older connection. Those tabs
@@ -539,16 +560,39 @@ export class IndexedDbBackend implements DocBackend {
     });
   }
 
+  async saveBlob(
+    spaceId: string,
+    hash: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    return this.use(true, async (db) => {
+      const tx = db.transaction(BLOBS, "readwrite");
+      tx.objectStore(BLOBS).put({ spaceId, hash, data } satisfies BlobRow);
+      await done(tx);
+    });
+  }
+
+  async loadBlob(spaceId: string, hash: string): Promise<Uint8Array | null> {
+    return this.use(false, async (db) => {
+      const tx = db.transaction(BLOBS, "readonly");
+      const row = await request<BlobRow | undefined>(
+        tx.objectStore(BLOBS).get([spaceId, hash]),
+      );
+      return row?.data ?? null;
+    });
+  }
+
   async remove(spaceId: string): Promise<void> {
     return this.use(true, async (db) => {
       const tx = db.transaction(
-        [SNAPSHOTS, UPDATES, MLS, FOLDERS],
+        [SNAPSHOTS, UPDATES, MLS, FOLDERS, BLOBS],
         "readwrite",
       );
       const committed = done(tx);
       tx.objectStore(SNAPSHOTS).delete(spaceId);
       tx.objectStore(MLS).delete(spaceId);
       tx.objectStore(FOLDERS).delete(spaceId);
+      tx.objectStore(BLOBS).delete(blobRange(spaceId));
       const updates = tx.objectStore(UPDATES);
       const keys = await request(updates.index(BY_SPACE).getAllKeys(spaceId));
       for (const key of keys) updates.delete(key);
@@ -562,6 +606,7 @@ export class MemoryBackend implements DocBackend {
   private readonly docs = new Map<string, StoredDoc>();
   private readonly groups = new Map<string, MlsRecord>();
   private readonly folders = new Map<string, FolderLink>();
+  private readonly blobs = new Map<string, Map<string, Uint8Array>>();
   private device: Uint8Array | null = null;
   private graph: Uint8Array | null = null;
   private labels: Record<string, string> = {};
@@ -641,10 +686,25 @@ export class MemoryBackend implements DocBackend {
     this.folders.delete(spaceId);
   }
 
+  async saveBlob(
+    spaceId: string,
+    hash: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    let space = this.blobs.get(spaceId);
+    if (!space) this.blobs.set(spaceId, (space = new Map()));
+    space.set(hash, data);
+  }
+
+  async loadBlob(spaceId: string, hash: string): Promise<Uint8Array | null> {
+    return this.blobs.get(spaceId)?.get(hash) ?? null;
+  }
+
   async remove(spaceId: string): Promise<void> {
     this.docs.delete(spaceId);
     this.groups.delete(spaceId);
     this.folders.delete(spaceId);
+    this.blobs.delete(spaceId);
   }
 }
 

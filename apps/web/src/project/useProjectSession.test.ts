@@ -16,7 +16,7 @@ import { LoroDoc } from "loro-crdt";
 import { Directory } from "@/directory/directory";
 import { directory } from "@/directory/store";
 import { editSecret, seedProject, token } from "@/directory/test-utils";
-import { initProject } from "@/doc/schema";
+import { initProject, NOT_A_PROJECT } from "@/doc/schema";
 import { LocalDocStore, MemoryBackend } from "@/persist/local-doc-store";
 
 import {
@@ -25,7 +25,7 @@ import {
   rememberShare,
   saveKeyring,
 } from "@/space/space-links";
-import { NOT_A_PROJECT, useProjectSession } from "./useProjectSession";
+import { useProjectSession } from "./useProjectSession";
 
 vi.mock("@/sync/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/sync/api")>()),

@@ -3,6 +3,7 @@ import {
   CloudOffIcon,
   FileTextIcon,
   FolderOpenIcon,
+  HardDriveIcon,
   ImportIcon,
   KeyRoundIcon,
   Loader2Icon,
@@ -40,7 +41,12 @@ import type { FolderBase } from "@/folder/base";
 import { defaultBackend } from "@/persist/local-doc-store";
 import { provisionalIdentity, useStoredIdentity } from "@/presence/identity";
 import { formatAbsolute, formatRelative } from "@/project/history-items";
-import { createLocalProject, deleteLocalProject } from "@/project/create";
+import type { ProjectSeed } from "@/project/create";
+import {
+  createStandaloneProject,
+  deleteStandaloneProject,
+} from "@/project/create-standalone";
+import { LOCAL_ONLY } from "@/mode";
 import type { Entry } from "@/directory/directory";
 import { useDirectory } from "@/directory/store";
 import { projectUrl } from "@/project/recent";
@@ -63,7 +69,20 @@ const UNAVAILABLE: Partial<Record<Entry["state"], string>> = {
   gone: "Link no longer works",
 };
 
-const FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
+// Behind the constant so the static build drops the server-backed module.
+async function createProject(title: string, seed?: ProjectSeed) {
+  if (LOCAL_ONLY) return createStandaloneProject(title, { seed });
+  const { createLocalProject } = await import("@/project/create");
+  return createLocalProject(title, { seed });
+}
+
+async function deleteProjectFiles(projectId: string) {
+  if (LOCAL_ONLY) return deleteStandaloneProject(projectId);
+  const { deleteLocalProject } = await import("@/project/create");
+  return deleteLocalProject(projectId);
+}
+
+const SERVER_FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
   {
     Icon: UsersIcon,
     title: "Real-time collaboration",
@@ -80,6 +99,47 @@ const FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
     text: "Keep writing offline. Changes sync later.",
   },
 ];
+
+const LOCAL_FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
+  {
+    Icon: HardDriveIcon,
+    title: "Stored in this browser",
+    text: "Your projects never leave this device.",
+  },
+  {
+    Icon: FolderOpenIcon,
+    title: "Linked folders",
+    text: "Keep a project in sync with a folder on your computer.",
+  },
+  {
+    Icon: CloudOffIcon,
+    title: "Works offline",
+    text: "Install it as an app and keep writing without a connection.",
+  },
+];
+
+// Everything the start page words differently when there is no server.
+const COPY = LOCAL_ONLY
+  ? {
+      tagline:
+        "Write Typst documents right in the browser. No accounts, no server.",
+      features: LOCAL_FEATURES,
+      deleteDescription:
+        "This deletes the project from this browser. Nothing is stored anywhere else, so export a zip first if you might want it back.",
+      emptyHint: "Projects you create in this browser will show up here.",
+      unreachable: (what: string) => `Could not ${what}.`,
+    }
+  : {
+      tagline:
+        "Write Typst documents together, right in the browser. No accounts, just a link.",
+      features: SERVER_FEATURES,
+      deleteDescription:
+        "It's only removed from this browser. Anyone with the link can still open it, so keep the link if you might want it back.",
+      emptyHint:
+        "Projects you create or open in this browser will show up here. To collaborate, share the link from inside a project.",
+      unreachable: (what: string) =>
+        `Could not ${what}. Is the server running?`,
+    };
 
 export function Home() {
   const navigate = useNavigate();
@@ -108,7 +168,7 @@ export function Home() {
 
   async function deleteProject(project: Entry) {
     try {
-      await deleteLocalProject(project.projectId);
+      await deleteProjectFiles(project.projectId);
       // The row disappears as soon as the directory doc changes, before
       // anything is saved, and a reload in that gap brings the project back.
       // The toast waits for the save, so it is the moment the delete sticks.
@@ -125,14 +185,14 @@ export function Home() {
     setCreating(true);
     setError(null);
     try {
-      const created = await createLocalProject(title.trim() || "Untitled");
+      const created = await createProject(title.trim() || "Untitled");
       navigate(projectUrl(created.editToken, created.key, ""));
     } catch (err) {
       console.error(err);
       setError(
         err instanceof RateLimitedError
           ? err.message
-          : "Could not create a project. Is the server running?",
+          : COPY.unreachable("create a project"),
       );
       setCreating(false);
     }
@@ -148,13 +208,12 @@ export function Home() {
       assertImportable(source);
       setImportStatus("Creating project…");
       const projectTitle = titleFor(title, source.name);
-      const created = await createLocalProject(projectTitle, {
-        seed: (project, assets) =>
-          writeImport(project, source, assets, (uploaded, total) => {
-            if (total > 0)
-              setImportStatus(`Uploading files (${uploaded} of ${total})…`);
-          }),
-      });
+      const created = await createProject(projectTitle, (project, assets) =>
+        writeImport(project, source, assets, (uploaded, total) => {
+          if (total > 0)
+            setImportStatus(`Uploading files (${uploaded} of ${total})…`);
+        }),
+      );
       warnSkipped(source.skipped);
       navigate(projectUrl(created.editToken, created.key, ""));
     } catch (err) {
@@ -162,7 +221,7 @@ export function Home() {
       setError(
         err instanceof ImportError || err instanceof RateLimitedError
           ? err.message
-          : "Could not import the project. Is the server running?",
+          : COPY.unreachable("import the project"),
       );
       setImportStatus(null);
     }
@@ -189,8 +248,9 @@ export function Home() {
       setImportStatus("Creating project…");
       const projectTitle = titleFor(title, handle.name);
       let base: FolderBase | null = null;
-      const created = await createLocalProject(projectTitle, {
-        seed: async (project, assets) => {
+      const created = await createProject(
+        projectTitle,
+        async (project, assets) => {
           base = await seedFromFolder(project, assets, fs, {
             onProgress: (uploaded, total) => {
               if (total > 0)
@@ -198,7 +258,7 @@ export function Home() {
             },
           });
         },
-      });
+      );
       try {
         await (
           await defaultBackend()
@@ -222,7 +282,7 @@ export function Home() {
       setError(
         err instanceof ImportError || err instanceof RateLimitedError
           ? err.message
-          : "Could not open the folder. Is the server running?",
+          : COPY.unreachable("open the folder"),
       );
       setImportStatus(null);
     }
@@ -301,7 +361,7 @@ export function Home() {
           <ConfirmDeleteDialog
             open={pendingDelete !== null}
             title={<>Delete &ldquo;{titleOf(pendingDelete)}&rdquo;?</>}
-            description="It's only removed from this browser. Anyone with the link can still open it, so keep the link if you might want it back."
+            description={COPY.deleteDescription}
             onCancel={() => setPendingDelete(null)}
             onConfirm={() => {
               const project = pendingDelete;
@@ -318,13 +378,12 @@ export function Home() {
             typstry
           </h1>
           <p className="text-lg text-pretty text-muted-foreground">
-            Write Typst documents together, right in the browser. No accounts,
-            just a link.
+            {COPY.tagline}
           </p>
         </div>
 
         <ul className="grid gap-4 sm:grid-cols-3 sm:gap-6">
-          {FEATURES.map(({ Icon, title, text }) => (
+          {COPY.features.map(({ Icon, title, text }) => (
             <li key={title} className="flex gap-3 sm:flex-col sm:gap-2">
               <Icon
                 aria-hidden
@@ -415,6 +474,12 @@ export function Home() {
               {error}
             </p>
           )}
+          {LOCAL_ONLY && (
+            <p className="text-sm text-muted-foreground">
+              Projects live only in this browser. Clearing site data deletes
+              them, so export a zip or link a folder to keep a copy.
+            </p>
+          )}
         </div>
       </section>
 
@@ -486,10 +551,7 @@ export function Home() {
       ) : (
         <p className="flex items-start gap-2 rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
           <ArrowRightIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
-          <span>
-            Projects you create or open in this browser will show up here. To
-            collaborate, share the link from inside a project.
-          </span>
+          <span>{COPY.emptyHint}</span>
         </p>
       )}
     </PageShell>

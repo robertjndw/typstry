@@ -1,9 +1,8 @@
 import type { RouteObject } from "react-router";
 
 import { RouteError } from "@/components/RouteError";
+import { LOCAL_ONLY } from "@/mode";
 import { Home } from "@/routes/Home";
-import { Pair } from "@/routes/Pair";
-import { Recover } from "@/routes/Recover";
 
 export const routes: RouteObject[] = [
   { path: "/", errorElement: <RouteError />, element: <Home /> },
@@ -14,12 +13,33 @@ export const routes: RouteObject[] = [
     // the start page needs none of them.
     HydrateFallback: () => null,
     lazy: async () => ({
-      Component: (await import("@/routes/Project")).Project,
+      Component: LOCAL_ONLY
+        ? (await import("@/routes/StandaloneProject")).StandaloneProject
+        : (await import("@/routes/Project")).Project,
     }),
   },
-  { path: "/pair", errorElement: <RouteError />, element: <Pair /> },
-  { path: "/recover", errorElement: <RouteError />, element: <Recover /> },
 ];
+
+// Pairing and recovery need a server, and the static build has none. Lazy
+// so the static bundle leaves them out.
+if (!LOCAL_ONLY) {
+  routes.push(
+    {
+      path: "/pair",
+      errorElement: <RouteError />,
+      HydrateFallback: () => null,
+      lazy: async () => ({ Component: (await import("@/routes/Pair")).Pair }),
+    },
+    {
+      path: "/recover",
+      errorElement: <RouteError />,
+      HydrateFallback: () => null,
+      lazy: async () => ({
+        Component: (await import("@/routes/Recover")).Recover,
+      }),
+    },
+  );
+}
 
 if (import.meta.env.DEV) {
   // Lazy so the dev-only module drops out of production builds entirely.

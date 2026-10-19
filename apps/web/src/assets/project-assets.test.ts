@@ -5,7 +5,14 @@ import { newProject } from "@/crypto/test-utils";
 import { AssetCache, contentHash } from "@/typst/asset-cache";
 
 import { mimeOf } from "./file-types";
-import { MAX_ASSET_BYTES, projectAssets } from "./project-assets";
+import { MemoryBackend } from "@/persist/local-doc-store";
+import { MAX_UPLOAD_BYTES } from "@/sync/api";
+
+import {
+  localProjectAssets,
+  MAX_ASSET_BYTES,
+  projectAssets,
+} from "./project-assets";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -78,5 +85,44 @@ describe("mimeOf", () => {
     expect(mimeOf({ name: "data.bin", type: "" })).toBe(
       "application/octet-stream",
     );
+  });
+});
+
+describe("localProjectAssets", () => {
+  it("round-trips a file through the blob store by content hash", async () => {
+    const backend = new MemoryBackend();
+    const assets = localProjectAssets("p1", backend);
+    const file = new File(["figure"], "fig.png", { type: "image/png" });
+
+    const info = await assets.store(file);
+
+    expect(info).toEqual({
+      hash: await contentHash(new TextEncoder().encode("figure")),
+      size: 6,
+      mime: "image/png",
+    });
+    expect(new TextDecoder().decode(await assets.load(info.hash))).toBe(
+      "figure",
+    );
+  });
+
+  it("keeps projects apart and drops blobs with their project", async () => {
+    const backend = new MemoryBackend();
+    const one = localProjectAssets("p1", backend);
+    const two = localProjectAssets("p2", backend);
+    const { hash } = await one.store(new File(["same"], "a.txt"));
+    await two.store(new File(["same"], "a.txt"));
+
+    await backend.remove("p1");
+
+    await expect(one.load(hash)).rejects.toThrow(/missing/);
+    expect(await two.load(hash)).toEqual(new TextEncoder().encode("same"));
+  });
+
+  it("refuses a file over the upload limit", async () => {
+    const assets = localProjectAssets("p1", new MemoryBackend());
+    const big = new File([], "big.bin");
+    Object.defineProperty(big, "size", { value: MAX_UPLOAD_BYTES + 1 });
+    await expect(assets.store(big)).rejects.toMatchObject({ status: 413 });
   });
 });

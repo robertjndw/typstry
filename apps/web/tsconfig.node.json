@@ -18,5 +18,10 @@
     "noUncheckedSideEffectImports": true,
     "erasableSyntaxOnly": true
   },
-  "include": ["vite.config.ts", "playwright.config.ts"]
+  "include": [
+    "vite.config.ts",
+    "playwright.config.ts",
+    "playwright.static.config.ts",
+    "pwa-assets.config.ts"
+  ]
 }

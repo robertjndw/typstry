@@ -5,5 +5,5 @@
     // page.evaluate callbacks run in the browser.
     "lib": ["ES2023", "DOM", "DOM.Iterable"]
   },
-  "include": ["e2e"]
+  "include": ["e2e", "e2e-static"]
 }

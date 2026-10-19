@@ -4,7 +4,7 @@
 // secret really parses (the view key's public half is a valid point, say)
 // is the wasm's call when the project opens; space-crypto.test.ts keeps
 // the two in agreement.
-import { fromBase64Url } from "./bytes";
+import { fromBase64Url, toBase64Url } from "./bytes";
 
 /** First byte of an edit secret, followed by 32 key bytes. */
 const SECRET_EDIT_V1 = 1;
@@ -44,4 +44,12 @@ export function isProjectSecret(raw: string): boolean {
 
 export function isEditSecret(raw: string): boolean {
   return secretKind(raw) === "edit";
+}
+
+/** A fresh edit secret, for a project that never had a server mint one. */
+export function newEditSecret(): string {
+  const bytes = new Uint8Array(1 + SECRET_BYTES);
+  bytes[0] = SECRET_EDIT_V1;
+  crypto.getRandomValues(bytes.subarray(1));
+  return toBase64Url(bytes);
 }

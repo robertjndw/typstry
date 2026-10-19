@@ -39,4 +39,10 @@ describe("routes", () => {
     renderAt("/p/abc123");
     expect(await screen.findByText("Project not found")).toBeInTheDocument();
   });
+
+  it("registers pairing and recovery with a server", () => {
+    const paths = routes.map((r) => r.path);
+    expect(paths).toContain("/pair");
+    expect(paths).toContain("/recover");
+  });
 });

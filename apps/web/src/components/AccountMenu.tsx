@@ -1,24 +1,15 @@
-import {
-  KeyRoundIcon,
-  LaptopIcon,
-  LifeBuoyIcon,
-  PaletteIcon,
-  SmartphoneIcon,
-} from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { PaletteIcon } from "lucide-react";
+import { lazy, Suspense, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
-import { AddDeviceDialog } from "@/components/AddDeviceDialog";
-import { DevicesDialog } from "@/components/DevicesDialog";
 import { NameDialog } from "@/components/NameDialog";
 import { PersonAvatar } from "@/components/PresenceBar";
-import { RecoveryDialog } from "@/components/RecoveryDialog";
+import type { ServerDialog } from "@/components/AccountMenuServer";
 import { ThemeMenuItems } from "@/components/ThemeToggle";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -27,9 +18,22 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { publishProfile } from "@/mls/profile";
+import { LOCAL_ONLY } from "@/mode";
 import { defaultBackend } from "@/persist/local-doc-store";
 import { setIdentity, type Identity } from "@/presence/identity";
+
+// Pairing, devices and recovery pull in the sync and MLS stack, which the
+// static build has no use for; lazy behind the constant keeps it out.
+const serverPart = <K extends "ServerMenuItems" | "ServerDialogs">(name: K) =>
+  LOCAL_ONLY
+    ? null
+    : lazy(() =>
+        import("@/components/AccountMenuServer").then((m) => ({
+          default: m[name],
+        })),
+      );
+const ServerItems = serverPart("ServerMenuItems");
+const ServerDialogs = serverPart("ServerDialogs");
 
 export interface AccountMenuProps {
   identity: Identity;
@@ -46,13 +50,13 @@ export function AccountMenu({
   children,
 }: AccountMenuProps) {
   const [editing, setEditing] = useState(false);
-  const [addingDevice, setAddingDevice] = useState(false);
-  const [listingDevices, setListingDevices] = useState(false);
-  const [recovering, setRecovering] = useState(false);
+  const [serverDialog, setServerDialog] = useState<ServerDialog | null>(null);
 
   function save(next: Identity) {
     setIdentity(next);
     setEditing(false);
+    // No other devices to tell without a server.
+    if (LOCAL_ONLY) return;
     // Only a real change reaches the graph, which has room for few entries.
     if (
       !firstVisit &&
@@ -60,8 +64,8 @@ export function AccountMenu({
       next.color === identity.color
     )
       return;
-    defaultBackend()
-      .then((backend) => publishProfile(backend, next))
+    Promise.all([defaultBackend(), import("@/mls/profile")])
+      .then(([backend, { publishProfile }]) => publishProfile(backend, next))
       .catch((error: unknown) => {
         console.error(error);
         toast.error("Could not send the new name to your other devices.");
@@ -96,28 +100,11 @@ export function AccountMenu({
             <PaletteIcon />
             Name and color…
           </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel>Devices</DropdownMenuLabel>
-          <DropdownMenuItem onSelect={() => setAddingDevice(true)}>
-            <SmartphoneIcon />
-            Add a device…
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setListingDevices(true)}>
-            <LaptopIcon />
-            Your devices…
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel>Recovery</DropdownMenuLabel>
-          <DropdownMenuItem onSelect={() => setRecovering(true)}>
-            <KeyRoundIcon />
-            Show recovery key…
-          </DropdownMenuItem>
-          <DropdownMenuItem asChild>
-            <a href="/recover">
-              <LifeBuoyIcon />
-              Restore with a key…
-            </a>
-          </DropdownMenuItem>
+          {ServerItems && (
+            <Suspense fallback={null}>
+              <ServerItems onOpen={setServerDialog} />
+            </Suspense>
+          )}
           {children}
           <DropdownMenuSeparator />
           <ThemeMenuItems />
@@ -129,9 +116,14 @@ export function AccountMenu({
         initial={identity}
         onClose={save}
       />
-      <AddDeviceDialog open={addingDevice} onOpenChange={setAddingDevice} />
-      <DevicesDialog open={listingDevices} onOpenChange={setListingDevices} />
-      <RecoveryDialog open={recovering} onOpenChange={setRecovering} />
+      {ServerDialogs && (
+        <Suspense fallback={null}>
+          <ServerDialogs
+            open={serverDialog}
+            onClose={() => setServerDialog(null)}
+          />
+        </Suspense>
+      )}
     </>
   );
 }

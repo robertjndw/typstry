@@ -1,6 +1,8 @@
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
+import { Link } from "react-router";
 
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 /** Full-page message for the states where there is no workspace to show. */
@@ -40,5 +42,14 @@ export function Notice({
         <div className="flex flex-wrap justify-center gap-2">{actions}</div>
       </div>
     </main>
+  );
+}
+
+/** The usual way out of a Notice. */
+export function StartPageButton({ label = "Go to the start page" }) {
+  return (
+    <Button asChild variant="outline">
+      <Link to="/">{label}</Link>
+    </Button>
   );
 }

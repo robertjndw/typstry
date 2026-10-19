@@ -32,7 +32,7 @@ The document layout is defined twice, in `crates/typstry-doc` (Rust, used by the
 ## In the browser
 
 - **CodeMirror** is the text editor. It is bound to the Loro document, so every keystroke becomes a small document change.
-- **The Typst worker** compiles the project with [typst.ts](https://github.com/Myriad-Dreamin/typst.ts) in a background thread and draws the result as SVG. Packages from Typst Universe are downloaded from `packages.typst.org` when a document imports them, and Typst's default fonts from `cdn.jsdelivr.net`. A build can point the fonts at a mirror with `VITE_TYPST_FONT_BASE` (and `VITE_TYPST_DEV_FONT_BASE` for the CJK and emoji fonts), set when the web app is built. See [Self-hosting](self-hosting.md).
+- **The Typst worker** compiles the project with [typst.ts](https://github.com/Myriad-Dreamin/typst.ts) in a background thread and draws the result as SVG. Packages from Typst Universe are downloaded from `packages.typst.org` when a document imports them, and Typst's default fonts from `cdn.jsdelivr.net`. A build can point the fonts at a mirror with `VITE_TYPST_FONT_BASE` (and `VITE_TYPST_DEV_FONT_BASE` for the CJK and emoji fonts), set when the web app is built. See [Self-hosting](self-hosting.md). A build with `VITE_TYPSTRY_LOCAL_ONLY=1` leaves out everything that needs the server and keeps projects in the browser, see [Static hosting](static-hosting.md).
 - **The tinymist worker** runs the [tinymist](https://github.com/Myriad-Dreamin/tinymist) language server for autocompletion, hover docs and signature help.
 - **The wasm module** (`crates/typstry-wasm`) holds the encryption and group code. It is the same Rust code the CLI uses, compiled to WebAssembly, so both sides encrypt in exactly the same way.
 
