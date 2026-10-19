@@ -95,6 +95,8 @@ typstry sync   # keep running and edit with any editor
 
 See [the CLI guide](docs/cli.md) for a typical day with git, all commands and the things to know.
 
+In Chromium browsers you can also keep a project in sync with a local folder without installing anything. See [Local folders in the browser](docs/local-folders.md).
+
 ## Configuration
 
 The server is configured through environment variables such as `TYPSTRY_ADDR`, `TYPSTRY_DATA_DIR` and `TYPSTRY_MAX_UPLOAD_BYTES`. [Self-hosting](docs/self-hosting.md#configuration) lists them all, including the [abuse limits](docs/self-hosting.md#abuse-limits), and explains [backups](docs/self-hosting.md#backups). Limits per client address are the reverse proxy's job; `compose.prod.yaml` sets them up in Traefik, see [the limits](docs/self-hosting.md#the-limits).

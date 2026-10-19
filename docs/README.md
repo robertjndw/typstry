@@ -4,6 +4,7 @@ The [main README](../README.md) covers what typstry is and how to start it. Thes
 
 ## Using typstry
 
+- [Local folders in the browser](local-folders.md): keep a project in sync with a folder on your computer from Chromium.
 - [The command line tool](cli.md): work on a project in a local folder, with your own editor and git.
 - [Self-hosting](self-hosting.md): run your own server, configure it and back it up.
 
