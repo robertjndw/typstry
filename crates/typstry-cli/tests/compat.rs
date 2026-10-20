@@ -18,7 +18,8 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use loro::awareness::EphemeralStore;
-use loro::{ExportMode, Frontiers, IdSpan, LoroDoc, LoroValue};
+use loro::cursor::Side;
+use loro::{ContainerTrait, ExportMode, Frontiers, IdSpan, LoroDoc, LoroText, LoroValue, TreeID};
 use serde_json::{Value, json};
 
 use typstry_cli::api::Permission;
@@ -36,7 +37,7 @@ use typstry_doc::paths::build_path_index;
 use typstry_doc::peers::set_peer;
 use typstry_doc::testing::file_json;
 use typstry_doc::versions::{named_versions, save_version};
-use typstry_doc::{SCHEMA_VERSION, root, text_content};
+use typstry_doc::{SCHEMA_VERSION, comment, root, text_content};
 use typstry_wire::crypto::{
     BLOB_CONTEXT, DocKeys, KEYRING_VERSION, Keyring, LinkSecret, LocalSigner, PROFILE_CONTEXT,
     PresenceKey, RECORD_VERSION, RecordSigner, SEAL_VERSION, SECRET_EDIT_V1, SECRET_VIEW_V1,
@@ -309,12 +310,13 @@ fn write_fixture(out: &Path) {
         .unwrap();
     doc.set_next_commit_message("delete version Scrapped");
     doc.commit();
+    let comments = write_comments(&doc, &coauthor);
     let second_log_entry = doc.export(ExportMode::updates(&logged_vv)).unwrap();
     let snapshot = doc.export(ExportMode::Snapshot).unwrap();
 
     fs::create_dir_all(out).unwrap();
     fs::write(out.join("doc.loro"), &snapshot).unwrap();
-    write_json(out, "doc.json", &doc_json(&doc, &scrapped_key));
+    write_json(out, "doc.json", &doc_json(&doc, &scrapped_key, &comments));
     write_json(
         out,
         "crypto.json",
@@ -425,12 +427,125 @@ fn write_fixture(out: &Path) {
     );
 }
 
+/// Who wrote a comment and when, as far as the record says.
+struct Byline {
+    name: &'static str,
+    color: &'static str,
+    created_at: f64,
+}
+
+/// One comment record, the way `addComment` and `reply` in
+/// apps/web/src/doc/comments.ts write it. Rust has no writer of its own.
+fn comment_record(
+    thread: Option<&str>,
+    file: TreeID,
+    text: &LoroText,
+    quote: &str,
+    body: &str,
+    by: &Byline,
+) -> LoroValue {
+    let from = text.to_string().find(quote).unwrap();
+    let to = from + quote.len();
+    let cursor = |pos| text.get_cursor(pos, Side::Middle).unwrap().encode();
+    let fields: HashMap<String, LoroValue> = [
+        (
+            comment::THREAD,
+            thread.map_or(LoroValue::Null, LoroValue::from),
+        ),
+        (comment::FILE_ID, LoroValue::from(file.to_string())),
+        (comment::TEXT_ID, LoroValue::from(text.id().to_string())),
+        // On the first and the last commented character.
+        (comment::ANCHOR, LoroValue::from(cursor(from))),
+        (comment::HEAD, LoroValue::from(cursor(to - 1))),
+        (comment::QUOTE, LoroValue::from(quote)),
+        (comment::BODY, LoroValue::from(body)),
+        (comment::CREATED_AT, LoroValue::from(by.created_at)),
+        (comment::NAME, LoroValue::from(by.name)),
+        (comment::COLOR, LoroValue::from(by.color)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    LoroValue::Map(fields.into())
+}
+
+/// What `write_comments` wrote, for doc.json.
+struct Comments {
+    thread: String,
+    reply: String,
+}
+
+/// A thread on "Hello" in main.typ with a reply by the coauthor, resolved.
+fn write_comments(doc: &LoroDoc, coauthor: &LoroDoc) -> Comments {
+    let main = typstry_doc::main_file(doc).unwrap();
+    let text = text_content(doc, main).unwrap();
+    let list = doc.get_list(root::COMMENTS);
+    let ada = Byline {
+        name: "Ada",
+        color: "#3366cc",
+        created_at: 1_700_000_000_006.0,
+    };
+    list.push(comment_record(
+        None,
+        main,
+        &text,
+        "Hello",
+        "Friendlier?",
+        &ada,
+    ))
+    .unwrap();
+    doc.set_next_commit_message("add comment");
+    doc.commit();
+    let id = list.get_id_at(list.len() - 1).unwrap();
+    let thread = format!("{}@{}", id.counter, id.peer);
+
+    coauthor
+        .import(
+            &doc.export(ExportMode::updates(&coauthor.oplog_vv()))
+                .unwrap(),
+        )
+        .unwrap();
+    let theirs = coauthor.get_list(root::COMMENTS);
+    let their_text = text_content(coauthor, main).unwrap();
+    theirs
+        .push(comment_record(
+            Some(&thread),
+            main,
+            &their_text,
+            "Hello",
+            "Fine as is.",
+            &Byline {
+                name: "Grace",
+                color: "#cc6633",
+                created_at: 1_700_000_000_007.0,
+            },
+        ))
+        .unwrap();
+    coauthor.set_next_commit_message("reply to comment");
+    coauthor.commit();
+    let id = theirs.get_id_at(theirs.len() - 1).unwrap();
+    let reply = format!("{}@{}", id.counter, id.peer);
+    doc.import(
+        &coauthor
+            .export(ExportMode::updates(&doc.oplog_vv()))
+            .unwrap(),
+    )
+    .unwrap();
+
+    doc.get_map(root::RESOLVED_COMMENTS)
+        .insert(&thread, 1_700_000_000_008_f64)
+        .unwrap();
+    doc.set_next_commit_message("resolve comment");
+    doc.commit();
+    Comments { thread, reply }
+}
+
 fn write_json(dir: &Path, name: &str, value: &Value) {
     let text = serde_json::to_string_pretty(value).unwrap() + "\n";
     fs::write(dir.join(name), text).unwrap();
 }
 
-fn doc_json(doc: &LoroDoc, deleted_key: &str) -> Value {
+fn doc_json(doc: &LoroDoc, deleted_key: &str, comments: &Comments) -> Value {
     let index = build_path_index(doc);
     let main = typstry_doc::main_file(doc).unwrap();
     let mut dirs: Vec<&str> = index
@@ -477,6 +592,37 @@ fn doc_json(doc: &LoroDoc, deleted_key: &str) -> Value {
             "id": deleted_key,
             "name": "Scrapped",
             "deletedAt": 1_700_000_000_004_i64,
+        }],
+        // `range` is the text the anchors cover now.
+        "comments": [
+            {
+                "id": comments.thread,
+                "thread": null,
+                "peer": AUTHOR.to_string(),
+                "file": "main.typ",
+                "quote": "Hello",
+                "range": "Hello",
+                "body": "Friendlier?",
+                "createdAt": 1_700_000_000_006_i64,
+                "name": "Ada",
+                "color": "#3366cc",
+            },
+            {
+                "id": comments.reply,
+                "thread": comments.thread,
+                "peer": COAUTHOR.to_string(),
+                "file": "main.typ",
+                "quote": "Hello",
+                "range": "Hello",
+                "body": "Fine as is.",
+                "createdAt": 1_700_000_000_007_i64,
+                "name": "Grace",
+                "color": "#cc6633",
+            },
+        ],
+        "resolvedComments": [{
+            "id": comments.thread,
+            "resolvedAt": 1_700_000_000_008_i64,
         }],
     })
 }

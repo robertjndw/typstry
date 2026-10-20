@@ -225,6 +225,12 @@ pub mod root {
     /// Map of project packages keyed `namespace/name/version`, see
     /// [`super::package`]. Values are plain maps, replaced as a whole.
     pub const PACKAGES: &str = "packages";
+    /// List of comments and replies, see [`super::comment`]. Values are
+    /// plain maps that are never edited, only removed.
+    pub const COMMENTS: &str = "comments";
+    /// Map of resolved comment threads: the root comment's list element id
+    /// (`counter@peer`) to the time it was resolved in unix ms.
+    pub const RESOLVED_COMMENTS: &str = "resolvedComments";
 }
 
 /// Keys of each entry in the `packages` map. The archive is an asset blob
@@ -256,6 +262,30 @@ pub mod package {
 pub mod package_source {
     pub const UPLOAD: &str = "upload";
     pub const UNIVERSE: &str = "universe";
+}
+
+/// Keys of each entry in the `comments` list, written by
+/// apps/web/src/doc/comments.ts. The CLI does not show comments, so only the
+/// history bookkeeping and the fixture tests here care about the layout.
+pub mod comment {
+    /// The root comment's list element id for a reply, null for a root.
+    pub const THREAD: &str = "thread";
+    /// TreeID of the commented text file.
+    pub const FILE_ID: &str = "fileId";
+    /// Container id of the file's text when the comment was made.
+    pub const TEXT_ID: &str = "textId";
+    /// Encoded Loro cursors on the first and the last commented character.
+    pub const ANCHOR: &str = "anchor";
+    pub const HEAD: &str = "head";
+    /// The commented text, cut to 200 code points.
+    pub const QUOTE: &str = "quote";
+    pub const BODY: &str = "body";
+    /// Unix milliseconds.
+    pub const CREATED_AT: &str = "createdAt";
+    /// What the author called themselves, a claim only. The author is the
+    /// peer of the entry's op id.
+    pub const NAME: &str = "name";
+    pub const COLOR: &str = "color";
 }
 
 /// Keys of each entry in the `versions` list. An entry names a point in

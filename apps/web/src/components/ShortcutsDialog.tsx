@@ -46,6 +46,9 @@ function groups(sidebarTabs: readonly SidebarTab[]): Group[] {
         ...(sidebarTabs.includes("outline")
           ? [{ label: "Show the outline", combo: SHORTCUTS.outline }]
           : []),
+        ...(sidebarTabs.includes("comments")
+          ? [{ label: "Comment on the selection", combo: SHORTCUTS.comment }]
+          : []),
       ],
     },
     EDITOR_GROUP,

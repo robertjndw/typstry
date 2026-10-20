@@ -23,7 +23,8 @@ Each project is one [Loro](https://loro.dev) document. Loro is a CRDT: a data st
 
 - the file tree and the content of every text file,
 - references to uploaded files such as images and fonts (the files themselves are stored separately as encrypted blobs),
-- the list of tagged versions.
+- the list of tagged versions,
+- comment threads, each anchored to a range of a text file with Loro cursors so it moves with the text.
 
 The browser keeps a copy of every project in IndexedDB. This is why projects open without a connection: you edit the local copy, and the changes are sent when the connection comes back.
 

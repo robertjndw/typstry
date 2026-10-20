@@ -16,6 +16,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
 - **Multi-file projects** - file tree, tabs, and uploads for images and data files. Images can also be pasted or dropped into the editor.
 - **Custom fonts and packages** - add fonts and Typst packages (uploaded or pinned from Universe) to a project in the Fonts & Packages dialog. They are encrypted and shared like any other file, and the zip download includes the packages for `typst compile --package-path typst-packages`.
+- **Comments** - threads anchored to the text they are about, which follow it through everyone's edits. They are encrypted like everything else, and view-only links can read them but not comment.
 - **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
 - **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so members can see who is in a project and its owner can remove a member, which also replaces the links.
 - **Your devices** - pair a phone, a laptop and the CLI with a short code to use them as one person. Your project list syncs between them, a lost device can be revoked from any other, and a recovery key brings everything back if all are lost.

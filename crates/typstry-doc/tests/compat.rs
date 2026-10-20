@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::Path;
 
-use loro::{ExportMode, LoroDoc, LoroValue, ToJson};
+use loro::{ExportMode, LoroDoc, LoroValue, ToJson, TreeID};
 use serde_json::{Value, json};
 use typstry_doc::directory::{self, DIRECTORY_SCHEMA_VERSION, NewLink, State};
 use typstry_doc::materialize::{MaterializedFile, materialize, materialize_at};
@@ -17,8 +17,8 @@ use typstry_doc::peers::peer_name;
 use typstry_doc::testing::file_json;
 use typstry_doc::versions::named_versions;
 use typstry_doc::{
-    FileKind, SCHEMA_VERSION, ensure_supported, main_file, migrate, root, schema_version, title,
-    version,
+    FileKind, SCHEMA_VERSION, comment, ensure_supported, main_file, migrate, root, schema_version,
+    title, version,
 };
 use typstry_wire::owner::OwnerSecret;
 
@@ -97,6 +97,67 @@ fn reads_every_compat_doc() {
             assert_eq!(
                 entry.get(version::NAME),
                 Some(&LoroValue::from(str_of(&want["name"])))
+            );
+        }
+
+        // Sets frozen before comments existed list none, and must not
+        // grow any on the way.
+        let comments = doc.get_list(root::COMMENTS);
+        let want = expected["comments"].as_array().map_or(&[][..], |c| c);
+        assert_eq!(comments.len(), want.len(), "v{n}");
+        for (i, want) in want.iter().enumerate() {
+            let id = comments.get_id_at(i).unwrap();
+            assert_eq!(format!("{}@{}", id.counter, id.peer), want["id"], "v{n}");
+            assert_eq!(id.peer.to_string(), want["peer"], "v{n}");
+            let LoroValue::Map(entry) = comments.get(i).unwrap().into_value().unwrap() else {
+                panic!("v{n}: comment is not a map");
+            };
+            let string = |key| match entry.get(key) {
+                Some(LoroValue::String(s)) => json!(s.as_str()),
+                Some(LoroValue::Null) => Value::Null,
+                other => panic!("v{n}: {key} is {other:?}"),
+            };
+            for (key, field) in [
+                (comment::THREAD, "thread"),
+                (comment::QUOTE, "quote"),
+                (comment::BODY, "body"),
+                (comment::NAME, "name"),
+                (comment::COLOR, "color"),
+            ] {
+                assert_eq!(string(key), want[field], "v{n} {field}");
+            }
+            let file = string(comment::FILE_ID);
+            let file = TreeID::try_from(file.as_str().unwrap()).unwrap();
+            assert_eq!(index.by_id[&file].path, want["file"], "v{n}");
+            assert_eq!(
+                entry
+                    .get(comment::CREATED_AT)
+                    .map(|v| v.to_json_value().as_f64()),
+                Some(want["createdAt"].as_f64()),
+                "v{n}"
+            );
+            for key in [comment::ANCHOR, comment::HEAD] {
+                assert!(
+                    matches!(entry.get(key), Some(LoroValue::Binary(_))),
+                    "v{n} {key}"
+                );
+            }
+        }
+        let resolved = doc.get_map(root::RESOLVED_COMMENTS);
+        let want = expected["resolvedComments"]
+            .as_array()
+            .map_or(&[][..], |c| c);
+        assert_eq!(resolved.len(), want.len(), "v{n}");
+        for want in want {
+            let at = resolved
+                .get(str_of(&want["id"]))
+                .unwrap()
+                .into_value()
+                .unwrap();
+            assert_eq!(
+                at.to_json_value().as_f64(),
+                want["resolvedAt"].as_f64(),
+                "v{n}"
             );
         }
 

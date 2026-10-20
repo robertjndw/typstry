@@ -19,6 +19,7 @@ import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { OutlinePanel } from "@/components/OutlinePanel";
+import { CommentsPanel } from "@/components/CommentsPanel";
 import { PdfDownloadButton } from "@/components/DownloadButton";
 import {
   EditorPane,
@@ -60,7 +61,9 @@ import { useShortcuts } from "@/hooks/use-shortcut";
 import { useWorkspaceLayout } from "@/hooks/use-workspace-layout";
 import { cn } from "@/lib/utils";
 import { SHORTCUTS } from "@/lib/shortcuts";
+import { CommentsUi, CommentsUiContext } from "@/project/comments-ui";
 import { useProject } from "@/project/context";
+import { useUnresolvedCount } from "@/project/useComments";
 import type { VersionTarget } from "@/project/history-items";
 import { projectIndex } from "@/project/project-index";
 import { CursorContext, CursorStore } from "@/editor/cursor-store";
@@ -96,7 +99,12 @@ export interface ProjectWorkspaceProps {
 // Panels beyond the file tree are passed to <Sidebar> as they exist, and
 // the shortcuts, menu and dialog follow this list. Module level so its
 // identity is stable.
-const sidebarTabs: readonly SidebarTab[] = ["files", "outline", "search"];
+const sidebarTabs: readonly SidebarTab[] = [
+  "files",
+  "outline",
+  "search",
+  "comments",
+];
 
 /** The full project UI for whatever ProjectProvider is above it. */
 export function ProjectWorkspace({
@@ -255,6 +263,27 @@ export function ProjectWorkspace({
     [layout, setSidebarTab],
   );
 
+  const [commentsUi] = useState(() => new CommentsUi());
+  useEffect(
+    () =>
+      commentsUi.onShowPanel((focus) => {
+        if (focus) openSidebar("comments");
+        // Clicking into highlighted text while the sidebar is hidden is
+        // just editing; it should not pop the sidebar open.
+        else if (!layout.isHidden("files")) setSidebarTab("comments");
+      }),
+    [commentsUi, openSidebar, layout, setSidebarTab],
+  );
+  const unresolved = useUnresolvedCount(project);
+  const startComment = useCallback(() => {
+    if (readOnly) {
+      openSidebar("comments");
+    } else if (!commentsUi.startDraft()) {
+      openSidebar("comments");
+      toast.info("Select some text in the editor to comment on it.");
+    }
+  }, [commentsUi, openSidebar, readOnly]);
+
   // The panel may still be collapsed, inert or unmounted for a few frames
   // after the request (toggle animation, tab switch), so retry until the
   // focus sticks.
@@ -314,6 +343,9 @@ export function ProjectWorkspace({
       }),
       ...(sidebarTabs.includes("outline") && {
         [SHORTCUTS.outline]: () => !viewing && openSidebar("outline"),
+      }),
+      ...(sidebarTabs.includes("comments") && {
+        [SHORTCUTS.comment]: () => !viewing && startComment(),
       }),
     },
     { scope: root },
@@ -464,39 +496,43 @@ export function ProjectWorkspace({
       ) : (
         <RevealContext value={reveal}>
           <CursorContext value={cursors}>
-            <WorkspaceLayout
-              layout={layout}
-              files={
-                <Sidebar
-                  tab={sidebarTab}
-                  onTabChange={setSidebarTab}
-                  heading={<FolderSyncStatus />}
-                  notice={<FolderSyncNotice />}
-                  outline={<OutlinePanel />}
-                  search={<SearchPanel />}
-                />
-              }
-              editor={
-                <EditorPane
-                  compiler={compiler}
-                  tinymist={tinymist}
-                  reveal={revealRequest}
-                  onJumpToPreview={jumpToPreview}
-                />
-              }
-              preview={
-                <PreviewPane
-                  client={compiler}
-                  onDiagnosticClick={onDiagnosticClick}
-                  onOpenFontsPackages={openFontsPackages}
-                  onJump={onPreviewJump}
-                  scrollTarget={previewTarget}
-                  actions={
-                    <PdfDownloadButton compiler={compiler} name={[title]} />
-                  }
-                />
-              }
-            />
+            <CommentsUiContext value={commentsUi}>
+              <WorkspaceLayout
+                layout={layout}
+                files={
+                  <Sidebar
+                    tab={sidebarTab}
+                    onTabChange={setSidebarTab}
+                    heading={<FolderSyncStatus />}
+                    notice={<FolderSyncNotice />}
+                    outline={<OutlinePanel />}
+                    search={<SearchPanel />}
+                    comments={<CommentsPanel />}
+                    badges={{ comments: unresolved }}
+                  />
+                }
+                editor={
+                  <EditorPane
+                    compiler={compiler}
+                    tinymist={tinymist}
+                    reveal={revealRequest}
+                    onJumpToPreview={jumpToPreview}
+                  />
+                }
+                preview={
+                  <PreviewPane
+                    client={compiler}
+                    onDiagnosticClick={onDiagnosticClick}
+                    onOpenFontsPackages={openFontsPackages}
+                    onJump={onPreviewJump}
+                    scrollTarget={previewTarget}
+                    actions={
+                      <PdfDownloadButton compiler={compiler} name={[title]} />
+                    }
+                  />
+                }
+              />
+            </CommentsUiContext>
           </CursorContext>
         </RevealContext>
       )}

@@ -127,14 +127,34 @@ export interface AuthorIdentity {
 const UNKNOWN = { name: "Unknown", color: "#71717a" };
 
 /**
- * Who wrote what, for the avatars. A peer whose records the group's roster
- * vouches for (`memberOfPeer`, from the signers of its decrypted records)
- * is shown under the member's signed name; anyone else under the name the
- * peer wrote into the doc, which is only a claim.
+ * How one peer is shown. A peer whose records the group's roster vouches
+ * for (`memberOfPeer`, from the signers of its decrypted records) appears
+ * under the member's signed name; anyone else under the name the peer wrote
+ * into the doc, which is only a claim, or else `fallback`.
  *
  * Every page load is a new Loro peer, so one person shows up under several
- * peer ids. A member collapses by its key, the rest by what they look like.
+ * peer ids. The key collapses a member by its signer, the rest by what they
+ * look like.
  */
+export function authorIdentity(
+  project: ProjectDoc,
+  peer: string,
+  memberOfPeer?: RosterLookup,
+  fallback: { name: string; color: string } = UNKNOWN,
+): AuthorIdentity {
+  const member = memberOfPeer?.(peer);
+  if (member) {
+    return {
+      key: `member:${member.signer}`,
+      name: member.name,
+      color: member.color,
+    };
+  }
+  const info = project.getPeer(peer) ?? fallback;
+  return { key: `${info.name}\u0000${info.color}`, ...info };
+}
+
+/** Who wrote what, for the avatars: authorIdentity without duplicates. */
 export function authorIdentities(
   project: ProjectDoc,
   peers: PeerID[],
@@ -142,16 +162,8 @@ export function authorIdentities(
 ): AuthorIdentity[] {
   const seen = new Map<string, AuthorIdentity>();
   for (const peer of peers) {
-    const member = memberOfPeer?.(peer);
-    if (member) {
-      const key = `member:${member.signer}`;
-      if (!seen.has(key))
-        seen.set(key, { key, name: member.name, color: member.color });
-      continue;
-    }
-    const info = project.getPeer(peer) ?? UNKNOWN;
-    const key = `${info.name}\u0000${info.color}`;
-    if (!seen.has(key)) seen.set(key, { key, ...info });
+    const identity = authorIdentity(project, peer, memberOfPeer);
+    if (!seen.has(identity.key)) seen.set(identity.key, identity);
   }
   return [...seen.values()];
 }

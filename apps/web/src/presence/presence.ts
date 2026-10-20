@@ -1,12 +1,10 @@
-import {
-  Cursor,
-  type EphemeralStore,
-  type LoroDoc,
-  type LoroText,
-  type TreeID,
-} from "loro-crdt";
+import type { EphemeralStore, LoroDoc, LoroText, TreeID } from "loro-crdt";
+
+import { encodeSelection } from "@/doc/cursors";
 
 import { isValidColor, normalizeName, type Identity } from "./identity";
+
+export { encodeSelection, resolveSelection } from "@/doc/cursors";
 
 /** What each client publishes under `p:<peerId>` in the ephemeral store. */
 export interface PresenceState {
@@ -61,63 +59,6 @@ export function parsePresence(value: unknown): PresenceState | null {
     state.head = v.head;
   }
   return state;
-}
-
-function encodeCursor(text: LoroText, pos: number): Uint8Array | undefined {
-  const cursor = text.getCursor(pos);
-  if (!cursor) return undefined;
-  try {
-    return cursor.encode();
-  } finally {
-    cursor.free();
-  }
-}
-
-/** Encodes a selection as stable Loro cursors (UTF-16 offsets in `text`). */
-export function encodeSelection(
-  text: LoroText,
-  anchor: number,
-  head: number,
-): { anchor: Uint8Array; head: Uint8Array } | null {
-  const a = encodeCursor(text, anchor);
-  const h = anchor === head ? a : encodeCursor(text, head);
-  return a && h ? { anchor: a, head: h } : null;
-}
-
-function decodeCursor(
-  doc: LoroDoc,
-  textId: string,
-  bytes: Uint8Array,
-): number | null {
-  let cursor: Cursor;
-  try {
-    cursor = Cursor.decode(bytes);
-  } catch {
-    return null;
-  }
-  try {
-    if (cursor.containerId() !== textId) return null;
-    // Throws when the cursor points at ops this doc has not received yet,
-    // which happens when presence overtakes the matching doc update.
-    return doc.getCursorPos(cursor)?.offset ?? null;
-  } catch {
-    return null;
-  } finally {
-    cursor.free();
-  }
-}
-
-/** Resolves a peer's selection against the current state of `text`. */
-export function resolveSelection(
-  doc: LoroDoc,
-  text: LoroText,
-  state: Pick<PresenceState, "anchor" | "head">,
-): { anchor: number; head: number } | null {
-  if (!state.anchor || !state.head) return null;
-  const anchor = decodeCursor(doc, text.id, state.anchor);
-  const head = decodeCursor(doc, text.id, state.head);
-  if (anchor === null || head === null) return null;
-  return { anchor, head };
 }
 
 export interface PresenceOptions {

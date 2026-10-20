@@ -281,6 +281,8 @@ const META_CONTAINERS: ReadonlySet<string> = new Set(
     { name: ROOT.peers, type: "Map" },
     { name: ROOT.versions, type: "List" },
     { name: ROOT.deletedVersions, type: "Map" },
+    { name: ROOT.comments, type: "List" },
+    { name: ROOT.resolvedComments, type: "Map" },
   ].map(({ name, type }) => `cid:root-${name}:${type}`),
 );
 
