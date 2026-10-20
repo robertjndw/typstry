@@ -22,15 +22,22 @@ import { usePresenceContext } from "@/presence/context";
 import { useProject } from "@/project/context";
 import { uploadReporting } from "@/project/tree";
 import type { CompilerClient } from "@/typst/compiler-client";
-import type { ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewDiagnostics } from "@/typst/hooks";
-import { diagnosticRange, toCodeMirrorDiagnostics } from "@/typst/lint";
+import { sourceRangeToOffsets, toCodeMirrorDiagnostics } from "@/typst/lint";
+import type { SourceRange } from "@/typst/protocol";
 
-/** A request to select a diagnostic's range once its file is open. */
+/** Where to select in a revealed file. */
+export type RevealTarget =
+  /** Typst's line and code point column, as diagnostics report it. */
+  | { kind: "source"; range: SourceRange }
+  /** UTF-16 offsets, which is what CodeMirror and Loro index by. */
+  | { kind: "offset"; from: number; to: number };
+
+/** A request to select a range once its file is open. */
 export interface RevealRequest {
   fileId: TreeID;
-  diagnostic: ProjectDiagnostic;
-  /** Distinguishes repeated clicks on the same diagnostic. */
+  target: RevealTarget;
+  /** Distinguishes repeated requests for the same target. */
   seq: number;
 }
 
@@ -142,7 +149,16 @@ export function EditorPane({
     if (!view.dom.isConnected) return;
     if (revealed.current === reveal.seq) return;
     revealed.current = reveal.seq;
-    const range = diagnosticRange(reveal.diagnostic, view.state.doc);
+    const doc = view.state.doc;
+    const { target } = reveal;
+    // The target can predate edits that shortened the file.
+    const range =
+      target.kind === "source"
+        ? sourceRangeToOffsets(target.range, doc)
+        : {
+            from: Math.min(target.from, doc.length),
+            to: Math.min(Math.max(target.from, target.to), doc.length),
+          };
     view.dispatch({
       selection: { anchor: range.from, head: range.to },
       scrollIntoView: true,

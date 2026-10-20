@@ -5,4 +5,8 @@ export const SHORTCUTS = {
   toggleFiles: "Mod+B",
   togglePreview: "Mod+\\",
   fontsPackages: "Mod+Alt+F",
+  search: "Mod+Shift+F",
+  outline: "Mod+Shift+O",
+  comment: "Mod+Alt+M",
+  jumpToPreview: "Mod+Alt+J",
 } as const;

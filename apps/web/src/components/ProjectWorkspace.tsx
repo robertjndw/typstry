@@ -13,12 +13,16 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import type { TreeID } from "loro-crdt";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { PdfDownloadButton } from "@/components/DownloadButton";
-import { EditorPane, type RevealRequest } from "@/components/EditorPane";
-import { FileTree } from "@/components/FileTree";
+import {
+  EditorPane,
+  type RevealRequest,
+  type RevealTarget,
+} from "@/components/EditorPane";
 import type { FontsPackagesTarget } from "@/components/fonts-packages/types";
 import {
   FolderSyncNotice,
@@ -29,6 +33,7 @@ import { PresenceBar } from "@/components/PresenceBar";
 import { PreviewPane } from "@/components/PreviewPane";
 import { ProjectTitle } from "@/components/ProjectTitle";
 import { QuickOpen } from "@/components/QuickOpen";
+import { Sidebar } from "@/components/Sidebar";
 import {
   TagVersionDialog,
   type TagTarget,
@@ -39,12 +44,19 @@ import { VersionView } from "@/components/VersionView";
 import { WorkspaceLayout } from "@/components/WorkspaceLayout";
 import { WorkspaceMenu } from "@/components/WorkspaceMenu";
 import { Separator } from "@/components/ui/separator";
+import {
+  SIDEBAR_AUTOFOCUS_ATTR,
+  SIDEBAR_PANEL_ATTR,
+  useSidebarTab,
+  type SidebarTab,
+} from "@/hooks/use-sidebar-tab";
 import { useShortcuts } from "@/hooks/use-shortcut";
 import { useWorkspaceLayout } from "@/hooks/use-workspace-layout";
 import { cn } from "@/lib/utils";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { useProject } from "@/project/context";
 import type { VersionTarget } from "@/project/history-items";
+import { RevealContext } from "@/project/reveal-context";
 import type { SyncNowResult } from "@/sync/connection";
 import { groupingFromLocation } from "@/project/useHistory";
 import type { ProjectDiagnostic } from "@/typst/diagnostics";
@@ -70,6 +82,11 @@ export interface ProjectWorkspaceProps {
   /** Pushes pending edits now; absent without a server connection. */
   onSyncNow?: () => Promise<SyncNowResult>;
 }
+
+// Panels beyond the file tree are passed to <Sidebar> as they exist, and
+// the shortcuts, menu and dialog follow this list. Module level so its
+// identity is stable.
+const sidebarTabs: readonly SidebarTab[] = ["files"];
 
 /** The full project UI for whatever ProjectProvider is above it. */
 export function ProjectWorkspace({
@@ -112,7 +129,9 @@ export function ProjectWorkspace({
 
   const compiler = useProjectCompiler();
   const tinymist = useProjectTinymist(compiler);
-  const [reveal, setReveal] = useState<RevealRequest | null>(null);
+  const [revealRequest, setRevealRequest] = useState<RevealRequest | null>(
+    null,
+  );
 
   // A version brings its own compiler. The live one would keep compiling
   // every remote edit for a preview nobody sees.
@@ -127,17 +146,70 @@ export function ProjectWorkspace({
     };
   }, [viewingVersion, compiler, tinymist]);
 
+  const reveal = useCallback(
+    (fileId: TreeID, target: RevealTarget) => {
+      openFile(fileId);
+      setRevealRequest((prev) => ({
+        fileId,
+        target,
+        seq: (prev?.seq ?? 0) + 1,
+      }));
+    },
+    [openFile],
+  );
+
   const onDiagnosticClick = useCallback(
     (diagnostic: ProjectDiagnostic) => {
       const fileId = diagnostic.path
         ? index.byPath.get(diagnostic.path)
         : undefined;
-      if (!fileId) return;
-      openFile(fileId);
-      setReveal((prev) => ({ fileId, diagnostic, seq: (prev?.seq ?? 0) + 1 }));
+      if (!fileId || !diagnostic.range) return;
+      reveal(fileId, { kind: "source", range: diagnostic.range });
     },
-    [index, openFile],
+    [index, reveal],
   );
+
+  const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
+  const [focusRequest, setFocusRequest] = useState(0);
+
+  const openSidebar = useCallback(
+    (tab: SidebarTab) => {
+      if (layout.isHidden("files")) layout.toggle("files");
+      setSidebarTab(tab);
+      setFocusRequest((n) => n + 1);
+    },
+    [layout, setSidebarTab],
+  );
+
+  // The panel may still be collapsed, inert or unmounted for a few frames
+  // after the request (toggle animation, tab switch), so retry until the
+  // focus sticks.
+  useEffect(() => {
+    if (focusRequest === 0) return;
+    let frame = 0;
+    let attempts = 0;
+    function focusPanel() {
+      const panel = root.current?.querySelector<HTMLElement>(
+        `[${SIDEBAR_PANEL_ATTR}="${sidebarTab}"]`,
+      );
+      const target =
+        panel?.querySelector<HTMLElement>(`[${SIDEBAR_AUTOFOCUS_ATTR}]`) ??
+        panel;
+      target?.focus();
+      if (
+        target &&
+        target.contains(document.activeElement) &&
+        document.activeElement !== document.body
+      ) {
+        return;
+      }
+      if (++attempts < 20) frame = requestAnimationFrame(focusPanel);
+    }
+    frame = requestAnimationFrame(focusPanel);
+    return () => cancelAnimationFrame(frame);
+    // Only a new request should refocus, not a later tab change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest]);
 
   const tag = readOnly ? undefined : setTagging;
   const syncing = useRef(false);
@@ -163,6 +235,12 @@ export function ProjectWorkspace({
       [SHORTCUTS.togglePreview]: () => !viewing && layout.toggle("preview"),
       [SHORTCUTS.fontsPackages]: () =>
         !viewing && openFontsPackages({ tab: "fonts" }),
+      ...(sidebarTabs.includes("search") && {
+        [SHORTCUTS.search]: () => !viewing && openSidebar("search"),
+      }),
+      ...(sidebarTabs.includes("outline") && {
+        [SHORTCUTS.outline]: () => !viewing && openSidebar("outline"),
+      }),
     },
     { scope: root },
   );
@@ -248,6 +326,8 @@ export function ProjectWorkspace({
             onShortcuts={() => setShortcutsOpen(true)}
             onFontsPackages={() => openFontsPackages({ tab: "fonts" })}
             onSyncNow={syncNow}
+            sidebarTabs={sidebarTabs}
+            onOpenSidebar={openSidebar}
           />
           {badge}
           {share && <div className="ml-1 flex items-center">{share}</div>}
@@ -282,7 +362,11 @@ export function ProjectWorkspace({
         />
       )}
       <QuickOpen open={quickOpen} onOpenChange={setQuickOpen} />
-      <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      <ShortcutsDialog
+        open={shortcutsOpen}
+        onOpenChange={setShortcutsOpen}
+        sidebarTabs={sidebarTabs}
+      />
       {fontsPackages && (
         <Suspense fallback={null}>
           <FontsPackagesDialog
@@ -306,30 +390,36 @@ export function ProjectWorkspace({
           />
         </div>
       ) : (
-        <WorkspaceLayout
-          layout={layout}
-          files={
-            <FileTree
-              heading={<FolderSyncStatus />}
-              notice={<FolderSyncNotice />}
-            />
-          }
-          editor={
-            <EditorPane
-              compiler={compiler}
-              tinymist={tinymist}
-              reveal={reveal}
-            />
-          }
-          preview={
-            <PreviewPane
-              client={compiler}
-              onDiagnosticClick={onDiagnosticClick}
-              onOpenFontsPackages={openFontsPackages}
-              actions={<PdfDownloadButton compiler={compiler} name={[title]} />}
-            />
-          }
-        />
+        <RevealContext value={reveal}>
+          <WorkspaceLayout
+            layout={layout}
+            files={
+              <Sidebar
+                tab={sidebarTab}
+                onTabChange={setSidebarTab}
+                heading={<FolderSyncStatus />}
+                notice={<FolderSyncNotice />}
+              />
+            }
+            editor={
+              <EditorPane
+                compiler={compiler}
+                tinymist={tinymist}
+                reveal={revealRequest}
+              />
+            }
+            preview={
+              <PreviewPane
+                client={compiler}
+                onDiagnosticClick={onDiagnosticClick}
+                onOpenFontsPackages={openFontsPackages}
+                actions={
+                  <PdfDownloadButton compiler={compiler} name={[title]} />
+                }
+              />
+            }
+          />
+        </RevealContext>
       )}
     </div>
   );

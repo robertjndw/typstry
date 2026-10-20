@@ -1,8 +1,10 @@
 import {
   DownloadIcon,
   EllipsisIcon,
+  FileSearchIcon,
   HistoryIcon,
   KeyboardIcon,
+  ListTreeIcon,
   Loader2Icon,
   RefreshCwIcon,
   SearchIcon,
@@ -10,6 +12,7 @@ import {
   TypeIcon,
 } from "lucide-react";
 
+import type { SidebarTab } from "@/hooks/use-sidebar-tab";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -42,6 +45,8 @@ export function WorkspaceMenu({
   onShortcuts,
   onFontsPackages,
   onSyncNow,
+  sidebarTabs = [],
+  onOpenSidebar,
 }: {
   layout: WorkspaceLayoutState;
   /** While a version is open the live panels are not on screen. */
@@ -54,6 +59,9 @@ export function WorkspaceMenu({
   onFontsPackages: () => void;
   /** Absent when there is no server connection to push to. */
   onSyncNow?: () => void;
+  /** Sidebar tabs beyond Files; each gets an entry. */
+  sidebarTabs?: readonly SidebarTab[];
+  onOpenSidebar?: (tab: SidebarTab) => void;
 }) {
   const { project, assets, title } = useProject();
   // Lives here rather than in the menu content, which unmounts on close
@@ -108,6 +116,28 @@ export function WorkspaceMenu({
               </DropdownMenuShortcut>
             )}
           </DropdownMenuItem>
+          {sidebarTabs.includes("search") && (
+            <DropdownMenuItem onSelect={() => onOpenSidebar?.("search")}>
+              <FileSearchIcon />
+              Search project
+              {desktop && (
+                <DropdownMenuShortcut>
+                  {formatShortcut(SHORTCUTS.search)}
+                </DropdownMenuShortcut>
+              )}
+            </DropdownMenuItem>
+          )}
+          {sidebarTabs.includes("outline") && (
+            <DropdownMenuItem onSelect={() => onOpenSidebar?.("outline")}>
+              <ListTreeIcon />
+              Outline
+              {desktop && (
+                <DropdownMenuShortcut>
+                  {formatShortcut(SHORTCUTS.outline)}
+                </DropdownMenuShortcut>
+              )}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem disabled={zip.busy} onSelect={zip.run}>
             <DownloadIcon />
             Download as zip
