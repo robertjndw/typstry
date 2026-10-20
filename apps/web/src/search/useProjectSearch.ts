@@ -17,12 +17,21 @@ const DEBOUNCE_MS = 150;
 /**
  * Searches every text file of `project` and keeps the result current while
  * collaborators or the user edit. `result` is null until the first run.
+ * `resultQuery` is the query `result` was computed with, which lags `query`
+ * by the debounce; a replace must use it, not the query being typed.
  */
 export function useProjectSearch(
   project: ProjectDoc,
   query: SearchQuery,
-): { result: SearchResult | null; searching: boolean } {
-  const [result, setResult] = useState<SearchResult | null>(null);
+): {
+  result: SearchResult | null;
+  resultQuery: SearchQuery | null;
+  searching: boolean;
+} {
+  const [{ result, resultQuery }, setOutcome] = useState<{
+    result: SearchResult | null;
+    resultQuery: SearchQuery | null;
+  }>({ result: null, resultQuery: null });
   const [searching, setSearching] = useState(false);
   const { pattern, regex, caseSensitive, wholeWord } = query;
   // The project effect below outlives query changes, so its string cache
@@ -39,6 +48,16 @@ export function useProjectSearch(
 
     const run = () => {
       timer = undefined;
+      const current = queryRef.current;
+      // Nothing to look for, so skip reading every file into a string.
+      if (current.pattern === "") {
+        setOutcome({
+          result: searchProject([], current),
+          resultQuery: current,
+        });
+        setSearching(false);
+        return;
+      }
       const files: SearchInput[] = [];
       const live = new Set<TreeID>();
       for (const entry of index.state.texts.values()) {
@@ -58,7 +77,10 @@ export function useProjectSearch(
         files.push({ fileId: entry.id, path: entry.path, text: cached.text });
       }
       for (const id of strings.keys()) if (!live.has(id)) strings.delete(id);
-      setResult(searchProject(files, queryRef.current));
+      setOutcome({
+        result: searchProject(files, current),
+        resultQuery: current,
+      });
       setSearching(false);
     };
     const schedule = () => {
@@ -70,8 +92,14 @@ export function useProjectSearch(
     const unsubscribe = index.subscribe((change) => {
       for (const id of change.edited) strings.delete(id);
       // Edits to a file with no match and no stale entry still need a run:
-      // they can create the first match.
-      if (change.edited.size > 0 || change.structural) schedule();
+      // they can create the first match. Other structural batches (peers,
+      // meta) change no text, so they don't.
+      if (
+        change.edited.size > 0 ||
+        change.textsAdded.length > 0 ||
+        change.textsRemoved.length > 0
+      )
+        schedule();
     });
     scheduleRef.current = schedule;
     schedule();
@@ -86,5 +114,5 @@ export function useProjectSearch(
     scheduleRef.current();
   }, [pattern, regex, caseSensitive, wholeWord]);
 
-  return { result, searching };
+  return { result, resultQuery, searching };
 }

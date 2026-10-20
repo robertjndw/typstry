@@ -43,7 +43,7 @@ export function SearchPanel() {
   const { project, readOnly, undoManager } = useProject();
   const reveal = useReveal();
   const { replacement, ...query } = useSearchState();
-  const { result, searching } = useProjectSearch(project, query);
+  const { result, resultQuery, searching } = useProjectSearch(project, query);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const input = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
@@ -88,9 +88,12 @@ export function SearchPanel() {
   }
 
   function replace(targets: ReplaceTarget[]) {
+    // The rows on screen come from resultQuery, which trails what was just
+    // typed or toggled until the debounce runs.
+    if (!resultQuery) return;
     let outcome;
     try {
-      outcome = replaceMatches(project, targets, replacement, query, {
+      outcome = replaceMatches(project, targets, replacement, resultQuery, {
         undoManager,
       });
     } catch (err) {

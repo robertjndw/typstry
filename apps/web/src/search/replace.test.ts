@@ -158,4 +158,46 @@ describe("replaceMatches", () => {
     undo.undo();
     expect(read(project, ids.get("a.typ")!)).toBe("foo there");
   });
+
+  it("keeps the next keystroke out of the replace step", () => {
+    const { project, ids } = setup({ "a.typ": "" });
+    const undo = new UndoManager(project.doc, {
+      mergeInterval: UNDO_MERGE_INTERVAL_MS,
+    });
+    const text = getText(project, ids.get("a.typ")!);
+    text.insert(0, "foo there");
+    project.doc.commit();
+    const query = q("foo");
+    replaceMatches(project, search(project, ids, query), "bar", query, {
+      undoManager: undo,
+    });
+    text.insert(9, "!");
+    project.doc.commit();
+    undo.undo();
+    expect(read(project, ids.get("a.typ")!)).toBe("bar there");
+    undo.undo();
+    expect(read(project, ids.get("a.typ")!)).toBe("foo there");
+  });
+
+  it("skips a literal whole-word match that stopped being one", () => {
+    const { project, ids } = setup({ "a.typ": "foo bar" });
+    const query = q("foo", { wholeWord: true });
+    const files = search(project, ids, query);
+    getText(project, ids.get("a.typ")!).insert(3, "s");
+    project.doc.commit();
+    expect(replaceMatches(project, files, "x", query)).toEqual({
+      replaced: 0,
+      skipped: 1,
+    });
+  });
+
+  it("expands replacement patterns like String.replace", () => {
+    const { project, ids } = setup({ "a.typ": "<ab>" });
+    const query = q("(a)(b)", { regex: true });
+    const replacement = "$$|$0|$1$2|$12|$3|$`|$'|$<n>|$x|$";
+    replaceMatches(project, search(project, ids, query), replacement, query);
+    expect(read(project, ids.get("a.typ")!)).toBe(
+      "<ab>".replace(/(a)(b)/u, replacement),
+    );
+  });
 });

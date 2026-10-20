@@ -25,7 +25,9 @@ export function replaceMatches(
 ): { replaced: number; skipped: number } {
   let replaced = 0;
   let skipped = 0;
-  const re = query.regex ? compileQuery(query, true) : null;
+  // Literal mode re-runs the match too: a collaborator typing right after
+  // "foo" leaves the text at the offsets intact but breaks a whole-word match.
+  const re = compileQuery(query, true);
 
   for (const { fileId, matches } of targets) {
     let text;
@@ -52,11 +54,14 @@ export function replaceMatches(
         skipped++;
         continue;
       }
-      const next = re ? expand(re, before, match, replacement) : replacement;
-      if (next === null) {
+      const m = rematch(re, before, match);
+      if (!m) {
         skipped++;
         continue;
       }
+      const next = query.regex
+        ? substitute(m, before, replacement)
+        : replacement;
       text.delete(match.from, match.to - match.from);
       text.insert(match.from, next);
       lastFrom = match.from;
@@ -64,33 +69,77 @@ export function replaceMatches(
     }
   }
   if (replaced > 0) {
-    // A commit within the merge interval of the user's last edit would fold
-    // into that undo step, and undoing the replace would eat the typing too.
+    // Merging works both ways: the replace would fold into the typing just
+    // before it, and the next keystroke into the replace, so one undo would
+    // take both. The interval stays at 0 until that next commit is recorded.
     undoManager?.setMergeInterval(0);
-    try {
-      project.doc.commit({ message: "replace" });
-    } finally {
-      undoManager?.setMergeInterval(UNDO_MERGE_INTERVAL_MS);
+    project.doc.commit({ message: "replace" });
+    if (undoManager) {
+      const unsubscribe = project.doc.subscribeLocalUpdates(() => {
+        unsubscribe();
+        undoManager.setMergeInterval(UNDO_MERGE_INTERVAL_MS);
+      });
     }
   }
   return { replaced, skipped };
 }
 
 /**
- * Expands $1, $<name>, $& and friends the way String.replace does. Matching
- * in place on the whole text, not on the matched substring alone, keeps
- * anchors, lookarounds and captures working.
+ * Re-runs the match in place on the whole text, not on the matched substring
+ * alone, so anchors, lookarounds and whole-word checks still apply.
  */
-function expand(
+function rematch(
   re: RegExp,
   text: string,
   match: SearchMatch,
-  replacement: string,
-): string | null {
+): RegExpExecArray | null {
   re.lastIndex = match.from;
   const m = re.exec(text);
-  if (!m || m.index !== match.from || m[0] !== match.text) return null;
-  re.lastIndex = match.from;
-  const out = text.replace(re, replacement);
-  return out.slice(match.from, out.length - (text.length - match.to));
+  return m && m.index === match.from && m[0] === match.text ? m : null;
+}
+
+/**
+ * Expands $1, $<name>, $& and friends the way String.replace does. Done by
+ * hand because text.replace() would copy the whole file for every match.
+ */
+function substitute(
+  m: RegExpExecArray,
+  text: string,
+  replacement: string,
+): string {
+  const captures = m.length - 1;
+  let out = "";
+  let i = 0;
+  while (i < replacement.length) {
+    const dollar = replacement.indexOf("$", i);
+    if (dollar < 0 || dollar === replacement.length - 1) break;
+    out += replacement.slice(i, dollar);
+    const c = replacement[dollar + 1]!;
+    i = dollar + 2;
+    if (c === "$") out += "$";
+    else if (c === "&") out += m[0];
+    else if (c === "`") out += text.slice(0, m.index);
+    else if (c === "'") out += text.slice(m.index + m[0].length);
+    else if (c >= "0" && c <= "9") {
+      const two = Number(c + (replacement[i] ?? ""));
+      if (/\d/.test(replacement[i] ?? "") && two >= 1 && two <= captures) {
+        out += m[two] ?? "";
+        i++;
+      } else if (Number(c) >= 1 && Number(c) <= captures) {
+        out += m[Number(c)] ?? "";
+      } else {
+        out += "$" + c;
+      }
+    } else if (c === "<" && m.groups) {
+      const close = replacement.indexOf(">", i);
+      if (close < 0) out += "$<";
+      else {
+        out += m.groups[replacement.slice(i, close)] ?? "";
+        i = close + 1;
+      }
+    } else {
+      out += "$" + c;
+    }
+  }
+  return out + replacement.slice(i);
 }
