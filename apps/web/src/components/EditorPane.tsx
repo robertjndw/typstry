@@ -33,6 +33,11 @@ export type RevealTarget =
   /** UTF-16 offsets, which is what CodeMirror and Loro index by. */
   | { kind: "offset"; from: number; to: number };
 
+function clampRange(from: number, to: number, length: number) {
+  const clamp = (n: number) => Math.min(Math.max(n, 0), length);
+  return { from: clamp(from), to: clamp(Math.max(from, to)) };
+}
+
 /** A request to select a range once its file is open. */
 export interface RevealRequest {
   fileId: TreeID;
@@ -155,10 +160,7 @@ export function EditorPane({
     const range =
       target.kind === "source"
         ? sourceRangeToOffsets(target.range, doc)
-        : {
-            from: Math.min(target.from, doc.length),
-            to: Math.min(Math.max(target.from, target.to), doc.length),
-          };
+        : clampRange(target.from, target.to, doc.length);
     view.dispatch({
       selection: { anchor: range.from, head: range.to },
       scrollIntoView: true,

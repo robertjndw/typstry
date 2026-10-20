@@ -146,16 +146,21 @@ export function ProjectWorkspace({
     };
   }, [viewingVersion, compiler, tinymist]);
 
+  const { isMobile, setView } = layout;
   const reveal = useCallback(
     (fileId: TreeID, target: RevealTarget) => {
       openFile(fileId);
+      // Opening a different file already switches a phone to the editor,
+      // but revealing in the file that is already open would otherwise
+      // select text behind the sidebar or preview.
+      if (isMobile) setView("editor");
       setRevealRequest((prev) => ({
         fileId,
         target,
         seq: (prev?.seq ?? 0) + 1,
       }));
     },
-    [openFile],
+    [openFile, isMobile, setView],
   );
 
   const onDiagnosticClick = useCallback(
@@ -163,8 +168,14 @@ export function ProjectWorkspace({
       const fileId = diagnostic.path
         ? index.byPath.get(diagnostic.path)
         : undefined;
-      if (!fileId || !diagnostic.range) return;
-      reveal(fileId, { kind: "source", range: diagnostic.range });
+      if (!fileId) return;
+      // A diagnostic without a span still opens its file, at the top.
+      reveal(
+        fileId,
+        diagnostic.range
+          ? { kind: "source", range: diagnostic.range }
+          : { kind: "offset", from: 0, to: 0 },
+      );
     },
     [index, reveal],
   );

@@ -59,7 +59,7 @@ export function WorkspaceMenu({
   onFontsPackages: () => void;
   /** Absent when there is no server connection to push to. */
   onSyncNow?: () => void;
-  /** Sidebar tabs beyond Files; each gets an entry. */
+  /** The sidebar tabs that exist; those with a shortcut get an entry. */
   sidebarTabs?: readonly SidebarTab[];
   onOpenSidebar?: (tab: SidebarTab) => void;
 }) {
@@ -117,7 +117,10 @@ export function WorkspaceMenu({
             )}
           </DropdownMenuItem>
           {sidebarTabs.includes("search") && (
-            <DropdownMenuItem onSelect={() => onOpenSidebar?.("search")}>
+            <DropdownMenuItem
+              disabled={panelsDisabled}
+              onSelect={() => onOpenSidebar?.("search")}
+            >
               <FileSearchIcon />
               Search project
               {desktop && (
@@ -128,7 +131,10 @@ export function WorkspaceMenu({
             </DropdownMenuItem>
           )}
           {sidebarTabs.includes("outline") && (
-            <DropdownMenuItem onSelect={() => onOpenSidebar?.("outline")}>
+            <DropdownMenuItem
+              disabled={panelsDisabled}
+              onSelect={() => onOpenSidebar?.("outline")}
+            >
               <ListTreeIcon />
               Outline
               {desktop && (
