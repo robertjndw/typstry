@@ -32,7 +32,10 @@ import {
 } from "@/components/FolderSyncStatus";
 import { HistoryPanel } from "@/components/HistoryPanel";
 import { PresenceBar } from "@/components/PresenceBar";
-import { PreviewPane } from "@/components/PreviewPane";
+import {
+  PreviewPane,
+  type PreviewScrollTarget,
+} from "@/components/PreviewPane";
 import { ProjectTitle } from "@/components/ProjectTitle";
 import { QuickOpen } from "@/components/QuickOpen";
 import { SearchPanel } from "@/components/SearchPanel";
@@ -63,7 +66,9 @@ import { CursorContext, CursorStore } from "@/editor/cursor-store";
 import { RevealContext } from "@/project/reveal-context";
 import type { SyncNowResult } from "@/sync/connection";
 import { groupingFromLocation } from "@/project/useHistory";
+import type { PreviewJump } from "@/typst/compiler-client";
 import type { ProjectDiagnostic } from "@/typst/diagnostics";
+import type { PagePosition } from "@/typst/protocol";
 import { useProjectCompiler } from "@/project/useProjectCompiler";
 import { useProjectTinymist } from "@/project/useProjectTinymist";
 
@@ -136,6 +141,9 @@ export function ProjectWorkspace({
   const [revealRequest, setRevealRequest] = useState<RevealRequest | null>(
     null,
   );
+  const [previewTarget, setPreviewTarget] =
+    useState<PreviewScrollTarget | null>(null);
+  const cursors = useMemo(() => new CursorStore(), []);
 
   // A version brings its own compiler. The live one would keep compiling
   // every remote edit for a preview nobody sees.
@@ -184,8 +192,51 @@ export function ProjectWorkspace({
     [index, reveal],
   );
 
+  const showInPreview = useCallback(
+    (points: PagePosition[], baseline: boolean) => {
+      if (layout.isHidden("preview")) layout.toggle("preview");
+      setPreviewTarget((prev) => ({
+        points,
+        baseline,
+        seq: (prev?.seq ?? 0) + 1,
+      }));
+    },
+    [layout],
+  );
+
+  const onPreviewJump = useCallback(
+    (jump: PreviewJump) => {
+      if (jump.kind === "source") {
+        const fileId = index.byPath.get(jump.path);
+        if (fileId)
+          reveal(fileId, {
+            kind: "offset",
+            from: jump.offset,
+            to: jump.offset,
+          });
+      } else if (jump.kind === "package") {
+        toast(`Defined in package ${jump.package}`);
+      } else if (jump.kind === "position") {
+        showInPreview([jump], false);
+      }
+      // A link to a URL already opens on a single click.
+    },
+    [index, reveal, showInPreview],
+  );
+
+  const jumpToPreview = useCallback(async () => {
+    const cursor = cursors.getSnapshot();
+    const path = cursor && index.byId.get(cursor.fileId)?.path;
+    if (!compiler || !cursor || !path) return;
+    const positions = await compiler.jumpFromCursor(path, cursor.head);
+    if (positions.length === 0) {
+      toast("Nothing to show for this spot in the preview");
+      return;
+    }
+    showInPreview(positions, true);
+  }, [compiler, cursors, index, showInPreview]);
+
   const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
-  const cursors = useMemo(() => new CursorStore(), []);
   const [focusRequest, setFocusRequest] = useState(0);
 
   const openSidebar = useCallback(
@@ -251,6 +302,7 @@ export function ProjectWorkspace({
       [SHORTCUTS.togglePreview]: () => !viewing && layout.toggle("preview"),
       [SHORTCUTS.fontsPackages]: () =>
         !viewing && openFontsPackages({ tab: "fonts" }),
+      [SHORTCUTS.jumpToPreview]: () => !viewing && void jumpToPreview(),
       ...(sidebarTabs.includes("search") && {
         [SHORTCUTS.search]: () => !viewing && openSidebar("search"),
       }),
@@ -430,6 +482,8 @@ export function ProjectWorkspace({
                   client={compiler}
                   onDiagnosticClick={onDiagnosticClick}
                   onOpenFontsPackages={openFontsPackages}
+                  onJump={onPreviewJump}
+                  scrollTarget={previewTarget}
                   actions={
                     <PdfDownloadButton compiler={compiler} name={[title]} />
                   }

@@ -35,7 +35,7 @@ docker build -t typstry .
 docker run -d -p 8787:8787 -v typstry-data:/data typstry
 ```
 
-The first build compiles tinymist to wasm, so expect it to take several minutes.
+The first build compiles tinymist and the Typst compiler to wasm, so expect it to take several minutes.
 
 ### Running the binary directly
 

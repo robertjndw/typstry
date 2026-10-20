@@ -18,6 +18,8 @@ import {
   DEFAULT_FONTS,
   type FontAsset,
   type FontConfig,
+  type JumpTarget,
+  type PagePosition,
   type RenderError,
   type RenderPayload,
   type WorkerEvents,
@@ -157,6 +159,31 @@ function typstPath(path: string): string {
   return "/" + path;
 }
 
+/** A JumpTarget with project files given by their project path. */
+export type PreviewJump =
+  | { kind: "source"; path: string; offset: number }
+  | { kind: "package"; package: string; path: string; offset: number }
+  | { kind: "url"; url: string }
+  | ({ kind: "position" } & PagePosition);
+
+function toPreviewJump(target: JumpTarget | null): PreviewJump | null {
+  if (target?.kind !== "source") return target;
+  if (target.package !== "")
+    return {
+      kind: "package",
+      package: target.package,
+      path: target.path,
+      offset: target.offset,
+    };
+  if (!target.path.startsWith("/")) return null;
+  return { kind: "source", path: target.path.slice(1), offset: target.offset };
+}
+
+type JumpResponse = Extract<
+  WorkerResponse,
+  { type: "jump" } | { type: "jumpPositions" }
+>;
+
 export function createCompileWorker(): WorkerLike {
   return new Worker(new URL("./compile.worker.ts", import.meta.url), {
     type: "module",
@@ -274,6 +301,12 @@ export class CompilerClient {
     number,
     { resolve: (pdf: Uint8Array) => void; reject: (err: Error) => void }
   >();
+  private nextJumpId = 1;
+  /** Called with the answer, or with null when the worker went away. */
+  private readonly jumpRequests = new Map<
+    number,
+    (msg: JumpResponse | null) => void
+  >();
 
   constructor(project: ProjectDoc, options: CompilerClientOptions = {}) {
     this.project = project;
@@ -348,6 +381,7 @@ export class CompilerClient {
       // Asked for by the user, so it is not a crash and does not count
       // toward giving up.
       this.rejectPdfRequests(new Error("the compiler was restarted"));
+      this.dropJumpRequests();
       this.replaceWorker();
       this.setState({ error: "Restarting the compiler.", stalled: false });
     } else if (this.initFailed) {
@@ -449,10 +483,58 @@ export class CompilerClient {
     });
   }
 
+  /**
+   * Where a point in the preview leads: page 0-based, x and y in pt from the
+   * page's top-left. Null when nothing is there or nothing compiled yet.
+   */
+  jumpFromClick(
+    page: number,
+    x: number,
+    y: number,
+  ): Promise<PreviewJump | null> {
+    return this.requestJump(
+      (id) => ({ type: "jumpFromClick", id, page, x, y }),
+      (msg) => (msg?.type === "jump" ? toPreviewJump(msg.target) : null),
+    );
+  }
+
+  /**
+   * Where the text at a UTF-16 offset in a project file shows up in the
+   * preview. Empty for code that renders no text of its own.
+   */
+  jumpFromCursor(path: string, offset: number): Promise<PagePosition[]> {
+    return this.requestJump(
+      (id) => ({ type: "jumpFromCursor", id, path: typstPath(path), offset }),
+      (msg) => (msg?.type === "jumpPositions" ? msg.positions : []),
+    );
+  }
+
+  private requestJump<T>(
+    request: (id: number) => WorkerRequest,
+    answer: (msg: JumpResponse | null) => T,
+  ): Promise<T> {
+    if (this.disposed || this.workerDead) return Promise.resolve(answer(null));
+    const id = this.nextJumpId++;
+    return new Promise((resolve) => {
+      this.jumpRequests.set(id, (msg) => resolve(answer(msg)));
+      this.post(request(id));
+    });
+  }
+
+  /**
+   * A jump that cannot be answered just goes nowhere; unlike a PDF export,
+   * nobody needs to be told why.
+   */
+  private dropJumpRequests(): void {
+    for (const settle of this.jumpRequests.values()) settle(null);
+    this.jumpRequests.clear();
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.rejectPdfRequests(new Error("compiler disposed"));
+    this.dropJumpRequests();
     this.unsubscribeIndex();
     this.retries.dispose();
     if (this.flushTimer !== null) clearTimeout(this.flushTimer);
@@ -522,6 +604,7 @@ export class CompilerClient {
     if (this.disposed || this.workerDead) return;
     this.clearWatchdog();
     this.rejectPdfRequests(new Error(reason.toLowerCase()));
+    this.dropJumpRequests();
     if (!this.spawnWorker || this.restarts >= MAX_RESTARTS) {
       this.workerDead = true;
       this.detach(this.worker);
@@ -920,6 +1003,13 @@ export class CompilerClient {
         this.pdfRequests.delete(msg.id);
         if ("data" in msg) request?.resolve(msg.data);
         else request?.reject(new Error(msg.error));
+        break;
+      }
+      case "jump":
+      case "jumpPositions": {
+        const settle = this.jumpRequests.get(msg.id);
+        this.jumpRequests.delete(msg.id);
+        settle?.(msg);
         break;
       }
     }

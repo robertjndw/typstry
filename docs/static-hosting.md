@@ -22,7 +22,7 @@ Projects are stored in this browser's IndexedDB. Clearing site data, or using an
 TYPSTRY_BASE=/typstry/ pnpm --filter web build:static
 ```
 
-The result is in `apps/web/dist-static`.
+The result is in `apps/web/dist-static`. Like any web build it needs the wasm builds in `apps/web/vendor/`, see [Getting started](../README.md#getting-started).
 
 | Variable                  | Meaning                                                                                                                |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------- |

@@ -17,6 +17,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/root/.cache/.wasm-pack \
     apps/web/scripts/build-tinymist.sh
 
+FROM wasm-tools AS typst-compiler
+# Node runs typst.ts's wasm-debundle step. The script installs the Rust
+# version typst.ts pins (1.92), which differs from this image's.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+COPY apps/web/scripts/build-typst-compiler.sh apps/web/scripts/
+COPY apps/web/patches/typst-ts-jump.patch apps/web/patches/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/root/.cache/.wasm-pack \
+    apps/web/scripts/build-typst-compiler.sh
+
 FROM wasm-tools AS typstry-wasm
 # Only what the wasm build reads, so server or CLI edits keep this stage
 # cached. The workspace globs crates/*, so it does not mind the other crates
@@ -41,6 +54,7 @@ RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile --filter web...
 COPY apps/web apps/web
 COPY --from=tinymist /src/apps/web/vendor/tinymist apps/web/vendor/tinymist
+COPY --from=typst-compiler /src/apps/web/vendor/typst-ts-web-compiler apps/web/vendor/typst-ts-web-compiler
 COPY --from=typstry-wasm /src/apps/web/vendor/typstry-wasm apps/web/vendor/typstry-wasm
 # Optional font mirrors (see docs/self-hosting.md). Left unset, the app
 # loads the fonts from jsDelivr.

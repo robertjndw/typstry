@@ -1650,3 +1650,134 @@ describe("CompilerClient font bundles", () => {
     expect(reinits().map((m) => m.fonts.assets)).toEqual([["text", "cjk"]]);
   });
 });
+
+describe("CompilerClient jumps", () => {
+  it("answers each jump with the response carrying its id", async () => {
+    const { worker, client } = setup();
+    worker.take();
+    const first = client.jumpFromClick(1, 20, 30);
+    const second = client.jumpFromClick(0, 5, 6);
+    const [a, b] = worker.take();
+    expect(a).toEqual({ type: "jumpFromClick", id: 1, page: 1, x: 20, y: 30 });
+    expect(b).toMatchObject({ type: "jumpFromClick", id: 2 });
+
+    // Out of order, and with an id nobody waits for in between.
+    worker.emit({ type: "jump", id: 7, target: null });
+    worker.emit({
+      type: "jump",
+      id: 2,
+      target: { kind: "url", url: "https://example.com" },
+    });
+    worker.emit({
+      type: "jump",
+      id: 1,
+      target: { kind: "position", page: 1, x: 3, y: 4 },
+    });
+    await expect(second).resolves.toEqual({
+      kind: "url",
+      url: "https://example.com",
+    });
+    await expect(first).resolves.toEqual({
+      kind: "position",
+      page: 1,
+      x: 3,
+      y: 4,
+    });
+  });
+
+  it("turns typst paths into project paths and keeps package files apart", async () => {
+    const { worker, client } = setup();
+    worker.take();
+    const local = client.jumpFromClick(0, 1, 1);
+    const pkg = client.jumpFromClick(0, 2, 2);
+    worker.emit({
+      type: "jump",
+      id: 1,
+      target: {
+        kind: "source",
+        path: "/chapters/intro.typ",
+        package: "",
+        offset: 12,
+      },
+    });
+    worker.emit({
+      type: "jump",
+      id: 2,
+      target: {
+        kind: "source",
+        path: "/lib.typ",
+        package: "@preview/cetz:0.3.4",
+        offset: 3,
+      },
+    });
+    await expect(local).resolves.toEqual({
+      kind: "source",
+      path: "chapters/intro.typ",
+      offset: 12,
+    });
+    await expect(pkg).resolves.toEqual({
+      kind: "package",
+      package: "@preview/cetz:0.3.4",
+      path: "/lib.typ",
+      offset: 3,
+    });
+  });
+
+  it("asks for cursor jumps with the typst path", async () => {
+    const { worker, client } = setup();
+    worker.take();
+    const positions = client.jumpFromCursor("chapters/intro.typ", 40);
+    expect(worker.take()).toEqual([
+      {
+        type: "jumpFromCursor",
+        id: 1,
+        path: "/chapters/intro.typ",
+        offset: 40,
+      },
+    ]);
+    worker.emit({
+      type: "jumpPositions",
+      id: 1,
+      positions: [{ page: 2, x: 10, y: 20 }],
+    });
+    await expect(positions).resolves.toEqual([{ page: 2, x: 10, y: 20 }]);
+  });
+
+  it("settles pending jumps as nothing on dispose", async () => {
+    const { worker, client } = setup();
+    const click = client.jumpFromClick(0, 1, 1);
+    const cursor = client.jumpFromCursor("main.typ", 0);
+    client.dispose();
+    await expect(click).resolves.toBeNull();
+    await expect(cursor).resolves.toEqual([]);
+    // A late answer from the old worker changes nothing.
+    worker.emit({ type: "jump", id: 1, target: null });
+    await expect(client.jumpFromClick(0, 1, 1)).resolves.toBeNull();
+  });
+
+  it("settles pending jumps as nothing when the worker is replaced", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const project = initProject(newProject(1), { title: "T" });
+    const workers: FakeWorker[] = [];
+    const client = new CompilerClient(project, {
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w;
+      },
+    });
+    workers[0]!.emit({ type: "ready" });
+    const beforeCrash = client.jumpFromCursor("main.typ", 0);
+    workers[0]!.crash();
+    await expect(beforeCrash).resolves.toEqual([]);
+
+    // A user restart of a stalled worker drops them too.
+    workers[1]!.emit({ type: "ready" });
+    workers[1]!.emit({ type: "compiling", id: 1 });
+    await vi.advanceTimersByTimeAsync(61_000);
+    const beforeRestart = client.jumpFromClick(0, 1, 1);
+    client.retry();
+    await expect(beforeRestart).resolves.toBeNull();
+    expect(workers).toHaveLength(3);
+  });
+});

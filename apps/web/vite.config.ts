@@ -60,6 +60,11 @@ function precompress(): Plugin {
   };
 }
 
+const compilerVendor = path.resolve(
+  import.meta.dirname,
+  "vendor/typst-ts-web-compiler",
+);
+
 const localOnly = process.env.VITE_TYPSTRY_LOCAL_ONLY === "1";
 // Served from a subpath on GitHub Pages (/<repo>/).
 const base = process.env.TYPSTRY_BASE ?? "/";
@@ -182,7 +187,20 @@ export default defineConfig({
     }),
   ],
   resolve: {
-    alias: { "@": path.resolve(import.meta.dirname, "src") },
+    alias: [
+      { find: "@", replacement: path.resolve(import.meta.dirname, "src") },
+      // Our build with source/preview jumps (scripts/build-typst-compiler.sh).
+      // The typst.ts wrapper imports the package by name, so it gets swapped
+      // everywhere rather than imported from vendor/ like typstry-wasm.
+      {
+        find: /^@myriaddreamin\/typst-ts-web-compiler$/,
+        replacement: path.resolve(compilerVendor, "pkg/wasm-pack-shim.mjs"),
+      },
+      {
+        find: /^@myriaddreamin\/typst-ts-web-compiler\//,
+        replacement: compilerVendor + "/",
+      },
+    ],
   },
   optimizeDeps: {
     // Both ship wasm-bindgen "bundler" output (ESM wasm imports). Pre-bundled,

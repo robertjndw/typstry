@@ -40,7 +40,43 @@ export type WorkerRequest =
    * it sent and answers with the current document in full, compiling only if
    * the renderer does not hold it yet.
    */
-  | { type: "rerender" };
+  | { type: "rerender" }
+  /**
+   * Where a point in the preview leads in the source, answered by "jump".
+   * Page is 0-based, x and y are pt from the page's top-left corner.
+   */
+  | { type: "jumpFromClick"; id: number; page: number; x: number; y: number }
+  /**
+   * Where a source position shows up in the preview, answered by
+   * "jumpPositions". Offset is in UTF-16 code units, like CodeMirror's.
+   */
+  | { type: "jumpFromCursor"; id: number; path: string; offset: number };
+
+/** A point in the preview: 0-based page, pt from the page's top-left. */
+export interface PagePosition {
+  page: number;
+  x: number;
+  y: number;
+}
+
+/**
+ * Where a click in the preview leads. Jumps resolve against the last
+ * document that compiled, so after a failed compile the offset is in the
+ * text that compiled, which may be behind the editor.
+ */
+export type JumpTarget =
+  | {
+      kind: "source";
+      /** Absolute typst path; within the package when `package` is set. */
+      path: string;
+      /** Package spec such as "@preview/cetz:0.3.4", or "" for project files. */
+      package: string;
+      /** UTF-16 offset into that file. */
+      offset: number;
+    }
+  | { kind: "url"; url: string }
+  /** An internal link, such as an outline entry. */
+  | ({ kind: "position" } & PagePosition);
 
 /** A typst source range, 0-based lines and columns in Unicode code points. */
 export interface SourceRange {
@@ -131,7 +167,9 @@ export type WorkerResponse =
       renderError?: RenderError;
       renderMs: number;
     }
-  | ({ type: "pdf"; id: number } & ({ data: Uint8Array } | { error: string }));
+  | ({ type: "pdf"; id: number } & ({ data: Uint8Array } | { error: string }))
+  | { type: "jump"; id: number; target: JumpTarget | null }
+  | { type: "jumpPositions"; id: number; positions: PagePosition[] };
 
 /** The Worker events the client listens to. */
 export interface WorkerEvents {
