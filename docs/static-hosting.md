@@ -39,4 +39,4 @@ Hosts cannot send the security headers the server sends, so the build puts the s
 
 Both the static build and the server build are installable as a PWA. A service worker caches the app, including the compiler, so it starts offline. When a new version has been downloaded, a toast offers to reload.
 
-Typst Universe packages are fetched from `packages.typst.org` while compiling and are not cached across sessions. Offline, only packages the compiler has already loaded in the current session work.
+Packages you pin to a project in the Fonts & Packages dialog are stored in the project itself, in IndexedDB for a local project, so they compile offline and across sessions. Typst Universe packages you have not pinned are still fetched from `packages.typst.org` while compiling and are not cached across sessions, so they need the network each time.

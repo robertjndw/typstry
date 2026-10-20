@@ -44,6 +44,10 @@ frames and hello, and saved MLS state report it as malformed instead of
 asking for an update. Held owner key secrets of a newer version are kept
 as they are: the web app and the CLI refuse to save over them.
 
+The root `packages` map and the `meta.cjkFonts` / `meta.emojiFonts`
+booleans are additive doc data, so they did not bump `meta.schema`. Older
+clients ignore them, and readers skip any package record that is malformed.
+
 Keep the Rust and TypeScript copies of a constant equal. The crypto,
 identity, pairing and MLS constants live in Rust only; the web app reads
 them from the wasm.

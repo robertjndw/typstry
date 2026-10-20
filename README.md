@@ -11,10 +11,11 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 
 - **Real-time collaboration** - edits merge conflict-free through [Loro](https://loro.dev) CRDTs, with live cursors and presence for everyone in the project.
 - **End-to-end encryption** - the project key lives only in the URL fragment and the browser, so the server stores ciphertext for documents and uploads alike.
-- **In-browser compilation** - Typst compiles in a Web Worker via [typst.ts](https://github.com/Myriad-Dreamin/typst.ts), with a live SVG preview and inline diagnostics. Typst Universe packages are fetched on demand.
+- **In-browser compilation** - Typst compiles in a Web Worker via [typst.ts](https://github.com/Myriad-Dreamin/typst.ts), with a live SVG preview and inline diagnostics. Typst Universe packages are fetched on demand, or pinned to the project to work offline.
 - **Autocompletion and docs** - [tinymist](https://github.com/Myriad-Dreamin/tinymist) runs in a second Web Worker for completions, hover docs and signature help, including your own functions and labels. File paths in `#include`, `#image` and similar calls complete from the project's files.
 - **Offline-first** - projects are kept in IndexedDB, open without the server, and sync once the connection comes back.
-- **Multi-file projects** - file tree, tabs, and uploads for images, fonts and data files. Images can also be pasted or dropped into the editor.
+- **Multi-file projects** - file tree, tabs, and uploads for images and data files. Images can also be pasted or dropped into the editor.
+- **Custom fonts and packages** - add fonts and Typst packages (uploaded or pinned from Universe) to a project in the Fonts & Packages dialog. They are encrypted and shared like any other file, and the zip download includes the packages for `typst compile --package-path typst-packages`.
 - **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
 - **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so members can see who is in a project and its owner can remove a member, which also replaces the links.
 - **Your devices** - pair a phone, a laptop and the CLI with a short code to use them as one person. Your project list syncs between them, a lost device can be revoked from any other, and a recovery key brings everything back if all are lost.
