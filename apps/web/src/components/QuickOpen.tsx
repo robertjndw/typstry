@@ -184,7 +184,7 @@ function QuickOpenBody({ onDone }: { onDone: () => void }) {
 }
 
 /** `text` with the matched characters emphasized. */
-function Highlighted({
+export function Highlighted({
   text,
   offset,
   positions,

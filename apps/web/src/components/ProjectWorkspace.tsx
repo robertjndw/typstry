@@ -10,6 +10,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -17,6 +18,7 @@ import type { TreeID } from "loro-crdt";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
+import { OutlinePanel } from "@/components/OutlinePanel";
 import { PdfDownloadButton } from "@/components/DownloadButton";
 import {
   EditorPane,
@@ -56,6 +58,7 @@ import { cn } from "@/lib/utils";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { useProject } from "@/project/context";
 import type { VersionTarget } from "@/project/history-items";
+import { CursorContext, CursorStore } from "@/editor/cursor-store";
 import { RevealContext } from "@/project/reveal-context";
 import type { SyncNowResult } from "@/sync/connection";
 import { groupingFromLocation } from "@/project/useHistory";
@@ -86,7 +89,7 @@ export interface ProjectWorkspaceProps {
 // Panels beyond the file tree are passed to <Sidebar> as they exist, and
 // the shortcuts, menu and dialog follow this list. Module level so its
 // identity is stable.
-const sidebarTabs: readonly SidebarTab[] = ["files"];
+const sidebarTabs: readonly SidebarTab[] = ["files", "outline"];
 
 /** The full project UI for whatever ProjectProvider is above it. */
 export function ProjectWorkspace({
@@ -181,6 +184,7 @@ export function ProjectWorkspace({
   );
 
   const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
+  const cursors = useMemo(() => new CursorStore(), []);
   const [focusRequest, setFocusRequest] = useState(0);
 
   const openSidebar = useCallback(
@@ -400,34 +404,37 @@ export function ProjectWorkspace({
         </div>
       ) : (
         <RevealContext value={reveal}>
-          <WorkspaceLayout
-            layout={layout}
-            files={
-              <Sidebar
-                tab={sidebarTab}
-                onTabChange={setSidebarTab}
-                heading={<FolderSyncStatus />}
-                notice={<FolderSyncNotice />}
-              />
-            }
-            editor={
-              <EditorPane
-                compiler={compiler}
-                tinymist={tinymist}
-                reveal={revealRequest}
-              />
-            }
-            preview={
-              <PreviewPane
-                client={compiler}
-                onDiagnosticClick={onDiagnosticClick}
-                onOpenFontsPackages={openFontsPackages}
-                actions={
-                  <PdfDownloadButton compiler={compiler} name={[title]} />
-                }
-              />
-            }
-          />
+          <CursorContext value={cursors}>
+            <WorkspaceLayout
+              layout={layout}
+              files={
+                <Sidebar
+                  tab={sidebarTab}
+                  onTabChange={setSidebarTab}
+                  heading={<FolderSyncStatus />}
+                  notice={<FolderSyncNotice />}
+                  outline={<OutlinePanel />}
+                />
+              }
+              editor={
+                <EditorPane
+                  compiler={compiler}
+                  tinymist={tinymist}
+                  reveal={revealRequest}
+                />
+              }
+              preview={
+                <PreviewPane
+                  client={compiler}
+                  onDiagnosticClick={onDiagnosticClick}
+                  onOpenFontsPackages={openFontsPackages}
+                  actions={
+                    <PdfDownloadButton compiler={compiler} name={[title]} />
+                  }
+                />
+              }
+            />
+          </CursorContext>
         </RevealContext>
       )}
     </div>
