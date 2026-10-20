@@ -496,13 +496,11 @@ function ThreadCard({
 function useAuthor(comment: Comment): Identity {
   const { project } = useProject();
   const memberOfPeer = useRoster()?.memberOfPeer;
+  // Not keyed on `comment` itself: the list is rebuilt on every doc change.
+  const { peer, name, color } = comment;
   return useMemo(
-    () =>
-      authorIdentity(project, comment.peer, memberOfPeer, {
-        name: comment.name,
-        color: comment.color,
-      }),
-    [project, comment, memberOfPeer],
+    () => authorIdentity(project, peer, memberOfPeer, { name, color }),
+    [project, peer, name, color, memberOfPeer],
   );
 }
 

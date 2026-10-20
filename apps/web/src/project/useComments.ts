@@ -25,12 +25,16 @@ function docStore<T>(
   let value: T;
   let stale = true;
   return {
-    subscribe: (listener: () => void) =>
-      project.doc.subscribe((batch) => {
+    subscribe: (listener: () => void) => {
+      // The first value was read during render, before this subscription, so
+      // a batch that landed in between would otherwise never show up.
+      stale = true;
+      return project.doc.subscribe((batch) => {
         if (!relevant(batch)) return;
         stale = true;
         listener();
-      }),
+      });
+    },
     get: (): T => {
       if (stale) {
         value = compute();

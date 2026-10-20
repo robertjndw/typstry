@@ -165,6 +165,8 @@ describe("comment threads", () => {
       { ...good, textId: 7 },
       { ...good, quote: "q".repeat(MAX_QUOTE_CHARS + 1) },
       { ...good, createdAt: "yesterday" },
+      // Finite, but past what Date can show.
+      { ...good, createdAt: 1e20 },
       { ...good, thread: "not an id" },
       // A reply whose thread does not exist.
       { ...good, thread: "999@1" },
@@ -270,6 +272,12 @@ describe("comment anchors", () => {
     text.delete(6, 1); // the first "b"
     a.doc.commit();
     expect(anchored(a, file, id)).toBe("rav");
+  });
+
+  it("cover a whole emoji at either end", () => {
+    const { a, file } = setup("say 👋 to 🌍 now");
+    const id = comment(a, file, 4, 11);
+    expect(anchored(a, file, id)).toBe("👋 to 🌍");
   });
 
   it("detach when the whole range is deleted", () => {

@@ -5,7 +5,7 @@
 import type { ContainerID, LoroText, TreeID } from "loro-crdt";
 import { createContext, useContext, useSyncExternalStore } from "react";
 
-import { encodeCursor } from "@/doc/cursors";
+import { encodeRange } from "@/doc/cursors";
 
 /** A selection about to be commented on, pinned with Loro cursors. */
 export interface CommentDraft {
@@ -94,17 +94,10 @@ export class CommentsUi {
   startDraft(): boolean {
     const s = this.selection;
     if (!s || s.from >= s.to) return false;
-    const anchor = encodeCursor(s.text, s.from);
-    const head = encodeCursor(s.text, s.to - 1);
-    if (!anchor || !head) return false;
+    const range = encodeRange(s.text, s.from, s.to);
+    if (!range) return false;
     this.update({
-      draft: {
-        fileId: s.fileId,
-        textId: s.text.id,
-        anchor,
-        head,
-        quote: s.text.toString().slice(s.from, s.to),
-      },
+      draft: { fileId: s.fileId, textId: s.text.id, ...range },
     });
     this.showPanel(true);
     return true;

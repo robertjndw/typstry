@@ -30,7 +30,7 @@ import {
 
 import { isValidColor, normalizeName } from "@/presence/identity";
 
-import { encodeCursor, resolveCursor } from "./cursors";
+import { encodeRange, resolveCursor } from "./cursors";
 import { getText } from "./fs-ops";
 import { COMMENT_ORIGIN, NODE, type ProjectDoc } from "./schema";
 
@@ -135,7 +135,13 @@ function parseComment(
     return null;
   if (typeof quote !== "string" || [...quote].length > MAX_QUOTE_CHARS)
     return null;
-  if (typeof createdAt !== "number" || !Number.isFinite(createdAt)) return null;
+  // Finite is not enough: Date and Intl throw beyond 8.64e15 ms, which
+  // would take the whole panel down on render.
+  if (
+    typeof createdAt !== "number" ||
+    Number.isNaN(new Date(createdAt).getTime())
+  )
+    return null;
   if (typeof body !== "string" || typeof name !== "string") return null;
   if (!isValidColor(color)) return null;
   const text = normalizeCommentBody(body);
@@ -268,20 +274,17 @@ export function addComment(
   // Pending edits are not part of the comment; committed under its origin
   // they would also drop out of the editor's undo.
   project.doc.commit();
-  // The anchors stick to the first and the last commented character, so
-  // text typed right before or right after the range stays outside it.
-  const anchor = encodeCursor(text, from);
-  const head = encodeCursor(text, to - 1);
-  if (!anchor || !head) throw new Error("Comment range must cover some text");
+  const range = encodeRange(text, from, to);
+  if (!range) throw new Error("Comment range must cover some text");
   return push(
     project,
     {
       [COMMENT.thread]: null,
       [COMMENT.fileId]: fileId,
       [COMMENT.textId]: text.id,
-      [COMMENT.anchor]: anchor,
-      [COMMENT.head]: head,
-      [COMMENT.quote]: truncateQuote(text.toString().slice(from, to)),
+      [COMMENT.anchor]: range.anchor,
+      [COMMENT.head]: range.head,
+      [COMMENT.quote]: truncateQuote(range.quote),
       [COMMENT.body]: body,
       [COMMENT.createdAt]: input.now ?? Date.now(),
       [COMMENT.name]: author.name,
@@ -398,10 +401,13 @@ export function resolveAnchor(
   const end = resolveCursor(doc, comment.textId, comment.head);
   if (!start || !end) return null;
   // The head sticks to the last character in the range, so the range ends
-  // right after it. Once that character is deleted, Loro reports where it
-  // used to be, which is already the end. Nothing is written back: the
-  // records are immutable and the original bytes keep resolving.
+  // right after it, which is two UTF-16 units for an emoji. Once that
+  // character is deleted, Loro reports where it used to be, which is
+  // already the end. Nothing is written back: the records are immutable
+  // and the original bytes keep resolving.
   const from = start.offset;
-  const to = end.deleted ? end.offset : end.offset + 1;
+  const to = end.deleted
+    ? end.offset
+    : end.offset + (content.charAt(end.offset).length || 1);
   return to > from ? { from, to } : null;
 }

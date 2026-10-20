@@ -22,6 +22,31 @@ export function encodeCursor(
   }
 }
 
+/**
+ * Pins the non-empty range `[from, to)` of `text` with cursors on its first
+ * and on its last character, so text typed right before or right after it
+ * stays outside. Also returns the covered text.
+ */
+export function encodeRange(
+  text: LoroText,
+  from: number,
+  to: number,
+): { anchor: Uint8Array; head: Uint8Array; quote: string } | null {
+  const content = text.toString();
+  // Loro has no cursor inside a surrogate pair, so a range ending in an
+  // emoji has to stick to the pair's first half.
+  const low = content.charCodeAt(to - 1);
+  const high = content.charCodeAt(to - 2);
+  const last =
+    low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff
+      ? to - 2
+      : to - 1;
+  const anchor = encodeCursor(text, from);
+  const head = encodeCursor(text, last);
+  if (!anchor || !head) return null;
+  return { anchor, head, quote: content.slice(from, to) };
+}
+
 export interface CursorPos {
   offset: number;
   /**
