@@ -17,6 +17,13 @@ export type WorkerRequest =
   | { type: "setText"; path: string; text: string }
   | { type: "setAsset"; path: string; data: Uint8Array }
   | { type: "remove"; path: string }
+  /**
+   * A project package as its stored .tar.gz. `key` is the doc's key
+   * ("ns/name/version"); the hash names the content, so a replacement can be
+   * told from the archive it supersedes.
+   */
+  | { type: "setPackage"; key: string; hash: string; data: Uint8Array }
+  | { type: "removePackage"; key: string }
   /** Debounced in the worker; only the latest pending request runs. */
   | { type: "compile"; mainPath: string }
   /** One-off PDF compile, answered by a "pdf" response with the same id. */
@@ -98,7 +105,11 @@ export interface RenderError {
 }
 
 export type WorkerResponse =
-  | { type: "ready" }
+  | {
+      type: "ready";
+      /** The extra font bundles could not load; the compiler runs without. */
+      fontWarning?: string;
+    }
   | { type: "initError"; message: string }
   | { type: "compiling"; id: number }
   | {

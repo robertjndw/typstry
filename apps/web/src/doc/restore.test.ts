@@ -21,6 +21,13 @@ import {
 import { initProject, PEER_INFO_ORIGIN, type ProjectDoc } from "./schema";
 import { fork, newProject, sync } from "./test-utils";
 import { listVersions, saveVersion } from "./versions";
+import {
+  deletePackage,
+  putPackage,
+  readFontBundles,
+  readPackages,
+  setFontBundle,
+} from "@/packages/records";
 
 /** Path -> text (or asset hash), the observable state of a project. */
 function files(project: ProjectDoc): Record<string, string> {
@@ -97,6 +104,39 @@ describe("restoreVersion", () => {
     expect(a.title).toBe("Paper");
     expect(buildPathIndex(a).byId.get(intro)!.path).toBe("chapters/intro.typ");
     expect(buildPathIndex(a).byId.get(logo)!.path).toBe("chapters/logo.png");
+  });
+
+  it("restores packages and font bundles", () => {
+    const base = {
+      namespace: "local",
+      name: "p",
+      version: "1.0.0",
+      hash: "h1",
+      size: 1,
+      mime: "application/gzip",
+      entrypoint: "lib.typ",
+      fileCount: 1,
+      unpackedSize: 1,
+      source: "upload" as const,
+      addedAt: 1,
+    };
+    const { a } = setup();
+    putPackage(a, base);
+    putPackage(a, { ...base, name: "gone" });
+    setFontBundle(a, "cjk", true);
+    const v1 = a.doc.oplogFrontiers();
+    putPackage(a, { ...base, hash: "h2" });
+    deletePackage(a, "local/gone/1.0.0");
+    putPackage(a, { ...base, name: "extra" });
+    setFontBundle(a, "cjk", false);
+    setFontBundle(a, "emoji", true);
+    expectRestored(a, v1);
+    expect([...readPackages(a).keys()]).toEqual([
+      "local/gone/1.0.0",
+      "local/p/1.0.0",
+    ]);
+    expect(readPackages(a).get("local/p/1.0.0")?.hash).toBe("h1");
+    expect(readFontBundles(a)).toEqual({ cjk: true, emoji: false });
   });
 
   it("swaps nested folders back without cycles", () => {

@@ -1,5 +1,5 @@
 //! Cross-language checks. `clash.loro`, the expected paths and
-//! `version.js.loro` are written by `apps/web/src/doc/fixture.test.ts`
+//! `version.js.loro` and `packages.js.loro` are written by `apps/web/src/doc/fixture.test.ts`
 //! (regenerate with `pnpm --filter web fixtures`); this side must derive the
 //! same paths and read the same version. `version.rust.loro` goes the other
 //! way and is rewritten by running this test with `TYPSTRY_WRITE_FIXTURES=1`.
@@ -12,6 +12,7 @@ use serde::Deserialize;
 use typstry_doc::init::init_project;
 use typstry_doc::materialize::{FileContent, is_safe_path, materialize, materialize_at};
 use typstry_doc::names::validate_name;
+use typstry_doc::packages::{font_bundles, packages};
 use typstry_doc::paths::build_path_index;
 use typstry_doc::versions::{NamedVersion, named_versions, save_version};
 use typstry_doc::{node, root, title};
@@ -112,6 +113,40 @@ fn reads_version_saved_by_typescript() {
     let files = materialize_at(&doc, &version.frontiers).unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "main.typ");
+}
+
+#[test]
+fn reads_packages_written_by_typescript() {
+    let doc = LoroDoc::from_snapshot(include_bytes!("fixtures/packages.js.loro")).unwrap();
+    let found = packages(&doc);
+    // The scratch package was removed, and the thesis one replaced.
+    let keys: Vec<_> = found
+        .iter()
+        .map(|p| format!("{}/{}/{}", p.namespace, p.name, p.version))
+        .collect();
+    assert_eq!(keys, ["local/thesis/1.0.0", "preview/cetz/0.3.0"]);
+
+    let thesis = &found[0];
+    assert_eq!(thesis.hash, "hash-new");
+    assert_eq!(thesis.size, 1024);
+    assert_eq!(thesis.file_count, 3);
+    assert_eq!(thesis.unpacked_size, 4096);
+    assert_eq!(thesis.added_at, 1_700_000_000_500);
+    assert_eq!(thesis.source, "upload");
+    assert_eq!(thesis.description.as_deref(), Some("A thesis template"));
+    assert_eq!(
+        thesis.authors.as_deref(),
+        Some(&["Ada".to_owned(), "Grace".to_owned()][..])
+    );
+    assert_eq!(thesis.license.as_deref(), Some("MIT"));
+    assert_eq!(thesis.compiler.as_deref(), Some("0.13.0"));
+
+    let cetz = &found[1];
+    assert_eq!(cetz.source, "universe");
+    assert_eq!(cetz.entrypoint, "src/lib.typ");
+    assert_eq!(cetz.description, None);
+
+    assert_eq!(font_bundles(&doc), (true, false));
 }
 
 fn rust_saved_version() -> (LoroDoc, NamedVersion) {

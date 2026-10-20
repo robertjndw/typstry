@@ -12,6 +12,20 @@ export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((byte, i) => byte === b[i]);
 }
 
+/** `chunks` joined into one array; `total` is their summed length. */
+export function concatBytes(
+  chunks: readonly Uint8Array[],
+  total = chunks.reduce((n, c) => n + c.length, 0),
+): Uint8Array {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return out;
+}
+
 export function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

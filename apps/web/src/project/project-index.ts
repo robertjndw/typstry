@@ -2,7 +2,9 @@ import type { ContainerID, LoroDoc, LoroEventBatch, TreeID } from "loro-crdt";
 
 import { getText } from "@/doc/fs-ops";
 import { buildPathIndex, type PathIndex } from "@/doc/paths";
-import { NODE, type ProjectDoc } from "@/doc/schema";
+import { NODE, type PackageRecord, type ProjectDoc } from "@/doc/schema";
+import { readFontBundles, readPackages } from "@/packages/records";
+import type { FontAsset } from "@/typst/protocol";
 
 export interface IndexedText {
   id: TreeID;
@@ -24,6 +26,10 @@ export interface ProjectIndexState {
   /** Asset files that carry a content hash, by path. */
   assets: ReadonlyMap<string, IndexedAsset>;
   mainFile: TreeID | null;
+  /** Valid package records by key. Same object while none changed. */
+  packages: ReadonlyMap<string, PackageRecord>;
+  /** Built-in font bundles to load. Same array while equal. */
+  fontAssets: readonly FontAsset[];
 }
 
 /** What one doc event batch changed, relative to the previous state. */
@@ -49,6 +55,11 @@ export interface ProjectIndexChange {
   /** Asset paths that are new or changed hash. */
   assetsAdded: readonly IndexedAsset[];
   mainChanged: boolean;
+  /** Packages that are new or changed their archive hash. */
+  packagesAdded: PackageRecord[];
+  /** Keys of packages that went away. */
+  packagesRemoved: string[];
+  fontAssetsChanged: boolean;
 }
 
 export type ProjectIndexListener = (change: ProjectIndexChange) => void;
@@ -58,7 +69,26 @@ const EMPTY_STATE: ProjectIndexState = {
   texts: new Map(),
   assets: new Map(),
   mainFile: null,
+  packages: new Map(),
+  fontAssets: ["text"],
 };
+
+function samePackages(
+  a: ReadonlyMap<string, PackageRecord>,
+  b: ReadonlyMap<string, PackageRecord>,
+): boolean {
+  if (a.size !== b.size) return false;
+  for (const [key, record] of a) {
+    const other = b.get(key);
+    if (!other || JSON.stringify(other) !== JSON.stringify(record))
+      return false;
+  }
+  return true;
+}
+
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
 
 function samePaths(a: PathIndex, b: PathIndex): boolean {
   if (a.byId.size !== b.byId.size || a.byPath.size !== b.byPath.size)
@@ -159,6 +189,9 @@ export class ProjectIndex {
           assetsRemoved: [],
           assetsAdded: [],
           mainChanged: false,
+          packagesAdded: [],
+          packagesRemoved: [],
+          fontAssetsChanged: false,
         };
     for (const listener of [...this.listeners]) {
       // An earlier listener may have unsubscribed this one.
@@ -208,11 +241,24 @@ export class ProjectIndex {
         );
       }
     }
+    const builtPackages = readPackages(this.project);
+    const packages = samePackages(prev.packages, builtPackages)
+      ? prev.packages
+      : builtPackages;
+    const bundles = readFontBundles(this.project);
+    const wanted: FontAsset[] = ["text"];
+    if (bundles.cjk) wanted.push("cjk");
+    if (bundles.emoji) wanted.push("emoji");
+    const fontAssets = sameList(prev.fontAssets, wanted)
+      ? prev.fontAssets
+      : wanted;
     this.current = {
       paths,
       texts,
       assets,
       mainFile: this.project.mainFile,
+      packages,
+      fontAssets,
     };
     return this.current;
   }
@@ -243,6 +289,16 @@ export class ProjectIndex {
     for (const [path, old] of prev.assets)
       if (!next.assets.has(path)) assetsRemoved.push(old);
 
+    const packagesAdded: PackageRecord[] = [];
+    const packagesRemoved: string[] = [];
+    if (prev.packages !== next.packages) {
+      for (const [key, record] of next.packages)
+        if (prev.packages.get(key)?.hash !== record.hash)
+          packagesAdded.push(record);
+      for (const key of prev.packages.keys())
+        if (!next.packages.has(key)) packagesRemoved.push(key);
+    }
+
     return {
       state: next,
       structural: true,
@@ -251,6 +307,9 @@ export class ProjectIndex {
       assetsRemoved,
       assetsAdded,
       mainChanged: prev.mainFile !== next.mainFile,
+      packagesAdded,
+      packagesRemoved,
+      fontAssetsChanged: prev.fontAssets !== next.fontAssets,
     };
   }
 }

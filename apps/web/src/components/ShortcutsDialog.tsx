@@ -16,6 +16,7 @@ const GROUPS: { title: string; items: { label: string; combo: string }[] }[] = [
       { label: "Sync now", combo: SHORTCUTS.syncNow },
       { label: "Show or hide files", combo: SHORTCUTS.toggleFiles },
       { label: "Show or hide the preview", combo: SHORTCUTS.togglePreview },
+      { label: "Fonts and packages", combo: SHORTCUTS.fontsPackages },
     ],
   },
   {

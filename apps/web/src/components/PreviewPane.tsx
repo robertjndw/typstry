@@ -58,6 +58,7 @@ import {
 import { formatShortcut } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 import type { CompilerClient, PreviewState } from "@/typst/compiler-client";
+import type { FontsPackagesTarget } from "@/components/fonts-packages/types";
 import { formatLocation, type ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewState } from "@/typst/hooks";
 import {
@@ -69,6 +70,11 @@ import {
 export interface PreviewPaneProps {
   client: CompilerClient | null;
   onDiagnosticClick?: (diagnostic: ProjectDiagnostic) => void;
+  /**
+   * Opens the Fonts & Packages dialog from a missing font or package error.
+   * Without it those errors show no shortcut.
+   */
+  onOpenFontsPackages?: (target: FontsPackagesTarget) => void;
   /** Extra toolbar buttons, shown before the zoom controls. */
   actions?: ReactNode;
   /**
@@ -126,6 +132,7 @@ const clampZoom = (scale: number) =>
 export function PreviewPane({
   client,
   onDiagnosticClick,
+  onOpenFontsPackages,
   actions,
   variant = "pane",
   className,
@@ -494,6 +501,21 @@ export function PreviewPane({
         </div>
       )}
 
+      {state?.fontWarning && !viewer && (
+        <div
+          role="status"
+          className="flex shrink-0 animate-in items-center gap-2 border-b bg-background px-3 py-1.5 text-xs duration-150 fade-in-0 slide-in-from-top-1"
+        >
+          <AlertTriangle className="size-3.5 shrink-0 text-warning" />
+          <span className="min-w-0 flex-1 truncate" title={state.fontWarning}>
+            {state.fontWarning}
+          </span>
+          <Button variant="outline" size="xs" onClick={() => client?.retry()}>
+            Retry
+          </Button>
+        </div>
+      )}
+
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div
           ref={viewportRef}
@@ -569,6 +591,7 @@ export function PreviewPane({
         <ProblemsPanel
           diagnostics={state.diagnostics}
           onDiagnosticClick={onDiagnosticClick}
+          onOpenFontsPackages={viewer ? undefined : onOpenFontsPackages}
         />
       )}
     </div>
@@ -859,9 +882,11 @@ function plural(n: number, word: string) {
 function ProblemsPanel({
   diagnostics,
   onDiagnosticClick,
+  onOpenFontsPackages,
 }: {
   diagnostics: ProjectDiagnostic[];
   onDiagnosticClick?: (d: ProjectDiagnostic) => void;
+  onOpenFontsPackages?: (target: FontsPackagesTarget) => void;
 }) {
   const listId = useId();
   const errors = diagnostics.filter((d) => d.severity === "error").length;
@@ -932,11 +957,12 @@ function ProblemsPanel({
         >
           {diagnostics.map((d, i) => {
             const Icon = d.severity === "error" ? AlertCircle : AlertTriangle;
+            const hint = onOpenFontsPackages && d.hint;
             return (
-              <li key={i}>
+              <li key={i} className="flex items-start">
                 <button
                   type="button"
-                  className="flex w-full items-start gap-2 px-3 py-1.5 text-left outline-none focus-visible:bg-muted enabled:hover:bg-muted disabled:cursor-default"
+                  className="flex min-w-0 flex-1 items-start gap-2 px-3 py-1.5 text-left outline-none focus-visible:bg-muted enabled:hover:bg-muted disabled:cursor-default"
                   disabled={!onDiagnosticClick || d.path === null}
                   onClick={() => onDiagnosticClick?.(d)}
                 >
@@ -955,6 +981,26 @@ function ProblemsPanel({
                     {d.message}
                   </span>
                 </button>
+                {hint && (
+                  // A sibling, not inside the row button: buttons can't nest.
+                  <Button
+                    variant="link"
+                    size="xs"
+                    className="my-0.5 mr-2 shrink-0"
+                    onClick={() =>
+                      onOpenFontsPackages(
+                        hint.kind === "font"
+                          ? { tab: "fonts" }
+                          : {
+                              tab: "packages",
+                              ...(hint.spec ? { prefill: hint.spec } : {}),
+                            },
+                      )
+                    }
+                  >
+                    {hint.kind === "font" ? "Upload font…" : "Add package…"}
+                  </Button>
+                )}
               </li>
             );
           })}

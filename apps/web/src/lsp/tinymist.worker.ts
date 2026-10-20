@@ -4,7 +4,9 @@ import initTinymist, {
 import tinymistWasmUrl from "../../vendor/tinymist/tinymist_bg.wasm?url";
 
 import { toBase64 } from "@/crypto/bytes";
+import { universeArchiveUrl } from "@/packages/spec";
 
+import { binaryStringToBytes, PackageStore } from "./package-store";
 import type { TinymistRequest, TinymistResponse } from "./protocol";
 
 // Same hand-typed worker scope as compile.worker.ts.
@@ -35,12 +37,39 @@ function toClient(message: JsonRpcMessage): void {
 // files by asking for them (tinymist/fs/watch) and is told about them, and
 // about later changes, through tinymist/fsChange.
 const files = new Map<string, Uint8Array>();
+
+// resolveFn cannot wait, so a Universe package is fetched with a blocking
+// request. That is allowed in a worker, and tinymist is stuck on the answer
+// anyway.
+function fetchPreviewArchive({
+  name,
+  version,
+}: {
+  name: string;
+  version: string;
+}): Uint8Array | undefined {
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", universeArchiveUrl(name, version), false);
+  // Synchronous requests refuse responseType "arraybuffer", so read the
+  // body as a byte-per-char string instead.
+  xhr.overrideMimeType("text/plain; charset=x-user-defined");
+  try {
+    xhr.send();
+  } catch (err) {
+    console.warn(`[tinymist] could not fetch ${name}:${version}`, err);
+    return undefined;
+  }
+  if (xhr.status !== 200) return undefined;
+  return binaryStringToBytes(xhr.responseText);
+}
+
+const packages = new PackageStore(fetchPreviewArchive);
 const watched = new Set<string>();
 /** Watched files changed since the last fsChange, sent together per drain. */
 const changed = new Set<string>();
 
 function fileChange(uri: string) {
-  const data = files.get(uri);
+  const data = files.get(uri) ?? packages.file(uri);
   return {
     uri,
     content: data
@@ -131,7 +160,8 @@ function onServerRequest(
         // Answered for missing files too: "not found" until the main thread
         // sends the file, which then counts as a change.
         markChanged(uri);
-        if (!files.has(uri)) scope.postMessage({ type: "needFile", uri });
+        if (!files.has(uri) && !packages.file(uri))
+          scope.postMessage({ type: "needFile", uri });
       }
       for (const uri of (params?.removes as string[] | undefined) ?? [])
         watched.delete(uri);
@@ -178,9 +208,13 @@ async function start(): Promise<void> {
         return;
       toClient({ method, params });
     },
-    // No packages yet. Resolving one means downloading and unpacking it
-    // synchronously, which we don't do.
-    resolveFn: () => undefined,
+    // tinymist calls this with a {namespace, name, version} spec and wants
+    // a directory path back, or undefined for "not found". It then reads
+    // the package through the same fs requests as project files, which
+    // serve the unpacked tree. It caches what it resolved, so the main
+    // thread restarts this worker when the project's packages change.
+    resolveFn: (spec: { namespace: string; name: string; version: string }) =>
+      packages.resolve(spec),
   });
   drain();
 }
@@ -210,8 +244,20 @@ scope.addEventListener("message", ({ data }) => {
     onClientMessage(data.message);
     return;
   }
-  if (data.type === "setFile") files.set(data.uri, data.data);
-  else files.delete(data.uri);
+  switch (data.type) {
+    case "setPackage":
+      packages.set(data.key, data.hash, data.data);
+      return;
+    case "removePackage":
+      packages.remove(data.key);
+      return;
+    case "setFile":
+      files.set(data.uri, data.data);
+      break;
+    case "removeFile":
+      files.delete(data.uri);
+      break;
+  }
   markChanged(data.uri);
 });
 

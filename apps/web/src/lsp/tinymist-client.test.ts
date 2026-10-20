@@ -9,7 +9,8 @@ import {
   getText,
   rename,
 } from "@/doc/fs-ops";
-import { initProject } from "@/doc/schema";
+import { initProject, type PackageRecord } from "@/doc/schema";
+import { deletePackage, putPackage } from "@/packages/records";
 import { newProject } from "@/doc/test-utils";
 
 import type { TinymistRequest, TinymistResponse } from "./protocol";
@@ -241,6 +242,126 @@ describe("TinymistClient worker failures", () => {
     expect(workers[1]!.terminated).toBe(true);
     expect(workers).toHaveLength(2);
     expect(warning).toHaveBeenCalledTimes(1);
+    client.dispose();
+  });
+});
+
+describe("TinymistClient packages", () => {
+  const record = (hash: string): PackageRecord => ({
+    namespace: "local",
+    name: "demo",
+    version: "1.0.0",
+    hash,
+    size: 1,
+    mime: "application/gzip",
+    entrypoint: "lib.typ",
+    fileCount: 1,
+    unpackedSize: 1,
+    source: "upload",
+    addedAt: 0,
+  });
+  const key = "local/demo/1.0.0";
+  const packageMessages = (worker: FakeWorker) =>
+    worker.sent
+      .map((s) => s.message)
+      .filter((m) => m.type === "setPackage" || m.type === "removePackage");
+
+  function setupWithWorkers() {
+    const load = vi.fn(async (hash: string) => new TextEncoder().encode(hash));
+    const assets = { load, store: vi.fn() } as unknown as ProjectAssets;
+    const project = initProject(newProject(1), { title: "T" });
+    const workers: FakeWorker[] = [];
+    const client = new TinymistClient(project, assets, {
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w as unknown as TinymistWorker;
+      },
+    });
+    return { project, workers, client, load };
+  }
+
+  it("sends packages already in the project without restarting", async () => {
+    const project = initProject(newProject(1), { title: "T" });
+    putPackage(project, record("h1"));
+    const workers: FakeWorker[] = [];
+    const assets = {
+      load: async (hash: string) => new TextEncoder().encode(hash),
+    } as unknown as ProjectAssets;
+    const client = new TinymistClient(project, assets, {
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w as unknown as TinymistWorker;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(workers).toHaveLength(1);
+    expect(packageMessages(workers[0]!)).toMatchObject([
+      { type: "setPackage", key, hash: "h1" },
+    ]);
+    client.dispose();
+  });
+
+  it("restarts quietly once, debounced, when the package set changes", async () => {
+    const { project, workers, client } = setupWithWorkers();
+    putPackage(project, record("h1"));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(packageMessages(workers[0]!)).toHaveLength(1);
+    expect(workers).toHaveLength(1);
+
+    putPackage(project, { ...record("h2"), name: "other" });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(workers).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(workers).toHaveLength(2);
+    expect(workers[0]!.terminated).toBe(true);
+
+    // The new worker gets both packages, the files, and a new handshake.
+    const sent = workers[1]!.sent.map((s) => s.message);
+    expect(packageMessages(workers[1]!)).toHaveLength(2);
+    expect(sent).toContainEqual(
+      expect.objectContaining({ type: "setFile", uri: `${ROOT}main.typ` }),
+    );
+    expect(
+      sent.some((m) => m.type === "lsp" && m.message.includes('"initialize"')),
+    ).toBe(true);
+
+    // The failure budget is untouched: one crash still gets a worker.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    workers[1]!.crash();
+    expect(workers).toHaveLength(3);
+    client.dispose();
+  });
+
+  it("tells the worker about a removed package and restarts", async () => {
+    const { project, workers, client } = setupWithWorkers();
+    putPackage(project, record("h1"));
+    await vi.advanceTimersByTimeAsync(200);
+    deletePackage(project, "local/demo/1.0.0");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(packageMessages(workers[0]!).map((m) => m.type)).toEqual([
+      "setPackage",
+      "removePackage",
+    ]);
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(workers).toHaveLength(2);
+    expect(packageMessages(workers[1]!)).toEqual([]);
+    client.dispose();
+  });
+
+  it("retries a package archive that failed to load, then restarts", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { project, workers, client, load } = setupWithWorkers();
+    load.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    putPackage(project, record("h1"));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(packageMessages(workers[0]!)).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(packageMessages(workers[0]!)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(workers).toHaveLength(2);
     client.dispose();
   });
 });

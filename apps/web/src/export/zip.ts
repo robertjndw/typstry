@@ -7,7 +7,10 @@ import { fileText } from "@/doc/restore";
 import { NODE, type ProjectDoc } from "@/doc/schema";
 import { mapConcurrent } from "@/lib/concurrent";
 import { toError } from "@/lib/errors";
+import { readPackages } from "@/packages/records";
+import { formatSpec } from "@/packages/spec";
 
+import { unpackPackages, type PackageArchive } from "./unpack";
 import type { ZipRequest, ZipResponse } from "./zip.worker";
 
 /** Asset downloads in flight at once; each one is a fetch and a decrypt. */
@@ -35,12 +38,20 @@ export interface ExportedZip {
    * checkout on macOS or Windows that would become git's own config.
    */
   skipped: string[];
+  /** Packages in the zip, unpacked under `typst-packages/`. */
+  packages: number;
+  /**
+   * Package keys left out because the project has files at the same paths,
+   * sorted. They stay in the project; only the export loses them.
+   */
+  packagesLeftOut: string[];
 }
 
 /**
  * Packs every file of `project` into a zip, using the same paths the
  * compiler sees (clash losers keep their "~id" names). If any asset fails to
- * load, the whole export fails. A zip with missing images looks fine until
+ * load, the whole export fails. Project packages are unpacked into
+ * `typst-packages/`, which `typst compile --package-path` takes as is. A zip with missing images looks fine until
  * someone tries to compile it.
  */
 export async function exportZip(
@@ -53,6 +64,7 @@ export async function exportZip(
   const index = buildPathIndex(project);
   const files: Zippable = {};
   const assets: { path: string; hash: string }[] = [];
+  const records = [...readPackages(project)];
   const failed: string[] = [];
   let firstError: Error | undefined;
   const nonEmptyDirs = new Set<string>();
@@ -82,18 +94,40 @@ export async function exportZip(
     }
     assets.push({ path, hash });
   }
+  const archives: PackageArchive[] = [];
   if (loadAsset) {
-    await mapConcurrent(assets, LOAD_CONCURRENCY, ({ path, hash }) =>
-      loadAsset(hash).then(
-        // Images, PDFs and fonts are compressed already; deflating them
-        // again only costs time.
-        (bytes) => void (files[path] = [bytes, { level: 0 }]),
-        (err: unknown) => {
-          failed.push(path);
-          firstError ??= toError(err);
-        },
-      ),
+    const fail = (name: string, err: unknown) => {
+      failed.push(name);
+      firstError ??= toError(err);
+    };
+    // One queue for both, so packages do not add to the downloads in flight.
+    await mapConcurrent(
+      [
+        ...assets.map(({ path, hash }) => ({
+          name: path,
+          hash,
+          // Images, PDFs and fonts are compressed already; deflating them
+          // again only costs time.
+          onLoad: (bytes: Uint8Array) => {
+            files[path] = [bytes, { level: 0 }];
+          },
+        })),
+        ...records.map(([key, r]) => ({
+          name: formatSpec(r),
+          hash: r.hash,
+          onLoad: (bytes: Uint8Array) => {
+            archives.push({ key, bytes });
+          },
+        })),
+      ],
+      LOAD_CONCURRENCY,
+      ({ name, hash, onLoad }) =>
+        loadAsset(hash).then(onLoad, (err: unknown) => fail(name, err)),
     );
+  } else {
+    for (const [, r] of records) {
+      failed.push(formatSpec(r));
+    }
   }
   if (failed.length > 0) throw new ExportError(failed.sort(), firstError);
 
@@ -102,7 +136,13 @@ export async function exportZip(
   for (const dir of dirs) {
     if (!nonEmptyDirs.has(dir)) files[`${dir}/`] = new Uint8Array(0);
   }
-  return { zip: await zip(files, mtime), skipped: skipped.sort() };
+  const built = await zip(files, archives, mtime);
+  return {
+    zip: built.zip,
+    skipped: skipped.sort(),
+    packages: archives.length - built.left.length,
+    packagesLeftOut: built.left,
+  };
 }
 
 /**
@@ -112,19 +152,30 @@ export async function exportZip(
  * starts one per large file. Falls back to the main thread where there are
  * no workers (tests).
  */
-function zip(files: Zippable, mtime: number): Promise<Uint8Array<ArrayBuffer>> {
+function zip(
+  files: Zippable,
+  packages: PackageArchive[],
+  mtime: number,
+): Promise<{ zip: Uint8Array<ArrayBuffer>; left: string[] }> {
   if (typeof Worker === "undefined") {
-    return Promise.resolve(
-      zipSync(files, { level: 6, mtime }) as Uint8Array<ArrayBuffer>,
-    );
+    return new Promise((resolve) => {
+      const left = unpackPackages(packages, files);
+      resolve({
+        zip: zipSync(files, { level: 6, mtime }) as Uint8Array<ArrayBuffer>,
+        left,
+      });
+    });
   }
   const worker = new Worker(new URL("./zip.worker.ts", import.meta.url), {
     type: "module",
     name: "zip",
   });
   const transfer = new Set<ArrayBuffer>();
-  for (const entry of Object.values(files)) {
-    const bytes = Array.isArray(entry) ? entry[0] : entry;
+  const candidates = [
+    ...Object.values(files).map((e) => (Array.isArray(e) ? e[0] : e)),
+    ...packages.map((p) => p.bytes),
+  ];
+  for (const bytes of candidates) {
     // Only buffers nothing else could be looking at: the loader hands out
     // fresh ones, but a view into something larger would take the rest
     // along when detached.
@@ -135,13 +186,15 @@ function zip(files: Zippable, mtime: number): Promise<Uint8Array<ArrayBuffer>> {
     )
       transfer.add(bytes.buffer as ArrayBuffer);
   }
-  return new Promise<Uint8Array<ArrayBuffer>>((resolve, reject) => {
-    worker.onmessage = (e: MessageEvent<ZipResponse>) => {
-      if (e.data.ok) resolve(e.data.zip);
-      else reject(new Error(e.data.message));
-    };
-    worker.onerror = (e) => reject(new Error(e.message || "zip failed"));
-    const request: ZipRequest = { files, mtime };
-    worker.postMessage(request, [...transfer]);
-  }).finally(() => worker.terminate());
+  return new Promise<{ zip: Uint8Array<ArrayBuffer>; left: string[] }>(
+    (resolve, reject) => {
+      worker.onmessage = (e: MessageEvent<ZipResponse>) => {
+        if (e.data.ok) resolve({ zip: e.data.zip, left: e.data.left });
+        else reject(new Error(e.data.message));
+      };
+      worker.onerror = (e) => reject(new Error(e.message || "zip failed"));
+      const request: ZipRequest = { files, packages, mtime };
+      worker.postMessage(request, [...transfer]);
+    },
+  ).finally(() => worker.terminate());
 }

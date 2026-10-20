@@ -1,6 +1,7 @@
 import { Text } from "@codemirror/state";
 
 import {
+  diagnosticHint,
   formatLocation,
   normalizeDiagnostic,
   parseRange,
@@ -36,6 +37,7 @@ describe("typst diagnostics", () => {
       severity: "warning",
       message: "unknown font family: nope",
       range: { startLine: 0, startCol: 16, endLine: 0, endCol: 22 },
+      hint: { kind: "font", family: "nope" },
     });
     expect(formatLocation(d)).toBe("chapters/a.typ:1:17");
   });
@@ -152,5 +154,43 @@ describe("toCodeMirrorDiagnostics", () => {
     expect(out).toEqual([
       { from: 0, to: 0, severity: "warning", message: "w" },
     ]);
+  });
+
+  it("hints at the package a missing import names", () => {
+    expect(
+      diagnosticHint("package not found (searched for @local/hello:0.1.0)"),
+    ).toEqual({ kind: "package", spec: "@local/hello:0.1.0" });
+    expect(
+      diagnosticHint(
+        "package not found (searched for @preview/cetz:0.3.4), hints: x",
+      ),
+    ).toEqual({ kind: "package", spec: "@preview/cetz:0.3.4" });
+  });
+
+  it("hints at a package version that does not exist", () => {
+    expect(
+      diagnosticHint("package found, but version 9.9.9 does not exist"),
+    ).toEqual({ kind: "package", spec: "" });
+    expect(
+      diagnosticHint(
+        "package found, but version 9.9.9 does not exist (@preview/cetz:9.9.9)",
+      ),
+    ).toEqual({ kind: "package", spec: "@preview/cetz:9.9.9" });
+  });
+
+  it("hints at an unknown font family and leaves other messages alone", () => {
+    expect(diagnosticHint("unknown font family: fira sans")).toEqual({
+      kind: "font",
+      family: "fira sans",
+    });
+    expect(diagnosticHint("file not found")).toBeUndefined();
+    const d = toProjectDiagnostic({
+      package: "",
+      path: "/main.typ",
+      severity: "error",
+      message: "file not found",
+      range: null,
+    });
+    expect("hint" in d).toBe(false);
   });
 });

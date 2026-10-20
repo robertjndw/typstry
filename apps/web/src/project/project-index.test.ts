@@ -2,6 +2,7 @@ import { createAsset, createFile, getText, rename } from "@/doc/fs-ops";
 import * as paths from "@/doc/paths";
 import { initProject } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
+import { deletePackage, putPackage, setFontBundle } from "@/packages/records";
 
 import { projectIndex, type ProjectIndexChange } from "./project-index";
 
@@ -60,5 +61,47 @@ describe("ProjectIndex", () => {
     project.setPeer("7", { name: "Ada", color: "#000" });
     expect(changes[0]!.structural).toBe(true);
     expect(changes[0]!.state.paths).toBe(before);
+  });
+
+  it("tracks packages and font bundles", () => {
+    const { project, index, changes } = setup();
+    expect(index.state.fontAssets).toEqual(["text"]);
+    const record = {
+      namespace: "local",
+      name: "p",
+      version: "1.0.0",
+      hash: "h1",
+      size: 1,
+      mime: "application/gzip",
+      entrypoint: "lib.typ",
+      fileCount: 1,
+      unpackedSize: 1,
+      source: "upload" as const,
+      addedAt: 1,
+    };
+    putPackage(project, record);
+    const [added] = changes.splice(0);
+    expect(added!.packagesAdded).toEqual([record]);
+    expect(added!.fontAssetsChanged).toBe(false);
+    const packages = index.state.packages;
+
+    // Unrelated structural change keeps the same map.
+    project.setPeer("7", { name: "Ada", color: "#000" });
+    expect(changes.splice(0)[0]!.state.packages).toBe(packages);
+
+    putPackage(project, { ...record, hash: "h2" });
+    expect(changes.splice(0)[0]!.packagesAdded.map((p) => p.hash)).toEqual([
+      "h2",
+    ]);
+
+    setFontBundle(project, "emoji", true);
+    const [fonts] = changes.splice(0);
+    expect(fonts!.fontAssetsChanged).toBe(true);
+    expect(fonts!.state.fontAssets).toEqual(["text", "emoji"]);
+
+    deletePackage(project, "local/p/1.0.0");
+    const [removed] = changes.splice(0);
+    expect(removed!.packagesRemoved).toEqual(["local/p/1.0.0"]);
+    expect(removed!.fontAssetsChanged).toBe(false);
   });
 });

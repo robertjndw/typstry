@@ -5,6 +5,8 @@ import {
   PanelRightIcon,
 } from "lucide-react";
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -17,6 +19,7 @@ import { toast } from "sonner";
 import { PdfDownloadButton } from "@/components/DownloadButton";
 import { EditorPane, type RevealRequest } from "@/components/EditorPane";
 import { FileTree } from "@/components/FileTree";
+import type { FontsPackagesTarget } from "@/components/fonts-packages/types";
 import {
   FolderSyncNotice,
   FolderSyncStatus,
@@ -48,6 +51,11 @@ import type { ProjectDiagnostic } from "@/typst/diagnostics";
 import { useProjectCompiler } from "@/project/useProjectCompiler";
 import { useProjectTinymist } from "@/project/useProjectTinymist";
 
+// Fonts, packages and their parsers are only needed once the dialog opens.
+const FontsPackagesDialog = lazy(
+  () => import("@/components/fonts-packages/FontsPackagesDialog"),
+);
+
 export interface ProjectWorkspaceProps {
   /** Sync state indicator; stays visible on phones too. */
   status?: ReactNode;
@@ -77,6 +85,14 @@ export function ProjectWorkspace({
   const [tagging, setTagging] = useState<TagTarget | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [fontsPackages, setFontsPackages] =
+    useState<FontsPackagesTarget | null>(null);
+  // Takes a target so a compile hint can open the packages tab with the
+  // missing spec prefilled; pass it down to the preview as a prop.
+  const openFontsPackages = useCallback(
+    (target: FontsPackagesTarget) => setFontsPackages(target),
+    [],
+  );
   const [viewing, setViewing] = useState<{
     target: VersionTarget;
     changes: boolean;
@@ -145,6 +161,8 @@ export function ProjectWorkspace({
       [SHORTCUTS.quickOpen]: () => !viewing && setQuickOpen((open) => !open),
       [SHORTCUTS.toggleFiles]: () => !viewing && layout.toggle("files"),
       [SHORTCUTS.togglePreview]: () => !viewing && layout.toggle("preview"),
+      [SHORTCUTS.fontsPackages]: () =>
+        !viewing && openFontsPackages({ tab: "fonts" }),
     },
     { scope: root },
   );
@@ -228,6 +246,7 @@ export function ProjectWorkspace({
             onTagVersion={tag && (() => tag({ kind: "current" }))}
             onQuickOpen={() => setQuickOpen(true)}
             onShortcuts={() => setShortcutsOpen(true)}
+            onFontsPackages={() => openFontsPackages({ tab: "fonts" })}
             onSyncNow={syncNow}
           />
           {badge}
@@ -264,6 +283,14 @@ export function ProjectWorkspace({
       )}
       <QuickOpen open={quickOpen} onOpenChange={setQuickOpen} />
       <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      {fontsPackages && (
+        <Suspense fallback={null}>
+          <FontsPackagesDialog
+            open={fontsPackages}
+            onClose={() => setFontsPackages(null)}
+          />
+        </Suspense>
+      )}
       {viewing ? (
         <div className="min-h-0 flex-1">
           <VersionView
@@ -298,6 +325,7 @@ export function ProjectWorkspace({
             <PreviewPane
               client={compiler}
               onDiagnosticClick={onDiagnosticClick}
+              onOpenFontsPackages={openFontsPackages}
               actions={<PdfDownloadButton compiler={compiler} name={[title]} />}
             />
           }

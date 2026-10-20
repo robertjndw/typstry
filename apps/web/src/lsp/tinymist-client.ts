@@ -12,7 +12,7 @@ import { toast } from "sonner";
 
 import type { ProjectAssets } from "@/assets/project-assets";
 import { getText } from "@/doc/fs-ops";
-import type { ProjectDoc } from "@/doc/schema";
+import type { PackageRecord, ProjectDoc } from "@/doc/schema";
 import {
   projectIndex,
   type ProjectIndex,
@@ -46,6 +46,8 @@ const lspTooltipTheme = EditorView.theme({
 /** Long enough for the first request, which waits for wasm and a compile. */
 const REQUEST_TIMEOUT_MS = 20_000;
 const SYNC_DEBOUNCE_MS = 150;
+/** Lets a burst of package changes (an upload of several) settle first. */
+const PACKAGE_RESTART_DEBOUNCE_MS = 1_000;
 
 const encoder = new TextEncoder();
 
@@ -108,6 +110,10 @@ interface AssetFile {
   requested: boolean;
 }
 
+interface PackageEntry {
+  record: PackageRecord;
+}
+
 /**
  * Runs tinymist in a worker for one project: completion, hover docs and
  * signature help for the editor. Open files are synced by the LSP client;
@@ -128,6 +134,8 @@ export class TinymistClient {
 
   private readonly textsById = new Map<TreeID, TextFile>();
   private readonly assetsByUri = new Map<string, AssetFile>();
+  private readonly packagesByKey = new Map<string, PackageEntry>();
+  private packageRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly retry = new RetryQueue();
   /**
    * URIs open in an editor, with how many editors show each. The LSP client
@@ -175,7 +183,7 @@ export class TinymistClient {
     this.unsubscribeIndex = this.index.subscribe((change) =>
       this.onIndexChange(change),
     );
-    this.syncStructure(this.index.state);
+    this.syncStructure(this.index.state, true);
   }
 
   /** The editor extension for the file at project path `path`. */
@@ -219,6 +227,8 @@ export class TinymistClient {
     this.unsubscribeIndex();
     this.retry.dispose();
     if (this.syncTimer !== null) clearTimeout(this.syncTimer);
+    if (this.packageRestartTimer !== null)
+      clearTimeout(this.packageRestartTimer);
     this.detach(this.worker);
     this.lsp.disconnect();
     this.worker.terminate();
@@ -252,30 +262,57 @@ export class TinymistClient {
   private onFailure(reason: string): void {
     if (this.disposed || this.failed) return;
     console.error(`[tinymist] ${reason}`);
+    if (this.spawnWorker && !this.restarted) {
+      this.restarted = true;
+      this.replaceWorker(this.spawnWorker);
+      return;
+    }
     this.detach(this.worker);
     this.lsp.disconnect();
     this.worker.terminate();
-    if (this.spawnWorker && !this.restarted) {
-      this.restarted = true;
-      this.worker = this.spawnWorker();
-      this.attach(this.worker);
-      // The new worker knows no files; mirror everything again. Assets wait
-      // for tinymist to ask, as before.
-      this.textsById.clear();
-      this.assetsByUri.clear();
-      this.dirty.clear();
-      this.pinnedMain = null;
-      this.syncStructure(this.index.state);
-      // Reconnecting also reopens the files shown in editors.
-      this.lsp.connect(this.transport());
-      return;
-    }
     this.failed = true;
     toast.warning("Language features are unavailable", {
       id: "tinymist-unavailable",
       description:
         "Completion and hover docs could not start. Editing and the preview still work; reload the page to try again.",
     });
+  }
+
+  private replaceWorker(spawn: () => TinymistWorker): void {
+    if (this.packageRestartTimer !== null)
+      clearTimeout(this.packageRestartTimer);
+    this.packageRestartTimer = null;
+    this.detach(this.worker);
+    this.lsp.disconnect();
+    this.worker.terminate();
+    this.worker = spawn();
+    this.attach(this.worker);
+    // The new worker knows no files; mirror everything again. Assets wait
+    // for tinymist to ask, as before.
+    this.textsById.clear();
+    this.assetsByUri.clear();
+    this.packagesByKey.clear();
+    this.dirty.clear();
+    this.pinnedMain = null;
+    this.syncStructure(this.index.state, true);
+    // Reconnecting also reopens the files shown in editors.
+    this.lsp.connect(this.transport());
+  }
+
+  /**
+   * tinymist remembers what a package resolved to (or that it was missing)
+   * for the life of the server, so a changed package set needs a new one.
+   * Unlike a failure restart this does not use up the one-shot budget.
+   * A caller-owned worker is left alone: the client has no way to make
+   * another.
+   */
+  private schedulePackageRestart(): void {
+    if (!this.spawnWorker || this.packageRestartTimer !== null) return;
+    this.packageRestartTimer = setTimeout(() => {
+      this.packageRestartTimer = null;
+      if (this.disposed || this.failed || !this.spawnWorker) return;
+      this.replaceWorker(this.spawnWorker);
+    }, PACKAGE_RESTART_DEBOUNCE_MS);
   }
 
   private post(message: TinymistRequest, transfer?: Transferable[]): void {
@@ -366,8 +403,11 @@ export class TinymistClient {
     );
   }
 
-  /** Brings the worker's mirror in line with the index. */
-  private syncStructure(state: ProjectIndexState): void {
+  /**
+   * Brings the worker's mirror in line with the index. `fresh` is for a
+   * worker that has been sent nothing yet.
+   */
+  private syncStructure(state: ProjectIndexState, fresh = false): void {
     this.structural = false;
     const paths: string[] = [];
     for (const entry of state.paths.byId.values())
@@ -412,9 +452,61 @@ export class TinymistClient {
       if (asset.requested) this.sendAsset(uri, asset);
     }
 
+    this.syncPackages(state, fresh);
+
     const mainId = state.mainFile;
     const mainPath = mainId ? state.paths.byId.get(mainId)?.path : undefined;
     this.pinMain(mainPath ?? null);
+  }
+
+  /**
+   * Project packages go to the worker up front: tinymist resolves a package
+   * synchronously, so there is no time to ask for the archive when an import
+   * is first seen. `fresh` is the first send to a worker, which needs no
+   * restart because it has not resolved anything yet.
+   */
+  private syncPackages(state: ProjectIndexState, fresh: boolean): void {
+    for (const [key, entry] of this.packagesByKey) {
+      const next = state.packages.get(key);
+      if (next?.hash === entry.record.hash) continue;
+      this.packagesByKey.delete(key);
+      this.retry.cancel(`package:${key}`);
+      if (!next) {
+        this.post({ type: "removePackage", key });
+        this.schedulePackageRestart();
+      }
+    }
+    for (const [key, record] of state.packages) {
+      if (this.packagesByKey.has(key)) continue;
+      const entry = { record };
+      this.packagesByKey.set(key, entry);
+      this.sendPackage(key, entry, fresh);
+    }
+  }
+
+  private sendPackage(key: string, entry: PackageEntry, fresh: boolean) {
+    const { record } = entry;
+    void this.assets?.load(record.hash).then(
+      (data) => {
+        // Replaced or removed while loading.
+        if (this.packagesByKey.get(key) !== entry) return;
+        this.retry.succeeded(`package:${key}`);
+        this.post({ type: "setPackage", key, hash: record.hash, data }, [
+          data.buffer,
+        ]);
+        if (!fresh) this.schedulePackageRestart();
+      },
+      (err: unknown) => {
+        console.error(`failed to load package ${key}`, err);
+        if (this.packagesByKey.get(key) !== entry) return;
+        // Whatever imported the package has already failed to resolve it,
+        // so a late success needs the restart too.
+        this.retry.schedule(`package:${key}`, () => {
+          const current = this.packagesByKey.get(key);
+          if (current) this.sendPackage(key, current, false);
+        });
+      },
+    );
   }
 
   /**

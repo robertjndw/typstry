@@ -13,6 +13,7 @@ import {
 import compilerWasmUrl from "@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm?url";
 
 import { wasmModuleRef } from "./wasm-module";
+import { ProjectPackageRegistry } from "./package-registry";
 
 import { normalizeDiagnostic, type RawDiagnostic } from "./diagnostics";
 import {
@@ -115,11 +116,21 @@ async function cachedFetch(
   return res;
 }
 
-// Shared across reinits so downloaded packages survive a font change.
-// FetchPackageRegistry uses synchronous XHR, which is only allowed in
+// Shared across reinits so downloaded and project packages survive a font
+// change. FetchPackageRegistry uses synchronous XHR, which is only allowed in
 // workers; another reason the compiler lives here.
 const accessModel = new MemoryAccessModel();
-const packages = new FetchPackageRegistry(accessModel);
+const packages = new ProjectPackageRegistry(
+  accessModel,
+  new FetchPackageRegistry(accessModel),
+);
+/**
+ * A package the compiler already looked up changed. Typst keeps package
+ * resolution for the life of the compiler, failures included, and reset()
+ * does not drop it (see package-registry.wasm.test.ts), so the next compile
+ * runs on a new compiler.
+ */
+let packagesStale = false;
 
 type FileEntry =
   { kind: "text"; text: string } | { kind: "asset"; data: Uint8Array };
@@ -169,7 +180,8 @@ function openIncrementalServer(
   });
 }
 
-async function buildSession(config: FontConfig): Promise<Session> {
+async function buildCompiler(config: FontConfig): Promise<TypstCompiler> {
+  packages.forgetLookups();
   const compiler = createTypstCompiler();
   await compiler.init({
     getModule: () => wasmModuleRef(compilerWasmUrl),
@@ -186,17 +198,43 @@ async function buildSession(config: FontConfig): Promise<Session> {
       withPackageRegistry(packages),
     ],
   });
+  return compiler;
+}
+
+async function buildSession(
+  config: FontConfig,
+): Promise<{ session: Session; fontWarning?: string }> {
+  let compiler: TypstCompiler;
+  let fontWarning: string | undefined;
+  try {
+    compiler = await buildCompiler(config);
+  } catch (err) {
+    // The CJK and emoji bundles come from a CDN. Losing them should cost the
+    // glyphs, not the whole preview.
+    if (config.assets.every((a) => a === "text")) throw err;
+    console.error("failed to load the font bundles", err);
+    compiler = await buildCompiler({ ...config, assets: ["text"] });
+    fontWarning =
+      "Couldn't load the CJK and emoji fonts. The preview uses the default fonts for now.";
+  }
   const incr = INCREMENTAL ? await openIncrementalServer(compiler) : null;
-  return { compiler, incr, needsReset: true };
+  return {
+    session: { compiler, incr, needsReset: true },
+    ...(fontWarning ? { fontWarning } : {}),
+  };
 }
 
 function startSession(config: FontConfig): void {
   const previous = current;
   current = null;
-  const pending = buildSession(config);
+  const building = buildSession(config);
+  const pending = building.then((b) => b.session);
   session = pending;
-  pending.then(
-    (s) => {
+  // Failures are reported through `building` below; readySession() awaits
+  // `pending` in a try, but nothing may be left to reject unhandled.
+  pending.catch(() => undefined);
+  building.then(
+    ({ session: s, fontWarning }) => {
       if (session !== pending) {
         s.incr?.release();
         return;
@@ -206,7 +244,9 @@ function startSession(config: FontConfig): void {
       // macrotasks, so none can slip in between this and `current = s`.
       for (const [path, f] of files) applyFile(s.compiler, path, f);
       current = s;
-      post({ type: "ready" });
+      // A new compiler resolves packages afresh anyway.
+      packagesStale = false;
+      post({ type: "ready", ...(fontWarning ? { fontWarning } : {}) });
     },
     (err: unknown) => {
       if (session === pending)
@@ -236,8 +276,21 @@ async function readySession(): Promise<Session | null> {
   }
 }
 
-async function compile(mainPath: string): Promise<void> {
+/**
+ * The current session, on a new compiler first if a package it already used
+ * changed. The new session replays the project's files, and its first
+ * artifact is a full one.
+ */
+async function sessionForCompile(): Promise<Session | null> {
   const s = await readySession();
+  if (!s || !packagesStale) return s;
+  packagesStale = false;
+  startSession(fonts);
+  return readySession();
+}
+
+async function compile(mainPath: string): Promise<void> {
+  const s = await sessionForCompile();
   if (!s) return; // a reinit recompiles once its session is ready
   const id = nextId++;
   post({ type: "compiling", id });
@@ -376,7 +429,7 @@ async function exportArtifact(
 
 async function exportPdf(id: number, mainPath: string): Promise<void> {
   const fail = (error: string) => post({ type: "pdf", id, error });
-  const s = await readySession();
+  const s = await sessionForCompile();
   if (!s) return fail("the compiler is not ready, try again");
   try {
     const { result, diagnostics } = await s.compiler.compile({
@@ -432,6 +485,12 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
     case "remove":
       files.delete(msg.path);
       current?.compiler.unmapShadow(msg.path);
+      break;
+    case "setPackage":
+      if (packages.set(msg.key, msg.hash, msg.data)) packagesStale = true;
+      break;
+    case "removePackage":
+      if (packages.remove(msg.key)) packagesStale = true;
       break;
     case "compile":
       lastMainPath = msg.mainPath;

@@ -9,9 +9,11 @@ import {
   rename,
   setMainFile,
 } from "@/doc/fs-ops";
-import { initProject, type ProjectDoc } from "@/doc/schema";
+import { initProject, type PackageRecord, type ProjectDoc } from "@/doc/schema";
 import { fork, newProject, sync } from "@/doc/test-utils";
 import { FOLDER_ORIGIN } from "@/folder/origin";
+
+import { deletePackage, putPackage, setFontBundle } from "@/packages/records";
 
 import { CompilerClient } from "./compiler-client";
 import type {
@@ -24,10 +26,13 @@ import type {
 
 class FakeWorker implements WorkerLike {
   sent: WorkerRequest[] = [];
+  /** The buffers handed over with each message, in order. */
+  transfers: (Transferable[] | undefined)[] = [];
   terminated = false;
   private listeners = new Map<string, Set<(e: never) => void>>();
-  postMessage(message: WorkerRequest) {
+  postMessage(message: WorkerRequest, transfer?: Transferable[]) {
     this.sent.push(message);
+    this.transfers.push(transfer);
   }
   addEventListener<K extends keyof WorkerEvents>(
     type: K,
@@ -60,6 +65,7 @@ class FakeWorker implements WorkerLike {
   take(): WorkerRequest[] {
     const out = this.sent;
     this.sent = [];
+    this.transfers = [];
     return out;
   }
 }
@@ -1396,5 +1402,251 @@ describe("CompilerClient error settling", () => {
     await settle();
     compileWith(worker, [warning]);
     expect(client.getState().diagnostics).toBe(shown);
+  });
+});
+
+function pkgRecord(hash: string, name = "hello"): PackageRecord {
+  return {
+    namespace: "local",
+    name,
+    version: "0.1.0",
+    hash,
+    size: 3,
+    mime: "application/gzip",
+    entrypoint: "lib.typ",
+    fileCount: 1,
+    unpackedSize: 10,
+    source: "upload",
+    addedAt: 0,
+  };
+}
+
+describe("CompilerClient packages", () => {
+  function pkgSetup(createWorker?: () => FakeWorker) {
+    const project = initProject(newProject(1), { title: "T" });
+    const workers: FakeWorker[] = [];
+    const loader = vi.fn(async (hash: string) =>
+      new TextEncoder().encode(hash),
+    );
+    const client = new CompilerClient(project, {
+      createWorker: () => {
+        const w = createWorker?.() ?? new FakeWorker();
+        workers.push(w);
+        return w;
+      },
+      assetLoader: loader,
+    });
+    workers[0]!.take();
+    const sentOf = <T extends WorkerRequest["type"]>(type: T, i = 0) =>
+      workers[i]!.take().filter(
+        (m): m is Extract<WorkerRequest, { type: T }> => m.type === type,
+      );
+    return { project, client, workers, loader, sentOf };
+  }
+
+  const decode = (data: Uint8Array) => new TextDecoder().decode(data);
+
+  it("sends a package with its buffer transferred and compiles", async () => {
+    const { project, workers, loader } = pkgSetup();
+    putPackage(project, pkgRecord("h1"));
+    await settle();
+    expect(loader).toHaveBeenCalledWith("h1", "local/hello/0.1.0.tar.gz");
+    const w = workers[0]!;
+    const i = w.sent.findIndex((m) => m.type === "setPackage");
+    const msg = w.sent[i]!;
+    expect(msg).toMatchObject({
+      type: "setPackage",
+      key: "local/hello/0.1.0",
+      hash: "h1",
+    });
+    if (msg.type !== "setPackage") return;
+    expect(decode(msg.data)).toBe("h1");
+    expect(w.transfers[i]).toEqual([msg.data.buffer]);
+    expect(w.sent.slice(i + 1)).toContainEqual({
+      type: "compile",
+      mainPath: "/main.typ",
+    });
+  });
+
+  it("sends the replacement when the archive changes, and a removal when it goes", async () => {
+    const { project, sentOf } = pkgSetup();
+    putPackage(project, pkgRecord("h1"));
+    await settle();
+    sentOf("setPackage");
+
+    putPackage(project, pkgRecord("h2"));
+    await settle();
+    expect(sentOf("setPackage").map((m) => [m.hash, decode(m.data)])).toEqual([
+      ["h2", "h2"],
+    ]);
+
+    deletePackage(project, "local/hello/0.1.0");
+    await settle();
+    const sent = sentOf("removePackage");
+    expect(sent).toEqual([{ type: "removePackage", key: "local/hello/0.1.0" }]);
+  });
+
+  it("retries a failed package load", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { project, loader, sentOf } = pkgSetup();
+    loader.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    putPackage(project, pkgRecord("h1"));
+    await settle();
+    expect(sentOf("setPackage")).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(sentOf("setPackage")).toHaveLength(1);
+  });
+
+  it("loads failed packages again on refreshAssets", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { project, client, loader, sentOf } = pkgSetup();
+    loader.mockRejectedValueOnce(new Error("link expired"));
+    putPackage(project, pkgRecord("h1"));
+    await settle();
+    client.refreshAssets();
+    await settle();
+    expect(sentOf("setPackage")).toHaveLength(1);
+  });
+
+  it("holds a PDF export until the package is loaded", async () => {
+    const project = initProject(newProject(1), { title: "T" });
+    putPackage(project, pkgRecord("h1"));
+    const worker = new FakeWorker();
+    let finish!: (data: Uint8Array) => void;
+    const client = new CompilerClient(project, {
+      worker,
+      assetLoader: () => new Promise((resolve) => (finish = resolve)),
+    });
+    worker.take();
+    const pdf = client.exportPdf();
+    await settle();
+    expect(worker.take().map((m) => m.type)).not.toContain("exportPdf");
+
+    finish(new Uint8Array([1]));
+    await settle();
+    const sent = worker.take().map((m) => m.type);
+    expect(sent.indexOf("exportPdf")).toBeGreaterThan(
+      sent.indexOf("setPackage"),
+    );
+    worker.emit({ type: "pdf", id: 1, data: new Uint8Array([9]) });
+    await expect(pdf).resolves.toEqual(new Uint8Array([9]));
+  });
+
+  it("sends every package again to a replacement worker", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { project, workers, loader } = pkgSetup();
+    putPackage(project, pkgRecord("h1"));
+    putPackage(project, pkgRecord("h2", "other"));
+    await settle();
+    loader.mockClear();
+
+    workers[0]!.crash();
+    await settle();
+    expect(workers).toHaveLength(2);
+    // The old worker took the buffers, so they are loaded afresh.
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(
+      workers[1]!.sent
+        .filter((m) => m.type === "setPackage")
+        .map((m) => (m.type === "setPackage" ? m.key : ""))
+        .sort(),
+    ).toEqual(["local/hello/0.1.0", "local/other/0.1.0"]);
+  });
+});
+
+describe("CompilerClient font bundles", () => {
+  function bundleSetup() {
+    const project = initProject(newProject(1), { title: "T" });
+    const workers: FakeWorker[] = [];
+    const client = new CompilerClient(project, {
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w;
+      },
+      assetLoader: async (hash) => new TextEncoder().encode(hash),
+    });
+    workers[0]!.take();
+    const reinits = (i = 0) =>
+      workers[i]!.take().filter(
+        (m): m is Extract<WorkerRequest, { type: "reinit" }> =>
+          m.type === "reinit",
+      );
+    return { project, client, workers, reinits };
+  }
+
+  it("reinits with the enabled bundles and drops them again", async () => {
+    const { project, reinits } = bundleSetup();
+    setFontBundle(project, "cjk", true);
+    await settle();
+    expect(reinits().map((m) => m.fonts.assets)).toEqual([["text", "cjk"]]);
+
+    setFontBundle(project, "emoji", true);
+    await settle();
+    expect(reinits().map((m) => m.fonts.assets)).toEqual([
+      ["text", "cjk", "emoji"],
+    ]);
+
+    setFontBundle(project, "cjk", false);
+    setFontBundle(project, "emoji", false);
+    await settle();
+    expect(reinits().map((m) => m.fonts.assets)).toEqual([["text"]]);
+  });
+
+  it("merges the bundles with a manual reinit", async () => {
+    const project = initProject(newProject(1), { title: "T" });
+    setFontBundle(project, "emoji", true);
+    const worker = new FakeWorker();
+    const client = new CompilerClient(project, {
+      worker,
+      assetLoader: async () => new Uint8Array(),
+    });
+    await settle();
+    worker.take();
+    client.reinit({ assets: ["text", "cjk"] });
+    await settle();
+    const msg = worker.take().find((m) => m.type === "reinit");
+    expect(msg?.type === "reinit" && msg.fonts.assets).toEqual([
+      "text",
+      "cjk",
+      "emoji",
+    ]);
+  });
+
+  it("asks a replacement worker for the bundles too", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { project, workers, reinits } = bundleSetup();
+    setFontBundle(project, "cjk", true);
+    await settle();
+    reinits();
+    workers[0]!.crash();
+    await settle();
+    expect(reinits(1).map((m) => m.fonts.assets)).toEqual([["text", "cjk"]]);
+  });
+
+  it("shows the worker's font warning until a compiler loads the fonts", () => {
+    const worker = new FakeWorker();
+    const client = new CompilerClient(
+      initProject(newProject(1), { title: "T" }),
+      { worker },
+    );
+    expect(client.getState().fontWarning).toBeNull();
+    worker.emit({ type: "ready", fontWarning: "no CJK" });
+    expect(client.getState().fontWarning).toBe("no CJK");
+    worker.emit({ type: "ready" });
+    expect(client.getState().fontWarning).toBeNull();
+  });
+
+  it("loads the bundles again on retry after a font warning", async () => {
+    const { project, client, workers, reinits } = bundleSetup();
+    setFontBundle(project, "cjk", true);
+    await settle();
+    reinits();
+    workers[0]!.emit({ type: "ready", fontWarning: "no CJK" });
+    client.retry();
+    await settle();
+    expect(reinits().map((m) => m.fonts.assets)).toEqual([["text", "cjk"]]);
   });
 });
