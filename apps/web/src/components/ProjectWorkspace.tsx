@@ -208,12 +208,12 @@ export function ProjectWorkspace({
     (jump: PreviewJump) => {
       if (jump.kind === "source") {
         const fileId = index.byPath.get(jump.path);
-        if (fileId)
-          reveal(fileId, {
-            kind: "offset",
-            from: jump.offset,
-            to: jump.offset,
-          });
+        if (!fileId) return;
+        reveal(fileId, {
+          kind: "offset",
+          from: jump.offset,
+          to: jump.offset,
+        });
       } else if (jump.kind === "package") {
         toast(`Defined in package ${jump.package}`);
       } else if (jump.kind === "position") {

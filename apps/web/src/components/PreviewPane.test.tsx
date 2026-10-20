@@ -656,5 +656,28 @@ describe("PreviewPane", () => {
       });
       expect(viewport.scrollTop).toBeCloseTo(768 + 150 * 3.68 - 100);
     });
+
+    it("does not replay the last jump when it mounts again", async () => {
+      const project = initProject(newProject(1), { title: "T" });
+      const worker = new FakeWorker();
+      const client = new CompilerClient(project, { worker });
+      await compile(worker, []);
+      // As after closing a version: the workspace still holds the last
+      // jump, which this fresh preview never asked for.
+      render(
+        <TooltipProvider>
+          <PreviewPane
+            client={client}
+            scrollTarget={{
+              points: [{ page: 1, x: 50, y: 10 }],
+              baseline: true,
+              seq: 3,
+            }}
+          />
+        </TooltipProvider>,
+      );
+      const mark = document.querySelector('[style*="var(--warning)"]');
+      expect(mark).toBeNull();
+    });
   });
 });

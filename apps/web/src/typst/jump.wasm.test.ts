@@ -151,13 +151,11 @@ describe.skipIf(reason !== null)(
         .map(toPagePosition);
       expect(positions.map((p) => p?.page)).toEqual([0, 1]);
       const [entry, heading] = positions;
-      expect(
-        toJumpTarget(raw.jump_from_click(0, entry!.x + 1, entry!.y - 2)),
-      ).toMatchObject({ kind: "position", page: 1 });
-      // The link target is the heading's top, above its baseline.
       const target = toJumpTarget(
         raw.jump_from_click(0, entry!.x + 1, entry!.y - 2),
       );
+      expect(target).toMatchObject({ kind: "position", page: 1 });
+      // The link target is the heading's top, above its baseline.
       expect(target?.kind === "position" && target.y).toBeLessThan(heading!.y);
     });
 

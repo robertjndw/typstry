@@ -190,7 +190,9 @@ export function PreviewPane({
   // our own scrolling, so this is fed by input events instead.
   const lastManualScroll = useRef<number | null>(null);
   const handledFollow = useRef(state?.follow?.seq ?? 0);
-  const handledScroll = useRef(0);
+  // Seeded like handledFollow: a remount (closing a version, switching to
+  // the phone layout) must not replay the last jump.
+  const handledScroll = useRef(scrollTarget?.seq ?? 0);
   // The point a scroll target landed on, which its page then marks.
   const [mark, setMark] = useState<JumpMark | null>(null);
 
