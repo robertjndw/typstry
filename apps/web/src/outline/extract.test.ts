@@ -44,11 +44,26 @@ describe("extractOutline", () => {
     expect(f?.label).toBeUndefined();
   });
 
+  it("decodes escapes in a string caption", () => {
+    const [f] = extractOutline('#figure(caption: "One\\ntwo \\u{1F600}")[]\n');
+    expect(f?.title).toBe("One two \u{1F600}");
+  });
+
   it("finds figures in code and ignores other calls", () => {
     const items = extractOutline(
       '#let f = figure(caption: [Inner])\n#image("x.png")\n#fig.figure()\n',
     );
     expect(items.map((i) => [i.kind, i.title])).toEqual([["figure", "Inner"]]);
+  });
+
+  it("skips headings and figures inside function bodies", () => {
+    const items = extractOutline(
+      "#let fig(p, cap) = figure(image(p), caption: cap)\n" +
+        "#show heading: it => figure(caption: [Shown])[#it]\n" +
+        "#let note(body) = [= Note #body]\n" +
+        "= Real\n",
+    );
+    expect(items.map((i) => [i.kind, i.title])).toEqual([["heading", "Real"]]);
   });
 
   it("does not attach a label after a paragraph break", () => {

@@ -49,7 +49,15 @@ function plainText(node: SyntaxNode, source: string): string {
 function unquote(str: string): string {
   return str
     .slice(1, str.endsWith('"') && str.length > 1 ? -1 : undefined)
-    .replace(/\\(.)/g, "$1");
+    .replace(/\\(u\{([0-9a-fA-F]+)\}|.)/g, (_, esc: string, hex?: string) => {
+      if (hex) {
+        // fromCodePoint throws past U+10FFFF, which a half-typed escape hits.
+        const code = parseInt(hex, 16);
+        return code <= 0x10ffff ? String.fromCodePoint(code) : "";
+      }
+      // Titles are one line, so Typst's whitespace escapes become spaces.
+      return "nrt".includes(esc) ? " " : esc;
+    });
 }
 
 /** The label that follows `node` on the same paragraph, if any. */
@@ -94,6 +102,11 @@ export function extractOutline(source: string): OutlineItem[] {
     enter(ref) {
       const node = ref.node;
       switch (node.name) {
+        // A function body (helpers, show rule transforms, templates) runs
+        // once per call, not where it is written, so its headings and
+        // figures are not entries of the document itself.
+        case "Closure":
+          return false;
         case "Heading": {
           const marker = node.getChild("HeadingMarker");
           const body = node.getChild("Markup");

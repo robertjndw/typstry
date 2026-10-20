@@ -17,6 +17,12 @@ import {
 const DEBOUNCE_MS = 200;
 const EMPTY: ProjectOutline = { items: [], files: new Set() };
 
+type ParseCache = Map<string, { text: string; items: OutlineItem[] }>;
+// Parsing the same text again is the expensive part of a rebuild, and most
+// rebuilds are caused by an edit in just one of the files. Module level,
+// because the panel remounts on every sidebar tab switch.
+const parseCaches = new WeakMap<ProjectDoc, ParseCache>();
+
 /**
  * The outline of the compiled document: the main file, or the open file
  * when the project has no usable main file, with includes expanded.
@@ -31,9 +37,8 @@ export function useOutline(): {
 
   useEffect(() => {
     const index = projectIndex(project);
-    // Parsing the same text again is the expensive part of a rebuild, and
-    // most rebuilds are caused by an edit in just one of the files.
-    const parsed = new Map<string, { text: string; items: OutlineItem[] }>();
+    let parsed = parseCaches.get(project);
+    if (!parsed) parseCaches.set(project, (parsed = new Map()));
     const extract = (path: string, text: string) => {
       const hit = parsed.get(path);
       if (hit?.text === text) return hit.items;
