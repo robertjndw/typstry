@@ -100,9 +100,13 @@ function isElementId(value: unknown): value is string {
   return typeof value === "string" && ELEMENT_ID.test(value);
 }
 
+function formatElementId(id: { counter: number; peer: PeerID }): string {
+  return `${id.counter}@${id.peer}`;
+}
+
 function elementId(project: ProjectDoc, index: number): string | undefined {
   const id = project.comments.getIdAt(index);
-  return id && `${id.counter}@${id.peer}`;
+  return id && formatElementId(id);
 }
 
 /**
@@ -168,11 +172,7 @@ function readComments(project: ProjectDoc): Comment[] {
   project.comments.toArray().forEach((value, index) => {
     const opId = project.comments.getIdAt(index);
     if (!opId) return;
-    const comment = parseComment(
-      `${opId.counter}@${opId.peer}`,
-      opId.peer,
-      value,
-    );
+    const comment = parseComment(formatElementId(opId), opId.peer, value);
     if (comment) out.push(comment);
   });
   return out;
