@@ -21,8 +21,8 @@ import { getText } from "@/doc/fs-ops";
 import { CursorContext, reportCursor } from "@/editor/cursor-store";
 import { Editor } from "@/editor/Editor";
 import {
-  commentComposer,
   commentHighlights,
+  commentSelection,
 } from "@/editor/comment-highlights";
 import { flashLine } from "@/editor/flash";
 import { revealScroll } from "@/editor/reveal-scroll";
@@ -175,7 +175,7 @@ export function EditorPane({
               fileId: openFileId,
               ui: commentsUi,
             }),
-            readOnly ? [] : commentComposer(commentsUi, openFileId, text),
+            readOnly ? [] : commentSelection(commentsUi, openFileId, text),
           ]
         : [],
     ],

@@ -9,9 +9,7 @@ import {
   Decoration,
   EditorView,
   ViewPlugin,
-  showTooltip,
   type DecorationSet,
-  type Tooltip,
   type ViewUpdate,
 } from "@codemirror/view";
 import type { LoroEventBatch, LoroText, TreeID } from "loro-crdt";
@@ -166,37 +164,11 @@ export function commentHighlightRanges(
   return out;
 }
 
-function commentTooltip(
-  state: EditorState,
-  onComment: (view: EditorView) => void,
-): Tooltip | null {
-  const main = state.selection.main;
-  if (main.empty) return null;
-  return {
-    pos: main.head,
-    above: main.head === main.from,
-    arrow: false,
-    create: (view) => {
-      const dom = document.createElement("div");
-      dom.className = "cm-comment-tooltip";
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "cm-comment-button";
-      button.textContent = "Comment";
-      // Keeps the editor's selection, which the draft is taken from.
-      button.addEventListener("mousedown", (e) => e.preventDefault());
-      button.addEventListener("click", () => onComment(view));
-      dom.append(button);
-      return { dom };
-    },
-  };
-}
-
 /**
- * For editors only: reports the selection to the shared comments state and
- * offers a "Comment" button next to it.
+ * For editors only: reports the selection to the shared comments state, so
+ * the shortcut and the panel's button can start a comment on it.
  */
-export function commentComposer(
+export function commentSelection(
   ui: CommentsUi,
   fileId: TreeID,
   text: LoroText,
@@ -205,19 +177,7 @@ export function commentComposer(
     const { from, to } = state.selection.main;
     ui.setSelection({ fileId, text, from, to });
   };
-  const tooltip = StateField.define<Tooltip | null>({
-    create: (state) => commentTooltip(state, start),
-    update(value, tr) {
-      if (!tr.docChanged && !tr.selection) return value;
-      return commentTooltip(tr.state, start);
-    },
-    provide: (field) => showTooltip.from(field),
-  });
-  function start(view: EditorView) {
-    report(view.state);
-    ui.startDraft();
-  }
-  const reporter = ViewPlugin.fromClass(
+  return ViewPlugin.fromClass(
     class {
       constructor(view: EditorView) {
         report(view.state);
@@ -230,5 +190,4 @@ export function commentComposer(
       }
     },
   );
-  return [tooltip, reporter];
 }

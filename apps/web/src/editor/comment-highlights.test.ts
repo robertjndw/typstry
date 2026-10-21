@@ -7,9 +7,9 @@ import { fork, newProject, sync } from "@/doc/test-utils";
 import { CommentsUi } from "@/project/comments-ui";
 
 import {
-  commentComposer,
   commentHighlightRanges,
   commentHighlights,
+  commentSelection,
 } from "./comment-highlights";
 import { createLoroEditorState } from "./loro-binding";
 
@@ -29,7 +29,7 @@ function setup(options: { composer?: boolean } = {}) {
       {
         extensions: [
           commentHighlights({ project: a, text, fileId: file, ui }),
-          options.composer ? commentComposer(ui, file, text) : [],
+          options.composer ? commentSelection(ui, file, text) : [],
         ],
       },
     ),
@@ -121,22 +121,19 @@ describe("commentHighlights", () => {
   });
 });
 
-describe("commentComposer", () => {
+describe("commentSelection", () => {
   afterEach(() => {
     document.body.innerHTML = "";
   });
 
-  it("offers a Comment button for a selection and drafts from it", () => {
+  it("drafts from the reported selection", () => {
     const { a, file, ui, view } = setup({ composer: true });
-    expect(view.dom.querySelector(".cm-comment-button")).toBeNull();
+    expect(ui.startDraft()).toBe(false);
     view.dispatch({ selection: { anchor: 6, head: 11 } });
-    const button =
-      view.dom.querySelector<HTMLButtonElement>(".cm-comment-button");
-    expect(button?.textContent).toBe("Comment");
 
     const shown = vi.fn();
     ui.onShowPanel(shown);
-    button!.click();
+    expect(ui.startDraft()).toBe(true);
     expect(shown).toHaveBeenCalledWith(true);
     const draft = ui.getState().draft!;
     expect(draft).toMatchObject({ fileId: file, quote: "brave" });
@@ -145,7 +142,6 @@ describe("commentComposer", () => {
     getText(a, file).insert(0, ">> ");
     a.doc.commit();
     view.dispatch({ selection: { anchor: 0 } });
-    expect(view.dom.querySelector(".cm-comment-button")).toBeNull();
     expect(ui.getState().draft).toBe(draft);
     view.destroy();
   });

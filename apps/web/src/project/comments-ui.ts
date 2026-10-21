@@ -69,7 +69,7 @@ export class CommentsUi {
   }
 
   /**
-   * The editor's selection, kept so the shortcut and the menu can start a
+   * The editor's selection, kept so the shortcut and the panel can start a
    * draft without asking the editor. Changes no state anyone renders.
    */
   setSelection(selection: Selection | null): void {

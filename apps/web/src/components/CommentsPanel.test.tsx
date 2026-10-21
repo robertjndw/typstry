@@ -198,6 +198,20 @@ describe("CommentsPanel", () => {
     expect(ui.getState().active).toBe(thread!.id);
   });
 
+  it("starts a draft from the selection with the New comment button", () => {
+    const { project, main, ui } = setup();
+    const button = screen.getByRole("button", { name: "New comment" });
+    fireEvent.click(button);
+    expect(screen.queryByRole("form", { name: "New comment" })).toBeNull();
+
+    const text = getText(project, main);
+    act(() => ui.setSelection({ fileId: main, text, from: 0, to: 5 }));
+    fireEvent.click(button);
+    expect(
+      screen.getByRole("form", { name: "New comment" }),
+    ).toBeInTheDocument();
+  });
+
   it("is read-only for viewers", () => {
     const { project, main, ui } = setup({ readOnly: true });
     act(() => {
@@ -211,5 +225,6 @@ describe("CommentsPanel", () => {
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.queryByRole("button", { name: "Resolve" })).toBeNull();
     expect(screen.queryByRole("button", { name: /^Delete/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New comment" })).toBeNull();
   });
 });

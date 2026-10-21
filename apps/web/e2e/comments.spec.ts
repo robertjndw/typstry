@@ -33,7 +33,6 @@ test("editors comment, reply and resolve; viewers only read", async ({
   await createProject(page, "Comments");
   await appendLine(page, PHRASE);
   await page.keyboard.press("Shift+Home");
-  await expect(page.locator(".cm-comment-button")).toBeVisible();
 
   // The app's Mod is Ctrl under Playwright's Desktop Chrome user agent.
   await page.keyboard.press("Control+Alt+M");
@@ -68,7 +67,9 @@ test("editors comment, reply and resolve; viewers only read", async ({
   ).toHaveCount(0);
   await editor(viewer).click();
   await viewer.keyboard.press("ControlOrMeta+A");
-  await expect(viewer.locator(".cm-comment-button")).toHaveCount(0);
+  await expect(viewer.getByRole("button", { name: "New comment" })).toHaveCount(
+    0,
+  );
   await viewer.keyboard.press("Control+Alt+M");
   await expect(viewer.getByRole("form", { name: "New comment" })).toHaveCount(
     0,

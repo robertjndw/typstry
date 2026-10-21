@@ -1,6 +1,7 @@
 import {
   CheckCheckIcon,
   CheckIcon,
+  MessageSquarePlusIcon,
   RotateCcwIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -34,6 +35,7 @@ import { getText } from "@/doc/fs-ops";
 import type { PathIndex } from "@/doc/paths";
 import type { ProjectDoc } from "@/doc/schema";
 import { SIDEBAR_AUTOFOCUS_ATTR } from "@/hooks/use-sidebar-tab";
+import { SHORTCUTS } from "@/lib/shortcuts";
 import { cn } from "@/lib/utils";
 import { useRoster } from "@/mls/context";
 import type { RosterMember } from "@/mls/members";
@@ -169,6 +171,19 @@ export function CommentsPanel() {
         >
           <CheckCheckIcon />
         </ToolbarButton>
+        {!readOnly && ui && (
+          <ToolbarButton
+            label="New comment"
+            tooltip="Comment on the selection"
+            shortcut={SHORTCUTS.comment}
+            onClick={() => {
+              if (!ui.startDraft())
+                toast.info("Select some text in the editor to comment on it.");
+            }}
+          >
+            <MessageSquarePlusIcon />
+          </ToolbarButton>
+        )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
         {draft && !readOnly && ui && (
@@ -190,7 +205,7 @@ export function CommentsPanel() {
           <p className="px-3 py-6 text-center text-xs text-muted-foreground">
             {readOnly
               ? "No comments yet."
-              : "No comments yet. Select some text and choose Comment."}
+              : "No comments yet. Select some text to comment on it."}
           </p>
         ) : (
           <>

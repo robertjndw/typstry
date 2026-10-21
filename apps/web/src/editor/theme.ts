@@ -91,23 +91,6 @@ export const editorTheme = EditorView.theme({
     cursor: "pointer",
   },
   ".cm-comment-active": { backgroundColor: "var(--cm-comment-active)" },
-  ".cm-tooltip.cm-comment-tooltip": { padding: "2px" },
-  ".cm-comment-button": {
-    height: "24px",
-    padding: "0 8px",
-    fontFamily: sans,
-    fontSize: "12px",
-    fontWeight: "500",
-    color: "var(--foreground)",
-    backgroundColor: "transparent",
-    border: "none",
-    borderRadius: radius,
-    cursor: "pointer",
-    "&:hover, &:focus-visible": {
-      backgroundColor: "var(--accent)",
-      outline: "none",
-    },
-  },
   ".cm-specialChar": { color: "var(--destructive)" },
   ".cm-placeholder": {
     color: "var(--muted-foreground)",
