@@ -79,10 +79,10 @@ index a672ab17..5d27541e 100644
      fn get_doc(&self, kind: u8) -> Result<Option<TypstDocument>, JsValue> {
 diff --git a/packages/compiler/src/jump.rs b/packages/compiler/src/jump.rs
 new file mode 100644
-index 00000000..1a56752f
+index 00000000..b93216a1
 --- /dev/null
 +++ b/packages/compiler/src/jump.rs
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,226 @@
 +//! Click-to-source and cursor-to-preview jumps against the last paged
 +//! document, for editors that keep using the stock typst.ts JS wrapper.
 +
@@ -93,8 +93,10 @@ index 00000000..1a56752f
 +use typst::diag::FileResult;
 +use typst::foundations::{Bytes, Datetime, Duration};
 +use typst::introspection::PagedPosition;
-+use typst::layout::{Abs, Point};
-+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
++use typst::layout::{Abs, Frame, FrameItem, Point};
++use typst::syntax::{
++    FileId, LinkedNode, RootedPath, Source, Span, SyntaxKind, VirtualPath, VirtualRoot,
++};
 +use typst::text::{Font, FontBook};
 +use typst::utils::LazyHash;
 +use typst::{Library, World};
@@ -166,6 +168,78 @@ index 00000000..1a56752f
 +    ])
 +}
 +
++/// The glyph in `frame` that shows the source text at `local`, a byte offset
++/// into the text node that `span` belongs to. Returns that offset too, so
++/// frames can be compared.
++///
++/// typst_ide::jump_from_cursor only looks at spans, and a paragraph is one
++/// text node: every line of it carries the same span, so it always answers
++/// with the first glyph of the first line. The offset each glyph keeps into
++/// its node is what tells the lines apart.
++fn glyph_at(frame: &Frame, span: Span, local: usize) -> Option<(u16, Point)> {
++    let mut best: Option<(u16, Point)> = None;
++    let mut consider = |offset: u16, point: Point| {
++        // Strictly greater, so repeated content (an outline entry and its
++        // heading) resolves to the first one, as typst-ide does.
++        if best.is_none_or(|(at, _)| offset > at) {
++            best = Some((offset, point));
++        }
++    };
++    for &(mut pos, ref item) in frame.items() {
++        match item {
++            FrameItem::Group(group) => {
++                if let Some((offset, point)) = glyph_at(&group.frame, span, local) {
++                    consider(offset, pos + point.transform(group.transform));
++                }
++            }
++            FrameItem::Text(text) => {
++                for glyph in &text.glyphs {
++                    if glyph.span.0 == span && usize::from(glyph.span.1) <= local {
++                        consider(glyph.span.1, pos);
++                    }
++                    pos.x += glyph.x_advance.at(text.size);
++                }
++            }
++            _ => {}
++        }
++    }
++    best
++}
++
++/// Like typst_ide::jump_from_cursor, but lands on the glyph at the cursor
++/// instead of the start of the text node it is in. None when the cursor is
++/// not in text, or no glyph matches and the caller should fall back.
++fn jump_from_cursor_exact(
++    doc: &TypstPagedDocument,
++    source: &Source,
++    cursor: usize,
++) -> Option<Vec<PagedPosition>> {
++    let root = LinkedNode::new(source.root());
++    let is_text =
++        |node: &LinkedNode| matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText);
++    let node = root
++        .leaf_at(cursor, typst::syntax::Side::Before)
++        .filter(is_text)
++        .or_else(|| {
++            root.leaf_at(cursor, typst::syntax::Side::After)
++                .filter(is_text)
++        })?;
++    let local = cursor.saturating_sub(node.offset());
++    let span = node.span();
++    let found: Vec<PagedPosition> = doc
++        .pages()
++        .iter()
++        .enumerate()
++        .filter_map(|(i, page)| {
++            glyph_at(&page.frame, span, local).map(|(_, point)| PagedPosition {
++                page: NonZeroUsize::MIN.saturating_add(i),
++                point,
++            })
++        })
++        .collect();
++    (!found.is_empty()).then_some(found)
++}
++
 +#[wasm_bindgen]
 +impl TypstCompiler {
 +    /// Where a click on the last compiled document leads: `{path, package?,
@@ -228,7 +302,8 @@ index 00000000..1a56752f
 +        let Some(cursor) = source.lines().utf16_to_byte(offset) else {
 +            return Array::new();
 +        };
-+        typst_ide::jump_from_cursor(doc.as_ref(), &source, cursor)
++        jump_from_cursor_exact(doc.as_ref(), &source, cursor)
++            .unwrap_or_else(|| typst_ide::jump_from_cursor(doc.as_ref(), &source, cursor))
 +            .iter()
 +            .map(position)
 +            .collect()

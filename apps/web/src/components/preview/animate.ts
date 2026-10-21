@@ -446,6 +446,7 @@ export function showJumpMark(
   const top = (baseline ? point.y - JUMP_MARK_ASCENT_PT : point.y) * scale;
   const el = document.createElement("div");
   el.setAttribute("aria-hidden", "true");
+  el.dataset.jumpMark = "";
   Object.assign(el.style, {
     position: "absolute",
     left: `${point.x * scale - 3}px`,

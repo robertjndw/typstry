@@ -76,3 +76,38 @@ test("Mod+Click on a name goes to its definition", async ({ page }) => {
     "#let greeting = [Hello there]",
   );
 });
+
+test("Mod+Click at the end of a paragraph marks that spot, not its start", async ({
+  page,
+}) => {
+  await createProject(page, "Jump in a paragraph");
+  const words = Array.from({ length: 150 }, (_, i) => `word${i}`);
+  // One source line that wraps over many lines in the preview.
+  await appendLine(page, words.join(" "));
+  const firstLine = firstPage(page).getByText("word0 word1").first();
+  await expect(firstLine).toBeVisible();
+
+  // Scroll the editor to the end of that line, where the last words are.
+  await page.keyboard.press("ControlOrMeta+End");
+  const line = page.locator(".cm-line", { hasText: "word149" });
+  const scroller = page.locator(".cm-scroller");
+  const [lineBox, scrollerBox] = await Promise.all([
+    line.boundingBox(),
+    scroller.boundingBox(),
+  ]);
+  await page.keyboard.down("Control");
+  await page.mouse.click(
+    scrollerBox!.x + scrollerBox!.width - 40,
+    lineBox!.y + lineBox!.height / 2,
+  );
+  await page.keyboard.up("Control");
+
+  const mark = page.locator("[data-jump-mark]");
+  await expect(mark).toBeVisible();
+  const [markBox, firstBox] = await Promise.all([
+    mark.boundingBox(),
+    firstLine.boundingBox(),
+  ]);
+  // Many lines further down, not on the first one.
+  expect(markBox!.y).toBeGreaterThan(firstBox!.y + 60);
+});

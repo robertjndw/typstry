@@ -110,16 +110,15 @@ describe.skipIf(reason !== null)(
 
       const raw = jumpCompiler(compiler);
       const at = src.indexOf("target");
-      // typst-ide answers with the start of the whole text node, here the
-      // "Ü", not the glyph under the cursor.
       const [pos] = raw
         .jump_from_cursor("/main.typ", at + 1)
         .map(toPagePosition);
       expect(pos?.page).toBe(0);
-      // Sweep the line: some click has to land right before "target", which
-      // only works out if the offsets are UTF-16 (bytes would be 4 further).
+      // Sweep the line around the glyph: some click has to land right before
+      // "target", which only works out if the offsets are UTF-16 (bytes would
+      // be 4 further).
       const offsets = new Set<number>();
-      for (let dx = 0.5; dx < 80; dx += 0.5) {
+      for (let dx = -40; dx < 80; dx += 0.5) {
         const t = toJumpTarget(
           raw.jump_from_click(pos!.page, pos!.x + dx, pos!.y - 2),
         );
@@ -157,6 +156,45 @@ describe.skipIf(reason !== null)(
       expect(target).toMatchObject({ kind: "position", page: 1 });
       // The link target is the heading's top, above its baseline.
       expect(target?.kind === "position" && target.y).toBeLessThan(heading!.y);
+    });
+
+    it("lands on the line the cursor is in, not the start of the paragraph", async () => {
+      // One text node that wraps over many lines, so every line shares a span.
+      const words = Array.from({ length: 150 }, (_, i) => `word${i}`);
+      const src = `${words.join(" ")}\n`;
+      compiler.addSource("/main.typ", src);
+      await compiler.compile({ mainFilePath: "/main.typ" });
+
+      const raw = jumpCompiler(compiler);
+      const at = (word: string) => src.indexOf(word) + 2;
+      const [first] = raw
+        .jump_from_cursor("/main.typ", at("word0"))
+        .map(toPagePosition);
+      const [middle] = raw
+        .jump_from_cursor("/main.typ", at("word75"))
+        .map(toPagePosition);
+      const [last] = raw
+        .jump_from_cursor("/main.typ", at("word149"))
+        .map(toPagePosition);
+      expect(first?.page).toBe(0);
+      // Each stop is further down, by lines and not by a hair.
+      expect(middle!.y).toBeGreaterThan(first!.y + 40);
+      expect(last!.y).toBeGreaterThan(middle!.y + 40);
+
+      // And a click there leads back to the word that was asked for.
+      for (const [pos, word] of [
+        [middle, "word75"],
+        [last, "word149"],
+      ] as const) {
+        const target = toJumpTarget(
+          raw.jump_from_click(pos!.page, pos!.x + 1, pos!.y - 2),
+        );
+        const from = src.indexOf(word);
+        expect(target?.kind).toBe("source");
+        const offset = target?.kind === "source" ? target.offset : -1;
+        expect(offset).toBeGreaterThanOrEqual(from - 1);
+        expect(offset).toBeLessThanOrEqual(from + word.length);
+      }
     });
 
     it("keeps the last good document when a compile fails", async () => {
