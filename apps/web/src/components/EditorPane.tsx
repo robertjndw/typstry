@@ -12,6 +12,7 @@ import { ShortcutKeys } from "@/components/ShortcutKeys";
 import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
 import { Editor } from "@/editor/Editor";
+import { revealScroll } from "@/editor/reveal-scroll";
 import { imageDrop } from "@/editor/image-drop";
 import { typstLanguage } from "@/editor/language";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
@@ -163,7 +164,7 @@ export function EditorPane({
         : clampRange(target.from, target.to, doc.length);
     view.dispatch({
       selection: { anchor: range.from, head: range.to },
-      scrollIntoView: true,
+      effects: revealScroll(view, range.from),
     });
     view.focus();
   }, [view, reveal, openFileId]);
