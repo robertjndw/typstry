@@ -143,7 +143,6 @@ export function ProjectWorkspace({
   );
   const [previewTarget, setPreviewTarget] =
     useState<PreviewScrollTarget | null>(null);
-  const cursors = useMemo(() => new CursorStore(), []);
 
   // A version brings its own compiler. The live one would keep compiling
   // every remote edit for a preview nobody sees.
@@ -240,6 +239,7 @@ export function ProjectWorkspace({
   );
 
   const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
+  const cursors = useMemo(() => new CursorStore(), []);
   const [focusRequest, setFocusRequest] = useState(0);
 
   const openSidebar = useCallback(
