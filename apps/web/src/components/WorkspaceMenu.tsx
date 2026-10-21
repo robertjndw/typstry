@@ -27,6 +27,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useZipDownload } from "@/hooks/use-download";
+import { useLineWrapping } from "@/hooks/use-line-wrapping";
 import type { WorkspaceLayoutState } from "@/hooks/use-workspace-layout";
 import { formatShortcut } from "@/lib/platform";
 import { SHORTCUTS } from "@/lib/shortcuts";
@@ -60,6 +61,7 @@ export function WorkspaceMenu({
   // while the zip is still being built.
   const zip = useZipDownload({ project, assets, name: [title] });
   const desktop = !layout.isMobile;
+  const [wrapLines, setWrapLines] = useLineWrapping();
 
   return (
     <DropdownMenu>
@@ -126,10 +128,10 @@ export function WorkspaceMenu({
             </DropdownMenuItem>
           )}
         </DropdownMenuGroup>
-        {desktop && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuGroup>
+          {desktop && (
+            <>
               <DropdownMenuCheckboxItem
                 checked={!layout.isHidden("files")}
                 disabled={panelsDisabled}
@@ -150,13 +152,22 @@ export function WorkspaceMenu({
                   {formatShortcut(SHORTCUTS.togglePreview)}
                 </DropdownMenuShortcut>
               </DropdownMenuCheckboxItem>
-              <DropdownMenuItem onSelect={onShortcuts}>
-                <KeyboardIcon />
-                Keyboard shortcuts
-              </DropdownMenuItem>
-            </DropdownMenuGroup>
-          </>
-        )}
+            </>
+          )}
+          <DropdownMenuCheckboxItem
+            checked={wrapLines}
+            disabled={panelsDisabled}
+            onCheckedChange={setWrapLines}
+          >
+            Wrap lines
+          </DropdownMenuCheckboxItem>
+          {desktop && (
+            <DropdownMenuItem onSelect={onShortcuts}>
+              <KeyboardIcon />
+              Keyboard shortcuts
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

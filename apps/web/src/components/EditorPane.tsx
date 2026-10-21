@@ -19,6 +19,7 @@ import { ShortcutKeys } from "@/components/ShortcutKeys";
 import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
 import { CursorContext, reportCursor } from "@/editor/cursor-store";
+import { useLineWrapping } from "@/hooks/use-line-wrapping";
 import { Editor } from "@/editor/Editor";
 import {
   commentHighlights,
@@ -103,6 +104,7 @@ export function EditorPane({
   const cursors = useContext(CursorContext);
   const revealFn = useContext(RevealContext);
   const commentsUi = useCommentsUi();
+  const [wrapLines] = useLineWrapping();
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
   // getText cannot throw for a text file.
@@ -119,6 +121,7 @@ export function EditorPane({
   const lspPath = isTypst && tinymist ? path : undefined;
   const extensions = useMemo(
     () => [
+      wrapLines ? EditorView.lineWrapping : [],
       isTypst ? typstLanguage : [],
       tinymist && lspPath ? tinymist.plugin(lspPath) : [],
       isTypst && text && openFileId && assets && !readOnly
@@ -183,6 +186,7 @@ export function EditorPane({
       commentsUi,
       onJumpToPreview,
       revealFn,
+      wrapLines,
       presence,
       cursors,
       project,
