@@ -76,9 +76,13 @@ export class CommentsUi {
     this.selection = selection;
   }
 
-  /** Clears the selection only if it still belongs to `fileId`. */
-  clearSelection(fileId: TreeID): void {
-    if (this.selection?.fileId === fileId) this.selection = null;
+  /**
+   * Clears the selection only if it is still the one `selection` set. An
+   * editor that is being replaced may build its successor before it is
+   * destroyed, and must not wipe what the successor just reported.
+   */
+  clearSelection(selection: Selection): void {
+    if (this.selection === selection) this.selection = null;
   }
 
   hasSelection(): boolean {

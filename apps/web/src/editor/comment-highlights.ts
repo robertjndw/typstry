@@ -69,6 +69,10 @@ export function commentHighlights(config: CommentHighlightsConfig): Extension {
             const touches = batch.events.some(
               (e) =>
                 watched.has(e.target) ||
+                // A restore or a remote replacement swaps the file's text
+                // container or deletes the file, which detaches its threads
+                // without any event on the comment lists.
+                (e.diff.type !== "text" && e.target !== text.id) ||
                 // Local edits came from this editor and are already mapped.
                 // Remote ones are recomputed, since Loro may merge them
                 // around an anchor differently than the mapping guesses.
@@ -173,20 +177,23 @@ export function commentSelection(
   fileId: TreeID,
   text: LoroText,
 ): Extension {
-  const report = (state: EditorState) => {
-    const { from, to } = state.selection.main;
-    ui.setSelection({ fileId, text, from, to });
-  };
   return ViewPlugin.fromClass(
     class {
+      private reported: Parameters<CommentsUi["clearSelection"]>[0] | null =
+        null;
       constructor(view: EditorView) {
-        report(view.state);
+        this.report(view.state);
       }
       update(update: ViewUpdate) {
-        if (update.selectionSet || update.docChanged) report(update.state);
+        if (update.selectionSet || update.docChanged) this.report(update.state);
       }
       destroy() {
-        ui.clearSelection(fileId);
+        if (this.reported) ui.clearSelection(this.reported);
+      }
+      private report(state: EditorState) {
+        const { from, to } = state.selection.main;
+        this.reported = { fileId, text, from, to };
+        ui.setSelection(this.reported);
       }
     },
   );
