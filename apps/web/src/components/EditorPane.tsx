@@ -23,12 +23,14 @@ import { Editor } from "@/editor/Editor";
 import { revealScroll } from "@/editor/reveal-scroll";
 import { imageDrop } from "@/editor/image-drop";
 import { typstLanguage } from "@/editor/language";
+import { modClick } from "@/editor/mod-click";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
 import type { TinymistClient } from "@/lsp/tinymist-client";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { cn } from "@/lib/utils";
 import { usePresenceContext } from "@/presence/context";
 import { useProject } from "@/project/context";
+import { RevealContext } from "@/project/reveal-context";
 import { uploadReporting } from "@/project/tree";
 import type { CompilerClient } from "@/typst/compiler-client";
 import { usePreviewDiagnostics } from "@/typst/hooks";
@@ -60,6 +62,11 @@ export interface EditorPaneProps {
   /** Completion and hover docs for Typst files, when available. */
   tinymist?: TinymistClient | null;
   reveal?: RevealRequest | null;
+  /**
+   * Shows an offset of a Typst file in the preview. Mod+Click calls it when
+   * the clicked spot has no definition to go to.
+   */
+  onJumpToPreview?: (fileId: TreeID, offset: number) => void;
   className?: string;
 }
 
@@ -67,6 +74,7 @@ export function EditorPane({
   compiler,
   tinymist,
   reveal,
+  onJumpToPreview,
   className,
 }: EditorPaneProps) {
   const { project, index, openFileId, undoManager, readOnly, assets } =
@@ -83,6 +91,7 @@ export function EditorPane({
   }
   const presence = usePresenceContext()?.presence;
   const cursors = useContext(CursorContext);
+  const revealFn = useContext(RevealContext);
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
   // getText cannot throw for a text file.
@@ -132,8 +141,24 @@ export function EditorPane({
           ]
         : [],
       cursors && openFileId ? reportCursor(cursors, openFileId) : [],
+      isTypst && openFileId && onJumpToPreview
+        ? modClick(async (view, pos) => {
+            const definition = await tinymist?.definition(view, pos);
+            if (definition && revealFn) {
+              revealFn(definition.fileId, {
+                kind: "offset",
+                from: definition.offset,
+                to: definition.offset,
+              });
+            } else {
+              onJumpToPreview(openFileId, pos);
+            }
+          })
+        : [],
     ],
     [
+      onJumpToPreview,
+      revealFn,
       presence,
       cursors,
       project,

@@ -59,7 +59,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { formatShortcut } from "@/lib/platform";
+import { formatShortcut, isModClick } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 import type {
   CompilerClient,
@@ -100,7 +100,7 @@ export interface PreviewPaneProps {
    * Without it those errors show no shortcut.
    */
   onOpenFontsPackages?: (target: FontsPackagesTarget) => void;
-  /** Double-clicking a page asks the compiler where that spot came from. */
+  /** Mod+Click on a page asks the compiler where that spot came from. */
   onJump?: (jump: PreviewJump) => void;
   scrollTarget?: PreviewScrollTarget | null;
   /** Extra toolbar buttons, shown before the zoom controls. */
@@ -350,9 +350,15 @@ export function PreviewPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollTarget, pages, viewportHeight]);
 
-  const onDoubleClick = (e: MouseEvent<HTMLDivElement>) => {
+  // On mousedown, since macOS turns Ctrl+Click into a context menu click
+  // that never fires `click`.
+  const onMouseDown = (e: MouseEvent<HTMLDivElement>) => {
     const el = viewportRef.current;
-    if (!onJump || !client || !el || renderedScale.current === null) return;
+    if (!isModClick(e) || !onJump || !client) return;
+    if (!el || renderedScale.current === null) return;
+    // Mod+Click on a link keeps opening it in a new tab.
+    if (e.target instanceof Element && e.target.closest("a")) return;
+    e.preventDefault();
     const rect = el.getBoundingClientRect();
     const point = pagePointAt(
       pages,
@@ -361,8 +367,6 @@ export function PreviewPane({
       e.clientY - rect.top - el.clientTop + el.scrollTop,
     );
     if (!point) return;
-    // The browser still selects the word under the pointer, which is fine:
-    // the editor takes the focus once the jump lands.
     void client
       .jumpFromClick(point.page, point.x, point.y)
       .then((jump) => jump && onJump(jump));
@@ -616,7 +620,7 @@ export function PreviewPane({
           data-testid="preview-viewport"
           onScroll={onScroll}
           onKeyDown={onKeyDown}
-          onDoubleClick={onDoubleClick}
+          onMouseDown={onMouseDown}
         >
           {state?.document && <DefsHost defs={state.document.defs} />}
           {pages.length > 0 ? (

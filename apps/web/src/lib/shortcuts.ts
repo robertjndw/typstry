@@ -8,5 +8,4 @@ export const SHORTCUTS = {
   search: "Mod+Shift+F",
   outline: "Mod+Shift+O",
   comment: "Mod+Alt+M",
-  jumpToPreview: "Mod+Alt+J",
 } as const;

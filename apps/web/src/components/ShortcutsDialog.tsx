@@ -36,8 +36,8 @@ function groups(sidebarTabs: readonly SidebarTab[]): Group[] {
         { label: "Show or hide the preview", combo: SHORTCUTS.togglePreview },
         { label: "Fonts and packages", combo: SHORTCUTS.fontsPackages },
         {
-          label: "Show the cursor's spot in the preview",
-          combo: SHORTCUTS.jumpToPreview,
+          label: "Go to the definition or the spot in the preview",
+          combo: "Mod+Click",
         },
         // Only the tabs that exist, so the list never promises a dead key.
         ...(sidebarTabs.includes("search")

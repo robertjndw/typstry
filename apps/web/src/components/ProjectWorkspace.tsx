@@ -224,17 +224,20 @@ export function ProjectWorkspace({
     [index, reveal, showInPreview],
   );
 
-  const jumpToPreview = useCallback(async () => {
-    const cursor = cursors.getSnapshot();
-    const path = cursor && index.byId.get(cursor.fileId)?.path;
-    if (!compiler || !cursor || !path) return;
-    const positions = await compiler.jumpFromCursor(path, cursor.head);
-    if (positions.length === 0) {
-      toast("Nothing to show for this spot in the preview");
-      return;
-    }
-    showInPreview(positions, true);
-  }, [compiler, cursors, index, showInPreview]);
+  const jumpToPreview = useCallback(
+    (fileId: TreeID, offset: number) => {
+      const path = index.byId.get(fileId)?.path;
+      if (!compiler || !path) return;
+      void compiler.jumpFromCursor(path, offset).then((positions) => {
+        if (positions.length === 0) {
+          toast("Nothing to show for this spot in the preview");
+          return;
+        }
+        showInPreview(positions, true);
+      });
+    },
+    [compiler, index, showInPreview],
+  );
 
   const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
   const [focusRequest, setFocusRequest] = useState(0);
@@ -302,7 +305,6 @@ export function ProjectWorkspace({
       [SHORTCUTS.togglePreview]: () => !viewing && layout.toggle("preview"),
       [SHORTCUTS.fontsPackages]: () =>
         !viewing && openFontsPackages({ tab: "fonts" }),
-      [SHORTCUTS.jumpToPreview]: () => !viewing && void jumpToPreview(),
       ...(sidebarTabs.includes("search") && {
         [SHORTCUTS.search]: () => !viewing && openSidebar("search"),
       }),
@@ -475,6 +477,7 @@ export function ProjectWorkspace({
                   compiler={compiler}
                   tinymist={tinymist}
                   reveal={revealRequest}
+                  onJumpToPreview={jumpToPreview}
                 />
               }
               preview={

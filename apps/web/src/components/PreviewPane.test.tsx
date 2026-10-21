@@ -4,6 +4,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { getText } from "@/doc/fs-ops";
 import { initProject, type ProjectDoc } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
+import { IS_MAC } from "@/lib/platform";
 import { CompilerClient } from "@/typst/compiler-client";
 import type {
   RenderPayload,
@@ -14,6 +15,8 @@ import type {
 } from "@/typst/protocol";
 
 import { PreviewPane, type PreviewScrollTarget } from "./PreviewPane";
+
+const MOD = IS_MAC ? { metaKey: true } : { ctrlKey: true };
 
 class FakeWorker implements WorkerLike {
   sent: WorkerRequest[] = [];
@@ -589,13 +592,14 @@ describe("PreviewPane", () => {
       };
     }
 
-    it("asks where a double-clicked spot came from", async () => {
+    it("asks where a Mod+Clicked spot came from", async () => {
       const { worker, onJump } = setupJumps();
       await compile(worker, []);
       worker.sent = [];
 
       const viewport = screen.getByTestId("preview-viewport");
-      fireEvent.doubleClick(viewport, {
+      fireEvent.mouseDown(viewport, {
+        ...MOD,
         clientX: 16 + 10 * 3.68,
         clientY: 16 + 20 * 3.68,
       });
@@ -622,13 +626,25 @@ describe("PreviewPane", () => {
       });
     });
 
-    it("ignores a double click between pages", async () => {
+    it("ignores a Mod+Click between pages", async () => {
       const { worker } = setupJumps();
       await compile(worker, []);
       worker.sent = [];
-      fireEvent.doubleClick(screen.getByTestId("preview-viewport"), {
+      fireEvent.mouseDown(screen.getByTestId("preview-viewport"), {
+        ...MOD,
         clientX: 200,
         clientY: 760,
+      });
+      expect(worker.sent).toEqual([]);
+    });
+
+    it("leaves a plain click alone", async () => {
+      const { worker } = setupJumps();
+      await compile(worker, []);
+      worker.sent = [];
+      fireEvent.mouseDown(screen.getByTestId("preview-viewport"), {
+        clientX: 16 + 10 * 3.68,
+        clientY: 16 + 20 * 3.68,
       });
       expect(worker.sent).toEqual([]);
     });

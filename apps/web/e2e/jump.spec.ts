@@ -8,7 +8,10 @@ import {
   test,
 } from "./fixtures";
 
-test("double-clicking the preview puts the cursor on that line", async ({
+// Mod is Ctrl under the Desktop Chrome user agent the suite runs with.
+const MOD_CLICK = { modifiers: ["Control" as const] };
+
+test("Mod+Click in the preview puts the cursor on that line", async ({
   page,
 }) => {
   await createProject(page, "Jump back");
@@ -20,14 +23,12 @@ test("double-clicking the preview puts the cursor on that line", async ({
   const activeLine = page.locator(".cm-activeLine");
   await expect(activeLine).not.toContainText("Somewhere");
 
-  await firstPage(page).getByText("unusual").dblclick();
+  await firstPage(page).getByText("unusual").click(MOD_CLICK);
   await expect(activeLine).toHaveText("Somewhere quite unusual");
   await expect(editor(page)).toBeFocused();
 });
 
-test("the jump shortcut scrolls the preview to the cursor", async ({
-  page,
-}) => {
+test("Mod+Click in the editor scrolls the preview there", async ({ page }) => {
   await createProject(page, "Jump ahead");
   await appendLine(page, "#pagebreak()");
   await appendLine(page, "= Far heading");
@@ -41,8 +42,31 @@ test("the jump shortcut scrolls the preview to the cursor", async ({
   await expect(firstPage(page)).toBeInViewport();
   await expect(secondPage).not.toBeInViewport();
 
-  await page.locator(".cm-line", { hasText: "= Far heading" }).click();
-  // Mod is Ctrl under the Desktop Chrome user agent the suite runs with.
-  await page.keyboard.press("Control+Alt+J");
+  await page
+    .locator(".cm-line", { hasText: "= Far heading" })
+    .getByText("Far heading")
+    .click(MOD_CLICK);
   await expect(secondPage).toBeInViewport();
+});
+
+test("Mod+Click on a name goes to its definition", async ({ page }) => {
+  await createProject(page, "Jump to definition");
+  await appendLine(page, "#let greeting = [Hello there]");
+  await appendLine(page, "#pagebreak()");
+  // Alone on its line, so a click in the middle of the line lands on it.
+  await appendLine(page, "#greeting");
+  await expect(
+    preview(page).getByRole("img", { name: "Page 2" }),
+  ).toContainText("Hello there");
+
+  const activeLine = page.locator(".cm-activeLine");
+  const use = page.locator(".cm-line", { hasText: /^#greeting$/ });
+  // tinymist may still be starting, in which case the click lands in the
+  // preview instead; trying again once it answers is what a user would do.
+  await expect(async () => {
+    await use.click(MOD_CLICK);
+    await expect(activeLine).toHaveText("#let greeting = [Hello there]", {
+      timeout: 1000,
+    });
+  }).toPass({ timeout: 30_000 });
 });
