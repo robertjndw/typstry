@@ -91,16 +91,20 @@ export function Sidebar({
         >
           {shown.map(({ tab: value, label, Icon, shortcut }) => (
             <Tooltip key={value}>
-              <TooltipTrigger asChild>
-                <TabsTrigger
-                  value={value}
-                  aria-label={label}
-                  aria-keyshortcuts={shortcut && ariaKeyShortcut(shortcut)}
-                  className="size-7 flex-none data-[state=active]:bg-muted data-[state=active]:text-foreground"
-                >
+              {/* Both triggers set data-state, and the outer one's loses.
+                  With the tooltip outside, its "closed" would hide which
+                  tab is active. */}
+              <TabsTrigger
+                asChild
+                value={value}
+                aria-label={label}
+                aria-keyshortcuts={shortcut && ariaKeyShortcut(shortcut)}
+                className="size-7 flex-none"
+              >
+                <TooltipTrigger>
                   <Icon className="size-4" />
-                </TabsTrigger>
-              </TooltipTrigger>
+                </TooltipTrigger>
+              </TabsTrigger>
               <TooltipContent side="bottom">
                 {label}
                 {shortcut && <ShortcutKeys combo={shortcut} />}

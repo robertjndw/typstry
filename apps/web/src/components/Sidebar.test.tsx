@@ -70,6 +70,14 @@ describe("Sidebar", () => {
     expect(tab("Search")).toHaveAttribute("aria-selected", "true");
   });
 
+  it("marks the active tab for its indicator, even with a tooltip", () => {
+    renderSidebar({ search: "x" });
+    expect(tab("Files")).toHaveAttribute("data-state", "active");
+    fireEvent.mouseDown(tab("Search")!);
+    expect(tab("Search")).toHaveAttribute("data-state", "active");
+    expect(tab("Files")).toHaveAttribute("data-state", "inactive");
+  });
+
   it("falls back to files when the stored tab is unavailable", () => {
     localStorage.setItem(KEY, '"comments"');
     renderSidebar({ search: "x" });
