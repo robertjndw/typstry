@@ -6,6 +6,7 @@ import type { SearchQuery } from "./search";
 
 export interface SearchState extends SearchQuery {
   replacement: string;
+  replaceOpen: boolean;
 }
 
 const OPTIONS_KEY = "typstry:search-options";
@@ -27,7 +28,12 @@ function loadOptions(): Pick<
 // The sidebar unmounts a panel when another tab is up, so the text lives
 // here to survive switching tabs. Only the toggles are persisted: a stale
 // pattern on the next visit would be more surprising than helpful.
-let state: SearchState = { pattern: "", replacement: "", ...loadOptions() };
+let state: SearchState = {
+  pattern: "",
+  replacement: "",
+  replaceOpen: false,
+  ...loadOptions(),
+};
 const listeners = new Set<() => void>();
 
 export function setSearchState(patch: Partial<SearchState>): void {
@@ -50,6 +56,11 @@ export function useSearchState(): SearchState {
 
 /** For tests, which share the module between cases. */
 export function resetSearchState(): void {
-  state = { pattern: "", replacement: "", ...loadOptions() };
+  state = {
+    pattern: "",
+    replacement: "",
+    replaceOpen: false,
+    ...loadOptions(),
+  };
   for (const listener of [...listeners]) listener();
 }

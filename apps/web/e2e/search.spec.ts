@@ -29,6 +29,7 @@ test("search and replace across files undoes in one step", async ({ page }) => {
     page.getByRole("status").filter({ hasText: "results" }),
   ).toHaveText("2 results in 2 files");
 
+  await page.getByRole("button", { name: "Toggle replace" }).click();
   await page.getByLabel("Replacement").fill("bar");
   await page.getByRole("button", { name: "Replace all" }).click();
   await expect(page.getByText("Replaced 2 matches")).toBeVisible();

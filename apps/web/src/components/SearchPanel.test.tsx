@@ -103,6 +103,7 @@ describe("SearchPanel", () => {
   it("hides replace controls when read only", async () => {
     setup({ readOnly: true });
     await search("foo");
+    expect(screen.queryByRole("button", { name: "Toggle replace" })).toBeNull();
     expect(screen.queryByLabelText("Replacement")).toBeNull();
     expect(screen.queryByRole("button", { name: "Replace all" })).toBeNull();
   });
@@ -110,6 +111,7 @@ describe("SearchPanel", () => {
   it("replaces all and reports it", async () => {
     const { project } = setup();
     await search("foo");
+    fireEvent.click(screen.getByRole("button", { name: "Toggle replace" }));
     fireEvent.change(screen.getByLabelText("Replacement"), {
       target: { value: "bar" },
     });
@@ -118,6 +120,21 @@ describe("SearchPanel", () => {
     expect(text(project, "chapter.typ")).toBe("x bar bar");
     await act(() => vi.advanceTimersByTimeAsync(100));
     expect(screen.getByText("Replaced 3 matches")).toBeInTheDocument();
+  });
+
+  it("hides replace until toggled and focuses its input", async () => {
+    setup();
+    await search("foo");
+    const toggle = screen.getByRole("button", { name: "Toggle replace" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByLabelText("Replacement")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Replace in / })).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByLabelText("Replacement")).toHaveFocus();
+    expect(
+      screen.getByRole("button", { name: "Replace in main.typ" }),
+    ).toBeInTheDocument();
   });
 
   it("clears the query on Escape", async () => {

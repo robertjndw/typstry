@@ -1,10 +1,12 @@
 import {
+  ChevronDownIcon,
   ChevronRightIcon,
   ReplaceAllIcon,
   ReplaceIcon,
   type LucideIcon,
 } from "lucide-react";
 import {
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -15,7 +17,6 @@ import { toast } from "sonner";
 
 import { EntryIcon } from "@/components/FileTree";
 import { ToolbarButton } from "@/components/ToolbarButton";
-import { Button } from "@/components/ui/button";
 import {
   Collapsible,
   CollapsibleContent,
@@ -42,14 +43,32 @@ const ROW_ATTR = "data-search-row";
 export function SearchPanel() {
   const { project, readOnly, undoManager } = useProject();
   const reveal = useReveal();
-  const { replacement, ...query } = useSearchState();
+  // replacement and replaceOpen stay out of the query so typing a
+  // replacement or opening the row does not re-run the search.
+  const { replacement, replaceOpen, ...query } = useSearchState();
   const { result, resultQuery, searching } = useProjectSearch(project, query);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const input = useRef<HTMLInputElement>(null);
+  const replaceInput = useRef<HTMLInputElement>(null);
+  const focusReplace = useRef(false);
   const list = useRef<HTMLDivElement>(null);
 
   const found = result && "files" in result ? result : null;
   const files = useMemo(() => found?.files ?? [], [found]);
+
+  function toggleReplace() {
+    const open = !replaceOpen;
+    setSearchState({ replaceOpen: open });
+    if (open) focusReplace.current = true;
+  }
+  // Only after a toggle: a panel remounting with replace already open
+  // leaves the focus on the search input.
+  useEffect(() => {
+    if (replaceOpen && focusReplace.current) replaceInput.current?.focus();
+    focusReplace.current = false;
+  }, [replaceOpen]);
+
+  const showReplace = replaceOpen && !readOnly;
 
   function rows(): HTMLElement[] {
     return [
@@ -152,51 +171,75 @@ export function SearchPanel() {
         </span>
       </div>
       <div className="flex shrink-0 flex-col gap-1.5 border-b p-2">
-        <div className="relative">
-          <Input
-            ref={input}
-            {...{ [SIDEBAR_AUTOFOCUS_ATTR]: "" }}
-            aria-label="Search query"
-            placeholder="Search"
-            autoComplete="off"
-            spellCheck={false}
-            value={query.pattern}
-            onChange={(e) => setSearchState({ pattern: e.target.value })}
-            onKeyDown={onQueryKeyDown}
-            className="h-8 pr-[4.75rem] text-sm"
-          />
-          <div className="absolute inset-y-0 right-1 flex items-center gap-0.5">
-            {toggle("regex", "Use regular expression", ".*")}
-            {toggle("caseSensitive", "Match case", "Aa")}
-            {toggle("wholeWord", "Match whole word", <u>ab</u>)}
+        <div className="flex gap-1">
+          {!readOnly && (
+            <button
+              type="button"
+              aria-label="Toggle replace"
+              aria-expanded={replaceOpen}
+              onClick={toggleReplace}
+              // Spans both input rows like the VS Code search view.
+              className="flex w-4 shrink-0 items-center justify-center self-stretch rounded-sm text-muted-foreground outline-none hover:bg-accent focus-visible:bg-accent"
+            >
+              {replaceOpen ? (
+                <ChevronDownIcon className="size-4" />
+              ) : (
+                <ChevronRightIcon className="size-4" />
+              )}
+            </button>
+          )}
+          <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+            <div className="relative">
+              <Input
+                ref={input}
+                {...{ [SIDEBAR_AUTOFOCUS_ATTR]: "" }}
+                aria-label="Search query"
+                placeholder="Search"
+                autoComplete="off"
+                spellCheck={false}
+                value={query.pattern}
+                onChange={(e) => setSearchState({ pattern: e.target.value })}
+                onKeyDown={onQueryKeyDown}
+                className="h-8 pr-[4.75rem] text-sm"
+              />
+              <div className="absolute inset-y-0 right-1 flex items-center gap-0.5">
+                {toggle("regex", "Use regular expression", ".*")}
+                {toggle("caseSensitive", "Match case", "Aa")}
+                {toggle("wholeWord", "Match whole word", <u>ab</u>)}
+              </div>
+            </div>
+            {showReplace && (
+              <div className="flex items-center gap-1">
+                <Input
+                  ref={replaceInput}
+                  aria-label="Replacement"
+                  placeholder="Replace"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={replacement}
+                  onChange={(e) =>
+                    setSearchState({ replacement: e.target.value })
+                  }
+                  className="h-8 text-sm"
+                />
+                <ToolbarButton
+                  label="Replace all"
+                  disabled={files.length === 0}
+                  onClick={() => replace(files)}
+                  className="size-7 shrink-0"
+                >
+                  <ReplaceAllIcon />
+                </ToolbarButton>
+              </div>
+            )}
           </div>
         </div>
-        {!readOnly && (
-          <div className="flex items-center gap-1">
-            <Input
-              aria-label="Replacement"
-              placeholder="Replace"
-              autoComplete="off"
-              spellCheck={false}
-              value={replacement}
-              onChange={(e) => setSearchState({ replacement: e.target.value })}
-              className="h-8 text-sm"
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={files.length === 0}
-              onClick={() => replace(files)}
-            >
-              Replace all
-            </Button>
-          </div>
-        )}
         <p
           role="status"
           aria-live="polite"
           className={cn(
             "min-h-4 text-xs text-muted-foreground",
+            !readOnly && "pl-5",
             searching && "opacity-60",
           )}
         >
@@ -221,7 +264,7 @@ export function SearchPanel() {
                 return next;
               })
             }
-            readOnly={readOnly}
+            canReplace={showReplace}
             onReplaceFile={() =>
               replace([{ fileId: file.fileId, matches: file.matches }])
             }
@@ -246,7 +289,7 @@ function FileGroup({
   file,
   open,
   onOpenChange,
-  readOnly,
+  canReplace,
   onReplaceFile,
   onReplaceMatch,
   onOpenMatch,
@@ -254,7 +297,7 @@ function FileGroup({
   file: FileMatches;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  readOnly: boolean;
+  canReplace: boolean;
   onReplaceFile: () => void;
   onReplaceMatch: (match: SearchMatch) => void;
   onOpenMatch: (match: SearchMatch) => void;
@@ -286,7 +329,7 @@ function FileGroup({
             {file.matches.length}
           </span>
         </CollapsibleTrigger>
-        {!readOnly && (
+        {canReplace && (
           <HoverAction
             icon={ReplaceAllIcon}
             label={`Replace in ${file.path}`}
@@ -306,7 +349,7 @@ function FileGroup({
             >
               <PreviewText match={match} />
             </button>
-            {!readOnly && (
+            {canReplace && (
               <HoverAction
                 icon={ReplaceIcon}
                 label="Replace this match"
