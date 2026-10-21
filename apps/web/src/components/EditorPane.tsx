@@ -1,5 +1,5 @@
 import type { Text } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import type { TreeID } from "loro-crdt";
 import { EyeIcon, FileCodeIcon } from "lucide-react";
 import {
@@ -20,6 +20,7 @@ import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
 import { CursorContext, reportCursor } from "@/editor/cursor-store";
 import { Editor } from "@/editor/Editor";
+import { flashLine } from "@/editor/flash";
 import { revealScroll } from "@/editor/reveal-scroll";
 import { imageDrop } from "@/editor/image-drop";
 import { typstLanguage } from "@/editor/language";
@@ -41,8 +42,12 @@ import type { SourceRange } from "@/typst/protocol";
 export type RevealTarget =
   /** Typst's line and code point column, as diagnostics report it. */
   | { kind: "source"; range: SourceRange }
-  /** UTF-16 offsets, which is what CodeMirror and Loro index by. */
-  | { kind: "offset"; from: number; to: number };
+  /**
+   * UTF-16 offsets, which is what CodeMirror and Loro index by. `flash`
+   * centres the spot and marks its line, for jumps that come from somewhere
+   * else on screen, where the eye has to find where it landed.
+   */
+  | { kind: "offset"; from: number; to: number; flash?: boolean };
 
 function clampRange(from: number, to: number, length: number) {
   const clamp = (n: number) => Math.min(Math.max(n, 0), length);
@@ -149,6 +154,7 @@ export function EditorPane({
                 kind: "offset",
                 from: definition.offset,
                 to: definition.offset,
+                flash: true,
               });
             } else {
               onJumpToPreview(openFileId, pos);
@@ -198,10 +204,14 @@ export function EditorPane({
       target.kind === "source"
         ? sourceRangeToOffsets(target.range, doc)
         : clampRange(target.from, target.to, doc.length);
+    const flash = target.kind === "offset" && target.flash;
     view.dispatch({
       selection: { anchor: range.from, head: range.to },
-      effects: revealScroll(view, range.from),
+      effects: flash
+        ? EditorView.scrollIntoView(range.from, { y: "center" })
+        : revealScroll(view, range.from),
     });
+    if (flash) flashLine(view, range.from);
     view.focus();
   }, [view, reveal, openFileId]);
 

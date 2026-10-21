@@ -27,6 +27,7 @@ import {
   rectangularSelection,
 } from "@codemirror/view";
 
+import { lineFlash } from "./flash";
 import { editorTheme, foldMarker, syntaxTheme } from "./theme";
 
 /**
@@ -58,6 +59,7 @@ export const editorBasics: Extension = [
     ...lintKeymap,
     indentWithTab,
   ]),
+  lineFlash,
   editorTheme,
   syntaxTheme,
 ];

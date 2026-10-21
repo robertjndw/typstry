@@ -213,6 +213,7 @@ export function ProjectWorkspace({
           kind: "offset",
           from: jump.offset,
           to: jump.offset,
+          flash: true,
         });
       } else if (jump.kind === "package") {
         toast(`Defined in package ${jump.package}`);

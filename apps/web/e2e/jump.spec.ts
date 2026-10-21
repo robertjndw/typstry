@@ -26,6 +26,9 @@ test("Mod+Click in the preview puts the cursor on that line", async ({
   await firstPage(page).getByText("unusual").click(MOD_CLICK);
   await expect(activeLine).toHaveText("Somewhere quite unusual");
   await expect(editor(page)).toBeFocused();
+  // Marked for a moment, so it is easy to spot where the jump landed.
+  await expect(page.locator(".cm-flash")).toHaveText("Somewhere quite unusual");
+  await expect(page.locator(".cm-flash")).toHaveCount(0);
 });
 
 test("Mod+Click in the editor scrolls the preview there", async ({ page }) => {
@@ -69,4 +72,7 @@ test("Mod+Click on a name goes to its definition", async ({ page }) => {
       timeout: 1000,
     });
   }).toPass({ timeout: 30_000 });
+  await expect(page.locator(".cm-flash")).toHaveText(
+    "#let greeting = [Hello there]",
+  );
 });
