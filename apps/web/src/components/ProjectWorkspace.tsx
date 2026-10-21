@@ -337,8 +337,6 @@ export function ProjectWorkspace({
             onShortcuts={() => setShortcutsOpen(true)}
             onFontsPackages={() => openFontsPackages({ tab: "fonts" })}
             onSyncNow={syncNow}
-            sidebarTabs={sidebarTabs}
-            onOpenSidebar={openSidebar}
           />
           {badge}
           {share && <div className="ml-1 flex items-center">{share}</div>}
