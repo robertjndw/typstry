@@ -25,15 +25,14 @@ function loadOptions(): Pick<
   };
 }
 
+function initialState(): SearchState {
+  return { pattern: "", replacement: "", replaceOpen: false, ...loadOptions() };
+}
+
 // The sidebar unmounts a panel when another tab is up, so the text lives
 // here to survive switching tabs. Only the toggles are persisted: a stale
 // pattern on the next visit would be more surprising than helpful.
-let state: SearchState = {
-  pattern: "",
-  replacement: "",
-  replaceOpen: false,
-  ...loadOptions(),
-};
+let state: SearchState = initialState();
 const listeners = new Set<() => void>();
 
 export function setSearchState(patch: Partial<SearchState>): void {
@@ -56,11 +55,6 @@ export function useSearchState(): SearchState {
 
 /** For tests, which share the module between cases. */
 export function resetSearchState(): void {
-  state = {
-    pattern: "",
-    replacement: "",
-    replaceOpen: false,
-    ...loadOptions(),
-  };
+  state = initialState();
   for (const listener of [...listeners]) listener();
 }
