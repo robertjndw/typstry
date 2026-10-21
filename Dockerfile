@@ -25,7 +25,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY apps/web/scripts/build-typst-compiler.sh apps/web/scripts/
 COPY apps/web/patches/typst-ts-jump.patch apps/web/patches/
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# Its own registry cache: this stage runs in parallel with the tinymist one,
+# and two cargos unpacking into one registry race on the .cargo-ok marker
+# ("File exists (os error 17)").
+RUN --mount=type=cache,id=cargo-registry-typst-compiler,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cache/.wasm-pack \
     apps/web/scripts/build-typst-compiler.sh
