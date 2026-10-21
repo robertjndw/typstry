@@ -47,6 +47,35 @@ export interface ProjectDiagnostic {
   severity: Severity;
   message: string;
   range: SourceRange | null;
+  /** What the user can add to make the error go away, if Typst says so. */
+  hint?: DiagnosticHint;
+}
+
+export type DiagnosticHint =
+  { kind: "package"; spec: string } | { kind: "font"; family: string };
+
+const PACKAGE_NOT_FOUND = /^package not found \(searched for (@[^\s)]+)\)/;
+const PACKAGE_VERSION_MISSING =
+  /^package found, but version (\S+) does not exist/;
+const UNKNOWN_FONT = /^unknown font family: (.+)$/s;
+
+/**
+ * Typst has no error codes, so the hint comes from the message text. A
+ * wording change in a future Typst only loses the hint, not the error.
+ */
+export function diagnosticHint(message: string): DiagnosticHint | undefined {
+  const notFound = PACKAGE_NOT_FOUND.exec(message);
+  if (notFound) return { kind: "package", spec: notFound[1]! };
+  // The version message may not name the package, so there is nothing to
+  // prefill beyond what Typst printed.
+  const version = PACKAGE_VERSION_MISSING.exec(message);
+  if (version) {
+    const spec = /@[^\s/:]+\/[^\s/:]+:[^\s,)]+/.exec(message);
+    return { kind: "package", spec: spec ? spec[0] : "" };
+  }
+  const font = UNKNOWN_FONT.exec(message);
+  if (font) return { kind: "font", family: font[1]!.trim() };
+  return undefined;
 }
 
 export function toProjectDiagnostic(d: WorkerDiagnostic): ProjectDiagnostic {
@@ -55,12 +84,14 @@ export function toProjectDiagnostic(d: WorkerDiagnostic): ProjectDiagnostic {
   const label = inPackage
     ? `${d.package}${d.path}`
     : (path ?? (d.path || "(unknown)"));
+  const hint = diagnosticHint(d.message);
   return {
     path,
     label,
     severity: d.severity,
     message: d.message,
     range: d.range,
+    ...(hint ? { hint } : {}),
   };
 }
 

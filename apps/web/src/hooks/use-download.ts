@@ -45,7 +45,7 @@ export function useZipDownload({
 }: ZipDownloadOptions) {
   return useDownload(
     async () => {
-      const { zip, skipped } = await exportZip(
+      const { zip, skipped, packages, packagesLeftOut } = await exportZip(
         project,
         assets ? (hash) => assets.load(hash) : null,
         mtime,
@@ -54,6 +54,14 @@ export function useZipDownload({
         toast.warning(
           `Left out ${skipped.length === 1 ? skipped[0] : `${skipped.length} files`}: the name is not safe to unpack.`,
         );
+      }
+      if (packagesLeftOut.length > 0) {
+        toast.warning(
+          `Left out ${packagesLeftOut.length === 1 ? packagesLeftOut[0] : `${packagesLeftOut.length} packages`}: the project has files in typst-packages/.`,
+        );
+      }
+      if (packages > 0) {
+        toast.success("Packages are under typst-packages/ in the zip.");
       }
       return new Blob([zip], { type: "application/zip" });
     },

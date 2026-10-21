@@ -16,6 +16,7 @@ import { RetryQueue } from "@/project/retry";
 import { toProjectDiagnostic, type ProjectDiagnostic } from "./diagnostics";
 import {
   DEFAULT_FONTS,
+  type FontAsset,
   type FontConfig,
   type RenderError,
   type RenderPayload,
@@ -72,6 +73,12 @@ export interface PreviewState {
    * first document.
    */
   animation: PreviewAnimation | null;
+  /**
+   * The font bundles the project turned on could not be loaded, so the
+   * preview runs with the default fonts. Cleared by the next compiler that
+   * loads them.
+   */
+  fontWarning: string | null;
 }
 
 /**
@@ -173,9 +180,13 @@ export class CompilerClient {
   private files: ProjectIndexState;
   /** Asset path -> hash currently mirrored (or being loaded). */
   private readonly assets = new Map<string, string>();
+  /** Package key -> hash currently mirrored (or being loaded). */
+  private readonly packages = new Map<string, string>();
   private readonly retries = new RetryQueue();
   private mainId: TreeID | null = null;
   private baseFonts: FontConfig = DEFAULT_FONTS;
+  /** The font bundles the project asks for; always starts with "text". */
+  private docAssets: readonly FontAsset[] = DEFAULT_FONTS.assets;
   /**
    * Sorted, comma-joined hashes of the project's font files; null after a
    * failed load so that the next sync retries.
@@ -216,6 +227,7 @@ export class CompilerClient {
     stalled: false,
     follow: null,
     animation: null,
+    fontWarning: null,
   };
   /** Edit sources since the last shown result; "typed" wins over "external". */
   private pendingKind: AnimationKind | null = null;
@@ -278,8 +290,9 @@ export class CompilerClient {
     );
     const state = this.index.state;
     this.files = state;
-    if (this.syncStructure(state, [], [...state.texts.values()], true))
+    if (this.syncStructure(state, [], [...state.texts.values()], true, true))
       this.requestCompile();
+    this.syncFontAssets(state);
   }
 
   getState = (): PreviewState => this.state;
@@ -320,7 +333,8 @@ export class CompilerClient {
   /**
    * Tries again after a failure shown in `error`: a compiler that could not
    * start or kept crashing, or a preview that could not render. While
-   * `stalled`, it restarts the worker instead.
+   * `stalled`, it restarts the worker instead. After `fontWarning`, it loads
+   * the font bundles again.
    */
   retry(): void {
     if (this.disposed) return;
@@ -338,6 +352,10 @@ export class CompilerClient {
       this.setState({ error: "Restarting the compiler.", stalled: false });
     } else if (this.initFailed) {
       this.post({ type: "restart" });
+    } else if (this.state.fontWarning) {
+      // The compiler runs, just without the bundles; a reinit fetches them
+      // again.
+      this.loadFonts();
     } else {
       this.post({ type: "rerender" });
       this.requestCompile();
@@ -353,8 +371,12 @@ export class CompilerClient {
     if (this.disposed || !this.assetLoader) return;
     const failed =
       this.fontKey === null ||
-      [...this.assets.values()].some((hash) => hash === FAILED_LOAD);
-    if (failed && this.syncAssets(this.files)) this.requestCompile();
+      [...this.assets.values()].some((hash) => hash === FAILED_LOAD) ||
+      [...this.packages.values()].some((hash) => hash === FAILED_LOAD);
+    if (!failed) return;
+    const assets = this.syncAssets(this.files);
+    const packages = this.syncPackages(this.files);
+    if (assets || packages) this.requestCompile();
   }
 
   /** Loads the project's font files and rebuilds the compiler with them. */
@@ -388,6 +410,7 @@ export class CompilerClient {
   private postFonts(projectFonts: Uint8Array[]): void {
     const fonts: FontConfig = {
       ...this.baseFonts,
+      assets: [...new Set([...this.baseFonts.assets, ...this.docAssets])],
       extra: [...(this.baseFonts.extra ?? []), ...projectFonts],
     };
     // Only the freshly loaded project fonts are ours to detach; the base
@@ -547,9 +570,15 @@ export class CompilerClient {
     this.fontKey = "";
     this.fontFiles = new Map();
     this.syncAssets(this.files);
+    this.packages.clear();
+    this.syncPackages(this.files);
     // Without project fonts syncAssets has no reason to reinit, but the new
-    // worker starts with the default fonts, not the ones reinit() chose.
-    if (this.fontFiles.size === 0 && this.baseFonts !== DEFAULT_FONTS)
+    // worker starts with the default fonts, not the ones reinit() or the
+    // project's bundles chose.
+    if (
+      this.fontFiles.size === 0 &&
+      (this.baseFonts !== DEFAULT_FONTS || this.docAssets.length > 1)
+    )
       this.loadFonts();
     this.requestCompile();
   }
@@ -613,7 +642,9 @@ export class CompilerClient {
         change.textsRemoved,
         change.textsAdded,
         change.assetsRemoved.length > 0 || change.assetsAdded.length > 0,
+        change.packagesRemoved.length > 0 || change.packagesAdded.length > 0,
       );
+      if (change.fontAssetsChanged) this.syncFontAssets(change.state);
       // A checkout or a collaborator's merged edits can change the file set
       // and file contents in one batch. Compiling the new file set while the
       // texts still wait out the debounce reports errors that never existed,
@@ -665,6 +696,7 @@ export class CompilerClient {
     textsRemoved: readonly IndexedText[],
     textsAdded: readonly IndexedText[],
     assetsChanged: boolean,
+    packagesChanged: boolean,
   ): boolean {
     let changed = textsRemoved.length > 0 || textsAdded.length > 0;
 
@@ -679,6 +711,7 @@ export class CompilerClient {
     }
     // Asset removes go out in here too, still ahead of the texts below.
     if (assetsChanged && this.syncAssets(state)) changed = true;
+    if (packagesChanged && this.syncPackages(state)) changed = true;
     for (const file of textsAdded) {
       this.dirty.delete(file.id);
       this.sendText(file);
@@ -732,6 +765,60 @@ export class CompilerClient {
     }
     this.syncFonts(fonts);
     return changed;
+  }
+
+  /**
+   * Mirrors the project's packages. Like assets, the archives are loaded by
+   * hash and transferred; the worker unpacks them when a compile imports
+   * one. True when a package was removed, which the compile has to know
+   * about; additions ask for their own compile once loaded.
+   */
+  private syncPackages(state: ProjectIndexState): boolean {
+    if (!this.assetLoader || this.disposed) return false;
+    const loader = this.assetLoader;
+    let changed = false;
+    for (const [key, { hash }] of state.packages) {
+      if (this.packages.get(key) === hash) continue;
+      this.packages.set(key, hash);
+      this.track(
+        loader(hash, `${key}.tar.gz`).then(
+          (data) => {
+            // Replaced or removed while loading.
+            if (this.packages.get(key) !== hash) return;
+            this.retries.succeeded(`package:${key}`);
+            this.post({ type: "setPackage", key, hash, data }, [data.buffer]);
+            this.requestCompile();
+          },
+          (err: unknown) => {
+            console.error(`failed to load package ${key}`, err);
+            if (this.packages.get(key) !== hash) return;
+            this.packages.set(key, FAILED_LOAD);
+            this.retries.schedule(`package:${key}`, () => {
+              if (this.syncPackages(this.files)) this.requestCompile();
+            });
+          },
+        ),
+      );
+    }
+    for (const key of [...this.packages.keys()]) {
+      if (state.packages.has(key)) continue;
+      this.packages.delete(key);
+      this.post({ type: "removePackage", key });
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** Rebuilds the compiler when the project turns a font bundle on or off. */
+  private syncFontAssets(state: ProjectIndexState): void {
+    const wanted = state.fontAssets;
+    if (
+      wanted.length === this.docAssets.length &&
+      wanted.every((asset, i) => asset === this.docAssets[i])
+    )
+      return;
+    this.docAssets = wanted;
+    this.loadFonts();
   }
 
   /**
@@ -800,6 +887,8 @@ export class CompilerClient {
         this.initFailed = false;
         this.retries.succeeded("init");
         if (this.state.error) this.setState({ error: null });
+        if (this.state.fontWarning !== (msg.fontWarning ?? null))
+          this.setState({ fontWarning: msg.fontWarning ?? null });
         break;
       case "initError":
         this.workerStarted = true;

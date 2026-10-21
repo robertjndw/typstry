@@ -7,6 +7,7 @@ import {
   RefreshCwIcon,
   SearchIcon,
   TagIcon,
+  TypeIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -39,6 +40,7 @@ export function WorkspaceMenu({
   onTagVersion,
   onQuickOpen,
   onShortcuts,
+  onFontsPackages,
   onSyncNow,
 }: {
   layout: WorkspaceLayoutState;
@@ -49,6 +51,7 @@ export function WorkspaceMenu({
   onTagVersion?: () => void;
   onQuickOpen: () => void;
   onShortcuts: () => void;
+  onFontsPackages: () => void;
   /** Absent when there is no server connection to push to. */
   onSyncNow?: () => void;
 }) {
@@ -96,6 +99,15 @@ export function WorkspaceMenu({
               )}
             </DropdownMenuItem>
           )}
+          <DropdownMenuItem onSelect={onFontsPackages}>
+            <TypeIcon />
+            Fonts &amp; packages…
+            {desktop && (
+              <DropdownMenuShortcut>
+                {formatShortcut(SHORTCUTS.fontsPackages)}
+              </DropdownMenuShortcut>
+            )}
+          </DropdownMenuItem>
           <DropdownMenuItem disabled={zip.busy} onSelect={zip.run}>
             <DownloadIcon />
             Download as zip

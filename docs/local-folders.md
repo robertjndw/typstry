@@ -49,6 +49,8 @@ These are left out, never written to the folder and never deleted from it:
 
 Text files are synced as text. Anything else is uploaded as an encrypted file, like an image you add in the browser.
 
+Packages are not synced. They live in the project's package store (the **Fonts & Packages** dialog), not in its file tree, so the folder never gets them and changing the folder never adds or removes one. To compile the folder with the Typst CLI, download the project as a zip: it holds the packages in `typst-packages/`, and `typst compile --package-path typst-packages` finds them.
+
 ## When both sides change
 
 If you edit a text file in the browser and in the folder at the same time, typstry merges the two edits, as the CLI does, and writes the result to both sides. Edits to different parts of the file never clash.

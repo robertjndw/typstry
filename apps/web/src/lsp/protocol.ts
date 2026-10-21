@@ -6,7 +6,14 @@ export type TinymistRequest =
   | { type: "lsp"; message: string }
   /** Project file contents, served when tinymist asks for a file. */
   | { type: "setFile"; uri: string; data: Uint8Array }
-  | { type: "removeFile"; uri: string };
+  | { type: "removeFile"; uri: string }
+  /**
+   * A project package's .tar.gz, keyed like the doc ("ns/name/version").
+   * Sent before tinymist can ask for it, because resolving a package is
+   * synchronous.
+   */
+  | { type: "setPackage"; key: string; hash: string; data: Uint8Array }
+  | { type: "removePackage"; key: string };
 
 export type TinymistResponse =
   | { type: "lsp"; message: string }

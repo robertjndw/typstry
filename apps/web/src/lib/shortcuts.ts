@@ -4,4 +4,5 @@ export const SHORTCUTS = {
   syncNow: "Mod+S",
   toggleFiles: "Mod+B",
   togglePreview: "Mod+\\",
+  fontsPackages: "Mod+Alt+F",
 } as const;

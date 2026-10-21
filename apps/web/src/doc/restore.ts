@@ -121,6 +121,23 @@ export function restoreVersion(
   };
   remove(project.fs.roots());
 
+  // Packages are plain records, so matching them is a per-key comparison.
+  const wanted = new Set(version.packages.keys());
+  for (const key of project.packages.keys())
+    if (!wanted.has(key)) project.packages.delete(key);
+  for (const key of wanted) {
+    const value: unknown = version.packages.get(key);
+    if (JSON.stringify(project.packages.get(key)) !== JSON.stringify(value))
+      project.packages.set(key, value as Record<string, unknown>);
+  }
+  for (const key of [META.cjkFonts, META.emojiFonts]) {
+    const value: unknown = version.meta.get(key);
+    if (project.meta.get(key) !== value) {
+      if (value === undefined) project.meta.delete(key);
+      else project.meta.set(key, value as boolean);
+    }
+  }
+
   const title = version.title;
   if (title && project.title !== title) project.meta.set(META.title, title);
   const main = version.mainFile;

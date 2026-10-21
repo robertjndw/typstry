@@ -17,6 +17,13 @@ import {
 } from "./fs-ops";
 import { buildPathIndex, type PathIndex } from "./paths";
 import { initProject, ProjectDoc } from "./schema";
+import {
+  deletePackage,
+  putPackage,
+  readFontBundles,
+  readPackages,
+  setFontBundle,
+} from "@/packages/records";
 import { fork, newProject, sync } from "./test-utils";
 import { deleteVersion, listVersions, saveVersion } from "./versions";
 
@@ -28,6 +35,7 @@ const SNAPSHOT = path.join(FIXTURES, "clash.loro");
 const EXPECTED = path.join(FIXTURES, "clash.paths.json");
 const JS_VERSION = path.join(FIXTURES, "version.js.loro");
 const JS_DELETED_VERSION = path.join(FIXTURES, "version-deleted.js.loro");
+const JS_PACKAGES = path.join(FIXTURES, "packages.js.loro");
 // Written by crates/typstry-doc/tests/fixture.rs.
 const RUST_VERSION = path.join(FIXTURES, "version.rust.loro");
 
@@ -162,6 +170,72 @@ describe("version fixture", () => {
     const old = new ProjectDoc(doc.forkAt(version!.frontiers));
     expect(old.title).toBe("From Rust");
     expect(old.versions.length).toBe(0);
+  });
+});
+
+function buildPackages(): ProjectDoc {
+  const project = initProject(newProject(12n), { title: "Packages" });
+  const base = {
+    namespace: "local",
+    name: "thesis",
+    version: "1.0.0",
+    hash: "hash-old",
+    size: 1024,
+    mime: "application/gzip",
+    entrypoint: "lib.typ",
+    fileCount: 3,
+    unpackedSize: 4096,
+    source: "upload" as const,
+    addedAt: 1700000000000,
+  };
+  putPackage(project, base);
+  // Replaced: the second write for the same key wins.
+  putPackage(project, {
+    ...base,
+    hash: "hash-new",
+    description: "A thesis template",
+    authors: ["Ada", "Grace"],
+    license: "MIT",
+    compiler: "0.13.0",
+    addedAt: 1700000000500,
+  });
+  putPackage(project, {
+    ...base,
+    namespace: "preview",
+    name: "cetz",
+    version: "0.3.0",
+    hash: "hash-cetz",
+    entrypoint: "src/lib.typ",
+    source: "universe",
+    addedAt: 1700000001000,
+  });
+  putPackage(project, { ...base, name: "scratch", hash: "hash-scratch" });
+  deletePackage(project, "local/scratch/1.0.0");
+  setFontBundle(project, "cjk", true);
+  return project;
+}
+
+describe("packages fixture", () => {
+  it.runIf(process.env.TYPSTRY_WRITE_FIXTURES === "1")(
+    "regenerates the JS-written packages",
+    () => {
+      writeFileSync(
+        JS_PACKAGES,
+        buildPackages().doc.export({ mode: "snapshot" }),
+      );
+    },
+  );
+
+  it("reads the committed snapshot like a fresh build", () => {
+    const doc = new LoroDoc();
+    doc.import(readFileSync(JS_PACKAGES));
+    const project = new ProjectDoc(doc);
+    expect(readPackages(project)).toEqual(readPackages(buildPackages()));
+    expect([...readPackages(project).keys()]).toEqual([
+      "local/thesis/1.0.0",
+      "preview/cetz/0.3.0",
+    ]);
+    expect(readFontBundles(project)).toEqual({ cjk: true, emoji: false });
   });
 });
 

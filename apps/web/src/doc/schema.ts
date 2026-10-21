@@ -27,6 +27,13 @@ export const ROOT = {
   versions: "versions",
   /** Map of deleted named versions, see versions.ts. */
   deletedVersions: "deletedVersions",
+  /**
+   * Map of project packages, keyed `namespace/name/version` (packageKey in
+   * packages/spec.ts). Values are plain PackageRecord objects, so replacing
+   * a package is one atomic write and concurrent writers resolve last
+   * writer wins per package. The archive itself is an asset blob.
+   */
+  packages: "packages",
 } as const;
 
 export const META = {
@@ -35,6 +42,13 @@ export const META = {
   schema: "schema",
   title: "title",
   mainFile: "mainFile",
+  /**
+   * Booleans enabling the built-in CJK and emoji font bundles. Two keys
+   * rather than a list so two people toggling different bundles at once
+   * don't overwrite each other.
+   */
+  cjkFonts: "cjkFonts",
+  emojiFonts: "emojiFonts",
 } as const;
 
 /**
@@ -104,6 +118,54 @@ export interface AssetInfo {
   mime: string;
 }
 
+/** Field names of a PackageRecord as stored in ROOT.packages. */
+export const PACKAGE = {
+  namespace: "namespace",
+  name: "name",
+  version: "version",
+  hash: "hash",
+  size: "size",
+  mime: "mime",
+  entrypoint: "entrypoint",
+  description: "description",
+  authors: "authors",
+  license: "license",
+  compiler: "compiler",
+  fileCount: "fileCount",
+  unpackedSize: "unpackedSize",
+  source: "source",
+  addedAt: "addedAt",
+} as const;
+
+export const PACKAGE_SOURCES = ["upload", "universe"] as const;
+export type PackageSource = (typeof PACKAGE_SOURCES)[number];
+
+/**
+ * A package stored in the project. `hash`/`size`/`mime` describe the
+ * canonical .tar.gz blob in the project's assets; name and version always
+ * match the archive's typst.toml, because Typst rejects a package whose
+ * manifest disagrees with the import.
+ */
+export interface PackageRecord {
+  namespace: string;
+  name: string;
+  version: string;
+  hash: string;
+  size: number;
+  mime: string;
+  entrypoint: string;
+  description?: string;
+  authors?: string[];
+  license?: string;
+  /** Minimum compiler version from the manifest, if any. */
+  compiler?: string;
+  fileCount: number;
+  unpackedSize: number;
+  source: PackageSource;
+  /** Unix ms. */
+  addedAt: number;
+}
+
 export const DEFAULT_MAIN_FILE = "main.typ";
 
 export function starterContent(title: string): string {
@@ -145,6 +207,10 @@ export class ProjectDoc {
 
   get deletedVersions(): LoroMap {
     return this.doc.getMap(ROOT.deletedVersions);
+  }
+
+  get packages(): LoroMap {
+    return this.doc.getMap(ROOT.packages);
   }
 
   get schemaVersion(): number | null {

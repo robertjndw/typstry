@@ -11,6 +11,12 @@ import {
   test,
   waitForLocalSave,
 } from "./fixtures";
+import {
+  addPackage,
+  dialog,
+  openDialog,
+  setMain,
+} from "../e2e/fonts-packages-helpers";
 
 const RED_PNG = path.join(import.meta.dirname, "../e2e/files/red.png");
 
@@ -103,4 +109,26 @@ test("the service worker serves the editor offline", async ({
   await page.goto(url);
   await expect(editor(page)).toContainText("Still here offline");
   await expect(firstPage(page)).toContainText("Still here offline");
+});
+
+test("an uploaded package imports and survives a reload", async ({ page }) => {
+  await createStandaloneProject(page, "Packages");
+  await openDialog(page);
+  await addPackage(page, "Hello from package");
+  await dialog(page)
+    .getByRole("form", { name: "Review package" })
+    .getByRole("button", { name: "Add package" })
+    .click();
+  await expect(
+    dialog(page).getByRole("listitem", { name: "@local/hello:0.1.0" }),
+  ).toBeVisible();
+  await dialog(page).getByRole("button", { name: "Close" }).click();
+  await expect(dialog(page)).toBeHidden();
+
+  await setMain(page, ['#import "@local/hello:0.1.0": hello', "#hello"]);
+  await expect(firstPage(page)).toContainText("Hello from package");
+
+  await waitForLocalSave(page);
+  await page.reload();
+  await expect(firstPage(page)).toContainText("Hello from package");
 });

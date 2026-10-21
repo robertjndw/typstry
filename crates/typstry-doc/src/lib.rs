@@ -8,6 +8,7 @@ pub mod directory;
 pub mod init;
 pub mod materialize;
 pub mod names;
+pub mod packages;
 pub mod paths;
 pub mod peers;
 #[cfg(any(test, feature = "test-util"))]
@@ -221,6 +222,40 @@ pub mod root {
     /// (`counter@peer`) to the deletion time in unix ms. Entries stay in
     /// `versions` so that later indexes never shift.
     pub const DELETED_VERSIONS: &str = "deletedVersions";
+    /// Map of project packages keyed `namespace/name/version`, see
+    /// [`super::package`]. Values are plain maps, replaced as a whole.
+    pub const PACKAGES: &str = "packages";
+}
+
+/// Keys of each entry in the `packages` map. The archive is an asset blob
+/// addressed by `hash`.
+pub mod package {
+    pub const NAMESPACE: &str = "namespace";
+    pub const NAME: &str = "name";
+    pub const VERSION: &str = "version";
+    pub const HASH: &str = "hash";
+    pub const SIZE: &str = "size";
+    pub const MIME: &str = "mime";
+    /// Path of the main file inside the archive, always relative.
+    pub const ENTRYPOINT: &str = "entrypoint";
+    pub const DESCRIPTION: &str = "description";
+    /// List of strings.
+    pub const AUTHORS: &str = "authors";
+    pub const LICENSE: &str = "license";
+    /// Minimum compiler version from the manifest.
+    pub const COMPILER: &str = "compiler";
+    pub const FILE_COUNT: &str = "fileCount";
+    pub const UNPACKED_SIZE: &str = "unpackedSize";
+    /// One of [`super::package_source`].
+    pub const SOURCE: &str = "source";
+    /// Unix milliseconds.
+    pub const ADDED_AT: &str = "addedAt";
+}
+
+/// Values of `package.source`.
+pub mod package_source {
+    pub const UPLOAD: &str = "upload";
+    pub const UNIVERSE: &str = "universe";
 }
 
 /// Keys of each entry in the `versions` list. An entry names a point in
@@ -256,6 +291,9 @@ pub mod meta {
     pub const SCHEMA: &str = "schema";
     pub const TITLE: &str = "title";
     pub const MAIN_FILE: &str = "mainFile";
+    /// Booleans enabling the built-in CJK and emoji font bundles.
+    pub const CJK_FONTS: &str = "cjkFonts";
+    pub const EMOJI_FONTS: &str = "emojiFonts";
 }
 
 /// Keys inside each `fs` tree node's data map.
