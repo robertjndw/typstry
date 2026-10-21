@@ -62,6 +62,7 @@ import { cn } from "@/lib/utils";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { useProject } from "@/project/context";
 import type { VersionTarget } from "@/project/history-items";
+import { projectIndex } from "@/project/project-index";
 import { CursorContext, CursorStore } from "@/editor/cursor-store";
 import { RevealContext } from "@/project/reveal-context";
 import type { SyncNowResult } from "@/sync/connection";
@@ -225,7 +226,9 @@ export function ProjectWorkspace({
 
   const jumpToPreview = useCallback(
     (fileId: TreeID, offset: number) => {
-      const path = index.byId.get(fileId)?.path;
+      // Looked up on use rather than closed over, so the callback stays the
+      // same across renames and the editor isn't reconfigured for them.
+      const path = projectIndex(project).state.paths.byId.get(fileId)?.path;
       if (!compiler || !path) return;
       void compiler.jumpFromCursor(path, offset).then((positions) => {
         if (positions.length === 0) {
@@ -235,7 +238,7 @@ export function ProjectWorkspace({
         showInPreview(positions, true);
       });
     },
-    [compiler, index, showInPreview],
+    [compiler, project, showInPreview],
   );
 
   const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
