@@ -111,3 +111,24 @@ test("Mod+Click at the end of a paragraph marks that spot, not its start", async
   // Many lines further down, not on the first one.
   expect(markBox!.y).toBeGreaterThan(firstBox!.y + 60);
 });
+
+test("clicking a reference in the preview scrolls to its target", async ({
+  page,
+}) => {
+  await createProject(page, "Internal links");
+  // References to a heading need it numbered.
+  await appendLine(page, '#set heading(numbering: "1.")');
+  await appendLine(page, "See @far");
+  await appendLine(page, "#pagebreak()");
+  await appendLine(page, "= Target <far>");
+  const secondPage = preview(page).getByRole("img", { name: "Page 2" });
+  await expect(secondPage).toContainText("Target");
+
+  const viewport = page.getByTestId("preview-viewport");
+  await page.waitForTimeout(1000);
+  await viewport.evaluate((el) => el.scrollTo({ top: 0, behavior: "instant" }));
+  await expect(secondPage).not.toBeInViewport();
+
+  await firstPage(page).locator("a[data-typst-location]").click();
+  await expect(secondPage).toBeInViewport();
+});

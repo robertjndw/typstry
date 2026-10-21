@@ -71,6 +71,7 @@ import { formatLocation, type ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewState } from "@/typst/hooks";
 import type { PagePosition } from "@/typst/protocol";
 import {
+  internalLinkTarget,
   PREVIEW_SCOPE_CLASS,
   type PageChange,
   type PreviewPage,
@@ -372,6 +373,16 @@ export function PreviewPane({
       .then((jump) => jump && onJump(jump));
   };
 
+  // Internal links, such as outline entries and references, scroll to
+  // where they point.
+  const onClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (!onJump || !(e.target instanceof Element)) return;
+    const target = internalLinkTarget(e.target);
+    if (!target) return;
+    e.preventDefault();
+    onJump({ kind: "position", ...target });
+  };
+
   /**
    * Applies a zoom while keeping the document point under `view` (viewport
    * px, default the centre) in place once the new scale renders.
@@ -616,11 +627,14 @@ export function PreviewPane({
           className={cn(
             PREVIEW_SCOPE_CLASS,
             "relative min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+            // Literal, so Tailwind finds it: LOCATION_ATTR.
+            "[&_[data-typst-location]]:cursor-pointer",
           )}
           data-testid="preview-viewport"
           onScroll={onScroll}
           onKeyDown={onKeyDown}
           onMouseDown={onMouseDown}
+          onClick={onClick}
         >
           {state?.document && <DefsHost defs={state.document.defs} />}
           {pages.length > 0 ? (
