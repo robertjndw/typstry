@@ -11,6 +11,20 @@ import { SHORTCUTS } from "@/lib/shortcuts";
 
 type Group = { title: string; items: { label: string; combo: string }[] };
 
+const EDITOR_GROUP: Group = {
+  title: "Editor",
+  items: [
+    { label: "Undo", combo: "Mod+Z" },
+    { label: "Redo", combo: "Mod+Shift+Z" },
+    { label: "Find and replace", combo: "Mod+F" },
+    { label: "Toggle comment", combo: "Mod+/" },
+    // CodeMirror binds this to Ctrl on every platform.
+    { label: "Suggest completions", combo: "Ctrl+Space" },
+    // Tab indents inside the editor, so leaving it takes Escape first.
+    { label: "Move focus out of the editor", combo: "Esc+Tab" },
+  ],
+};
+
 function groups(sidebarTabs: readonly SidebarTab[]): Group[] {
   return [
     {
@@ -33,20 +47,6 @@ function groups(sidebarTabs: readonly SidebarTab[]): Group[] {
     EDITOR_GROUP,
   ];
 }
-
-const EDITOR_GROUP: Group = {
-  title: "Editor",
-  items: [
-    { label: "Undo", combo: "Mod+Z" },
-    { label: "Redo", combo: "Mod+Shift+Z" },
-    { label: "Find and replace", combo: "Mod+F" },
-    { label: "Toggle comment", combo: "Mod+/" },
-    // CodeMirror binds this to Ctrl on every platform.
-    { label: "Suggest completions", combo: "Ctrl+Space" },
-    // Tab indents inside the editor, so leaving it takes Escape first.
-    { label: "Move focus out of the editor", combo: "Esc+Tab" },
-  ],
-};
 
 export function ShortcutsDialog({
   open,
