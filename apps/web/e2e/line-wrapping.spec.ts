@@ -1,8 +1,10 @@
+import type { Page } from "@playwright/test";
+
 import { appendLine, createProject, editor, expect, test } from "./fixtures";
 
 const LONG_LINE = "word ".repeat(120).trim();
 
-async function setWrapping(page: import("@playwright/test").Page, on: boolean) {
+async function setWrapping(page: Page, on: boolean) {
   await page.getByRole("button", { name: "More actions" }).click();
   const item = page.getByRole("menuitemcheckbox", { name: "Wrap lines" });
   if ((await item.getAttribute("aria-checked")) !== String(on)) {

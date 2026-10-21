@@ -130,6 +130,13 @@ export function WorkspaceMenu({
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
+          <DropdownMenuCheckboxItem
+            checked={wrapLines}
+            disabled={panelsDisabled}
+            onCheckedChange={setWrapLines}
+          >
+            Wrap lines
+          </DropdownMenuCheckboxItem>
           {desktop && (
             <>
               <DropdownMenuCheckboxItem
@@ -152,20 +159,11 @@ export function WorkspaceMenu({
                   {formatShortcut(SHORTCUTS.togglePreview)}
                 </DropdownMenuShortcut>
               </DropdownMenuCheckboxItem>
+              <DropdownMenuItem onSelect={onShortcuts}>
+                <KeyboardIcon />
+                Keyboard shortcuts
+              </DropdownMenuItem>
             </>
-          )}
-          <DropdownMenuCheckboxItem
-            checked={wrapLines}
-            disabled={panelsDisabled}
-            onCheckedChange={setWrapLines}
-          >
-            Wrap lines
-          </DropdownMenuCheckboxItem>
-          {desktop && (
-            <DropdownMenuItem onSelect={onShortcuts}>
-              <KeyboardIcon />
-              Keyboard shortcuts
-            </DropdownMenuItem>
           )}
         </DropdownMenuGroup>
       </DropdownMenuContent>

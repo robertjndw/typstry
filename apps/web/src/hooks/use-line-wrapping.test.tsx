@@ -15,7 +15,7 @@ describe("useLineWrapping", () => {
     expect(result.current[0]).toBe(false);
   });
 
-  it("remembers the choice and tells every user of it", () => {
+  it("saves the choice and updates every component using it", () => {
     const a = renderHook(() => useLineWrapping());
     const b = renderHook(() => useLineWrapping());
     act(() => a.result.current[1](true));

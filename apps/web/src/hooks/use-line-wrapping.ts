@@ -1,12 +1,14 @@
 import { useSyncExternalStore } from "react";
 
-import { getStorage, readJson, writeJson } from "@/lib/storage";
+import { readJson, writeJson } from "@/lib/storage";
 
 const KEY = "typstry:line-wrapping";
 
+const load = () => readJson(KEY) === true;
+
 // Shared by the menu that flips it and the editor that follows it, which sit
 // far apart in the tree. Per browser, like the layout, not per project.
-let wrapping = readJson(KEY) === true;
+let wrapping = load();
 const listeners = new Set<() => void>();
 
 function subscribe(listener: () => void) {
@@ -14,11 +16,15 @@ function subscribe(listener: () => void) {
   return () => void listeners.delete(listener);
 }
 
-export function setLineWrapping(next: boolean): void {
+function emit() {
+  for (const listener of [...listeners]) listener();
+}
+
+function setLineWrapping(next: boolean): void {
   if (next === wrapping) return;
   wrapping = next;
   writeJson(KEY, next);
-  for (const listener of [...listeners]) listener();
+  emit();
 }
 
 /** Whether long lines wrap in the editor, and a way to change it. */
@@ -33,6 +39,6 @@ export function useLineWrapping(): [boolean, (next: boolean) => void] {
 
 /** For tests, which share the module between cases. */
 export function resetLineWrapping(): void {
-  wrapping = readJson(KEY, getStorage()) === true;
-  for (const listener of [...listeners]) listener();
+  wrapping = load();
+  emit();
 }

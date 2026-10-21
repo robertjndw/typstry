@@ -27,6 +27,7 @@ export interface EditorProps {
    */
   extensions?: Extension;
   readOnly?: boolean;
+  wrapLines?: boolean;
   /** Maps diagnostics onto the current text; re-applied when it changes. */
   diagnostics?: (doc: Text) => Diagnostic[];
   className?: string;
@@ -39,24 +40,29 @@ export function Editor({
   onReady,
   extensions,
   readOnly = false,
+  wrapLines = false,
   diagnostics,
   className,
 }: EditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const [extra] = useState(() => new Compartment());
+  // Kept apart from `extra` so toggling wrapping doesn't rebuild the LSP
+  // plugin and the other per-file extensions.
+  const [wrap] = useState(() => new Compartment());
   // getText()/getContainerById() hand out a fresh wrapper per call, so key the
   // view on the container id rather than on object identity.
   const textId = text.id;
-  const latest = useRef({ text, onReady, extensions, diagnostics });
+  const latest = useRef({ text, onReady, extensions, wrapLines, diagnostics });
   useLayoutEffect(() => {
-    latest.current = { text, onReady, extensions, diagnostics };
+    latest.current = { text, onReady, extensions, wrapLines, diagnostics };
   });
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    const { text, onReady, extensions, diagnostics } = latest.current;
+    const { text, onReady, extensions, wrapLines, diagnostics } =
+      latest.current;
     const view = new EditorView({
       parent: host,
       state: createLoroEditorState(
@@ -70,6 +76,7 @@ export function Editor({
               ? [EditorState.readOnly.of(true), EditorView.editable.of(false)]
               : [],
             extra.of(extensions ?? []),
+            wrap.of(wrapLines ? EditorView.lineWrapping : []),
           ],
         },
       ),
@@ -83,7 +90,7 @@ export function Editor({
       view.destroy();
       latest.current.onReady?.(null);
     };
-  }, [doc, textId, undoManager, readOnly, extra]);
+  }, [doc, textId, undoManager, readOnly, extra, wrap]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -92,6 +99,14 @@ export function Editor({
     if (extra.get(view.state) !== next)
       view.dispatch({ effects: extra.reconfigure(next) });
   }, [extensions, extra]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const next = wrapLines ? EditorView.lineWrapping : [];
+    if (wrap.get(view.state) !== next)
+      view.dispatch({ effects: wrap.reconfigure(next) });
+  }, [wrapLines, wrap]);
 
   useEffect(() => {
     const view = viewRef.current;

@@ -121,7 +121,6 @@ export function EditorPane({
   const lspPath = isTypst && tinymist ? path : undefined;
   const extensions = useMemo(
     () => [
-      wrapLines ? EditorView.lineWrapping : [],
       isTypst ? typstLanguage : [],
       tinymist && lspPath ? tinymist.plugin(lspPath) : [],
       isTypst && text && openFileId && assets && !readOnly
@@ -186,7 +185,6 @@ export function EditorPane({
       commentsUi,
       onJumpToPreview,
       revealFn,
-      wrapLines,
       presence,
       cursors,
       project,
@@ -249,6 +247,7 @@ export function EditorPane({
         text={text}
         undoManager={undoManager}
         readOnly={readOnly}
+        wrapLines={wrapLines}
         extensions={extensions}
         diagnostics={diagnostics}
         onReady={setView}
