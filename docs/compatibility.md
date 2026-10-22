@@ -48,6 +48,10 @@ The root `packages` map and the `meta.cjkFonts` / `meta.emojiFonts`
 booleans are additive doc data, so they did not bump `meta.schema`. Older
 clients ignore them, and readers skip any package record that is malformed.
 
+The root `comments` list and `resolvedComments` map are additive doc data
+that older clients ignore, so they did not bump `meta.schema`, and readers
+skip any comment record that is malformed.
+
 Keep the Rust and TypeScript copies of a constant equal. The crypto,
 identity, pairing and MLS constants live in Rust only; the web app reads
 them from the wasm.

@@ -4,7 +4,7 @@ import { toHex } from "@/crypto/bytes";
 import type { Member } from "@/crypto/wasm";
 import { initProject } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
-import { authorIdentities } from "@/project/history-items";
+import { authorIdentities, authorIdentity } from "@/project/history-items";
 
 import { peopleOf, rosterOf } from "./members";
 import { PeerSigners } from "./peer-signers";
@@ -180,5 +180,17 @@ describe("history authors", () => {
     expect(
       authorIdentities(project, ["100", "999"] as never).map((a) => a.name),
     ).toEqual(["Mallory", "Unknown"]);
+  });
+
+  it("shows a single author, falling back to what it claimed in a record", () => {
+    const project = initProject(newProject(1), { title: "T" });
+    const claimed = { name: "Ada", color: "#3366cc" };
+    const member = { name: "Alice", color: "#047857", signer: "01" };
+    expect(authorIdentity(project, "100", () => member).name).toBe("Alice");
+    expect(authorIdentity(project, "100", undefined, claimed)).toEqual({
+      key: "Ada\u0000#3366cc",
+      ...claimed,
+    });
+    expect(authorIdentity(project, "100").name).toBe("Unknown");
   });
 });

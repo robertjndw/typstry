@@ -85,6 +85,12 @@ export const editorTheme = EditorView.theme({
   ".cm-searchMatch-selected, .cm-searchMatch-selected *": {
     backgroundColor: "color-mix(in oklch, var(--warning) 45%, transparent)",
   },
+  ".cm-comment": {
+    backgroundColor: "var(--cm-comment)",
+    borderBottom: "2px solid var(--cm-comment-line)",
+    cursor: "pointer",
+  },
+  ".cm-comment-active": { backgroundColor: "var(--cm-comment-active)" },
   ".cm-specialChar": { color: "var(--destructive)" },
   ".cm-placeholder": {
     color: "var(--muted-foreground)",

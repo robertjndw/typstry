@@ -91,4 +91,24 @@ describe("Sidebar", () => {
     act(() => void renderSidebar({ search: "x" }));
     expect(tab("Files")).toHaveAttribute("aria-selected", "true");
   });
+
+  it("shows a tab's badge count in its name", () => {
+    const project = initProject(newProject(1), { title: "Test" });
+    const view = (count: number) => (
+      <TooltipProvider>
+        <ProjectProvider doc={project}>
+          <Sidebar
+            tab="files"
+            onTabChange={() => {}}
+            comments={<p>comments panel</p>}
+            badges={{ comments: count }}
+          />
+        </ProjectProvider>
+      </TooltipProvider>
+    );
+    const { rerender } = render(view(3));
+    expect(tab("Comments (3)")).toHaveTextContent("3");
+    rerender(view(0));
+    expect(tab("Comments")).not.toHaveTextContent(/\d/);
+  });
 });

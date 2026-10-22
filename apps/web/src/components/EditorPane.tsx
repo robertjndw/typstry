@@ -20,6 +20,10 @@ import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
 import { CursorContext, reportCursor } from "@/editor/cursor-store";
 import { Editor } from "@/editor/Editor";
+import {
+  commentHighlights,
+  commentSelection,
+} from "@/editor/comment-highlights";
 import { flashLine } from "@/editor/flash";
 import { revealScroll } from "@/editor/reveal-scroll";
 import { imageDrop } from "@/editor/image-drop";
@@ -30,6 +34,7 @@ import type { TinymistClient } from "@/lsp/tinymist-client";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { cn } from "@/lib/utils";
 import { usePresenceContext } from "@/presence/context";
+import { useCommentsUi } from "@/project/comments-ui";
 import { useProject } from "@/project/context";
 import { RevealContext } from "@/project/reveal-context";
 import { uploadReporting } from "@/project/tree";
@@ -97,6 +102,7 @@ export function EditorPane({
   const presence = usePresenceContext()?.presence;
   const cursors = useContext(CursorContext);
   const revealFn = useContext(RevealContext);
+  const commentsUi = useCommentsUi();
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
   // getText cannot throw for a text file.
@@ -161,8 +167,20 @@ export function EditorPane({
             }
           })
         : [],
+      commentsUi && text && openFileId
+        ? [
+            commentHighlights({
+              project,
+              text,
+              fileId: openFileId,
+              ui: commentsUi,
+            }),
+            readOnly ? [] : commentSelection(commentsUi, openFileId, text),
+          ]
+        : [],
     ],
     [
+      commentsUi,
       onJumpToPreview,
       revealFn,
       presence,

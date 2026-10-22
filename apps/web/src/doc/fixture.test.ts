@@ -2,15 +2,25 @@
 // Cross-language checks against crates/typstry-doc/tests/fixture.rs. The
 // clash snapshot is read there and must derive the same paths; the version
 // snapshots go both ways, so each side reads a version the other one saved.
+// The comments snapshot is read there as bookkeeping on top of a version.
 // Regenerate with `pnpm --filter web fixtures` after changing a scenario.
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { LoroDoc } from "loro-crdt";
 import { describe, expect, it } from "vitest";
 import {
+  addComment,
+  deleteComment,
+  listThreads,
+  reply,
+  resolveAnchor,
+  resolveThread,
+} from "./comments";
+import {
   createFile,
   deleteNode,
   FsError,
+  getText,
   move,
   rename,
   validateName,
@@ -36,6 +46,7 @@ const EXPECTED = path.join(FIXTURES, "clash.paths.json");
 const JS_VERSION = path.join(FIXTURES, "version.js.loro");
 const JS_DELETED_VERSION = path.join(FIXTURES, "version-deleted.js.loro");
 const JS_PACKAGES = path.join(FIXTURES, "packages.js.loro");
+const JS_COMMENTS = path.join(FIXTURES, "comments.js.loro");
 // Written by crates/typstry-doc/tests/fixture.rs.
 const RUST_VERSION = path.join(FIXTURES, "version.rust.loro");
 
@@ -236,6 +247,75 @@ describe("packages fixture", () => {
       "preview/cetz/0.3.0",
     ]);
     expect(readFontBundles(project)).toEqual({ cjk: true, emoji: false });
+  });
+});
+
+function buildComments(): ProjectDoc {
+  const project = initProject(newProject(12n), { title: "Comments" });
+  const main = project.mainFile!;
+  const text = getText(project, main);
+  const at = (word: string) => {
+    const from = text.toString().indexOf(word);
+    return { from, to: from + word.length };
+  };
+  saveVersion(project, "Reviewed", { now: 1700000000000 });
+  const ada = { name: "Ada", color: "#3366cc" };
+  const kept = addComment(project, {
+    fileId: main,
+    text,
+    ...at("Hello"),
+    body: "Friendlier?",
+    ...ada,
+    now: 1700000000001,
+  });
+  reply(project, kept, {
+    body: "Fine as is.",
+    name: "Grace",
+    color: "#cc6633",
+    now: 1700000000002,
+  });
+  resolveThread(project, kept, { now: 1700000000003 });
+  const gone = addComment(project, {
+    fileId: main,
+    text,
+    ...at("Typst"),
+    body: "Scratch that",
+    ...ada,
+    now: 1700000000004,
+  });
+  reply(project, gone, { body: "Gone too", ...ada, now: 1700000000005 });
+  deleteComment(project, gone);
+  return project;
+}
+
+describe("comments fixture", () => {
+  it.runIf(process.env.TYPSTRY_WRITE_FIXTURES === "1")(
+    "regenerates the JS-written comments",
+    () => {
+      writeFileSync(
+        JS_COMMENTS,
+        buildComments().doc.export({ mode: "snapshot" }),
+      );
+    },
+  );
+
+  it("reads the committed snapshot like a fresh build", () => {
+    const doc = new LoroDoc();
+    doc.import(readFileSync(JS_COMMENTS));
+    const project = new ProjectDoc(doc);
+    const threads = listThreads(project);
+    expect(threads).toEqual(listThreads(buildComments()));
+    expect(threads).toHaveLength(1);
+    const [thread] = threads;
+    expect(thread!.resolvedAt).toBe(1700000000003);
+    expect(thread!.replies.map((r) => r.body)).toEqual(["Fine as is."]);
+    const range = resolveAnchor(project, thread!.root);
+    expect(range).not.toBeNull();
+    expect(
+      getText(project, project.mainFile!)
+        .toString()
+        .slice(range!.from, range!.to),
+    ).toBe("Hello");
   });
 });
 

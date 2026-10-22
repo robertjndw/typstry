@@ -1,21 +1,22 @@
-//! Cross-language checks. `clash.loro`, the expected paths and
-//! `version.js.loro` and `packages.js.loro` are written by `apps/web/src/doc/fixture.test.ts`
-//! (regenerate with `pnpm --filter web fixtures`); this side must derive the
-//! same paths and read the same version. `version.rust.loro` goes the other
+//! Cross-language checks. `clash.loro`, the expected paths,
+//! `version.js.loro`, `packages.js.loro` and `comments.js.loro` are written by
+//! `apps/web/src/doc/fixture.test.ts` (regenerate with
+//! `pnpm --filter web fixtures`); this side must derive the same paths, read
+//! the same version and packages, and see the comments as bookkeeping. `version.rust.loro` goes the other
 //! way and is rewritten by running this test with `TYPSTRY_WRITE_FIXTURES=1`.
 //! `names.json` is written by hand and checked on both sides.
 
 use std::path::Path;
 
-use loro::{ExportMode, LoroDoc};
+use loro::{ExportMode, LoroDoc, LoroValue};
 use serde::Deserialize;
 use typstry_doc::init::init_project;
 use typstry_doc::materialize::{FileContent, is_safe_path, materialize, materialize_at};
 use typstry_doc::names::validate_name;
 use typstry_doc::packages::{font_bundles, packages};
 use typstry_doc::paths::build_path_index;
-use typstry_doc::versions::{NamedVersion, named_versions, save_version};
-use typstry_doc::{node, root, title};
+use typstry_doc::versions::{NamedVersion, named_versions, save_version, tag_at};
+use typstry_doc::{comment, node, root, title};
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct Expected {
@@ -147,6 +148,62 @@ fn reads_packages_written_by_typescript() {
     assert_eq!(cetz.description, None);
 
     assert_eq!(font_bundles(&doc), (true, false));
+}
+
+#[test]
+fn reads_comments_written_by_typescript() {
+    let doc = LoroDoc::from_snapshot(include_bytes!("fixtures/comments.js.loro")).unwrap();
+    // Commenting after the version was saved is not an edit, so the
+    // current state is still the tagged one.
+    assert_eq!(
+        tag_at(&doc, None).map(|v| v.name).as_deref(),
+        Some("Reviewed")
+    );
+
+    // The deleted thread took its reply along; one thread and its reply
+    // are left, in the layout typstry_doc::comment names.
+    let LoroValue::List(entries) = doc.get_list(root::COMMENTS).get_value() else {
+        panic!("comments is not a list");
+    };
+    let list = doc.get_list(root::COMMENTS);
+    let root_id = list.get_id_at(0).unwrap();
+    let root_key = format!("{}@{}", root_id.counter, root_id.peer);
+    let fields: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let LoroValue::Map(map) = entry else {
+                panic!("comment is not a map");
+            };
+            for key in [comment::ANCHOR, comment::HEAD] {
+                assert!(matches!(map.get(key), Some(LoroValue::Binary(_))), "{key}");
+            }
+            let string = |key| match map.get(key) {
+                Some(LoroValue::String(s)) => Some(s.to_string()),
+                _ => None,
+            };
+            (
+                string(comment::THREAD),
+                string(comment::BODY).unwrap(),
+                string(comment::QUOTE).unwrap(),
+                string(comment::NAME).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            (None, "Friendlier?".into(), "Hello".into(), "Ada".into()),
+            (
+                Some(root_key.clone()),
+                "Fine as is.".into(),
+                "Hello".into(),
+                "Grace".into()
+            ),
+        ]
+    );
+    let resolved = doc.get_map(root::RESOLVED_COMMENTS);
+    let keys: Vec<String> = resolved.keys().map(|k| k.to_string()).collect();
+    assert_eq!(keys, [root_key]);
 }
 
 fn rust_saved_version() -> (LoroDoc, NamedVersion) {

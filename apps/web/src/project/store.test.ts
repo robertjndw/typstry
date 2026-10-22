@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import { addComment, deleteComment, listThreads } from "@/doc/comments";
 import { createFile, deleteNode, getText } from "@/doc/fs-ops";
 import { initProject, type ProjectDoc } from "@/doc/schema";
 import { fork, newProject } from "@/doc/test-utils";
@@ -25,6 +26,34 @@ describe("ProjectStore undo", () => {
     expect(store.undoManager.canUndo()).toBe(true);
     store.undoManager.undo();
     expect(text.toString()).toBe(`disk ${before}`);
+    store.dispose();
+  });
+
+  it("never undoes comments", () => {
+    const project = initProject(newProject(1), { title: "T" });
+    const main = project.mainFile!;
+    const store = new ProjectStore(project);
+    const text = getText(project, main);
+    const before = text.toString();
+
+    text.insert(0, "typed ");
+    project.doc.commit();
+    const id = addComment(project, {
+      fileId: main,
+      text,
+      from: 0,
+      to: 5,
+      body: "Why?",
+      name: "Ada",
+      color: "#3366cc",
+    });
+    store.undoManager.undo();
+    expect(text.toString()).toBe(before);
+    expect(listThreads(project).map((t) => t.id)).toEqual([id]);
+    expect(store.undoManager.canUndo()).toBe(false);
+
+    deleteComment(project, id);
+    expect(store.undoManager.canUndo()).toBe(false);
     store.dispose();
   });
 });

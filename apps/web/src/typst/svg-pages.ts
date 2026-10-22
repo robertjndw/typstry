@@ -1,6 +1,6 @@
 import { lcsMatch } from "@/lib/lcs";
 
-import type { RenderPayload } from "./protocol";
+import type { PagePosition, RenderPayload } from "./protocol";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
@@ -120,8 +120,8 @@ function allowedHref(el: Element, href: string): boolean {
  * before they are imported. The app's CSP blocks inline handlers as well;
  * this is the first line of defense, not the only one.
  *
- * Internal links (`@typst:handleTypstLocation(...)`) lose their handler too.
- * They never worked here: the typst.ts script that defines it is not loaded.
+ * Internal links are turned into `LOCATION_ATTR` before this runs, see
+ * parseSvg.
  */
 export function sanitizeSvg(root: Element): void {
   const doomed: Element[] = [];
@@ -159,8 +159,32 @@ export function sanitizeSvg(root: Element): void {
   for (const el of doomed) el.remove();
 }
 
+/** Where an internal link points: page (from 1), x and y in pt. */
+export const LOCATION_ATTR = "data-typst-location";
+
+// typst.ts writes internal links as an onclick calling a script of its own,
+// which is not loaded here. Blink checks the CSP as soon as it parses an
+// inline handler, even in a DOMParser document, so sanitizeSvg removing it
+// afterwards still logs a violation. Only this exact form is rewritten, and
+// the replacement holds nothing but the numbers; any other onclick is left
+// for sanitizeSvg.
+const INTERNAL_LINK =
+  /onclick="handleTypstLocation\(this, (\d+), (-?\d+(?:\.\d+)?), (-?\d+(?:\.\d+)?)\); return false"/g;
+
+/** The target of an internal link in the preview, if `el` is in one. */
+export function internalLinkTarget(el: Element): PagePosition | null {
+  const value = el.closest(`[${LOCATION_ATTR}]`)?.getAttribute(LOCATION_ATTR);
+  const [page, x, y] = (value ?? "").split(" ").map(Number);
+  if (!page || x === undefined || y === undefined) return null;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { page: page - 1, x, y };
+}
+
 function parseSvg(markup: string): SVGSVGElement {
-  const parsed = new DOMParser().parseFromString(markup, "image/svg+xml");
+  const parsed = new DOMParser().parseFromString(
+    markup.replace(INTERNAL_LINK, `${LOCATION_ATTR}="$1 $2 $3"`),
+    "image/svg+xml",
+  );
   const root = parsed.documentElement;
   if (root.nodeName !== "svg") {
     throw new Error("typst.ts returned malformed SVG");

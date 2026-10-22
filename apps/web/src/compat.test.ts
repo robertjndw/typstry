@@ -22,8 +22,9 @@ import {
 } from "./crypto/wasm";
 import { Directory } from "./directory/directory";
 import { DIRECTORY_SCHEMA_VERSION, ROOT } from "./directory/schema";
+import { listThreads, resolveAnchor, type Comment } from "./doc/comments";
 import { buildPathIndex } from "./doc/paths";
-import { versionAt } from "./doc/restore";
+import { fileText, versionAt } from "./doc/restore";
 import {
   isSchemaTooNew,
   migrate,
@@ -79,6 +80,21 @@ interface DocFixture {
     name: string;
     deletedAt: number;
   }[];
+  /** Absent from sets frozen before comments existed. */
+  comments?: {
+    id: string;
+    thread: string | null;
+    peer: string;
+    file: string;
+    quote: string;
+    /** What the anchors cover now. */
+    range: string;
+    body: string;
+    createdAt: number;
+    name: string;
+    color: string;
+  }[];
+  resolvedComments?: { id: string; resolvedAt: number }[];
 }
 
 /** Every file of `project` the way doc.json lists them, sorted by path. */
@@ -184,6 +200,34 @@ describe.each(compatDirs())("compat v%i", (_n, dir) => {
       const entry = project.versions.get(gone.index) as { name?: unknown };
       expect(entry.name).toBe(gone.name);
     }
+
+    const comments = listThreads(project).flatMap((t) => [
+      t.root,
+      ...t.replies,
+    ]);
+    const text = (c: Comment) => {
+      const range = resolveAnchor(project, c);
+      return range && fileText(project, c.fileId)!.slice(range.from, range.to);
+    };
+    expect(
+      comments.map((c) => ({
+        id: c.id,
+        thread: c.thread,
+        peer: c.peer,
+        file: index.byId.get(c.fileId)?.path,
+        quote: c.quote,
+        range: text(c),
+        body: c.body,
+        createdAt: c.createdAt,
+        name: c.name,
+        color: c.color,
+      })),
+    ).toEqual(expected.comments ?? []);
+    expect(
+      listThreads(project)
+        .filter((t) => t.resolvedAt !== null)
+        .map((t) => ({ id: t.id, resolvedAt: t.resolvedAt })),
+    ).toEqual(expected.resolvedComments ?? []);
 
     // Migrating leaves a current doc alone and loses nothing on an older one.
     const fork = new ProjectDoc(doc.fork());

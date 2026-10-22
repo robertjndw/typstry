@@ -1,5 +1,7 @@
 import {
   buildPreviewDocument,
+  internalLinkTarget,
+  LOCATION_ATTR,
   scopeCss,
   type PreviewDocument,
 } from "./svg-pages";
@@ -265,11 +267,26 @@ describe("sanitizing", () => {
     }
   });
 
-  it("drops internal jump links, which never had a handler here", () => {
+  it("turns internal links into a target the preview follows", () => {
+    const page = render(link("@typst:handleTypstLocation(this, 2, 10.5, 20)"))
+      .pages[0]!.element;
+    const anchor = page.querySelector("a")!;
+    expect(attributesOf(page).filter((a) => /^on/i.test(a))).toEqual([]);
+    expect(anchor.getAttribute(LOCATION_ATTR)).toBe("2 10.5 20");
+    expect(internalLinkTarget(anchor.querySelector("rect")!)).toEqual({
+      page: 1,
+      x: 10.5,
+      y: 20,
+    });
+  });
+
+  it("drops an onclick that only looks like an internal link", () => {
     const page = render(
-      link("@typst:handleTypstLocation(this, 2, 10.00, 20.00)"),
+      link("@typst:handleTypstLocation(this, 2, 10, alert(1))"),
     ).pages[0]!.element;
-    expect(page.querySelector("a")!.attributes).toHaveLength(0);
+    const anchor = page.querySelector("a")!;
+    expect(anchor.attributes).toHaveLength(0);
+    expect(internalLinkTarget(anchor)).toBeNull();
   });
 
   it("keeps web links and drops script and data links", () => {

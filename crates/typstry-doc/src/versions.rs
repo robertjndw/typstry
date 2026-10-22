@@ -170,6 +170,8 @@ fn is_bookkeeping(id: &ContainerID) -> bool {
         (root::PEERS, ContainerType::Map)
             | (root::VERSIONS, ContainerType::List)
             | (root::DELETED_VERSIONS, ContainerType::Map)
+            | (root::COMMENTS, ContainerType::List)
+            | (root::RESOLVED_COMMENTS, ContainerType::Map)
     )
 }
 
@@ -301,5 +303,53 @@ mod tests {
             .unwrap();
         doc.commit();
         assert_eq!(tag_at(&doc, Some(&tagged)), None);
+    }
+
+    /// A comment, the way apps/web/src/doc/comments.ts writes one.
+    fn comment(thread: Option<&str>) -> LoroValue {
+        LoroValue::Map(LoroMapValue::from(
+            [
+                (
+                    crate::comment::THREAD,
+                    thread.map_or(LoroValue::Null, LoroValue::from),
+                ),
+                (crate::comment::FILE_ID, LoroValue::from("1@7")),
+                (crate::comment::TEXT_ID, LoroValue::from("cid:3@7:Text")),
+                (crate::comment::ANCHOR, LoroValue::from(vec![1u8])),
+                (crate::comment::HEAD, LoroValue::from(vec![2u8])),
+                (crate::comment::QUOTE, LoroValue::from("Hello")),
+                (crate::comment::BODY, LoroValue::from("Why?")),
+                (crate::comment::CREATED_AT, LoroValue::from(1.0)),
+                (crate::comment::NAME, LoroValue::from("Ada")),
+                (crate::comment::COLOR, LoroValue::from("#3366cc")),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect::<HashMap<_, _>>(),
+        ))
+    }
+
+    #[test]
+    fn comments_are_bookkeeping() {
+        let doc = LoroDoc::new();
+        doc.set_peer_id(7).unwrap();
+        init_project(&doc, "T").unwrap();
+        let saved = save_version(&doc, "Tagged", 1).unwrap();
+
+        let comments = doc.get_list(root::COMMENTS);
+        comments.push(comment(None)).unwrap();
+        doc.commit();
+        let root_key = entry_key(comments.get_id_at(0).unwrap());
+        comments.push(comment(Some(&root_key))).unwrap();
+        doc.commit();
+        let resolved = doc.get_map(root::RESOLVED_COMMENTS);
+        resolved.insert(&root_key, 2.0).unwrap();
+        doc.commit();
+        resolved.delete(&root_key).unwrap();
+        comments.delete(0, 2).unwrap();
+        doc.commit();
+        assert!(comments.is_empty());
+        // Every one of those changes is bookkeeping, so the tag still holds.
+        assert_eq!(tag_at(&doc, None).as_ref(), Some(&saved));
     }
 }

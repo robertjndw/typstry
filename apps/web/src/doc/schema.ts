@@ -34,6 +34,10 @@ export const ROOT = {
    * writer wins per package. The archive itself is an asset blob.
    */
   packages: "packages",
+  /** List of comments and replies, see comments.ts. */
+  comments: "comments",
+  /** Map of resolved comment threads, see comments.ts. */
+  resolvedComments: "resolvedComments",
 } as const;
 
 export const META = {
@@ -92,6 +96,13 @@ export const PEER_INFO_ORIGIN = "typstry:peer-info";
  * prefix covers it too.
  */
 export const META_ORIGIN = `${PEER_INFO_ORIGIN}:meta`;
+
+/**
+ * Commit origin of every comment write. Under PEER_INFO_ORIGIN for the same
+ * reason: Ctrl+Z in the editor must not take back a comment, nor bring
+ * back one that was deleted.
+ */
+export const COMMENT_ORIGIN = `${PEER_INFO_ORIGIN}:comment`;
 
 /** Longest title the UI accepts for a project. */
 export const MAX_TITLE_CHARS = 200;
@@ -211,6 +222,14 @@ export class ProjectDoc {
 
   get packages(): LoroMap {
     return this.doc.getMap(ROOT.packages);
+  }
+
+  get comments(): LoroList {
+    return this.doc.getList(ROOT.comments);
+  }
+
+  get resolvedComments(): LoroMap {
+    return this.doc.getMap(ROOT.resolvedComments);
   }
 
   get schemaVersion(): number | null {
