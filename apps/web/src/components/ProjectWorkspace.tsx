@@ -35,6 +35,7 @@ import { PresenceBar } from "@/components/PresenceBar";
 import { PreviewPane } from "@/components/PreviewPane";
 import { ProjectTitle } from "@/components/ProjectTitle";
 import { QuickOpen } from "@/components/QuickOpen";
+import { SearchPanel } from "@/components/SearchPanel";
 import { Sidebar } from "@/components/Sidebar";
 import {
   TagVersionDialog,
@@ -89,7 +90,7 @@ export interface ProjectWorkspaceProps {
 // Panels beyond the file tree are passed to <Sidebar> as they exist, and
 // the shortcuts, menu and dialog follow this list. Module level so its
 // identity is stable.
-const sidebarTabs: readonly SidebarTab[] = ["files", "outline"];
+const sidebarTabs: readonly SidebarTab[] = ["files", "outline", "search"];
 
 /** The full project UI for whatever ProjectProvider is above it. */
 export function ProjectWorkspace({
@@ -414,6 +415,7 @@ export function ProjectWorkspace({
                   heading={<FolderSyncStatus />}
                   notice={<FolderSyncNotice />}
                   outline={<OutlinePanel />}
+                  search={<SearchPanel />}
                 />
               }
               editor={

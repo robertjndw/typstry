@@ -12,6 +12,12 @@ import {
   type ProjectIndexState,
 } from "./project-index";
 
+/**
+ * Commits closer together than this merge into one undo step. Loro has no
+ * getter, so whoever temporarily changes it needs this to put it back.
+ */
+export const UNDO_MERGE_INTERVAL_MS = 1000;
+
 function isOpenable(kind: FileKind | undefined): boolean {
   return kind === "text" || kind === "asset";
 }
@@ -61,6 +67,7 @@ export class ProjectStore {
     this.project = project;
     this.options = options;
     this.undoManager = new UndoManager(project.doc, {
+      mergeInterval: UNDO_MERGE_INTERVAL_MS,
       excludeOriginPrefixes: [PEER_INFO_ORIGIN, FOLDER_ORIGIN],
     });
     this.index = projectIndex(project);
