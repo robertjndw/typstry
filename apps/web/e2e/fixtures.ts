@@ -74,6 +74,13 @@ export function firstPage(page: Page) {
   return preview(page).getByRole("img", { name: "Page 1" });
 }
 
+/** The editor's file tabs, not the sidebar's. */
+export function openTabs(page: Page, options?: { selected?: boolean }) {
+  return page
+    .getByRole("tablist", { name: "Open files" })
+    .getByRole("tab", options);
+}
+
 export function tab(page: Page, name: string) {
   return page
     .getByRole("tablist", { name: "Open files" })

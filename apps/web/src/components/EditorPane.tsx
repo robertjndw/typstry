@@ -2,7 +2,14 @@ import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import type { TreeID } from "loro-crdt";
 import { EyeIcon, FileCodeIcon } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { fileCategory } from "@/assets/file-types";
 import { AssetView } from "@/components/AssetView";
@@ -11,6 +18,7 @@ import { EntryIcon } from "@/components/FileTree";
 import { ShortcutKeys } from "@/components/ShortcutKeys";
 import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
+import { CursorContext, reportCursor } from "@/editor/cursor-store";
 import { Editor } from "@/editor/Editor";
 import { revealScroll } from "@/editor/reveal-scroll";
 import { imageDrop } from "@/editor/image-drop";
@@ -74,6 +82,7 @@ export function EditorPane({
     );
   }
   const presence = usePresenceContext()?.presence;
+  const cursors = useContext(CursorContext);
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
   // getText cannot throw for a text file.
@@ -122,9 +131,11 @@ export function EditorPane({
             reportSelection(presence, openFileId, text),
           ]
         : [],
+      cursors && openFileId ? reportCursor(cursors, openFileId) : [],
     ],
     [
       presence,
+      cursors,
       project,
       text,
       openFileId,

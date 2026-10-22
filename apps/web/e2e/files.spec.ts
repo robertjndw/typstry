@@ -7,6 +7,7 @@ import {
   expect,
   fileTree,
   firstPage,
+  openTabs,
   preview,
   renameEntry,
   tab,
@@ -98,15 +99,15 @@ test("tabs close with their button and a middle click", async ({ page }) => {
   await createProject(page, "Tabs");
   await createEntry(page, "a.typ");
   await createEntry(page, "b.typ");
-  await expect(page.getByRole("tab")).toHaveCount(3);
+  await expect(openTabs(page)).toHaveCount(3);
 
   await page.getByRole("button", { name: "Close b.typ" }).click();
   await expect(tab(page, "b.typ")).toBeHidden();
-  await expect(page.getByRole("tab", { selected: true })).toHaveCount(1);
+  await expect(openTabs(page, { selected: true })).toHaveCount(1);
 
   await tab(page, "a.typ").click({ button: "middle" });
   await expect(tab(page, "a.typ")).toBeHidden();
-  await expect(page.getByRole("tab")).toHaveCount(1);
+  await expect(openTabs(page)).toHaveCount(1);
 
   // Closing a tab leaves the file itself alone.
   await expect(
@@ -120,9 +121,9 @@ test("open tabs come back after a reload", async ({ page }) => {
   await createEntry(page, "b.typ");
   await page.getByRole("button", { name: "Close b.typ" }).click();
   await tab(page, "a.typ").click();
-  await expect(page.getByRole("tab")).toHaveCount(2);
+  await expect(openTabs(page)).toHaveCount(2);
 
   await page.reload();
-  await expect(page.getByRole("tab")).toHaveText(["main.typ", "a.typ"]);
+  await expect(openTabs(page)).toHaveText(["main.typ", "a.typ"]);
   await expect(tab(page, "a.typ")).toHaveAttribute("aria-selected", "true");
 });
