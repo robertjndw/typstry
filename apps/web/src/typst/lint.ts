@@ -1,6 +1,7 @@
 import type { Diagnostic } from "@codemirror/lint";
 import type { Text } from "@codemirror/state";
 import type { ProjectDiagnostic } from "./diagnostics";
+import type { SourceRange } from "./protocol";
 
 /**
  * Converts a code point column within `line` to a UTF-16 offset, which is
@@ -31,8 +32,16 @@ export function diagnosticRange(
   doc: Text,
 ): { from: number; to: number } {
   if (!d.range) return { from: 0, to: 0 };
-  const from = toOffset(doc, d.range.startLine, d.range.startCol);
-  const to = Math.max(from, toOffset(doc, d.range.endLine, d.range.endCol));
+  return sourceRangeToOffsets(d.range, doc);
+}
+
+/** Maps a Typst line/code point column range onto UTF-16 offsets in `doc`. */
+export function sourceRangeToOffsets(
+  range: SourceRange,
+  doc: Text,
+): { from: number; to: number } {
+  const from = toOffset(doc, range.startLine, range.startCol);
+  const to = Math.max(from, toOffset(doc, range.endLine, range.endCol));
   return { from, to };
 }
 
