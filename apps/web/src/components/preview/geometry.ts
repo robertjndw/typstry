@@ -5,6 +5,8 @@
 // with every page horizontally centred in a content box that is at least as
 // wide as the viewport.
 
+import type { PagePosition } from "@/typst/protocol";
+
 export interface PageSize {
   width: number;
   height: number;
@@ -86,4 +88,30 @@ export function positionOf(
     x: contentWidth(pages, layout) / 2 + point.x * layout.scale,
     y: pageTop(pages, layout, page) + point.y * layout.scale,
   };
+}
+
+/**
+ * The page point under a position in scroll content px, or null in the
+ * padding and gaps around the pages, where a click hits no page.
+ */
+export function pagePointAt(
+  pages: PageSize[],
+  layout: Layout,
+  x: number,
+  y: number,
+): PagePosition | null {
+  if (pages.length === 0) return null;
+  const point = pointAt(pages, layout, x, y);
+  const { width, height } = pages[point.page]!;
+  // DocPoint.x is measured from the column's centre line, which runs
+  // through the middle of every page.
+  const px = point.x + width / 2;
+  if (point.y < 0 || point.y > height || px < 0 || px > width) return null;
+  return { page: point.page, x: px, y: point.y };
+}
+
+/** The document point for a page point, the inverse of pagePointAt. */
+export function docPointOf(pages: PageSize[], point: PagePosition): DocPoint {
+  const page = Math.min(Math.max(0, point.page), pages.length - 1);
+  return { page, y: point.y, x: point.x - (pages[page]?.width ?? 0) / 2 };
 }

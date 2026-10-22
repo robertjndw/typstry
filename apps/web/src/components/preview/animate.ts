@@ -424,3 +424,55 @@ export function showHighlight(
   });
   fade.onfinish = fade.oncancel = () => el.remove();
 }
+
+const JUMP_MARK_MS = 1200;
+// Typst's default text size is 11pt. Without the glyph's real size this is
+// close enough to cover a line of body text and most headings' lower part.
+const JUMP_MARK_LINE_PT = 14;
+const JUMP_MARK_ASCENT_PT = 11;
+
+/**
+ * Flashes a mark where a jump landed, so the eye finds it after the scroll.
+ * `y` is a text baseline for a cursor jump, so the mark sits on the line
+ * above it, or the top of the spot for a link target.
+ */
+export function showJumpMark(
+  overlay: HTMLElement,
+  point: { x: number; y: number },
+  scale: number,
+  baseline: boolean,
+): void {
+  const height = JUMP_MARK_LINE_PT * scale;
+  const top = (baseline ? point.y - JUMP_MARK_ASCENT_PT : point.y) * scale;
+  const el = document.createElement("div");
+  el.setAttribute("aria-hidden", "true");
+  el.dataset.jumpMark = "";
+  Object.assign(el.style, {
+    position: "absolute",
+    left: `${point.x * scale - 3}px`,
+    top: `${top}px`,
+    width: `${Math.max(24, 2 * height)}px`,
+    height: `${height}px`,
+    borderRadius: "4px",
+    // Pages stay white in dark mode, so this needs a colour that shows on
+    // white in both themes, like showHighlight's.
+    borderLeft: "3px solid var(--warning)",
+    background: "color-mix(in oklab, var(--warning) 24%, transparent)",
+  });
+  overlay.appendChild(el);
+  // Without motion the mark just stays for the same time and goes.
+  if (prefersReducedMotion() || typeof el.animate !== "function") {
+    setTimeout(() => el.remove(), JUMP_MARK_MS);
+    return;
+  }
+  const fade = el.animate(
+    [
+      { opacity: 0 },
+      { opacity: 1, offset: 0.1 },
+      { opacity: 1, offset: 0.55 },
+      { opacity: 0 },
+    ],
+    { duration: JUMP_MARK_MS, easing: EASE },
+  );
+  fade.onfinish = fade.oncancel = () => el.remove();
+}

@@ -1,5 +1,6 @@
 import {
   LSPClient,
+  LSPPlugin,
   hoverTooltips,
   serverCompletion,
   signatureHelp,
@@ -30,6 +31,31 @@ const PROJECT_ROOT_URI = `file://${PROJECT_ROOT}`;
 
 function projectUri(path: string): string {
   return `${PROJECT_ROOT_URI}/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+/** How long a Mod+Click waits for a definition before showing the preview. */
+const DEFINITION_TIMEOUT_MS = 1500;
+
+interface LspRange {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+}
+
+/** A `Location`, or the `LocationLink` tinymist answers with. */
+type LspLocation =
+  | { uri: string; range: LspRange }
+  | { targetUri: string; targetSelectionRange: LspRange };
+
+/** A UTF-16 offset for an LSP position, which counts UTF-16 units too. */
+function offsetOf(text: string, line: number, character: number): number {
+  let start = 0;
+  for (let i = 0; i < line; i++) {
+    const next = text.indexOf("\n", start);
+    if (next < 0) return text.length;
+    start = next + 1;
+  }
+  const end = text.indexOf("\n", start);
+  return Math.min(start + character, end < 0 ? text.length : end);
 }
 
 // tinymist's docs are long (the hover on `text` lists every parameter), and
@@ -201,6 +227,63 @@ export class TinymistClient {
       EditorState.languageData.of(() => data),
       lspTooltipTheme,
     ];
+  }
+
+  /**
+   * Where the symbol at `pos` is defined: the label a reference points to,
+   * a `let` binding, an imported file. Null when tinymist has no answer in
+   * time, or the definition is outside the project or is `pos` itself.
+   */
+  async definition(
+    view: EditorView,
+    pos: number,
+  ): Promise<{ fileId: TreeID; offset: number } | null> {
+    const plugin = LSPPlugin.get(view);
+    if (!plugin || this.failed) return null;
+    plugin.client.sync();
+    const request = plugin.client
+      .request<unknown, LspLocation | LspLocation[] | null>(
+        "textDocument/definition",
+        {
+          textDocument: { uri: plugin.uri },
+          position: plugin.toPosition(pos),
+        },
+      )
+      .catch((err: unknown) => {
+        console.warn("[tinymist] definition failed", err);
+        return null;
+      });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), DEFINITION_TIMEOUT_MS);
+    });
+    const response = await Promise.race([request, timeout]);
+    clearTimeout(timer);
+    const location = Array.isArray(response) ? response[0] : response;
+    if (!location) return null;
+
+    const [uri, { start, end }] =
+      "uri" in location
+        ? [location.uri, location.range]
+        : [location.targetUri, location.targetSelectionRange];
+    const fileId = this.fileIdOf(uri);
+    if (!fileId) return null;
+    if (uri !== plugin.uri) {
+      const text = getText(this.project, fileId).toString();
+      return { fileId, offset: offsetOf(text, start.line, start.character) };
+    }
+    const from = plugin.fromPosition(start, view.state.doc);
+    const to = plugin.fromPosition(end, view.state.doc);
+    // Clicking a label or a binding's own name finds itself.
+    if (pos >= from && pos <= to) return null;
+    return { fileId, offset: from };
+  }
+
+  private fileIdOf(uri: string): TreeID | null {
+    for (const [id, file] of this.textsById) {
+      if (file.uri === uri) return id;
+    }
+    return null;
   }
 
   /**

@@ -32,7 +32,10 @@ import {
 } from "@/components/FolderSyncStatus";
 import { HistoryPanel } from "@/components/HistoryPanel";
 import { PresenceBar } from "@/components/PresenceBar";
-import { PreviewPane } from "@/components/PreviewPane";
+import {
+  PreviewPane,
+  type PreviewScrollTarget,
+} from "@/components/PreviewPane";
 import { ProjectTitle } from "@/components/ProjectTitle";
 import { QuickOpen } from "@/components/QuickOpen";
 import { SearchPanel } from "@/components/SearchPanel";
@@ -59,11 +62,14 @@ import { cn } from "@/lib/utils";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { useProject } from "@/project/context";
 import type { VersionTarget } from "@/project/history-items";
+import { projectIndex } from "@/project/project-index";
 import { CursorContext, CursorStore } from "@/editor/cursor-store";
 import { RevealContext } from "@/project/reveal-context";
 import type { SyncNowResult } from "@/sync/connection";
 import { groupingFromLocation } from "@/project/useHistory";
+import type { PreviewJump } from "@/typst/compiler-client";
 import type { ProjectDiagnostic } from "@/typst/diagnostics";
+import type { PagePosition } from "@/typst/protocol";
 import { useProjectCompiler } from "@/project/useProjectCompiler";
 import { useProjectTinymist } from "@/project/useProjectTinymist";
 
@@ -136,6 +142,8 @@ export function ProjectWorkspace({
   const [revealRequest, setRevealRequest] = useState<RevealRequest | null>(
     null,
   );
+  const [previewTarget, setPreviewTarget] =
+    useState<PreviewScrollTarget | null>(null);
 
   // A version brings its own compiler. The live one would keep compiling
   // every remote edit for a preview nobody sees.
@@ -182,6 +190,56 @@ export function ProjectWorkspace({
       );
     },
     [index, reveal],
+  );
+
+  const showInPreview = useCallback(
+    (points: PagePosition[], baseline: boolean) => {
+      if (layout.isHidden("preview")) layout.toggle("preview");
+      setPreviewTarget((prev) => ({
+        points,
+        baseline,
+        seq: (prev?.seq ?? 0) + 1,
+      }));
+    },
+    [layout],
+  );
+
+  const onPreviewJump = useCallback(
+    (jump: PreviewJump) => {
+      if (jump.kind === "source") {
+        const fileId = index.byPath.get(jump.path);
+        if (!fileId) return;
+        reveal(fileId, {
+          kind: "offset",
+          from: jump.offset,
+          to: jump.offset,
+          flash: true,
+        });
+      } else if (jump.kind === "package") {
+        toast(`Defined in package ${jump.package}`);
+      } else if (jump.kind === "position") {
+        showInPreview([jump], false);
+      }
+      // A link to a URL already opens on a single click.
+    },
+    [index, reveal, showInPreview],
+  );
+
+  const jumpToPreview = useCallback(
+    (fileId: TreeID, offset: number) => {
+      // Looked up on use rather than closed over, so the callback stays the
+      // same across renames and the editor isn't reconfigured for them.
+      const path = projectIndex(project).state.paths.byId.get(fileId)?.path;
+      if (!compiler || !path) return;
+      void compiler.jumpFromCursor(path, offset).then((positions) => {
+        if (positions.length === 0) {
+          toast("Nothing to show for this spot in the preview");
+          return;
+        }
+        showInPreview(positions, true);
+      });
+    },
+    [compiler, project, showInPreview],
   );
 
   const [sidebarTab, setSidebarTab] = useSidebarTab(sidebarTabs);
@@ -423,6 +481,7 @@ export function ProjectWorkspace({
                   compiler={compiler}
                   tinymist={tinymist}
                   reveal={revealRequest}
+                  onJumpToPreview={jumpToPreview}
                 />
               }
               preview={
@@ -430,6 +489,8 @@ export function ProjectWorkspace({
                   client={compiler}
                   onDiagnosticClick={onDiagnosticClick}
                   onOpenFontsPackages={openFontsPackages}
+                  onJump={onPreviewJump}
+                  scrollTarget={previewTarget}
                   actions={
                     <PdfDownloadButton compiler={compiler} name={[title]} />
                   }

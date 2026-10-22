@@ -36,7 +36,7 @@ The repository's `compose.yaml` runs the same image with `docker compose up -d`.
 
 Browsers only give typstry the APIs it needs on `localhost` or over HTTPS, so anywhere else run it behind a reverse proxy that terminates TLS. For an instance on the internet, `compose.prod.yaml` puts it behind Traefik with a Let's Encrypt certificate and per-address rate limits: set your domain in `.env` and run `docker compose -f compose.prod.yaml up -d`, see [Production with Traefik](docs/self-hosting.md#production-with-traefik). Anyone who can reach the server can create projects, see [Who can use your instance](docs/self-hosting.md#who-can-use-your-instance). [Self-hosting](docs/self-hosting.md) also covers configuration, backups and upgrading.
 
-To build the image from a checkout instead (the first build compiles tinymist to wasm, so expect it to take several minutes):
+To build the image from a checkout instead (the first build compiles tinymist and the Typst compiler to wasm, so expect it to take several minutes):
 
 ```sh
 docker build -t typstry .
@@ -111,20 +111,23 @@ The server is configured through environment variables such as `TYPSTRY_ADDR`, `
 - [Rust](https://rustup.rs) 1.99, pinned in `rust-toolchain.toml`
 - [Node.js](https://nodejs.org) 26 or newer
 - [pnpm](https://pnpm.io) 12 (`corepack enable` picks up the pinned version)
-- [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist and the crypto code for the browser
+- [wasm-pack](https://rustwasm.github.io/wasm-pack/), to build tinymist, the Typst compiler and the crypto code for the browser
 
 ### Getting started
 
 ```sh
 pnpm install
 apps/web/scripts/build-tinymist.sh
+apps/web/scripts/build-typst-compiler.sh
 pnpm --filter web wasm
 pnpm dev
 ```
 
 The tinymist script builds the language server to wasm from a pinned commit into `apps/web/vendor/` (the npm package is only a stub). The first build takes a few minutes. Rerun it after the pinned commit changes.
 
-`pnpm --filter web wasm` builds `crates/typstry-wasm`, the encryption and MLS code the web app shares with the CLI, into `apps/web/vendor/typstry-wasm`. It takes about a minute. Rerun it after changing `typstry-wire` or `typstry-wasm`. Typecheck, tests and builds of the web app need both vendor directories.
+The compiler script does the same for [typst.ts](https://github.com/Myriad-Dreamin/typst.ts)'s web compiler, with `apps/web/patches/typst-ts-jump.patch` applied for jumping between source and preview, into `apps/web/vendor/typst-ts-web-compiler`. Vite and TypeScript use it in place of the npm package. It installs the Rust version typst.ts pins and takes a few minutes the first time. Rerun it after the script or the patch changes.
+
+`pnpm --filter web wasm` builds `crates/typstry-wasm`, the encryption and MLS code the web app shares with the CLI, into `apps/web/vendor/typstry-wasm`. It takes about a minute. Rerun it after changing `typstry-wire` or `typstry-wasm`. Typecheck, tests and builds of the web app need all three vendor directories.
 
 This starts the Vite dev server for the frontend and the Rust server on port 8787, with Vite proxying `/api` and `/ws` to it. Set `TYPSTRY_BACKEND` to point Vite at a server on a different address.
 

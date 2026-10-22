@@ -1,5 +1,5 @@
 name: Set up web
-description: Node, pnpm, dependencies and the wasm builds of tinymist and typstry-wire
+description: Node, pnpm, dependencies and the wasm builds of tinymist, the Typst compiler and typstry-wire
 
 runs:
   using: composite
@@ -28,6 +28,24 @@ runs:
       if: steps.tinymist.outputs.cache-hit != 'true'
       shell: bash
       run: apps/web/scripts/build-tinymist.sh
+    # Our build of typst.ts's compiler with the source/preview jump patch.
+    # Vite and tsconfig point the npm package name at it, so nothing in the
+    # web app typechecks or runs without it. The script pins the commit; the
+    # patch is the rest of what goes in.
+    - name: Restore the Typst compiler
+      id: typst-compiler
+      uses: actions/cache@v6
+      with:
+        path: apps/web/vendor/typst-ts-web-compiler
+        key: typst-compiler-${{ hashFiles('apps/web/scripts/build-typst-compiler.sh', 'apps/web/patches/typst-ts-jump.patch') }}
+    - uses: taiki-e/install-action@v2
+      if: steps.typst-compiler.outputs.cache-hit != 'true'
+      with:
+        tool: wasm-pack@0.15.0
+    - name: Build the Typst compiler
+      if: steps.typst-compiler.outputs.cache-hit != 'true'
+      shell: bash
+      run: apps/web/scripts/build-typst-compiler.sh
     # The web app's crypto and MLS code is typstry-wire built to wasm, so the
     # cache key covers the Rust sources it is built from.
     - name: Restore typstry-wasm

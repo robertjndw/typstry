@@ -109,3 +109,50 @@
 .cm-editor .tok-invalid {
   color: var(--destructive);
 }
+
+/*
+ * The band and edge that mark where a jump landed (see flash.ts). Two
+ * identical animations, so flashing the same line twice restarts it.
+ */
+.cm-editor .cm-flash-a {
+  animation: cm-flash-a 1.4s ease-out;
+}
+.cm-editor .cm-flash-b {
+  animation: cm-flash-b 1.4s ease-out;
+}
+@keyframes cm-flash-a {
+  from {
+    background-color: color-mix(in oklab, var(--warning) 32%, transparent);
+    box-shadow: inset 3px 0 0 var(--warning);
+  }
+  60% {
+    background-color: color-mix(in oklab, var(--warning) 22%, transparent);
+    box-shadow: inset 3px 0 0 var(--warning);
+  }
+  to {
+    background-color: transparent;
+    box-shadow: inset 3px 0 0 transparent;
+  }
+}
+@keyframes cm-flash-b {
+  from {
+    background-color: color-mix(in oklab, var(--warning) 32%, transparent);
+    box-shadow: inset 3px 0 0 var(--warning);
+  }
+  60% {
+    background-color: color-mix(in oklab, var(--warning) 22%, transparent);
+    box-shadow: inset 3px 0 0 var(--warning);
+  }
+  to {
+    background-color: transparent;
+    box-shadow: inset 3px 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-editor .cm-flash-a,
+  .cm-editor .cm-flash-b {
+    animation: none;
+    background-color: color-mix(in oklab, var(--warning) 22%, transparent);
+    box-shadow: inset 3px 0 0 var(--warning);
+  }
+}

@@ -19,6 +19,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type MouseEvent,
   type ReactNode,
 } from "react";
 
@@ -30,10 +31,13 @@ import {
   playAfter,
   prefersReducedMotion,
   showHighlight,
+  showJumpMark,
   type AnimationKind,
 } from "@/components/preview/animate";
 import { followScrollTop } from "@/components/preview/follow";
 import {
+  docPointOf,
+  pagePointAt,
   pointAt,
   positionOf,
   type DocPoint,
@@ -55,17 +59,38 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { formatShortcut } from "@/lib/platform";
+import { formatShortcut, isModClick } from "@/lib/platform";
 import { cn } from "@/lib/utils";
-import type { CompilerClient, PreviewState } from "@/typst/compiler-client";
+import type {
+  CompilerClient,
+  PreviewJump,
+  PreviewState,
+} from "@/typst/compiler-client";
 import type { FontsPackagesTarget } from "@/components/fonts-packages/types";
 import { formatLocation, type ProjectDiagnostic } from "@/typst/diagnostics";
 import { usePreviewState } from "@/typst/hooks";
+import type { PagePosition } from "@/typst/protocol";
 import {
   PREVIEW_SCOPE_CLASS,
   type PageChange,
   type PreviewPage,
 } from "@/typst/svg-pages";
+
+/** Where to scroll the preview to and mark, from a jump. */
+export interface PreviewScrollTarget {
+  /**
+   * Where the spot shows up, usually once. Repeated text (a heading and
+   * its outline entry) has several; the first at or below the current
+   * scroll position wins.
+   */
+  points: PagePosition[];
+  /** y is a text baseline (a cursor jump), not the top of the spot. */
+  baseline: boolean;
+  /** Tells repeated jumps to the same spot apart. */
+  seq: number;
+}
+
+type JumpMark = PagePosition & { baseline: boolean; seq: number };
 
 export interface PreviewPaneProps {
   client: CompilerClient | null;
@@ -75,6 +100,9 @@ export interface PreviewPaneProps {
    * Without it those errors show no shortcut.
    */
   onOpenFontsPackages?: (target: FontsPackagesTarget) => void;
+  /** Mod+Click on a page asks the compiler where that spot came from. */
+  onJump?: (jump: PreviewJump) => void;
+  scrollTarget?: PreviewScrollTarget | null;
   /** Extra toolbar buttons, shown before the zoom controls. */
   actions?: ReactNode;
   /**
@@ -133,6 +161,8 @@ export function PreviewPane({
   client,
   onDiagnosticClick,
   onOpenFontsPackages,
+  onJump,
+  scrollTarget = null,
   actions,
   variant = "pane",
   className,
@@ -160,6 +190,11 @@ export function PreviewPane({
   // our own scrolling, so this is fed by input events instead.
   const lastManualScroll = useRef<number | null>(null);
   const handledFollow = useRef(state?.follow?.seq ?? 0);
+  // Seeded like handledFollow: a remount (closing a version, switching to
+  // the phone layout) must not replay the last jump.
+  const handledScroll = useRef(scrollTarget?.seq ?? 0);
+  // The point a scroll target landed on, which its page then marks.
+  const [mark, setMark] = useState<JumpMark | null>(null);
 
   useLayoutEffect(() => {
     const el = viewportRef.current;
@@ -279,6 +314,63 @@ export function PreviewPane({
     // layoutFor only closes over padding, which is constant per mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [follow]);
+
+  // Brings a jump target into view. Unlike a follow it waits for a viewport
+  // to scroll: the preview may have just been shown and still be opening.
+  useLayoutEffect(() => {
+    const el = viewportRef.current;
+    if (!scrollTarget || scrollTarget.seq === handledScroll.current) return;
+    if (!el || pages.length === 0 || el.clientHeight === 0) return;
+    if (scrollTarget.points.length === 0) return;
+    handledScroll.current = scrollTarget.seq;
+    const layout = layoutFor(el, scale);
+    const placed = scrollTarget.points.map((point) => ({
+      point,
+      pos: positionOf(pages, layout, docPointOf(pages, point)),
+    }));
+    const target =
+      placed.find(({ pos }) => pos.y >= el.scrollTop) ?? placed[0]!;
+    const top = Math.max(0, target.pos.y - el.clientHeight / 3);
+    const near = Math.abs(top - el.scrollTop) < el.clientHeight;
+    const reduced = prefersReducedMotion();
+    if (near && !reduced && typeof el.scrollTo === "function")
+      el.scrollTo({ top, behavior: "smooth" });
+    else el.scrollTop = top;
+    if (
+      target.pos.x < el.scrollLeft ||
+      target.pos.x > el.scrollLeft + el.clientWidth
+    )
+      el.scrollLeft = target.pos.x - el.clientWidth / 2;
+    setMark({
+      ...target.point,
+      baseline: scrollTarget.baseline,
+      seq: scrollTarget.seq,
+    });
+    // layoutFor only closes over padding, which is constant per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollTarget, pages, viewportHeight]);
+
+  // On mousedown, since macOS turns Ctrl+Click into a context menu click
+  // that never fires `click`.
+  const onMouseDown = (e: MouseEvent<HTMLDivElement>) => {
+    const el = viewportRef.current;
+    if (!isModClick(e) || !onJump || !client) return;
+    if (!el || renderedScale.current === null) return;
+    // Mod+Click on a link keeps opening it in a new tab.
+    if (e.target instanceof Element && e.target.closest("a")) return;
+    e.preventDefault();
+    const rect = el.getBoundingClientRect();
+    const point = pagePointAt(
+      pages,
+      layoutFor(el, renderedScale.current),
+      e.clientX - rect.left - el.clientLeft + el.scrollLeft,
+      e.clientY - rect.top - el.clientTop + el.scrollTop,
+    );
+    if (!point) return;
+    void client
+      .jumpFromClick(point.page, point.x, point.y)
+      .then((jump) => jump && onJump(jump));
+  };
 
   /**
    * Applies a zoom while keeping the document point under `view` (viewport
@@ -528,6 +620,7 @@ export function PreviewPane({
           data-testid="preview-viewport"
           onScroll={onScroll}
           onKeyDown={onKeyDown}
+          onMouseDown={onMouseDown}
         >
           {state?.document && <DefsHost defs={state.document.defs} />}
           {pages.length > 0 ? (
@@ -546,6 +639,7 @@ export function PreviewPane({
                   index={i}
                   scale={scale}
                   animation={requests.get(i) ?? null}
+                  mark={mark?.page === i ? mark : null}
                 />
               ))}
             </div>
@@ -799,11 +893,13 @@ const PageView = memo(function PageView({
   index,
   scale,
   animation,
+  mark,
 }: {
   page: PreviewPage;
   index: number;
   scale: number;
   animation: PageAnimation | null;
+  mark: JumpMark | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -847,6 +943,13 @@ const PageView = memo(function PageView({
   useLayoutEffect(() => {
     renderedScale.current = scale;
   });
+  const markSeq = mark?.seq;
+  useLayoutEffect(() => {
+    if (!mark || !overlayRef.current) return;
+    showJumpMark(overlayRef.current, mark, scale, mark.baseline);
+    // Only a new jump marks; a zoom or rerender of the page must not.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [markSeq]);
   const width = page.width * scale;
   const height = page.height * scale;
   return (

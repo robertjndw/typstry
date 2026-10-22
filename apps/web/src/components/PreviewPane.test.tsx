@@ -4,6 +4,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { getText } from "@/doc/fs-ops";
 import { initProject, type ProjectDoc } from "@/doc/schema";
 import { newProject } from "@/doc/test-utils";
+import { IS_MAC } from "@/lib/platform";
 import { CompilerClient } from "@/typst/compiler-client";
 import type {
   RenderPayload,
@@ -13,7 +14,9 @@ import type {
   WorkerResponse,
 } from "@/typst/protocol";
 
-import { PreviewPane } from "./PreviewPane";
+import { PreviewPane, type PreviewScrollTarget } from "./PreviewPane";
+
+const MOD = IS_MAC ? { metaKey: true } : { ctrlKey: true };
 
 class FakeWorker implements WorkerLike {
   sent: WorkerRequest[] = [];
@@ -538,6 +541,159 @@ describe("PreviewPane", () => {
       fireEvent.scroll(viewport);
       compileEdit(worker, project, render("a", "x", "y"));
       expect(viewport.scrollTop).toBeGreaterThan(first);
+    });
+  });
+
+  describe("jumps", () => {
+    beforeEach(() => {
+      // Same stand-in layout as for following edits: a 400 x 300 viewport,
+      // so pages fit at 3.68 px per pt, page 1 at (16, 16) and page 2 at
+      // y = 16 + 736 + 16.
+      vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(
+        400,
+      );
+      vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(
+        300,
+      );
+      const tops = new WeakMap<Element, number>();
+      vi.spyOn(HTMLElement.prototype, "scrollTop", "get").mockImplementation(
+        function (this: HTMLElement) {
+          return tops.get(this) ?? 0;
+        },
+      );
+      vi.spyOn(HTMLElement.prototype, "scrollTop", "set").mockImplementation(
+        function (this: HTMLElement, v: number) {
+          tops.set(this, v);
+        },
+      );
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    function setupJumps() {
+      const project = initProject(newProject(1), { title: "T" });
+      const worker = new FakeWorker();
+      const client = new CompilerClient(project, { worker });
+      const onJump = vi.fn();
+      const view = (scrollTarget: PreviewScrollTarget | null) => (
+        <TooltipProvider>
+          <PreviewPane
+            client={client}
+            onJump={onJump}
+            scrollTarget={scrollTarget}
+          />
+        </TooltipProvider>
+      );
+      const result = render(view(null));
+      return {
+        worker,
+        onJump,
+        retarget: (target: PreviewScrollTarget) =>
+          result.rerender(view(target)),
+      };
+    }
+
+    it("asks where a Mod+Clicked spot came from", async () => {
+      const { worker, onJump } = setupJumps();
+      await compile(worker, []);
+      worker.sent = [];
+
+      const viewport = screen.getByTestId("preview-viewport");
+      fireEvent.mouseDown(viewport, {
+        ...MOD,
+        clientX: 16 + 10 * 3.68,
+        clientY: 16 + 20 * 3.68,
+      });
+      const [request] = worker.sent;
+      expect(request).toMatchObject({ type: "jumpFromClick", page: 0 });
+      const { x, y, id } = request as Extract<
+        WorkerRequest,
+        { type: "jumpFromClick" }
+      >;
+      expect(x).toBeCloseTo(10);
+      expect(y).toBeCloseTo(20);
+
+      await act(async () => {
+        worker.emit({
+          type: "jump",
+          id,
+          target: { kind: "source", path: "/main.typ", package: "", offset: 4 },
+        });
+      });
+      expect(onJump).toHaveBeenCalledWith({
+        kind: "source",
+        path: "main.typ",
+        offset: 4,
+      });
+    });
+
+    it("ignores a Mod+Click between pages", async () => {
+      const { worker } = setupJumps();
+      await compile(worker, []);
+      worker.sent = [];
+      fireEvent.mouseDown(screen.getByTestId("preview-viewport"), {
+        ...MOD,
+        clientX: 200,
+        clientY: 760,
+      });
+      expect(worker.sent).toEqual([]);
+    });
+
+    it("leaves a plain click alone", async () => {
+      const { worker } = setupJumps();
+      await compile(worker, []);
+      worker.sent = [];
+      fireEvent.mouseDown(screen.getByTestId("preview-viewport"), {
+        clientX: 16 + 10 * 3.68,
+        clientY: 16 + 20 * 3.68,
+      });
+      expect(worker.sent).toEqual([]);
+    });
+
+    it("scrolls a jump target a third of the way down the viewport", async () => {
+      const { worker, retarget } = setupJumps();
+      await compile(worker, []);
+      const viewport = screen.getByTestId("preview-viewport");
+
+      retarget({
+        points: [{ page: 1, x: 50, y: 100 }],
+        baseline: true,
+        seq: 1,
+      });
+      expect(viewport.scrollTop).toBeCloseTo(768 + 100 * 3.68 - 100);
+
+      // Of several, the first at or below the current scroll position.
+      retarget({
+        points: [
+          { page: 0, x: 50, y: 10 },
+          { page: 1, x: 50, y: 150 },
+        ],
+        baseline: true,
+        seq: 2,
+      });
+      expect(viewport.scrollTop).toBeCloseTo(768 + 150 * 3.68 - 100);
+    });
+
+    it("does not replay the last jump when it mounts again", async () => {
+      const project = initProject(newProject(1), { title: "T" });
+      const worker = new FakeWorker();
+      const client = new CompilerClient(project, { worker });
+      await compile(worker, []);
+      // As after closing a version: the workspace still holds the last
+      // jump, which this fresh preview never asked for.
+      render(
+        <TooltipProvider>
+          <PreviewPane
+            client={client}
+            scrollTarget={{
+              points: [{ page: 1, x: 50, y: 10 }],
+              baseline: true,
+              seq: 3,
+            }}
+          />
+        </TooltipProvider>,
+      );
+      const mark = document.querySelector('[style*="var(--warning)"]');
+      expect(mark).toBeNull();
     });
   });
 });

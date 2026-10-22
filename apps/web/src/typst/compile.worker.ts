@@ -20,11 +20,13 @@ import {
   DEFAULT_FONTS,
   type ArtifactUpdate,
   type FontConfig,
+  type PagePosition,
   type WorkerDiagnostic,
   type WorkerRequest,
   type WorkerResponse,
 } from "./protocol";
 import { FONT_CACHE } from "./cache-names";
+import { jumpCompiler, toJumpTarget, toPagePosition } from "./jump";
 import { createPreviewRenderer } from "./renderer";
 import { RenderHost, type RenderOutcome } from "./render-state";
 import { CompileScheduler } from "./scheduler";
@@ -184,6 +186,9 @@ async function buildCompiler(config: FontConfig): Promise<TypstCompiler> {
   packages.forgetLookups();
   const compiler = createTypstCompiler();
   await compiler.init({
+    // The wrapper's own import of the glue lives in node_modules, which
+    // Vitest does not alias; this keeps it on our build everywhere.
+    getWrapper: () => import("@myriaddreamin/typst-ts-web-compiler"),
     getModule: () => wasmModuleRef(compilerWasmUrl),
     beforeBuild: [
       // loadFonts must be passed explicitly: in typst.ts 0.7 the implicit
@@ -457,6 +462,37 @@ async function exportPdf(id: number, mainPath: string): Promise<void> {
   }
 }
 
+/**
+ * Answered right away rather than through the scheduler: a jump only reads
+ * the last compiled document, and a click should not wait for a compile.
+ */
+function jumpFromClick(id: number, page: number, x: number, y: number): void {
+  let target = null;
+  try {
+    if (current)
+      target = toJumpTarget(
+        jumpCompiler(current.compiler).jump_from_click(page, x, y),
+      );
+  } catch (err) {
+    console.error("typst jump from click failed", err);
+  }
+  post({ type: "jump", id, target });
+}
+
+function jumpFromCursor(id: number, path: string, offset: number): void {
+  let positions: PagePosition[] = [];
+  try {
+    if (current)
+      positions = jumpCompiler(current.compiler)
+        .jump_from_cursor(path, offset)
+        .map(toPagePosition)
+        .filter((p) => p !== null);
+  } catch (err) {
+    console.error("typst jump from cursor failed", err);
+  }
+  post({ type: "jumpPositions", id, positions });
+}
+
 // Throttle, not a trailing debounce: a debounce adds its full delay to every
 // keystroke and starves the preview while the user keeps typing. A compile
 // starts as soon as the previous one has rendered, with the latest text, one
@@ -512,6 +548,12 @@ scope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
       break;
     case "restart":
       restartSession();
+      break;
+    case "jumpFromClick":
+      jumpFromClick(msg.id, msg.page, msg.x, msg.y);
+      break;
+    case "jumpFromCursor":
+      jumpFromCursor(msg.id, msg.path, msg.offset);
       break;
   }
 });

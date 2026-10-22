@@ -1,0 +1,311 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fc8a320f..7c251f6a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5812,6 +5812,7 @@ dependencies = [
+  "sha2",
+  "typst",
+  "typst-assets",
++ "typst-ide",
+  "typst-ts-test-common",
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+diff --git a/packages/compiler/Cargo.toml b/packages/compiler/Cargo.toml
+index d26e7941..6af2fa03 100644
+--- a/packages/compiler/Cargo.toml
++++ b/packages/compiler/Cargo.toml
+@@ -40,6 +40,7 @@ reflexo-typst2vec.workspace = true
+ reflexo-typst = { workspace = true, features = ["web"] }
+ reflexo-vec2svg.workspace = true
+ typst.workspace = true
++typst-ide.workspace = true
+ typst-assets = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
+diff --git a/packages/compiler/src/lib.rs b/packages/compiler/src/lib.rs
+index a672ab17..5d27541e 100644
+--- a/packages/compiler/src/lib.rs
++++ b/packages/compiler/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub mod builder;
++mod jump;
+ 
+ #[cfg(feature = "incr")]
+ mod incr;
+@@ -101,6 +102,7 @@ fn convert_diag<'a>(
+ #[wasm_bindgen]
+ pub struct TypstCompiler {
+     pub(crate) verse: TypstBrowserUniverse,
++    pub(crate) last_paged: jump::LastPaged,
+ }
+ 
+ impl TypstCompiler {
+@@ -117,6 +119,7 @@ impl TypstCompiler {
+                 registry,
+                 fonts,
+             ),
++            last_paged: Default::default(),
+         })
+     }
+ }
+@@ -318,6 +321,7 @@ impl TypstCompiler {
+ 
+         Ok(TypstCompileWorld {
+             graph: WorldComputeGraph::new(CompileSnapshot::from_world(world)),
++            last_paged: self.last_paged.clone(),
+         })
+     }
+ 
+@@ -383,6 +387,7 @@ type HtmlCFlag = CFlag<reflexo_typst::TypstHtmlDocument>;
+ #[wasm_bindgen]
+ pub struct TypstCompileWorld {
+     graph: Arc<WorldComputeGraph<BrowserCompilerFeat>>,
++    last_paged: jump::LastPaged,
+ }
+ 
+ #[wasm_bindgen]
+@@ -516,7 +521,11 @@ impl TypstCompileWorld {
+     fn do_compile_paged(&mut self) -> Result<Option<Arc<TypstPagedDocument>>, JsValue> {
+         let g = &self.graph;
+         let _ = g.provide::<PagedCFlag>(Ok(FlagTask::flag(true)));
+-        Ok(g.shared_compile()?)
++        let doc = g.shared_compile()?;
++        if let Some(doc) = &doc {
++            jump::remember(&self.last_paged, g, doc);
++        }
++        Ok(doc)
+     }
+ 
+     fn get_doc(&self, kind: u8) -> Result<Option<TypstDocument>, JsValue> {
+diff --git a/packages/compiler/src/jump.rs b/packages/compiler/src/jump.rs
+new file mode 100644
+index 00000000..b93216a1
+--- /dev/null
++++ b/packages/compiler/src/jump.rs
+@@ -0,0 +1,226 @@
++//! Click-to-source and cursor-to-preview jumps against the last paged
++//! document, for editors that keep using the stock typst.ts JS wrapper.
++
++use std::{cell::RefCell, num::NonZeroUsize, rc::Rc, sync::Arc};
++
++use js_sys::{Array, Object, Reflect};
++use reflexo_typst::{BrowserCompilerFeat, TypstPagedDocument, WorldComputeGraph};
++use typst::diag::FileResult;
++use typst::foundations::{Bytes, Datetime, Duration};
++use typst::introspection::PagedPosition;
++use typst::layout::{Abs, Frame, FrameItem, Point};
++use typst::syntax::{
++    FileId, LinkedNode, RootedPath, Source, Span, SyntaxKind, VirtualPath, VirtualRoot,
++};
++use typst::text::{Font, FontBook};
++use typst::utils::LazyHash;
++use typst::{Library, World};
++use typst_ide::{IdeWorld, Jump};
++use wasm_bindgen::prelude::*;
++
++use crate::TypstCompiler;
++
++type Graph = Arc<WorldComputeGraph<BrowserCompilerFeat>>;
++
++/// The document is kept together with the world it was compiled in: spans
++/// only resolve against the sources that produced them, and a failed compile
++/// leaves the previous document on screen.
++pub(crate) type LastPaged = Rc<RefCell<Option<(Graph, Arc<TypstPagedDocument>)>>>;
++
++pub(crate) fn remember(last: &LastPaged, graph: &Graph, doc: &Arc<TypstPagedDocument>) {
++    *last.borrow_mut() = Some((graph.clone(), doc.clone()));
++}
++
++/// typst-ide wants an IdeWorld, which the orphan rule keeps us from
++/// implementing on reflexo's world directly.
++struct Ide<'a>(&'a dyn World);
++
++impl World for Ide<'_> {
++    fn library(&self) -> &LazyHash<Library> {
++        self.0.library()
++    }
++    fn book(&self) -> &LazyHash<FontBook> {
++        self.0.book()
++    }
++    fn main(&self) -> FileId {
++        self.0.main()
++    }
++    fn source(&self, id: FileId) -> FileResult<Source> {
++        self.0.source(id)
++    }
++    fn file(&self, id: FileId) -> FileResult<Bytes> {
++        self.0.file(id)
++    }
++    fn font(&self, index: usize) -> Option<Font> {
++        self.0.font(index)
++    }
++    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
++        self.0.today(offset)
++    }
++}
++
++impl IdeWorld for Ide<'_> {
++    fn upcast(&self) -> &dyn World {
++        self.0
++    }
++}
++
++fn object(entries: &[(&str, JsValue)]) -> JsValue {
++    let obj = Object::new();
++    for (key, value) in entries {
++        let _ = Reflect::set(&obj, &(*key).into(), value);
++    }
++    obj.into()
++}
++
++/// Pages are 0-based and coordinates are pt from the page's top-left, like
++/// the vector renderer's page layout.
++fn position(pos: &PagedPosition) -> JsValue {
++    object(&[
++        ("page", (pos.page.get() - 1).into()),
++        ("x", pos.point.x.to_pt().into()),
++        ("y", pos.point.y.to_pt().into()),
++    ])
++}
++
++/// The glyph in `frame` that shows the source text at `local`, a byte offset
++/// into the text node that `span` belongs to. Returns that offset too, so
++/// frames can be compared.
++///
++/// typst_ide::jump_from_cursor only looks at spans, and a paragraph is one
++/// text node: every line of it carries the same span, so it always answers
++/// with the first glyph of the first line. The offset each glyph keeps into
++/// its node is what tells the lines apart.
++fn glyph_at(frame: &Frame, span: Span, local: usize) -> Option<(u16, Point)> {
++    let mut best: Option<(u16, Point)> = None;
++    let mut consider = |offset: u16, point: Point| {
++        // Strictly greater, so repeated content (an outline entry and its
++        // heading) resolves to the first one, as typst-ide does.
++        if best.is_none_or(|(at, _)| offset > at) {
++            best = Some((offset, point));
++        }
++    };
++    for &(mut pos, ref item) in frame.items() {
++        match item {
++            FrameItem::Group(group) => {
++                if let Some((offset, point)) = glyph_at(&group.frame, span, local) {
++                    consider(offset, pos + point.transform(group.transform));
++                }
++            }
++            FrameItem::Text(text) => {
++                for glyph in &text.glyphs {
++                    if glyph.span.0 == span && usize::from(glyph.span.1) <= local {
++                        consider(glyph.span.1, pos);
++                    }
++                    pos.x += glyph.x_advance.at(text.size);
++                }
++            }
++            _ => {}
++        }
++    }
++    best
++}
++
++/// Like typst_ide::jump_from_cursor, but lands on the glyph at the cursor
++/// instead of the start of the text node it is in. None when the cursor is
++/// not in text, or no glyph matches and the caller should fall back.
++fn jump_from_cursor_exact(
++    doc: &TypstPagedDocument,
++    source: &Source,
++    cursor: usize,
++) -> Option<Vec<PagedPosition>> {
++    let root = LinkedNode::new(source.root());
++    let is_text =
++        |node: &LinkedNode| matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText);
++    let node = root
++        .leaf_at(cursor, typst::syntax::Side::Before)
++        .filter(is_text)
++        .or_else(|| {
++            root.leaf_at(cursor, typst::syntax::Side::After)
++                .filter(is_text)
++        })?;
++    let local = cursor.saturating_sub(node.offset());
++    let span = node.span();
++    let found: Vec<PagedPosition> = doc
++        .pages()
++        .iter()
++        .enumerate()
++        .filter_map(|(i, page)| {
++            glyph_at(&page.frame, span, local).map(|(_, point)| PagedPosition {
++                page: NonZeroUsize::MIN.saturating_add(i),
++                point,
++            })
++        })
++        .collect();
++    (!found.is_empty()).then_some(found)
++}
++
++#[wasm_bindgen]
++impl TypstCompiler {
++    /// Where a click on the last compiled document leads: `{path, package?,
++    /// offset}` (offset in UTF-16 units), `{url}`, `{page, x, y}`, or null.
++    pub fn jump_from_click(&self, page: usize, x: f64, y: f64) -> JsValue {
++        let last = self.last_paged.borrow();
++        let Some((graph, doc)) = last.as_ref() else {
++            return JsValue::NULL;
++        };
++        let world = Ide(&graph.snap.world);
++        let click = PagedPosition {
++            page: NonZeroUsize::MIN.saturating_add(page),
++            point: Point::new(Abs::pt(x), Abs::pt(y)),
++        };
++        match typst_ide::jump_from_click(&world, doc.as_ref(), &click) {
++            Some(Jump::File(id, offset)) => {
++                let Some(offset) = world
++                    .source(id)
++                    .ok()
++                    .and_then(|s| s.lines().byte_to_utf16(offset))
++                else {
++                    return JsValue::NULL;
++                };
++                // reflexo puts the workspace under a made-up package root
++                // (@ws/p0), so project files are told apart by sharing the
++                // main file's root, not by VirtualRoot::Project.
++                let package = match id.root() {
++                    root if root == world.main().root() => JsValue::UNDEFINED,
++                    VirtualRoot::Project => JsValue::UNDEFINED,
++                    VirtualRoot::Package(spec) => spec.to_string().into(),
++                };
++                object(&[
++                    ("path", id.vpath().get_with_slash().into()),
++                    ("package", package),
++                    ("offset", offset.into()),
++                ])
++            }
++            Some(Jump::Url(url)) => object(&[("url", url.as_str().into())]),
++            Some(Jump::Position(pos)) => position(&pos),
++            None => JsValue::NULL,
++        }
++    }
++
++    /// Where the text at a UTF-16 offset in a project file shows up in the
++    /// last compiled document. Usually one position, more for content that
++    /// repeats (headers, outlines), none for code that renders no text.
++    pub fn jump_from_cursor(&self, path: &str, offset: usize) -> Array {
++        let last = self.last_paged.borrow();
++        let Some((graph, doc)) = last.as_ref() else {
++            return Array::new();
++        };
++        let Ok(vpath) = VirtualPath::new(path) else {
++            return Array::new();
++        };
++        let world = &graph.snap.world;
++        let id = RootedPath::new(world.main().root().clone(), vpath).intern();
++        let Ok(source) = world.source(id) else {
++            return Array::new();
++        };
++        let Some(cursor) = source.lines().utf16_to_byte(offset) else {
++            return Array::new();
++        };
++        jump_from_cursor_exact(doc.as_ref(), &source, cursor)
++            .unwrap_or_else(|| typst_ide::jump_from_cursor(doc.as_ref(), &source, cursor))
++            .iter()
++            .map(position)
++            .collect()
++    }
++}

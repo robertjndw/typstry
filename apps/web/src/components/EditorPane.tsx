@@ -1,5 +1,5 @@
 import type { Text } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import type { TreeID } from "loro-crdt";
 import { EyeIcon, FileCodeIcon } from "lucide-react";
 import {
@@ -20,15 +20,18 @@ import { basename, dirname } from "@/doc/names";
 import { getText } from "@/doc/fs-ops";
 import { CursorContext, reportCursor } from "@/editor/cursor-store";
 import { Editor } from "@/editor/Editor";
+import { flashLine } from "@/editor/flash";
 import { revealScroll } from "@/editor/reveal-scroll";
 import { imageDrop } from "@/editor/image-drop";
 import { typstLanguage } from "@/editor/language";
+import { modClick } from "@/editor/mod-click";
 import { remoteCursors, reportSelection } from "@/editor/remote-cursors";
 import type { TinymistClient } from "@/lsp/tinymist-client";
 import { SHORTCUTS } from "@/lib/shortcuts";
 import { cn } from "@/lib/utils";
 import { usePresenceContext } from "@/presence/context";
 import { useProject } from "@/project/context";
+import { RevealContext } from "@/project/reveal-context";
 import { uploadReporting } from "@/project/tree";
 import type { CompilerClient } from "@/typst/compiler-client";
 import { usePreviewDiagnostics } from "@/typst/hooks";
@@ -39,8 +42,12 @@ import type { SourceRange } from "@/typst/protocol";
 export type RevealTarget =
   /** Typst's line and code point column, as diagnostics report it. */
   | { kind: "source"; range: SourceRange }
-  /** UTF-16 offsets, which is what CodeMirror and Loro index by. */
-  | { kind: "offset"; from: number; to: number };
+  /**
+   * UTF-16 offsets, which is what CodeMirror and Loro index by. `flash`
+   * centres the spot and marks its line, for jumps that come from somewhere
+   * else on screen, where the eye has to find where it landed.
+   */
+  | { kind: "offset"; from: number; to: number; flash?: boolean };
 
 function clampRange(from: number, to: number, length: number) {
   const clamp = (n: number) => Math.min(Math.max(n, 0), length);
@@ -60,6 +67,11 @@ export interface EditorPaneProps {
   /** Completion and hover docs for Typst files, when available. */
   tinymist?: TinymistClient | null;
   reveal?: RevealRequest | null;
+  /**
+   * Shows an offset of a Typst file in the preview. Mod+Click calls it when
+   * the clicked spot has no definition to go to.
+   */
+  onJumpToPreview?: (fileId: TreeID, offset: number) => void;
   className?: string;
 }
 
@@ -67,6 +79,7 @@ export function EditorPane({
   compiler,
   tinymist,
   reveal,
+  onJumpToPreview,
   className,
 }: EditorPaneProps) {
   const { project, index, openFileId, undoManager, readOnly, assets } =
@@ -83,6 +96,7 @@ export function EditorPane({
   }
   const presence = usePresenceContext()?.presence;
   const cursors = useContext(CursorContext);
+  const revealFn = useContext(RevealContext);
   const openKind = openFileId ? index.byId.get(openFileId)?.kind : undefined;
   // The store only reports an open id that resolves to a live node, so
   // getText cannot throw for a text file.
@@ -132,8 +146,25 @@ export function EditorPane({
           ]
         : [],
       cursors && openFileId ? reportCursor(cursors, openFileId) : [],
+      isTypst && openFileId && onJumpToPreview
+        ? modClick(async (view, pos) => {
+            const definition = await tinymist?.definition(view, pos);
+            if (definition && revealFn) {
+              revealFn(definition.fileId, {
+                kind: "offset",
+                from: definition.offset,
+                to: definition.offset,
+                flash: true,
+              });
+            } else {
+              onJumpToPreview(openFileId, pos);
+            }
+          })
+        : [],
     ],
     [
+      onJumpToPreview,
+      revealFn,
       presence,
       cursors,
       project,
@@ -173,10 +204,14 @@ export function EditorPane({
       target.kind === "source"
         ? sourceRangeToOffsets(target.range, doc)
         : clampRange(target.from, target.to, doc.length);
+    const flash = target.kind === "offset" && target.flash;
     view.dispatch({
       selection: { anchor: range.from, head: range.to },
-      effects: revealScroll(view, range.from),
+      effects: flash
+        ? EditorView.scrollIntoView(range.from, { y: "center" })
+        : revealScroll(view, range.from),
     });
+    if (flash) flashLine(view, range.from);
     view.focus();
   }, [view, reveal, openFileId]);
 

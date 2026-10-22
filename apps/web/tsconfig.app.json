@@ -19,7 +19,15 @@
     "noUncheckedIndexedAccess": true,
     "noUncheckedSideEffectImports": true,
     "erasableSyntaxOnly": true,
-    "paths": { "@/*": ["./src/*"] }
+    "paths": {
+      "@/*": ["./src/*"],
+      "@myriaddreamin/typst-ts-web-compiler": [
+        "./vendor/typst-ts-web-compiler/pkg/typst_ts_web_compiler.d.ts"
+      ],
+      "@myriaddreamin/typst-ts-web-compiler/*": [
+        "./vendor/typst-ts-web-compiler/*"
+      ]
+    }
   },
   "include": ["src"],
   "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-setup.ts"]

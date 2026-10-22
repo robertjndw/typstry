@@ -37,6 +37,23 @@ export function formatShortcut(combo: string): string {
   return shortcutKeys(combo).join(IS_MAC ? "" : "+");
 }
 
+/**
+ * Cmd+Click on Apple platforms, Ctrl+Click elsewhere. On a Mac Ctrl+Click
+ * opens the context menu, so the two can't be treated alike.
+ */
+export function isModClick(event: {
+  button: number;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+}): boolean {
+  if (event.button !== 0 || event.altKey || event.shiftKey) return false;
+  return IS_MAC
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+}
+
 /** The `aria-keyshortcuts` value for a combo, e.g. "Meta+B". */
 export function ariaKeyShortcut(combo: string): string {
   return combo
