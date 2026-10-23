@@ -11,8 +11,8 @@ import {
 
 /** What is being imported, and the source once it has been read. */
 export interface PendingImport {
-  /** A zip is unpacked first, so the UI says so. */
-  kind: "zip" | "files";
+  /** A zip is unpacked first and a repository fetched, so the UI says so. */
+  kind: "zip" | "files" | "git";
   source: Promise<ImportSource>;
 }
 

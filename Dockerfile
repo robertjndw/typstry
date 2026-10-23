@@ -91,7 +91,8 @@ RUN cargo build --release --locked -p typstry-server
 RUN mkdir /src/data
 
 # The server only needs glibc and libgcc_s, which the cc variant has. It
-# makes no outbound TLS connections, so no CA certificates either.
+# trusts the CA roots compiled into it (webpki-roots) for the Git relay's
+# outbound TLS, so it needs no CA bundle in the image.
 FROM gcr.io/distroless/cc-debian13
 LABEL org.opencontainers.image.title="typstry" \
       org.opencontainers.image.description="Self-hostable, end-to-end encrypted collaborative Typst editor" \

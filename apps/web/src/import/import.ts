@@ -146,7 +146,7 @@ function dropped(segments: string[], unwrap: boolean): boolean {
   return isJunk(segments) || kept.some((s) => !isSafePath(s));
 }
 
-function segmentsOf(path: string): string[] {
+export function segmentsOf(path: string): string[] {
   return path.split("/").filter((s) => s !== "" && s !== ".");
 }
 

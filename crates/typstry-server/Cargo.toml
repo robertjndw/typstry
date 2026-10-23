@@ -14,7 +14,12 @@ futures-util.workspace = true
 getrandom.workspace = true
 loro.workspace = true
 loro-protocol.workspace = true
+# The git relay's outbound client. Roots come from webpki-roots below, since
+# the runtime image has no CA bundle.
+reqwest = { workspace = true, features = ["stream"] }
+rustls.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
@@ -24,12 +29,12 @@ tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webpki-roots.workspace = true
 # Only the check of the owner's signature on a rotation; the server never
 # holds a key, so the encryption stays out.
 typstry-wire = { workspace = true, features = ["owner-proof"] }
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
