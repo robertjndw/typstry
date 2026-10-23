@@ -165,13 +165,18 @@ function GitImportForm({
     setUrl(value);
     setChosen(null);
     const next = tryParse(value);
+    const nextUrl = next && "url" in next ? next.url : null;
+    // Same repository means no new lookup, so clear the flag or the next
+    // keystroke would skip the debounce.
+    if (nextUrl === null || nextUrl === repoUrl) immediate.current = false;
     if (!next || !("url" in next)) return;
     // A plain link to another repository must not inherit the last one's.
     if (next.ref || next.path || refs?.url !== next.url)
       hint.current = { ref: next.ref, path: next.path };
     if (refs?.url !== next.url) return;
-    if (next.ref && hasRef(refs, next.ref)) setRef(next.ref);
-    if (next.path !== undefined) setPath(next.path);
+    const wanted = resolveHint(refs, { ref: next.ref, path: next.path });
+    if (wanted.ref && hasRef(refs, wanted.ref)) setRef(wanted.ref);
+    if (next.path !== undefined) setPath(wanted.path ?? "");
   }
 
   // State left over from an earlier URL or ref is ignored by comparing its
@@ -185,13 +190,13 @@ function GitImportForm({
         (found) => {
           if (!live) return;
           setLookup({ url: repoUrl, state: "ready", refs: found });
-          const wanted = hint.current.ref;
+          const wanted = resolveHint(found, hint.current);
           setRef(
-            wanted && hasRef(found, wanted)
-              ? wanted
+            wanted.ref && hasRef(found, wanted.ref)
+              ? wanted.ref
               : (found.defaultBranch ?? found.branches[0] ?? ""),
           );
-          setPath(hint.current.path ?? "");
+          setPath(wanted.path ?? "");
         },
         (err: unknown) => {
           if (live)
@@ -223,9 +228,16 @@ function GitImportForm({
       pending = fetchSnapshot(refs.url, ref, (progress) => {
         if (live) setSnap({ key: snapKey, state: "loading", progress });
       });
+      // Each snapshot holds a whole pack in memory, so only the current one
+      // is kept; going back to an earlier ref fetches it again.
+      snapshots.current.clear();
       snapshots.current.set(snapKey, pending);
       // A failed fetch is not worth keeping; picking the ref again retries.
-      pending.catch(() => snapshots.current.delete(snapKey));
+      const failed = pending;
+      failed.catch(() => {
+        if (snapshots.current.get(snapKey) === failed)
+          snapshots.current.delete(snapKey);
+      });
     }
     pending.then(
       (snapshot) => {
@@ -276,11 +288,14 @@ function GitImportForm({
   function choose(template: GitTemplate) {
     setChosen(template);
     hint.current = { ref: template.ref, path: template.path };
-    immediate.current = true;
+    const next = tryParse(template.url);
+    const nextUrl = next && "url" in next ? next.url : null;
+    // Only skip the debounce when this actually starts a new lookup.
+    immediate.current = nextUrl !== null && nextUrl !== repoUrl;
     setUrl(template.url);
     // The same repository is already looked up, so land on the template's
     // ref and folder right away.
-    if (refs && parseGitUrl(template.url).url === refs.url) {
+    if (refs && nextUrl === refs.url) {
       setRef(
         template.ref && hasRef(refs, template.ref)
           ? template.ref
@@ -528,6 +543,25 @@ function GitImportForm({
 
 function hasRef(refs: RemoteRefs, name: string): boolean {
   return refs.branches.includes(name) || refs.tags.includes(name);
+}
+
+/**
+ * A link puts the ref and the folder in one path, and parseGitUrl can only
+ * guess that the first segment is the ref. With the refs known, the longest
+ * prefix that names one wins, so "feature/x/docs" can be the branch
+ * "feature/x" and the folder "docs".
+ */
+function resolveHint(refs: RemoteRefs, hint: Hint): Hint {
+  if (!hint.ref || hasRef(refs, hint.ref)) return hint;
+  const parts = [hint.ref, ...(hint.path ? hint.path.split("/") : [])];
+  for (let n = parts.length; n > 1; n--) {
+    const ref = parts.slice(0, n).join("/");
+    if (hasRef(refs, ref)) {
+      const rest = parts.slice(n).join("/");
+      return { ref, path: rest || undefined };
+    }
+  }
+  return hint;
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {

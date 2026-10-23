@@ -76,7 +76,10 @@ export function Combobox({
     setOpen(next);
     if (next) {
       setQuery("");
-      setActive(Math.max(0, options.indexOf(selected!)));
+      // Only the first MAX_SHOWN rows render. A selection further down can't
+      // be highlighted, so start at the top or Enter would do nothing.
+      const index = selected ? options.indexOf(selected) : -1;
+      setActive(index >= 0 && index < MAX_SHOWN ? index : 0);
     }
   }
 

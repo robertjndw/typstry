@@ -213,6 +213,9 @@ export async function fetchSnapshot(
   const { git, http } = await loadGit(deps);
   const fs = deps.fs ?? createMemFs();
   const dir = "/";
+  // Without a shared cache isomorphic-git re-parses the pack index on every
+  // readTree and readBlob, which is quadratic in the number of objects.
+  const cache = {};
 
   let head: string | null;
   try {
@@ -224,6 +227,7 @@ export async function fetchSnapshot(
       http,
       dir,
       url,
+      cache,
       corsProxy: deps.corsProxy ?? CORS_PROXY,
       ref,
       singleBranch: true,
@@ -247,7 +251,7 @@ export async function fetchSnapshot(
       manifest: false,
     };
     if (folders.length < MAX_FOLDERS) folders.push(folder);
-    const { tree } = await git.readTree({ fs, dir, oid: treeOid });
+    const { tree } = await git.readTree({ fs, dir, oid: treeOid, cache });
     // Git sorts directories as if they ended in a slash; the picker wants
     // plain path order.
     const entries = [...tree].sort((a, b) =>
@@ -268,7 +272,7 @@ export async function fetchSnapshot(
   }
   try {
     onProgress?.("Listing folders");
-    const root = await git.readTree({ fs, dir, oid });
+    const root = await git.readTree({ fs, dir, oid, cache });
     await list(root.oid, "");
   } catch (err) {
     throw new ImportError(
@@ -279,8 +283,9 @@ export async function fetchSnapshot(
   }
 
   async function read(input: string): Promise<ImportSource> {
+    // Don't call onProgress here. The dialog treats it as the snapshot
+    // loading again and would stay stuck on "Reading files" if this throws.
     const path = segmentsOf(input).join("/");
-    onProgress?.("Reading files");
     const raw: { path: string; bytes: Uint8Array }[] = [];
     const skipped: string[] = [];
     let bytes = 0;
@@ -290,6 +295,7 @@ export async function fetchSnapshot(
         dir,
         oid,
         filepath: path || undefined,
+        cache,
       });
       const trees = [{ at: path, entries: root.tree }];
       for (let tree = trees.pop(); tree; tree = trees.pop()) {
@@ -298,7 +304,7 @@ export async function fetchSnapshot(
           const shown = at.slice(path ? path.length + 1 : 0);
           if (isJunk(shown.split("/"))) continue;
           if (entry.type === "tree") {
-            const sub = await git.readTree({ fs, dir, oid: entry.oid });
+            const sub = await git.readTree({ fs, dir, oid: entry.oid, cache });
             trees.push({ at, entries: sub.tree });
             continue;
           }
@@ -308,14 +314,19 @@ export async function fetchSnapshot(
             continue;
           }
           if (raw.length >= MAX_IMPORT_ENTRIES) throw tooManyEntries();
-          const { blob } = await git.readBlob({ fs, dir, oid: entry.oid });
+          const { blob } = await git.readBlob({
+            fs,
+            dir,
+            oid: entry.oid,
+            cache,
+          });
           bytes += blob.length;
           if (bytes > MAX_IMPORT_BYTES) {
             throw new ImportError(
               `The files add up to more than ${mb(MAX_IMPORT_BYTES)} MB`,
             );
           }
-          raw.push({ path: shown, bytes: new Uint8Array(blob) });
+          raw.push({ path: shown, bytes: blob });
         }
       }
     } catch (err) {
@@ -355,6 +366,7 @@ export async function readGit(
   const ref = spec.ref?.trim() || parsed.ref;
   const path = spec.path?.trim() || parsed.path || "";
   const snapshot = await fetchSnapshot(parsed.url, ref, onProgress, deps);
+  onProgress?.("Reading files");
   return snapshot.read(path);
 }
 

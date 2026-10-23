@@ -530,6 +530,9 @@ async fn run(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, RelayError> {
+    // Taken before the body is read, so a slow upload eats into the same
+    // budget as the download instead of starting a fresh one.
+    let deadline = Instant::now() + TOTAL_TIMEOUT;
     let target = parse_target(method, target, query)?;
     let mut url = target.url(git.scheme)?;
     git.check_url(&url)?;
@@ -540,7 +543,6 @@ async fn run(
             .map_err(|_| RelayError::TooLarge)?,
     };
 
-    let deadline = Instant::now() + TOTAL_TIMEOUT;
     let mut hops = 0;
     let res = loop {
         let mut req = match target.kind {
