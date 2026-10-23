@@ -72,6 +72,7 @@ tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "trace", "fs", "timeout", "set-header"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webpki-roots = "1.0.9"
 zeroize = "1.8.2"
 
 [workspace.lints.rust]

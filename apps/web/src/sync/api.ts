@@ -170,6 +170,58 @@ export async function resolveShare(
   return share;
 }
 
+/** A starting point an admin offers: a repository, optionally a ref and folder. */
+export interface GitTemplate {
+  name: string;
+  description?: string;
+  url: string;
+  ref?: string;
+  path?: string;
+}
+
+export interface TemplateInfo {
+  /** Whether the server relays Git traffic at all. */
+  gitImport: boolean;
+  templates: GitTemplate[];
+}
+
+/**
+ * What the server offers for starting from Git. Any failure reads as "not
+ * offered": the start page works without it.
+ */
+export async function fetchTemplates(
+  opts: ApiOptions = {},
+): Promise<TemplateInfo> {
+  const off: TemplateInfo = { gitImport: false, templates: [] };
+  try {
+    const res = await apiFetch(`${opts.baseUrl ?? ""}/api/templates`, {
+      signal: opts.signal,
+    });
+    if (!res.ok) return off;
+    const body = (await res.json()) as Record<string, unknown>;
+    if (body.gitImport !== true) return off;
+    const list = Array.isArray(body.templates) ? body.templates : [];
+    const templates = list.flatMap((t): GitTemplate[] => {
+      const item = t as Record<string, unknown> | null;
+      if (typeof item?.name !== "string" || typeof item.url !== "string")
+        return [];
+      const optional = (v: unknown) => (typeof v === "string" ? v : undefined);
+      return [
+        {
+          name: item.name,
+          url: item.url,
+          description: optional(item.description),
+          ref: optional(item.ref),
+          path: optional(item.path),
+        },
+      ];
+    });
+    return { gitImport: true, templates };
+  } catch {
+    return off;
+  }
+}
+
 /** What a newcomer needs to open a project and join its MLS group. */
 export interface MlsBootstrap {
   incarnation: number;

@@ -87,7 +87,7 @@ async function focusWindow(page: Page) {
 
 async function openFolder(page: Page) {
   await page.goto("/");
-  await page.getByRole("button", { name: "Open local folder" }).click();
+  await page.getByRole("button", { name: "Local folder" }).click();
   await expect(page).toHaveURL(/\/p\/[^/#]+#.+/);
   await expect(syncStatus(page)).toHaveText("Connected");
 }
@@ -125,7 +125,7 @@ test("opening a folder makes a project of its files", async ({ page }) => {
 
 test("an empty folder is refused", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Open local folder" }).click();
+  await page.getByRole("button", { name: "Local folder" }).click();
   await expect(page.getByRole("alert")).toHaveText(
     "There is nothing to import",
   );

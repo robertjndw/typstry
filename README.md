@@ -20,7 +20,7 @@ A self-hostable, real-time collaborative editor for [Typst](https://typst.app), 
 - **History** - browse the edit history, tag versions to find them again, preview, diff and restore.
 - **Sharing and members** - separate edit and view-only links, no accounts required. Every device that opens a project joins its [MLS](https://www.rfc-editor.org/rfc/rfc9420) group, so members can see who is in a project and its owner can remove a member, which also replaces the links.
 - **Your devices** - pair a phone, a laptop and the CLI with a short code to use them as one person. Your project list syncs between them, a lost device can be revoked from any other, and a recovery key brings everything back if all are lost.
-- **Import and export** - start a project from a ZIP or a folder, and download the compiled PDF or the whole project as a ZIP.
+- **Import and export** - start a project from a ZIP, a folder or a public Git repository (one-time copy, no git link afterwards), and download the compiled PDF or the whole project as a ZIP.
 - **Local editing and git** - the `typstry` CLI syncs a project with a local folder, so you can use your own editor and keep the files in your own git repository.
 
 ## Quick start

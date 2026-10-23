@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use typstry_wire::ds::MAX_DS_MESSAGE;
 
+use crate::http::git::{GitConfig, Template, valid_host_entry, validate_templates};
 use crate::http::{default_font_origins, valid_font_origin};
 use crate::limits::DEFAULT_MAX_CONNECTIONS;
 use crate::relay::RelayConfig;
@@ -26,6 +27,7 @@ pub struct Config {
     pub rooms: RoomConfig,
     pub limits: ConnLimits,
     pub relay: RelayConfig,
+    pub git: GitConfig,
     /// Open WebSockets across all clients.
     pub max_connections: usize,
     /// Origins the web app may fetch Typst fonts from, for its CSP. Empty
@@ -44,6 +46,7 @@ impl Default for Config {
             rooms: RoomConfig::default(),
             limits: ConnLimits::default(),
             relay: RelayConfig::default(),
+            git: GitConfig::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             font_origins: default_font_origins(),
         }
@@ -60,6 +63,8 @@ pub enum ConfigError {
         expected: &'static str,
         value: String,
     },
+    #[error("TYPSTRY_TEMPLATES is invalid: {0}")]
+    InvalidTemplates(String),
 }
 
 impl Config {
@@ -189,6 +194,46 @@ impl Config {
         {
             config.relay.ttl = Duration::from_secs(secs);
         }
+        if let Some(raw) = text("TYPSTRY_GIT_IMPORT") {
+            config.git.enabled = match raw.trim().to_ascii_lowercase().as_str() {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    return Err(ConfigError::Invalid {
+                        var: "TYPSTRY_GIT_IMPORT",
+                        expected: "on or off",
+                        value: raw,
+                    });
+                }
+            };
+        }
+        if let Some(raw) = text("TYPSTRY_GIT_HOSTS") {
+            let hosts: Vec<String> = raw
+                .split(',')
+                .map(|host| host.trim().to_ascii_lowercase())
+                .filter(|host| !host.is_empty())
+                .collect();
+            if !hosts.iter().all(|host| valid_host_entry(host)) {
+                return Err(ConfigError::Invalid {
+                    var: "TYPSTRY_GIT_HOSTS",
+                    expected: "comma-separated hostnames like github.com",
+                    value: raw,
+                });
+            }
+            config.git.hosts = hosts;
+        }
+        if let Some(bytes) =
+            parse("TYPSTRY_GIT_MAX_BYTES", "a positive byte count").get_where(|&n| n >= 1)?
+        {
+            config.git.max_bytes = bytes;
+        }
+        if let Some(raw) = text("TYPSTRY_TEMPLATES") {
+            let templates: Vec<Template> = serde_json::from_str(&raw)
+                .map_err(|err| ConfigError::InvalidTemplates(err.to_string()))?;
+            validate_templates(&templates, &config.git.hosts)
+                .map_err(ConfigError::InvalidTemplates)?;
+            config.git.templates = templates;
+        }
         Ok(config)
     }
 }
@@ -261,6 +306,84 @@ mod tests {
         assert_eq!(config.space_quota_bytes, 1 << 30);
         assert_eq!(config.font_origins, ["https://cdn.jsdelivr.net"]);
         assert_eq!(config.max_connections, 10_000);
+        assert!(config.git.enabled);
+        assert!(config.git.hosts.is_empty());
+        assert_eq!(config.git.max_bytes, 200 * 1024 * 1024);
+        assert!(config.git.templates.is_empty());
+    }
+
+    #[test]
+    fn git_variables() {
+        let config = config(&[
+            ("TYPSTRY_GIT_IMPORT", " OFF "),
+            ("TYPSTRY_GIT_HOSTS", " GitHub.com, gitlab.com ,,"),
+            ("TYPSTRY_GIT_MAX_BYTES", "1048576"),
+            (
+                "TYPSTRY_TEMPLATES",
+                r#"[{"name":"Thesis","description":"d","url":"https://github.com/o/r","ref":"v1","path":"a/b"},
+                    {"name":"Bare","url":"https://gitlab.com/o/r"}]"#,
+            ),
+        ])
+        .unwrap();
+        assert!(!config.git.enabled);
+        assert_eq!(config.git.hosts, ["github.com", "gitlab.com"]);
+        assert_eq!(config.git.max_bytes, 1 << 20);
+        assert_eq!(config.git.templates.len(), 2);
+        assert_eq!(config.git.templates[0].r#ref.as_deref(), Some("v1"));
+        assert_eq!(config.git.templates[1].path, None);
+
+        // Set but empty means any public host.
+        let any = super::tests::config(&[("TYPSTRY_GIT_HOSTS", "")]).unwrap();
+        assert!(any.git.hosts.is_empty());
+        assert!(
+            super::tests::config(&[("TYPSTRY_GIT_IMPORT", "on")])
+                .unwrap()
+                .git
+                .enabled
+        );
+    }
+
+    #[test]
+    fn rejects_bad_git_values() {
+        let template = r#"[{"name":"T","url":"https://github.com/o/r"}]"#;
+        for (var, value) in [
+            ("TYPSTRY_GIT_IMPORT", "yes"),
+            ("TYPSTRY_GIT_IMPORT", ""),
+            ("TYPSTRY_GIT_HOSTS", "https://github.com"),
+            ("TYPSTRY_GIT_HOSTS", "github.com/x"),
+            ("TYPSTRY_GIT_HOSTS", "*.github.com"),
+            ("TYPSTRY_GIT_MAX_BYTES", "0"),
+            ("TYPSTRY_GIT_MAX_BYTES", "lots"),
+            ("TYPSTRY_TEMPLATES", "not json"),
+            ("TYPSTRY_TEMPLATES", r#"{"name":"T"}"#),
+            ("TYPSTRY_TEMPLATES", r#"[{"name":"T"}]"#),
+            (
+                "TYPSTRY_TEMPLATES",
+                r#"[{"name":"T","url":"https://h.com","extra":1}]"#,
+            ),
+            (
+                "TYPSTRY_TEMPLATES",
+                r#"[{"name":"","url":"https://h.com/o/r"}]"#,
+            ),
+            (
+                "TYPSTRY_TEMPLATES",
+                r#"[{"name":"T","url":"http://h.com/o/r"}]"#,
+            ),
+            (
+                "TYPSTRY_TEMPLATES",
+                r#"[{"name":"T","url":"https://h.com/o/r","path":"../x"}]"#,
+            ),
+        ] {
+            assert!(config(&[(var, value)]).is_err(), "{var}={value}");
+        }
+        assert!(config(&[("TYPSTRY_TEMPLATES", template)]).is_ok());
+        // A template off the allowlist.
+        let err = config(&[
+            ("TYPSTRY_GIT_HOSTS", "gitlab.com"),
+            ("TYPSTRY_TEMPLATES", template),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("github.com"), "{err}");
     }
 
     #[test]

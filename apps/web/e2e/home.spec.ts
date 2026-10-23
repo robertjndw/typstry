@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { strToU8, zipSync } from "fflate";
+import type { Page } from "@playwright/test";
 
 import {
   createProject,
@@ -12,6 +13,7 @@ import {
   syncStatus,
   test,
 } from "./fixtures";
+import { makeFixture, serve as serveRepo } from "./git-backend";
 
 test("created projects are listed and can be removed", async ({ page }) => {
   await createProject(page, "Listed");
@@ -94,7 +96,7 @@ test("a zip imports as a new project, assets included", async ({
 
   await page.goto("/");
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "Import" }).click();
+  await page.getByRole("button", { name: "Files or zip" }).click();
   await (
     await chooser
   ).setFiles({
@@ -146,6 +148,100 @@ test("dropping a zip on the start page imports it", async ({ page }) => {
     page.getByRole("button", { name: /Project title: paper\./ }),
   ).toBeVisible();
   await expect(firstPage(page)).toBeVisible();
+});
+
+/**
+ * Offers Git import and relays `/api/git` to a real `git http-backend` over a
+ * fixture repo, so the browser speaks actual smart HTTP to it.
+ */
+async function serveGit(page: Page, root: string, status?: number) {
+  await page.route("**/api/templates", (route) =>
+    route.fulfill({
+      json: {
+        gitImport: true,
+        templates: [
+          {
+            name: "Letter",
+            description: "A plain letter",
+            url: "https://git.example/o/repo",
+            path: "letter",
+          },
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/git/**", async (route) => {
+    const request = route.request();
+    if (status) return route.fulfill({ status, body: "" });
+    const url = new URL(request.url());
+    const reply = await serveRepo(
+      { root },
+      {
+        method: request.method(),
+        url: url.pathname.replace("/api/git/git.example", "") + url.search,
+        headers: request.headers(),
+        body: request.postDataBuffer() ?? undefined,
+      },
+    );
+    await route.fulfill({
+      status: reply.status,
+      headers: reply.headers,
+      body: reply.body,
+    });
+  });
+}
+
+test("a template from Git imports as a new project", async ({ page }) => {
+  const fixture = makeFixture({
+    files: {
+      "README.md": "not part of the template\n",
+      "letter/main.typ": "= Dear reader\n",
+      "letter/parts/body.typ": "Hello\n",
+    },
+  });
+  await serveGit(page, fixture.root);
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Template or Git" }).click();
+  await page.getByRole("radio", { name: /Letter/ }).click();
+  await expect(page.getByLabel("Repository URL")).toHaveValue(
+    "https://git.example/o/repo",
+  );
+  await page.getByRole("button", { name: "Create project" }).click();
+
+  await expect(page).toHaveURL(/\/p\/[^/#]+#.+/);
+  await expect(syncStatus(page)).toHaveText("Connected");
+  await expect(
+    page.getByRole("button", { name: /Project title: Letter\./ }),
+  ).toBeVisible();
+  await expect(
+    fileTree(page).getByRole("treeitem", { name: "main.typ" }),
+  ).toBeVisible();
+  await expect(
+    fileTree(page).getByRole("treeitem", { name: "README.md" }),
+  ).toBeHidden();
+  await expect(firstPage(page)).toBeVisible();
+});
+
+test("a repository the relay cannot find says so", async ({ page }) => {
+  await serveGit(page, "", 404);
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Template or Git" }).click();
+  await page.getByLabel("Repository URL").fill("git.example/o/missing");
+
+  // The lookup fails before anything is created, right under the field.
+  await expect(
+    page.getByText("The repository was not found, or it is not public"),
+  ).toBeVisible();
+  await expect(page.getByLabel("Repository URL")).toHaveAttribute(
+    "aria-invalid",
+    "true",
+  );
+  await expect(
+    page.getByRole("button", { name: "Create project" }),
+  ).toBeDisabled();
+  await expect(page).toHaveURL("/");
 });
 
 test("a name changed on the start page shows up in a project", async ({

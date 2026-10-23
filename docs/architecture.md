@@ -51,13 +51,14 @@ The server cannot merge records, because it cannot read them. Its log of records
 
 ## The server
 
-The server is a single Rust program (`crates/typstry-server`) with a SQLite database and a folder for uploaded files. It does five jobs:
+The server is a single Rust program (`crates/typstry-server`) with a SQLite database and a folder for uploaded files. It does six jobs:
 
 | Job              | Connection  | What it does                                                                                                                                                          |
 | ---------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Document rooms   | `/ws`       | Stores encrypted document records and forwards them to everyone in the project. Forwards presence without storing it.                                                 |
 | Uploads          | `/api`      | Stores and serves encrypted files (images, fonts, data files).                                                                                                        |
 | Delivery service | `/ws/mls`   | Stores and forwards the messages that change who is in a project. It decides the order of these messages, but cannot read them. See [members](members-and-owners.md). |
+| Git relay        | `/api/git`  | Fetches a public Git repository for the browser when a project is started from it. The files are read and imported in the browser.                                    |
 | Pairing relay    | `/ws/relay` | Connects two of your devices for a moment while you pair them. See [devices](devices-and-accounts.md).                                                                |
 | Static files     | `/`         | Serves the web app itself.                                                                                                                                            |
 
@@ -69,7 +70,8 @@ The server sees:
 - share-link tokens (the part of the link before `#`),
 - the unencrypted headers of records, the size of uploads, and when things happen,
 - how many members a group has and when it changes,
-- each project's owner public key.
+- each project's owner public key,
+- which public Git repository a project was started from, if any. The Git host sees the server's address, not yours.
 
 The server does not see document content, file names, uploaded files, names of people, cursors or the keys. The [encryption page](encryption.md) explains why.
 

@@ -1,5 +1,6 @@
 pub mod assets;
 mod error;
+pub mod git;
 pub mod mls;
 pub mod protocol;
 pub mod relay;
@@ -13,7 +14,7 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -178,6 +179,7 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
         .route("/api/spaces", post(spaces::create))
         .route("/api/share/{token}", get(spaces::share))
         .route(typstry_wire::relay::RELAY_API_PATH, post(relay::allocate))
+        .route("/api/templates", get(git::templates))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             API_TIMEOUT,
@@ -188,6 +190,9 @@ pub fn router(state: AppState, web_dist: &Path) -> Router {
     // one can hold.
     let gated = Router::new()
         .merge(api)
+        // Same for the Git relay, which has its own 120 s deadline (see
+        // git::relay).
+        .route("/api/git/{*target}", any(git::relay))
         .route("/api/s/{token}/assets", post(assets::upload))
         .route("/api/s/{token}/blobs/{hash}", get(assets::blob))
         .route("/api/s/{token}/mls", get(mls::bootstrap))

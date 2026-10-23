@@ -3,6 +3,7 @@ import {
   CloudOffIcon,
   FileTextIcon,
   FolderOpenIcon,
+  GitBranchIcon,
   HardDriveIcon,
   ImportIcon,
   KeyRoundIcon,
@@ -26,6 +27,7 @@ import { toast } from "sonner";
 
 import { AccountMenu } from "@/components/AccountMenu";
 import { ConfirmDeleteDialog } from "@/components/ConfirmDeleteDialog";
+import { GitImportDialog, type GitLoad } from "@/components/GitImportDialog";
 import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -50,7 +52,11 @@ import { LOCAL_ONLY } from "@/mode";
 import type { Entry } from "@/directory/directory";
 import { useDirectory } from "@/directory/store";
 import { projectUrl } from "@/project/recent";
-import { RateLimitedError } from "@/sync/api";
+import {
+  fetchTemplates,
+  RateLimitedError,
+  type TemplateInfo,
+} from "@/sync/api";
 
 const TITLE_MAX_LENGTH = 120;
 
@@ -81,6 +87,13 @@ async function deleteProjectFiles(projectId: string) {
   const { deleteLocalProject } = await import("@/project/create");
   return deleteLocalProject(projectId);
 }
+
+/** What an import says until it has something more specific to report. */
+const STARTING: Record<PendingImport["kind"], string> = {
+  zip: "Unpacking zip…",
+  files: "Reading files…",
+  git: "Fetching from Git…",
+};
 
 const SERVER_FEATURES: { Icon: LucideIcon; title: string; text: string }[] = [
   {
@@ -156,6 +169,8 @@ export function Home() {
   const busy = creating || importing;
   const [folderSupported] = useState(folderSyncSupported);
   const [error, setError] = useState<string | null>(null);
+  const [gitOpen, setGitOpen] = useState(false);
+  const [gitInfo, setGitInfo] = useState<TemplateInfo | null>(null);
   const entries = useDirectory();
   const projects = useMemo(
     () => entries?.filter((e) => e.state !== "forgotten") ?? null,
@@ -165,6 +180,16 @@ export function Home() {
   const stored = useStoredIdentity();
   const [provisional] = useState(() => provisionalIdentity());
   const now = useNow(60_000);
+
+  useEffect(() => {
+    // There is no server to relay Git traffic in the static build.
+    if (LOCAL_ONLY) return;
+    const controller = new AbortController();
+    void fetchTemplates({ signal: controller.signal }).then((info) => {
+      if (!controller.signal.aborted) setGitInfo(info);
+    });
+    return () => controller.abort();
+  }, []);
 
   async function deleteProject(project: Entry) {
     try {
@@ -198,16 +223,14 @@ export function Home() {
     }
   }
 
-  async function importFrom(pending: PendingImport) {
-    setImportStatus(
-      pending.kind === "zip" ? "Unpacking zip…" : "Reading files…",
-    );
+  async function importFrom(pending: PendingImport, typedTitle = title) {
+    setImportStatus(STARTING[pending.kind]);
     setError(null);
     try {
       const source = await pending.source;
       assertImportable(source);
       setImportStatus("Creating project…");
-      const projectTitle = titleFor(title, source.name);
+      const projectTitle = titleFor(typedTitle, source.name);
       const created = await createProject(projectTitle, (project, assets) =>
         writeImport(project, source, assets, (uploaded, total) => {
           if (total > 0)
@@ -225,6 +248,25 @@ export function Home() {
       );
       setImportStatus(null);
     }
+  }
+
+  function importGit(load: GitLoad, projectTitle: string) {
+    if (busy) return;
+    void importFrom(
+      {
+        kind: "git",
+        source: load((phase) =>
+          setImportStatus(`Fetching from Git: ${phase}…`),
+        ),
+      },
+      projectTitle,
+    );
+  }
+
+  function setGitDialog(open: boolean) {
+    setGitOpen(open);
+    // A failed Git import's message belongs to the dialog, not the page.
+    setError(null);
   }
 
   async function openFolder() {
@@ -417,35 +459,67 @@ export function Home() {
               )}
               New project
             </Button>
+          </form>
+          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-2">
+            <span className="mr-0.5 text-sm text-muted-foreground">
+              Or start from
+            </span>
             <Button
               type="button"
               variant="outline"
-              size="lg"
+              size="sm"
               disabled={busy}
               title="Import a zip or Typst files"
               onClick={() => fileInput.current?.click()}
             >
-              {importing ? (
+              {importing && !gitOpen ? (
                 <Loader2Icon className="animate-spin" />
               ) : (
                 <ImportIcon />
               )}
-              {importing ? "Importing…" : "Import"}
+              Files or zip
             </Button>
+            {gitInfo?.gitImport && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                aria-haspopup="dialog"
+                title="Start from a template or a public Git repository"
+                onClick={() => setGitDialog(true)}
+              >
+                <GitBranchIcon />
+                {gitInfo.templates.length > 0
+                  ? "Template or Git"
+                  : "Git repository"}
+              </Button>
+            )}
             {folderSupported && (
               <Button
                 type="button"
                 variant="outline"
-                size="lg"
+                size="sm"
                 disabled={busy}
                 title="Open a folder on this computer and keep it in sync"
                 onClick={() => void openFolder()}
               >
                 <FolderOpenIcon />
-                Open local folder
+                Local folder
               </Button>
             )}
-          </form>
+          </div>
+          {gitInfo?.gitImport && (
+            <GitImportDialog
+              open={gitOpen}
+              onOpenChange={setGitDialog}
+              templates={gitInfo.templates}
+              status={gitOpen ? importStatus : null}
+              error={gitOpen ? error : null}
+              initialTitle={title}
+              onSubmit={importGit}
+            />
+          )}
           <input
             ref={fileInput}
             type="file"
@@ -454,7 +528,8 @@ export function Home() {
             aria-label="Files to import"
             onChange={onPick}
           />
-          {importStatus ? (
+          {/* While the Git dialog is open, it shows progress and errors. */}
+          {importStatus && !gitOpen ? (
             <p
               role="status"
               className="flex items-center gap-2 text-sm text-muted-foreground"
@@ -469,7 +544,7 @@ export function Home() {
               </p>
             )
           )}
-          {error && (
+          {error && !gitOpen && (
             <p role="alert" className="text-sm text-destructive">
               {error}
             </p>

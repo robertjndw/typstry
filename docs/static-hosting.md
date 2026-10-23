@@ -11,6 +11,7 @@ Everything that needs a server is left out of the build:
 - sharing links and collaboration, including presence
 - pairing devices, the device list and recovery keys
 - the personal project list on the server (the list is kept in the browser instead)
+- starting a project from a Git repository or a template, which needs the server to fetch the repository
 
 ## Where projects are stored
 

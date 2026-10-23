@@ -6,6 +6,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
 use crate::http::Csp;
+use crate::http::git::GitRelay;
 use crate::limits::ConnCeiling;
 use crate::relay::RelayRegistry;
 use crate::room::RoomRegistry;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub relay: RelayRegistry,
     /// Caps open WebSockets across all clients.
     pub conns: ConnCeiling,
+    /// Outbound client and settings for the Git import relay.
+    pub git: GitRelay,
     /// Content security policies for the app's pages.
     pub csp: Csp,
     /// Cancelled when the server starts shutting down; open WebSockets
@@ -54,6 +57,7 @@ impl AppState {
             limits: config.limits.clone(),
             relay,
             conns: ConnCeiling::new(config.max_connections),
+            git: GitRelay::new(&config.git),
             csp: Csp::new(&config.font_origins),
             shutdown,
             connections: TaskTracker::new(),

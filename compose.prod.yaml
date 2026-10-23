@@ -118,6 +118,18 @@ services:
       - traefik.http.middlewares.typstry-relay-limit.ratelimit.burst=10
       - traefik.http.middlewares.typstry-relay-limit.ratelimit.sourcecriterion.ipstrategy.ipv6subnet=64
 
+      # Git imports: 20 requests a minute. Starting a project from a repo
+      # takes two, and each one makes the server fetch from another host.
+      - traefik.http.routers.typstry-git.rule=Host(`${TYPSTRY_DOMAIN}`) && PathPrefix(`/api/git/`)
+      - traefik.http.routers.typstry-git.priority=100
+      - traefik.http.routers.typstry-git.entrypoints=websecure
+      - traefik.http.routers.typstry-git.service=typstry
+      - traefik.http.routers.typstry-git.middlewares=typstry-hsts,typstry-git-limit
+      - traefik.http.middlewares.typstry-git-limit.ratelimit.average=20
+      - traefik.http.middlewares.typstry-git-limit.ratelimit.period=1m
+      - traefik.http.middlewares.typstry-git-limit.ratelimit.burst=20
+      - traefik.http.middlewares.typstry-git-limit.ratelimit.sourcecriterion.ipstrategy.ipv6subnet=64
+
       # WebSockets (/ws, /ws/mls, /ws/relay): at most 200 open per address.
       # A request counts as in flight for as long as its socket is open. A
       # browser tab holds two per project, and a whole office may share one

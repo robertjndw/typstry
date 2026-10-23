@@ -86,6 +86,7 @@ Each limit is a Traefik middleware in the `labels:` of the `typstry` service, wi
 | `POST /api/spaces`            | `typstry-spaces-limit`  | 2 a minute, bursts up to 20   | 429 with Retry-After |
 | `POST /api/s/<token>/assets`  | `typstry-uploads-limit` | 60 a minute, bursts up to 200 | 429 with Retry-After |
 | `POST /api/relay`             | `typstry-relay-limit`   | 10 a minute, bursts up to 10  | 429 with Retry-After |
+| `/api/git/...`                | `typstry-git-limit`     | 20 a minute, bursts up to 20  | 429 with Retry-After |
 | `/ws`, `/ws/mls`, `/ws/relay` | `typstry-ws-limit`      | 200 open WebSockets           | 429, clients retry   |
 
 They count per client address, with IPv6 clients counted per /64 network. The rate limits are token buckets: `burst` requests may go through at once, then `average` per `period` (Traefik's `ratelimit` middleware). The WebSocket cap uses `inflightreq`, which counts a WebSocket for as long as it is open. The web app and the CLI retry a 429 a few times on their own.
@@ -110,7 +111,7 @@ Whenever typstry is reachable from anywhere but `localhost`, it needs a reverse 
 - **WebSockets** are used on `/ws`, `/ws/mls` and `/ws/relay`; the proxy must pass the upgrade through. Connections stay open for as long as a project is open.
 - **Request bodies** up to `TYPSTRY_MAX_UPLOAD_BYTES` (25 MiB by default) must be allowed. nginx refuses anything over 1 MiB unless told otherwise.
 - **Access logs contain secrets.** Share links travel in URL paths (`/api/s/<token>/...`, `/api/share/<token>`) and pairing claims in query strings, and whoever has a link can open the project. Turn the proxy's access log off for typstry or strip paths and queries from it. The server itself never logs them.
-- **Per-address limits are yours to add.** The server does not limit clients by address. Configure the proxy to rate limit `POST /api/spaces`, `POST /api/s/<token>/assets` and `POST /api/relay` per client and to cap open WebSockets per client, as [the Traefik setup](#the-limits) does, or one visitor can use up the instance.
+- **Per-address limits are yours to add.** The server does not limit clients by address. Configure the proxy to rate limit `POST /api/spaces`, `POST /api/s/<token>/assets`, `POST /api/relay` and `/api/git/` per client and to cap open WebSockets per client, as [the Traefik setup](#the-limits) does, or one visitor can use up the instance.
 
 Caddy:
 
@@ -153,9 +154,26 @@ Neither example limits anything per address yet. With nginx, `limit_req_zone`/`l
 
 ## What the browser loads from elsewhere
 
-The web app is served by your instance, but the Typst compiler in the browser fetches its fonts from `cdn.jsdelivr.net` and Typst packages (`#import "@preview/..."`) from `packages.typst.org`. Neither request carries project content.
+The web app is served by your instance, but the Typst compiler in the browser fetches its fonts from `cdn.jsdelivr.net` and Typst packages (`#import "@preview/..."`) from `packages.typst.org`. Neither request carries project content. Git imports go through your server instead, see [Git imports and templates](#git-imports-and-templates).
 
 To serve the fonts from somewhere else, build the image with the `VITE_TYPST_FONT_BASE` and `VITE_TYPST_DEV_FONT_BASE` build arguments pointing at your mirror (`docker build --build-arg VITE_TYPST_FONT_BASE=https://fonts.example.com/fonts/ ...`), and set `TYPSTRY_FONT_ORIGINS` to the mirror's origin so the server's Content Security Policy allows it. Fonts hosted by the typstry server itself need no extra origin: set `TYPSTRY_FONT_ORIGINS` to an empty value. The published images use the jsDelivr default.
+
+## Git imports and templates
+
+People can start a project from a public Git repository over HTTPS. The browser cannot reach Git hosts itself, so the server relays the fetch on `/api/git/`: it forwards only the read-only requests a clone needs, never connects to private, loopback or link-local addresses, and sends no cookies or credentials. This is the only time the server connects to another host. The files are copied once; the project has no link to the repository afterwards, and private repositories are not supported.
+
+To offer templates in the new-project form, list them in `TYPSTRY_TEMPLATES` as JSON. `ref` (a branch or tag) and `path` (a folder in the repository) are optional, so one repository can hold many templates:
+
+```yaml
+environment:
+  TYPSTRY_TEMPLATES: >-
+    [{"name": "Thesis", "description": "University thesis", "url": "https://github.com/example/typst-templates", "ref": "main", "path": "thesis"},
+     {"name": "Letter", "url": "https://gitlab.com/example/letter"}]
+  # Optional: only these hosts may be imported from.
+  TYPSTRY_GIT_HOSTS: github.com,gitlab.com
+```
+
+The server refuses to start if a template is not valid or its host is not in `TYPSTRY_GIT_HOSTS`. `TYPSTRY_GIT_IMPORT=off` turns the feature off; the button and the templates are then hidden.
 
 ## Configuration
 
@@ -211,6 +229,15 @@ These settings control the log of group changes (joins, removals, new links) tha
 | Variable                 | Default | Description                                                                 |
 | ------------------------ | ------- | --------------------------------------------------------------------------- |
 | `TYPSTRY_RELAY_TTL_SECS` | `300`   | How long a pairing channel lives. This is how long a pairing code is valid. |
+
+### Git imports
+
+| Variable                | Default               | Description                                                                                          |
+| ----------------------- | --------------------- | ---------------------------------------------------------------------------------------------------- |
+| `TYPSTRY_GIT_IMPORT`    | `on`                  | `off` turns off starting projects from Git and hides the templates.                                  |
+| `TYPSTRY_GIT_HOSTS`     | (any public host)     | Comma-separated hosts that may be imported from, like `github.com,gitlab.com`.                       |
+| `TYPSTRY_GIT_MAX_BYTES` | `209715200` (200 MiB) | Largest response the server relays for one Git request. Past it, the import fails with 413.          |
+| `TYPSTRY_TEMPLATES`     | (none)                | JSON list of templates shown in the new-project form. See [Git imports](#git-imports-and-templates). |
 
 [env-filter]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
 

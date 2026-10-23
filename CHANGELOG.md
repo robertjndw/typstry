@@ -20,6 +20,7 @@ The first release.
 - Separate edit and view links, an MLS member group per project, and an owner who can remove members and reset the links.
 - Devices without accounts: pairing with a short code, a synced project list, revoking lost devices and 17-word recovery keys.
 - Import from a ZIP or a folder, export of the compiled PDF or the whole project as a ZIP.
+- Starting a project from a public Git repository or one of the instance's templates, optionally from a branch, tag or subfolder.
 - Local folders in Chromium browsers: open a folder as a project, or link a project to a folder, and keep the two in sync live with merging of edits made on both sides.
 - The `typstry` CLI, which syncs a project with a local folder so it can be edited in any editor and kept in git.
 - A self-hostable server with Docker images on `ghcr.io/robertjndw/typstry`, and prebuilt CLI binaries for Linux and macOS with build provenance attestations.
