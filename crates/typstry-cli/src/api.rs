@@ -593,14 +593,19 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_429_is_retried_after_retry_after() {
-        // The backoff alone would take seconds; Retry-After: 0 takes none.
         let (origin, mut requests) =
             fake_server_answering(vec![RATE_LIMITED_NOW, RATE_LIMITED_NOW, SPACE_CREATED]).await;
+        let mut api = Api::new(&origin).unwrap();
+        // Far longer than three local requests could take on a loaded CI
+        // runner, so only actually waiting out the backoff trips the
+        // assertion. Retry-After: 0 should skip it entirely.
+        let backoff = Duration::from_secs(10);
+        api.rate_limit_backoff = backoff;
         let started = std::time::Instant::now();
-        let created = Api::new(&origin).unwrap().create_space().await.unwrap();
+        let created = api.create_space().await.unwrap();
         assert_eq!(created.edit_token, "e");
         assert_eq!(count(&mut requests), 3);
-        assert!(started.elapsed() < RATE_LIMIT_BACKOFF);
+        assert!(started.elapsed() < backoff);
     }
 
     #[tokio::test]
