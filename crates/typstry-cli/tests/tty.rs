@@ -10,6 +10,7 @@
 mod common;
 
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,7 +86,11 @@ impl Tty {
         drop(pair.slave);
 
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 1000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            NonZeroU16::new(ROWS).unwrap(),
+            NonZeroU16::new(COLS).unwrap(),
+            1000,
+        )));
         let raw = Arc::new(Mutex::new(Vec::new()));
         let mut reader = pair.master.try_clone_reader().unwrap();
         {
